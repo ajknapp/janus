@@ -1,0 +1,97 @@
+cabal-version:      2.4
+name:               janus
+version:            0.1.0.0
+
+synopsis: An extensible EDSL for high-performance computing.
+
+-- A longer description of the package.
+-- description:
+
+-- A URL where users can report bugs.
+-- bug-reports:
+
+-- The license under which the package is released.
+license:            BSD-2-Clause OR Apache-2.0
+license-file:       LICENSE.md
+author:             Andrew Knapp
+maintainer:         andy.j.knapp@gmail.com
+
+-- A copyright notice.
+-- copyright:
+-- category:
+extra-source-files: CHANGELOG.md
+
+library
+    exposed-modules:  Janus
+                      Janus.Backend.C
+                      Janus.Backend.C.Build
+                      Janus.Control.Fold
+                      Janus.Control.Pipe
+                      Janus.Control.Step
+                      Janus.Control.Stream
+                      Janus.Control.Unfold
+                      Janus.Command.Array
+                      Janus.Command.Case
+                      Janus.Command.Cond
+                      Janus.Command.Format
+                      Janus.Command.IO
+                      Janus.Command.Range
+                      Janus.Command.Ref
+                      Janus.Command.TicToc
+                      Janus.Command.While
+                      Janus.Expression.Bool
+                      Janus.Expression.Bits
+                      Janus.Expression.Cast
+                      Janus.Expression.Cond
+                      Janus.Expression.Eq
+                      Janus.Expression.Extract
+                      Janus.Expression.Inject
+                      Janus.Expression.Integral
+                      Janus.Expression.Let
+                      Janus.Expression.Let.Do
+                      Janus.Expression.Math
+                      Janus.Expression.MurmurHash
+                      Janus.Expression.Ord
+                      Janus.FFI.Arg
+                      Janus.FFI.Ret
+                      Janus.Fix
+                      Janus.Typed
+    -- Modules included in this library but not exported.
+    -- other-modules:
+
+    -- LANGUAGE extensions used by modules in this package.
+    -- other-extensions:
+    build-depends:    base ^>=4.18
+                    , async
+                    , base16-bytestring
+                    , bytestring
+                    , containers
+                    , cryptohash-sha256
+                    , dependent-sum-template
+                    , directory
+                    , hashable
+                    , filepath
+                    , kan-extensions
+                    , language-c-quote
+                    , lens
+                    , libffi
+                    , mtl
+                    , mainland-pretty
+                    , monad-control
+                    , process
+                    , profunctors
+                    , semigroupoids
+                    , rock
+                    , semilattices
+                    , some
+                    , srcloc
+                    , stm
+                    , template-haskell
+                    , transformers
+                    , unix
+                    , vector
+    hs-source-dirs:   src
+    c-sources:        cbits/janus.c
+    include-dirs:     cbits/
+    default-language: Haskell2010
+    ghc-options:      -Wall

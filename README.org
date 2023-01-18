@@ -1,0 +1,43 @@
+* Janus
+
+This is an extensible EDSL for low-level computing (especially numerical computing) based on compilation to C.
+A CUDA C backend is the next major feature on the list, followed by adding sum types.
+SIMD support is also a possibility if I need it.
+I will also explore using the =ST= trick to prevent scoping errors.
+Once these items are complete, I will consider this package mostly done.
+Development will then switch to improving the standard library, improving UI ergonomics, and using this package to build numerical software.
+
+An example use case is a Bayesian [[https://arxiv.org/abs/2303.18221][Microcanonical Langevin Monte Carlo]] sampler built on a Janus-based autodiff package, which I will release as soon as I've updated it to incorporate some recent Janus API changes.
+In the medium term, I intend for that sampler to run many chains in parallel on the GPU.
+However, the largest codebase built on top of Janus is a quantitative trading system capable of full orderbook reconstruction, which will not be released for the forseeable future.
+That package implements proprietary online machine learning algorithms and quantitative signals, in addition to the necessary market data plumbing.
+
+An LLVM backend is possible, but I have used LLVM in a professional capacity, and I learned it is a very fast treadmill for a single developer (or even a small team) to stay on.
+
+The name comes from the fact that the language is implemented in a finally tagless style, where all of the typeclasses defined in this package have two instances.
+The first instance directly evaluates the program, using normal Haskell functions like =(+)=.
+This instance is intended for debugging and program construction purposes: Janus code is just normal Haskell code with this instance.
+Once the program is constructed, the user changes a type signature, and now the same program generates, compiles, and runs low-level C code.
+Inlining is absolutely predictable, all overhead from continuation-based stream fusion is eliminated, and there is no overhead from laziness when >99% of values are elements of massive arrays of floating point numbers, allocated when the program starts and freed when it exits.
+Therefore, the user can iteratively test ideas in GHCI, with full access to debugging features and Haskell abstractions, while generating very fast code: we have "abstraction without regret" as Oleg Kiselyov says.
+In fact, Janus was inspired in part by Oleg's work on [[https://www.okmij.org/ftp/ML/MetaOCaml.html][MetaOCaml]].
+The idea of a high-level macro language for a low-level language came from [[https://terralang.org/][Terra]].
+
+Janus is not very functional, and using it feels quite like writing C.
+This is deliberate: my goal when writing Janus was to build a compilation target that is easy to write primitives in.
+However, all of the abstractions developed so far are "one-pass" or "Turbo Pascal" flavored: no syntax trees are analyzed.
+A good example of this flavor of abstraction is in =Janus.Control.Pipe=.
+This example also explains my lack of urgency around adding embedded sum types: we can get quite far with continuations and native Haskell sum types.
+
+Here are some batteries that are included:
+- Most of the C operators.
+- Recursion.
+- Loops.
+- Tensors in a particular basis (multidimensional arrays) are provided.
+- Mutable references.
+- Structs.
+- Streaming combinators based on folds, unfolds, streams, and pipes (Mealy machines) provide complete fusion.
+
+A note of caution: Janus is pre-alpha software.
+There are no docs.
+Expect things to break often and without warning.
