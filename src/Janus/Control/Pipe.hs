@@ -191,6 +191,19 @@ source (Stream s) = Pipe $ pure $ Kleisli $ \case
   Skip -> pure Skip
   Stop -> pure Stop
 
+-- for debugging purposes only
+traceShowP :: (CmdPutString m e, Monad m, Show a) => Pipe m a a
+traceShowP = Pipe $ pure $ Kleisli $ \case
+  Yield a -> ContT $ \k -> withString (show a <> "\n") putString >> k (Yield a)
+  Skip -> pure Skip
+  Stop -> pure Stop
+
+traceFormatP :: (Monad m, CmdFormat m e a) => Pipe m (e a) (e a)
+traceFormatP = Pipe $ pure $ Kleisli $ \case
+  Yield a -> ContT $ \k -> format a >> k (Yield a)
+  Skip -> pure Skip
+  Stop -> pure Stop
+
 formatP :: (Monad m, CmdFormat m e a) => Sink m (e a)
 formatP = Pipe $ pure $ Kleisli $ \case
   Yield a -> ContT $ \k -> format a >> k (Yield ())
@@ -211,6 +224,12 @@ pipe step = pipe' (pure ()) (const (pure ())) (const . step)
 pipeM :: (Monad m) => (a -> m b) -> Pipe m a b
 pipeM k = Pipe $ pure $ Kleisli $ \case
   Yield a -> lift $ Yield <$> k a
+  Skip -> pure Skip
+  Stop -> pure Stop
+
+joinP :: Monad m => Pipe m (m a) a
+joinP = Pipe $ pure $ Kleisli $ \case
+  Yield ma -> ContT $ \k -> ma >>= k . Yield
   Skip -> pure Skip
   Stop -> pure Stop
 
