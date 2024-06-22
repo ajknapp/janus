@@ -87,6 +87,7 @@ library
                     , srcloc
                     , stm
                     , template-haskell
+                    , text
                     , transformers
                     , unix
                     , vector

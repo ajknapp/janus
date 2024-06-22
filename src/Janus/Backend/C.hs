@@ -10,7 +10,7 @@
 {-# LANGUAGE TemplateHaskell #-}
 {-# LANGUAGE TypeApplications #-}
 {-# LANGUAGE TypeFamilies #-}
-{-# OPTIONS_GHC -Wno-unused-imports #-}
+{-# LANGUAGE FlexibleContexts #-}
 
 module Janus.Backend.C where
 
@@ -21,7 +21,7 @@ import Control.Monad.Reader
 import Control.Monad.State
 import Crypto.Hash.SHA256 as SHA256
 import qualified Data.ByteString.Base16 as B16
-import Data.ByteString.Char8 (pack, unpack)
+import Data.ByteString.Char8 (unpack)
 import Data.Coerce
 import Data.Complex
 import Data.Int
@@ -34,6 +34,8 @@ import Data.Semilattice.Lower
 import Data.Semilattice.Meet
 import Data.Semilattice.Upper
 import qualified Data.Set as Set
+import qualified Data.Text as Text
+import qualified Data.Text.Encoding as Text
 import Data.Traversable
 import Data.Typeable
 import Data.Word
@@ -42,6 +44,7 @@ import Foreign.LibFFI
 import Foreign.Ptr
 import GHC.Float
 import Janus.Backend.C.Build
+import Janus.FFI.Arg
 import Janus.FFI.Ret
 import Language.C.Quote as C
 import System.FilePath
@@ -49,7 +52,6 @@ import System.IO
 import System.Posix
 import Text.PrettyPrint.Mainland (pretty)
 import Text.PrettyPrint.Mainland.Class
-import Data.Map (argSet)
 
 newtype LVal a = LVal {getLVal :: Exp}
 
@@ -62,16 +64,16 @@ data JCTypedef = JCTypedef DeclSpec String
   deriving (Eq, Ord, Show)
 
 data JCFunc = JCFunc
-  { _jcfName :: String
-  , _jcfHeaders :: Set.Set String
-  , _jcfTypedefs :: Set.Set JCTypedef
-  , _jcfTypeCache :: Map.Map TypeRep JCType
-  , _jcfProtos :: Set.Set InitGroup
-  , _jcfType :: Maybe JCType
-  , _jcfParams :: Params
-  , _jcfBlock :: Endo [BlockItem]
-  , _jcfExp :: Maybe Exp
-  , _jcfVarCounter :: Int
+  { _jcfName :: String,
+    _jcfHeaders :: Set.Set String,
+    _jcfTypedefs :: Set.Set JCTypedef,
+    _jcfTypeCache :: Map.Map TypeRep JCType,
+    _jcfProtos :: Set.Set InitGroup,
+    _jcfType :: Maybe JCType,
+    _jcfParams :: Params,
+    _jcfBlock :: Endo [BlockItem],
+    _jcfExp :: Maybe Exp,
+    _jcfVarCounter :: Int
   }
 
 $(makeLenses ''JCFunc)
@@ -105,7 +107,7 @@ renderJCFunc (JCFunc fname headerSet typedefSet _ funcSet (Just (JCType spec dec
       typedefs = foldMap ((<> "\n") . pretty 120 . ppr . tdef) typedefSet
       block' = appendBlock block [BlockStm $ Return e noLoc]
       body = pretty 120 $ ppr $ Func spec (Id fname noLoc) dec params (appEndo block' []) noLoc
-  in headers <> ['\n' | not (null headers)] <> typedefs <> ['\n' | not (null typedefs)] <> protos <> ['\n' | not (null protos)] <> body
+   in headers <> ['\n' | not (null headers)] <> typedefs <> ['\n' | not (null typedefs)] <> protos <> ['\n' | not (null protos)] <> body
 renderJCFunc _ = error "renderJCFunc: function has no type specified!"
 
 modifyFunction :: (JCFunc -> JCFunc) -> JanusCM ()
@@ -116,7 +118,7 @@ modifyFunction f = do
 class (Typeable a) => JanusCTyped a where
   jctype :: Proxy a -> JanusCM JCType
 
-finishFunction :: forall a. JanusCTyped a => JanusC a -> JanusCM ()
+finishFunction :: forall a. (JanusCTyped a) => JanusC a -> JanusCM ()
 finishFunction a = do
   ty <- getJanusCType (Proxy @a)
   RVal e <- getJanusC a
@@ -133,24 +135,28 @@ finishFunction_ = do
   case Map.lookup fname jcs of
     Just f ->
       let voidty = JCType (DeclSpec [] [] (Tvoid noLoc) noLoc) (DeclRoot noLoc)
-      in put $ flip (Map.insert fname) jcs $ f & jcfExp .~ Nothing & jcfType ?~ voidty
+       in put $ flip (Map.insert fname) jcs $ f & jcfExp .~ Nothing & jcfType ?~ voidty
     Nothing -> error "finishFunction_: the impossible happened"
 
 defaultJCFunc :: String -> Params -> JCFunc
-defaultJCFunc name params = JCFunc
-  { _jcfName = name
-  , _jcfHeaders = Set.empty
-  , _jcfTypedefs = Set.empty
-  , _jcfTypeCache = Map.empty
-  , _jcfProtos = Set.empty
-  , _jcfType = Nothing
-  , _jcfParams = params
-  , _jcfBlock = mempty
-  , _jcfExp = Nothing
-  , _jcfVarCounter = 0
-  }
+defaultJCFunc name params =
+  JCFunc
+    { _jcfName = name,
+      _jcfHeaders = Set.empty,
+      _jcfTypedefs = Set.empty,
+      _jcfTypeCache = Map.empty,
+      _jcfProtos = Set.empty,
+      _jcfType = Nothing,
+      _jcfParams = params,
+      _jcfBlock = mempty,
+      _jcfExp = Nothing,
+      _jcfVarCounter = 0
+    }
 
-janusCFunctions :: forall a. JanusCTyped a => String -> JanusCM (JanusC a) -> [JCFunc]
+mkArgId :: Int -> Id
+mkArgId m = Id ("arg_" <> show m) noLoc
+
+janusCFunctions :: forall a. (JanusCTyped a) => String -> JanusCM (JanusC a) -> [JCFunc]
 janusCFunctions name a = Map.elems $ flip execState defaultJanusState $ flip runReaderT name $ getJanusCM $ do
   fname <- ask
   _ <- getJanusCType (Proxy @a)
@@ -159,42 +165,75 @@ janusCFunctions name a = Map.elems $ flip execState defaultJanusState $ flip run
   finishFunction a'
   getJanusCType (Proxy @a)
 
-runJanusC :: forall a. JanusCTyped a => String -> JanusCM (JanusC a) -> String
-runJanusC name a =
-  let jcs = janusCFunctions name a
+type family JanusCEval a where
+  JanusCEval (JanusC a -> r) = a -> JanusCEval r
+  -- TODO figure out why the unsafePerformIO required for this allows the DL to be closed before use
+  JanusCEval (JanusC a) = IO a
+  JanusCEval (JanusCM (JanusC a)) = IO a
+
+type family JanusCRetType a where
+-- -- TODO figure out why the unsafePerformIO required for this allows the DL to be closed before use
+  JanusCRetType (JanusC a) = a
+  JanusCRetType (JanusCM (JanusC a)) = a
+  JanusCRetType (JanusC a -> r) = JanusCRetType r
+
+class JanusCParam r where
+  jcparam :: String -> Int -> r -> [JCFunc]
+  jceval :: FunPtr r -> [Arg] -> r -> JanusCEval r
+
+-- TODO figure out why the unsafePerformIO required for this allows the DL to be closed before use
+instance (FFIRet a, JanusCTyped a) => JanusCParam (JanusC a) where
+  jcparam name n a = Map.elems $ flip execState defaultJanusState $ flip runReaderT name $ getJanusCM $ do
+    fname <- ask
+    JCType spec dec <- getJanusCType (Proxy @a)
+    let params' = [Param (Just (mkArgId i)) spec dec noLoc | i <- [0..n-1::Int]]
+    modify $ \s -> s & ix fname .~ defaultJCFunc fname (Params params' False noLoc)
+    finishFunction a
+    getJanusCType (Proxy @a)
+  jceval fp args _ = callFFI fp (ret (Proxy @a)) (reverse args)
+
+instance (FFIRet a, JanusCTyped a) => JanusCParam (JanusCM (JanusC a)) where
+  jcparam name n a = Map.elems $ flip execState defaultJanusState $ flip runReaderT name $ getJanusCM $ do
+    fname <- ask
+    JCType spec dec <- getJanusCType (Proxy @a)
+    let params' = [Param (Just (mkArgId i)) spec dec noLoc | i <- [0..n-1::Int]]
+    modify $ \s -> s & ix fname .~ defaultJCFunc fname (Params params' False noLoc)
+    a' <- a
+    finishFunction a'
+    getJanusCType (Proxy @a)
+  jceval fp args _ = callFFI fp (ret (Proxy @a)) (reverse args)
+
+instance (FFIArg a, JanusCParam r) => JanusCParam (JanusC a -> r) where
+  jcparam name n f = jcparam name (n + 1) (f $ JanusC $ pure $ RVal $ Var (Id ("arg_" <> show n) noLoc) noLoc)
+  jceval fp args f a = jceval (castFunPtr fp) (arg a:args) (f $ JanusC $ pure $ RVal $ Var (Id "this_is_a_bug_if_you_see_this" noLoc) noLoc)
+
+withJanusC :: forall a r. (JanusCParam r, FFIRet (JanusCRetType r)) => r -> (JanusCEval r -> IO a) -> IO a
+withJanusC a k = do
+  let dir = "_cache"
+  files <- writeJanusCFiles dir (jcparam "janus_main" 0 a)
+  withJanusCDL dir files $ \dl -> do
+    fp <- dlsym dl "janus_main"
+    if fp == nullFunPtr
+      then error "withJanusC: null function pointer"
+      else k (jceval fp [] a :: JanusCEval r)
+
+showJanusC :: forall a. (JanusCParam a) => String -> a -> String
+showJanusC name a =
+  let jcs = jcparam name 0 a
       strChar 0 = '\n'
       strChar 81 = '\n'
       strChar _ = '-'
-      str = fmap strChar [0..81::Int]
-  in foldMap ((<> str) . renderJCFunc) jcs
+      str = fmap strChar [0 .. 81 :: Int]
+   in foldMap ((<> str) . renderJCFunc) jcs
 
-runJanusC_ :: String -> JanusCM () -> String
-runJanusC_ name a =
-  let jcs = flip execState defaultJanusState $ flip runReaderT name $ getJanusCM $ do
-        fname <- ask
-        modify $ \s -> s & at fname ?~ defaultJCFunc fname (Params [] False noLoc)
-        a >> finishFunction_
-      strChar 0 = '\n'
-      strChar 81 = '\n'
-      strChar _ = '-'
-      str = fmap strChar [0..81::Int]
-  in foldMap ((<> str) . renderJCFunc) jcs
+printJanusC :: (JanusCParam r) => r -> IO ()
+printJanusC = putStrLn . showJanusC "janus_main"
 
-janusC :: (JanusCTyped a) => JanusC a -> IO ()
-janusC = putStrLn . runJanusC "janus_main" . pure
-
-janusCM :: (JanusCTyped a) => JanusCM (JanusC a) -> IO ()
-janusCM = putStrLn . runJanusC "janus_main"
-
-janusCM_ :: JanusCM () -> IO ()
-janusCM_ = putStrLn . runJanusC_ "janus_main"
-
-renderJanusC :: forall a. (JanusCTyped a) => FilePath -> JanusC a -> IO [String]
-renderJanusC dir a = do
-  let funcs = janusCFunctions "janus_main" (pure a)
+writeJanusCFiles :: FilePath -> [JCFunc] -> IO [String]
+writeJanusCFiles dir funcs = do
   for funcs $ \f -> do
     let body = renderJCFunc f
-        sha = SHA256.hash (pack body)
+        sha = SHA256.hash (Text.encodeUtf8 $ Text.pack body)
         filename = unpack (B16.encode sha) <> ".c"
         path = dir </> filename
     exist <- fileExist path
@@ -202,15 +241,6 @@ renderJanusC dir a = do
       withFile path WriteMode $ \hndl -> do
         hPutStrLn hndl body
     pure filename
-
-withJanusC :: forall a. (FFIRet a, JanusCTyped a) => FilePath -> JanusC a -> IO a
-withJanusC dir jc = do
-  file <- renderJanusC dir jc
-  withJanusCDL dir file $ \dl -> do
-    fp <- dlsym dl "janus_main"
-    if fp == nullFunPtr
-      then error "withJanusC: null function pointer"
-      else callFFI fp (ret (Proxy @a)) []
 
 getFunction :: JanusCM JCFunc
 getFunction = do
@@ -250,9 +280,11 @@ getJanusCType p = do
               spec' = DeclSpec [] [] (Tnamed tyId [] noLoc) noLoc
               dec' = DeclRoot noLoc
               t' = JCType spec' dec'
-              f' = f & jcfTypeCache %~ Map.insert tyrep t'
-                     & jcfVarCounter +~ 1
-                     & jcfTypedefs %~ Set.insert (JCTypedef spec tyname)
+              f' =
+                f
+                  & jcfTypeCache %~ Map.insert tyrep t'
+                  & jcfVarCounter +~ 1
+                  & jcfTypedefs %~ Set.insert (JCTypedef spec tyname)
           modify $ \s -> s & at fname ?~ f'
           pure t'
 
@@ -493,7 +525,7 @@ instance JanusCFFICall (JanusC a) where
       Nothing -> pure ()
     pure $ RVal $ FnCall (Var (Id name noLoc) noLoc) (reverse args') noLoc
 
-instance JanusCTyped a => JanusCFFICall (JanusCM (JanusC a)) where
+instance (JanusCTyped a) => JanusCFFICall (JanusCM (JanusC a)) where
   jcffi mheader name args = do
     args' <- args
     case mheader of
@@ -506,8 +538,10 @@ instance JanusCTyped a => JanusCFFICall (JanusCM (JanusC a)) where
         var = Id ("x_" <> show c) noLoc
         val = FnCall (Var (Id name noLoc) noLoc) (reverse args') noLoc
         ini = Init var dec Nothing (Just $ ExpInitializer val noLoc) [] noLoc
-        fn' = fn & jcfBlock %~ flip appendBlock [BlockDecl $ InitGroup spec [] [ini] noLoc]
-                 & jcfVarCounter +~ 1
+        fn' =
+          fn
+            & jcfBlock %~ flip appendBlock [BlockDecl $ InitGroup spec [] [ini] noLoc]
+            & jcfVarCounter +~ 1
     modify $ \st -> st & ix fname .~ fn'
     pure $ JanusC $ pure $ RVal $ Var var noLoc
 
@@ -524,8 +558,10 @@ instance {-# OVERLAPS #-} JanusCFFICall (JanusCM (JanusC (Ptr ()))) where
         var = Id ("x_" <> show c) noLoc
         val = FnCall (Var (Id name noLoc) noLoc) (reverse args') noLoc
         ini = Init var dec Nothing (Just $ ExpInitializer val noLoc) [] noLoc
-        fn' = fn & jcfBlock %~ flip appendBlock [BlockDecl $ InitGroup spec [] [ini] noLoc]
-                 & jcfVarCounter +~ 1
+        fn' =
+          fn
+            & jcfBlock %~ flip appendBlock [BlockDecl $ InitGroup spec [] [ini] noLoc]
+            & jcfVarCounter +~ 1
     modify $ \st -> st & ix fname .~ fn'
     pure $ JanusC $ pure $ RVal $ Var var noLoc
 
@@ -538,15 +574,15 @@ instance JanusCFFICall (JanusCM ()) where
     let fncall = FnCall (Var (Id name noLoc) noLoc) (reverse args') noLoc
     modifyFunction $ \fn -> fn & jcfBlock %~ flip appendBlock [BlockStm $ Exp (Just fncall) noLoc]
 
-instance JanusCFFICall r => JanusCFFICall (JanusC a -> r) where
-  jcffi mheader name args arg = jcffi mheader name args''
+instance (JanusCFFICall r) => JanusCFFICall (JanusC a -> r) where
+  jcffi mheader name args a = jcffi mheader name args''
     where
       args'' = do
-        RVal arg' <- getJanusC arg
+        RVal arg' <- getJanusC a
         args' <- args
-        pure (arg':args')
+        pure (arg' : args')
 
-janusCFFICall :: JanusCFFICall r => Maybe String -> String -> r
+janusCFFICall :: (JanusCFFICall r) => Maybe String -> String -> r
 janusCFFICall header name = jcffi header name (pure [])
 
 unMathFun :: String -> JanusC a -> JanusC a
