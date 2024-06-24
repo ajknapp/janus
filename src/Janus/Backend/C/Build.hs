@@ -18,6 +18,9 @@ import Control.Concurrent.Async
 import Control.Concurrent.STM
 import Control.Monad.Reader
 import Control.Monad.Trans.Control
+import Crypto.Hash.SHA256 as SHA256
+import qualified Data.ByteString.Base16 as B16
+import Data.ByteString.Char8 (unpack)
 import Data.Foldable
 import Data.GADT.Compare
 import Data.GADT.Compare.TH (deriveGEq)
@@ -25,6 +28,8 @@ import Data.Hashable
 import Data.IORef
 import Data.Maybe
 import Data.Some
+import qualified Data.Text as Text
+import qualified Data.Text.Encoding as Text
 import Data.Traversable
 import GHC.Generics
 import qualified Rock
@@ -85,7 +90,7 @@ janusRules key = do
             p <- spawnProcess (ccName GCC) ["-O3", "-fPIC", "-flto", "-o", ofilePath, "-c", dir </> cfile]
             waitForProcess p >>= \case
               ExitSuccess -> pure (Just ofilePath)
-              _ -> pure Nothing
+              _exitFailure -> pure Nothing
     SharedLibrary dir sofile cfiles -> do
       ofiles <- fetchConcurrently (fmap (ObjectFile dir) cfiles)
       let success = all isJust ofiles
@@ -97,7 +102,7 @@ janusRules key = do
           p <- spawnProcess (ccName GCC) $ ["-O3", "-fPIC", "-shared", "-flto", "-o", sofilePath] <> ofiles'
           waitForProcess p >>= \case
             ExitSuccess -> pure (Just sofilePath)
-            _ -> pure Nothing
+            _exitFailure -> pure Nothing
 
 fetchConcurrently :: (Traversable g, Hashable (Some f), GEq f) => g (f a) -> Rock.Task f (g a)
 fetchConcurrently queries = do
@@ -118,10 +123,15 @@ fetchConcurrently queries = do
     replicateConcurrently_ (max n 8) workerThread
     for jobs (readIORef . snd)
 
-withJanusCDL :: FilePath -> [FilePath] -> (DL -> IO a) -> IO a
-withJanusCDL dir cfiles k = do
+acquireJanusCDL :: FilePath -> [FilePath] -> IO DL
+acquireJanusCDL dir cfiles = do
   memoVar <- newIORef mempty
-  result <- Rock.runTask (Rock.memoise memoVar janusRules) . Rock.fetch $ SharedLibrary dir "libjanus.so" cfiles
+  let filesHash = B16.encode (SHA256.hash $ Text.encodeUtf8 (foldMap Text.pack cfiles))
+      sofile_ = unpack filesHash <> ".so"
+  result <- Rock.runTask (Rock.memoise memoVar janusRules) . Rock.fetch $ SharedLibrary dir sofile_ cfiles
   case result of
-    Just sofile -> withDL sofile [RTLD_LAZY, RTLD_LOCAL] k
+    Just sofile -> dlopen sofile [RTLD_LAZY, RTLD_LOCAL]
     Nothing -> error "withJanusDL: compilation failed!"
+
+releaseJanusCDL :: DL -> IO ()
+releaseJanusCDL = dlclose

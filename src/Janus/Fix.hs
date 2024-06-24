@@ -84,6 +84,13 @@ jfix ::
 jfix name f = jcfun name (pure []) (pure []) 0 (f $ jcfake name (pure []) (jfix name f))
 
 -- TODO find a way to get rid of the Proxy argument
+-- TODO hash function name based on type, so the same function can be
+-- specialized multiple times in the same program
+--
+-- only use fun directly beneath a toplevel, pointfree definition like so:
+-- foo :: e a -> e b -> e c -> e d
+-- foo = fun (Proxy @e) "foo" $ \x y z -> ... x ... y ... (bar z)
+-- to prevent scope extrusion problems
 class ExpFix (e :: K.Type -> K.Type) r where
   fun :: Proxy e -> String -> (r -> r) -> r
 

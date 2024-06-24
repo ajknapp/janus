@@ -9,8 +9,7 @@
   outputs = { self, nixpkgs, flake-utils }:
     flake-utils.lib.eachDefaultSystem (system:
       let
-        pkgs = nixpkgs.legacyPackages.${system};
-
+        pkgs = import nixpkgs { system = "x86_64-linux"; config.allowUnfree = true; };
         haskellPackages = pkgs.haskellPackages;
 
         jailbreakUnbreak = pkg:
@@ -27,17 +26,21 @@
           , base16-bytestring
           , containers
           , cryptohash-sha256
+          , cudatoolkit
           , dependent-sum-template
           , gcc
           , hashable
           , lens
           , language-c-quote
           , libffi
-          , mmap
+          , linuxPackages
           , profunctors
           , rock
           , semigroupoids
           , semilattices
+          , tasty-discover
+          , tasty-hedgehog
+          , tasty-hunit
           , transformers
           , vector
           , zstd
@@ -58,7 +61,6 @@
                 lens
                 language-c-quote
                 libffi
-                mmap
                 profunctors
                 rock
                 semigroupoids
@@ -67,7 +69,8 @@
                 vector
                 zstd
               ];
-            librarySystemDepends = [ gcc ];
+            librarySystemDepends = [ cudatoolkit gcc linuxPackages.nvidia_x11 ];
+            testHaskellDepends = [tasty-discover tasty-hedgehog tasty-hunit];
             description = "An extensible EDSL for high-performance computing.";
             license = "unknown";
             hydraPlatforms = lib.platforms.none;
@@ -94,8 +97,13 @@
           ];
           # shellHook = "export LIBRARY_PATH=${pkgs.lib.getLib pkgs.stdenv.cc.libc}/lib";
           withHoogle = true;
+          shellHook = ''
+            export CUDA_PATH=${pkgs.cudatoolkit}
+            export LD_LIBRARY_PATH=${pkgs.linuxPackages.nvidia_x11}/lib
+            export EXTRA_LDFLAGS="-L/lib -L${pkgs.linuxPackages.nvidia_x11}/lib"
+            export EXTRA_CCFLAGS="-I/usr/include"
+         '';
         };
 
       });
 }
-

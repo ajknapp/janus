@@ -14,6 +14,7 @@
 
 module Janus.Backend.C where
 
+import Control.Exception
 import Control.Lens
 import Control.Monad
 import Control.Monad.Fix
@@ -207,15 +208,23 @@ instance (FFIArg a, JanusCParam r) => JanusCParam (JanusC a -> r) where
   jcparam name n f = jcparam name (n + 1) (f $ JanusC $ pure $ RVal $ Var (Id ("arg_" <> show n) noLoc) noLoc)
   jceval fp args f a = jceval (castFunPtr fp) (arg a:args) (f $ JanusC $ pure $ RVal $ Var (Id "this_is_a_bug_if_you_see_this" noLoc) noLoc)
 
-withJanusC :: forall a r. (JanusCParam r, FFIRet (JanusCRetType r)) => r -> (JanusCEval r -> IO a) -> IO a
-withJanusC a k = do
+-- this mostly exists for use with hedgehog withResource
+acquireJanusC :: forall r. JanusCParam r => r -> IO (JanusCEval r, DL)
+acquireJanusC a = do
   let dir = "_cache"
   files <- writeJanusCFiles dir (jcparam "janus_main" 0 a)
-  withJanusCDL dir files $ \dl -> do
-    fp <- dlsym dl "janus_main"
-    if fp == nullFunPtr
-      then error "withJanusC: null function pointer"
-      else k (jceval fp [] a :: JanusCEval r)
+  dl <- acquireJanusCDL dir files
+  fp <- dlsym dl "janus_main"
+  if fp == nullFunPtr
+    then error "withJanusC: null function pointer"
+    else pure (jceval fp [] a :: JanusCEval r, dl)
+
+-- this mostly exists for use with hedgehog withResource
+releaseJanusC :: (a, DL) -> IO ()
+releaseJanusC = releaseJanusCDL . snd
+
+withJanusC :: forall a r. (JanusCParam r, FFIRet (JanusCRetType r)) => r -> (JanusCEval r -> IO a) -> IO a
+withJanusC a k = bracket (acquireJanusC a) releaseJanusC (k . fst)
 
 showJanusC :: forall a. (JanusCParam a) => String -> a -> String
 showJanusC name a =

@@ -1,4 +1,4 @@
-cabal-version:      2.4
+cabal-version:      3.0
 name:               janus
 version:            0.1.0.0
 
@@ -21,7 +21,11 @@ maintainer:         andy.j.knapp@gmail.com
 -- category:
 extra-source-files: CHANGELOG.md
 
+common warnings
+    ghc-options:      -Wall
+
 library
+    import:           warnings
     exposed-modules:  Janus
                       Janus.Backend.C
                       Janus.Backend.C.Build
@@ -95,4 +99,35 @@ library
     c-sources:        cbits/janus.c
     include-dirs:     cbits/
     default-language: Haskell2010
-    ghc-options:      -Wall
+
+test-suite janus-test
+    -- Import common warning flags.
+    import:           warnings
+
+    -- Base language which the package is written in.
+    default-language: Haskell2010
+
+    -- Modules included in this executable, other than Main.
+    other-modules:    Test.Janus.Fix
+                      Test.Janus.Expression.Let
+
+    -- LANGUAGE extensions used by modules in this package.
+    -- other-extensions:
+
+    -- The interface type and version of the test suite.
+    type:             exitcode-stdio-1.0
+
+    -- Directories containing source files.
+    hs-source-dirs:   test
+
+    -- The entrypoint to the test suite.
+    main-is:          Main.hs
+
+    -- Test dependencies.
+    build-depends:    base ^>=4.18
+                    , hedgehog
+                    , janus
+                    , tasty
+                    , tasty-hedgehog
+                    , tasty-hunit
+                    , vector
