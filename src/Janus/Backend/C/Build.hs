@@ -99,10 +99,12 @@ janusRules key = do
         then pure Nothing
         else liftIO $ do
           let ofiles' = catMaybes ofiles
-          p <- spawnProcess (ccName GCC) $ ["-O3", "-fPIC", "-shared", "-flto", "-o", sofilePath] <> ofiles'
-          waitForProcess p >>= \case
-            ExitSuccess -> pure (Just sofilePath)
-            _exitFailure -> pure Nothing
+          sofileExists <- liftIO $ doesPathExist sofilePath
+          if sofileExists then pure (Just sofilePath) else do
+            p <- spawnProcess (ccName GCC) $ ["-O3", "-fPIC", "-shared", "-flto", "-o", sofilePath] <> ofiles'
+            waitForProcess p >>= \case
+              ExitSuccess -> pure (Just sofilePath)
+              _exitFailure -> pure Nothing
 
 fetchConcurrently :: (Traversable g, Hashable (Some f), GEq f) => g (f a) -> Rock.Task f (g a)
 fetchConcurrently queries = do

@@ -29,6 +29,7 @@ library
     exposed-modules:  Janus
                       Janus.Backend.C
                       Janus.Backend.C.Build
+                      Janus.Backend.C.LinuxX86_64
                       Janus.Control.Fold
                       Janus.Control.Pipe
                       Janus.Control.Step

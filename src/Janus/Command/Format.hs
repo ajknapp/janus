@@ -102,6 +102,9 @@ primFormatJanusC h a term = withString (formatString (Proxy @a) <> term) $ \s ->
 instance CmdFormat JanusCM JanusC Int64 where
   hformat = primFormatJanusC
 
+instance CmdFormat JanusCM JanusC Word64 where
+  hformat = primFormatJanusC
+
 instance CmdFormat JanusCM JanusC Float where
   hformat h a = primFormatJanusC h (toFloating a :: JanusC Double)
 

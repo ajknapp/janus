@@ -17,6 +17,9 @@ class FFIRet a where
 instance FFIRet () where
   ret _ = retVoid
 
+instance FFIRet Bool where
+  ret _ = withRetType (pure . (/= 0)) retCChar
+
 instance FFIRet CInt where
   ret _ = retCInt
 

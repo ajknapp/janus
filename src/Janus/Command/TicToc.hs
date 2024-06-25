@@ -4,11 +4,10 @@ module Janus.Command.TicToc where
 
 import Data.Functor.Identity
 import Data.Word
-import Foreign.C
 
-foreign import ccall janus_tic :: IO CLLong
+foreign import ccall janus_tic :: IO Word64
 
-foreign import ccall janus_toc :: IO CLLong
+foreign import ccall janus_toc :: IO Word64
 
 newtype Tic e = Tic { getTic :: e Word64 }
 

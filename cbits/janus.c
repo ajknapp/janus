@@ -1,30 +1,48 @@
 #include <stdio.h>
+#include <stdint.h>
+#include <time.h>
 #include <x86gprintrin.h>
 
-unsigned long long janus_tic()
+#if defined(__x86_64__)
+uint64_t janus_tic()
 {
-  unsigned long long start_time;
-  asm volatile ("rdtsc\n\t"         // Memory barrier to inhibit speculation
-                "lfence\n\t"          // Returns the time in EDX:EAX.
-                "shl $32, %%rdx\n\t" // Shift the upper bits left.
-                "or %%rdx, %0"       // 'Or' in the lower bits.
+  uint64_t start_time;
+  asm volatile ("rdtsc\n\t"
+                "lfence\n\t"
+                "shl $32, %%rdx\n\t"
+                "or %%rdx, %0"
                 : "=a" (start_time)
                 :
                 : "rdx");
   return start_time;
 }
 
-unsigned long long janus_toc()
+uint64_t janus_toc()
 {
-  unsigned long long stop_time;
-  asm volatile ("rdtscp\n\t"          // Returns the time in EDX:EAX.
-                "shl $32, %%rdx\n\t"  // Shift the upper bits left.
-                "or %%rdx, %0"        // 'Or' in the lower bits.
+  uint64_t stop_time;
+  asm volatile ("rdtscp\n\t"
+                "shl $32, %%rdx\n\t"
+                "or %%rdx, %0"
                 : "=a" (stop_time)
                 :
                 : "rdx");
   return stop_time;
 }
+#elif defined(__aarch64__)
+uint64_t janus_tic()
+{
+  struct timespec res;
+  clock_gettime(CLOCK_MONOTONIC, &res);
+  return ((uint64_t) res.tv_sec)*1000000000 + ((uint64_t) res.tv_nsec);
+}
+
+uint64_t janus_toc()
+{
+  struct timespec res;
+  clock_gettime(CLOCK_MONOTONIC, &res);
+  return ((uint64_t) res.tv_sec)*1000000000 + ((uint64_t) res.tv_nsec);
+}
+#endif
 
 FILE* janus_stdout()
 {
