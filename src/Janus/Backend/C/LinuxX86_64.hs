@@ -16,7 +16,9 @@ import Control.Monad.Reader
 import Control.Monad.State
 import Data.Coerce
 import Data.Complex
+import Data.Loc
 import qualified Data.Map as Map
+import Data.Proxy
 import Data.Word
 import Janus.Backend.C
 import Janus.Command.Array
@@ -42,8 +44,6 @@ import Janus.Expression.MurmurHash
 import Janus.Expression.Ord
 import Janus.Typed
 import Language.C.Quote
-import Data.Loc
-import Data.Proxy
 
 newtype LinuxX86_64C a = LinuxX86_64C {getLinuxX86_64C :: JanusC a}
 
@@ -100,9 +100,10 @@ instance (Num a, JanusLitC a, ExpIntegral JanusC a) => ExpIntegral LinuxX86_64C 
 deriving via JanusC instance ExpLet LinuxX86_64C
 
 deriving via JanusC a instance (FMA (JanusC a), JanusLitC a, Num a) => FMA (LinuxX86_64C a)
+
 deriving via JanusC a instance (Hypot (JanusC a), JanusLitC a, Floating (LinuxX86_64C a)) => Hypot (LinuxX86_64C a)
 
-instance ExpMurmurHash JanusC a => ExpMurmurHash LinuxX86_64C a where
+instance (ExpMurmurHash JanusC a) => ExpMurmurHash LinuxX86_64C a where
   murmurHashWithSalt = coerce (murmurHashWithSalt @JanusC @a)
 
 instance (ExpOrd JanusC a) => ExpOrd LinuxX86_64C a where
@@ -111,11 +112,11 @@ instance (ExpOrd JanusC a) => ExpOrd LinuxX86_64C a where
   gt = coerce (gt @JanusC @a)
   ge = coerce (ge @JanusC @a)
 
-instance ExpSized JanusC a => ExpSized LinuxX86_64C a where
+instance (ExpSized JanusC a) => ExpSized LinuxX86_64C a where
   sizeOf = coerce (sizeOf @JanusC @a)
   alignOf = coerce (alignOf @JanusC @a)
 
-instance ExpPtr JanusC a => ExpPtr LinuxX86_64C a where
+instance (ExpPtr JanusC a) => ExpPtr LinuxX86_64C a where
   nullPtr = coerce (nullPtr @JanusC @a)
   ptrAdd = coerce (ptrAdd @JanusC @a)
 
@@ -149,7 +150,7 @@ instance CmdString LinuxX86_64CM LinuxX86_64C where
 instance CmdPutString LinuxX86_64CM LinuxX86_64C where
   hputString = coerce (hputString @JanusCM @JanusC)
 
-instance CmdFormat JanusCM JanusC a => CmdFormat LinuxX86_64CM LinuxX86_64C a where
+instance (CmdFormat JanusCM JanusC a) => CmdFormat LinuxX86_64CM LinuxX86_64C a where
   hformat = coerce (hformat @JanusCM @JanusC @a)
 
 newtype LinuxX86_64CRef a = LinuxX86_64CRef {getLinuxX86_64CRef :: JanusCRef a}
@@ -169,8 +170,8 @@ instance CmdWhile LinuxX86_64CM LinuxX86_64C where
 
 --------------------------------------------------------------------------------
 
-ticTocAsmBlock
-  :: (LinuxX86_64C a -> b) -> String -> LinuxX86_64CM b
+ticTocAsmBlock ::
+  (LinuxX86_64C a -> b) -> String -> LinuxX86_64CM b
 ticTocAsmBlock newty str = LinuxX86_64CM $ do
   fname <- ask
   JCType spec dec <- getJanusCType (Proxy @Word64)
@@ -183,11 +184,12 @@ ticTocAsmBlock newty str = LinuxX86_64CM $ do
           asm = Asm True [] (StringLit [show str] "" noLoc) [AsmOut Nothing "\"=a\"" vid] [] ["\"rdx\""] noLoc
 
           block = appendBlock (f ^. jcfBlock) [BlockDecl (InitGroup spec [] [ini] noLoc), BlockStm asm]
-      put $ jcs & at fname . _Just . jcfVarCounter +~ 1
-                & at fname . _Just . jcfBlock .~ block
+      put $
+        jcs
+          & at fname . _Just . jcfVarCounter +~ 1
+          & at fname . _Just . jcfBlock .~ block
       pure $ newty $ LinuxX86_64C $ JanusC $ pure $ RVal (Var vid noLoc)
     Nothing -> error "tic: the impossible happened"
-
 
 instance CmdTicToc LinuxX86_64CM LinuxX86_64C where
   tic = ticTocAsmBlock Tic "rdtsc\n\tlfence\n\tshl $32, %%rdx\n\tor %%rdx, %0"
