@@ -10,7 +10,6 @@
 
 module Janus.Command.Ref where
 
-import Control.Monad.Reader
 import Control.Monad.State
 import Data.Functor.Identity
 import Data.IORef
@@ -51,7 +50,7 @@ instance CmdRef JanusCM JanusC where
     RVal a' <- a
     JCType spec dec <- getJanusCType (Proxy @a)
     fn <- getFunction
-    fname <- ask
+    fname <- askFuncName
     let c = fn ^. jcfVarCounter
         var1 = Id ("ref_" <> show c) noLoc
         ini = Init var1 dec Nothing (Just $ ExpInitializer a' noLoc) [] noLoc
@@ -65,7 +64,7 @@ instance CmdRef JanusCM JanusC where
   newRef' =  do
     JCType spec dec <- getJanusCType (Proxy @a)
     fn <- getFunction
-    fname <- ask
+    fname <- askFuncName
     let c = fn ^. jcfVarCounter
         var1 = Id ("ref_" <> show c) noLoc
         ini = Init var1 dec Nothing Nothing [] noLoc
@@ -79,7 +78,7 @@ instance CmdRef JanusCM JanusC where
   readRef (JanusCRef (LVal ref)) = do
     JCType spec dec <- getJanusCType (Proxy @a)
     fn <- getFunction
-    fname <- ask
+    fname <- askFuncName
     let c = fn ^. jcfVarCounter
         val1 = Id ("x_" <> show c) noLoc
         ini = Init val1 dec Nothing (Just $ ExpInitializer ref noLoc) [] noLoc

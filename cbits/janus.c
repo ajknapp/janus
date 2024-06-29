@@ -1,3 +1,5 @@
+#include <cuda.h>
+#include <nvJitLink.h>
 #include <stdio.h>
 #include <stdint.h>
 #include <time.h>

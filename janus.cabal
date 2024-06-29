@@ -26,9 +26,12 @@ common warnings
 
 library
     import:           warnings
+    extra-libraries:  cuda nvJitLink
     exposed-modules:  Janus
                       Janus.Backend.C
                       Janus.Backend.C.Build
+                      Janus.Backend.C.CUDA
+                      Janus.Backend.C.CUDA.Foreign
                       Janus.Backend.C.LinuxX86_64
                       Janus.Control.Fold
                       Janus.Control.Pipe
@@ -96,6 +99,7 @@ library
                     , transformers
                     , unix
                     , vector
+    ghc-options:      -fno-ghci-sandbox
     hs-source-dirs:   src
     c-sources:        cbits/janus.c
     include-dirs:     cbits/

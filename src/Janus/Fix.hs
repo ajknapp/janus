@@ -25,16 +25,21 @@ class JanusCFix r where
   jcfun :: String -> JanusCM [Exp] -> JanusCM [Param] -> Int -> r -> r
   jcfake :: String -> JanusCM [Exp] -> r -> r
 
+localFun :: JCFuncInfo -> JanusCM a -> JanusCM a
+localFun x = local (const x)
+
 instance (JanusCTyped a) => JanusCFix (JanusCM (JanusC a)) where
   jcfun name args params _ body = do
-    params' <- local (const name) params
+    backend <- asks _jcfiBackend
+    let funInfo = JCFuncInfo name backend True
+    params' <- localFun funInfo params
     let params'' = Params (reverse params') False noLoc
-    local (const name) $ do
+    localFun funInfo $ do
       modify $ \s -> s & ix name . jcfParams .~ params''
       body' <- body
       finishFunction body'
     JCType spec dec <- getJanusCType (Proxy @a)
-    let proto = InitGroup spec [] [Init (Id name noLoc) (Proto dec params'' noLoc) Nothing Nothing [] noLoc] noLoc
+    let proto = InitGroup (setTypeQualifiers (jcTypeQuals funInfo) spec) [] [Init (Id name noLoc) (Proto dec params'' noLoc) Nothing Nothing [] noLoc] noLoc
     modifyFunction $ \f -> f & jcfProtos %~ Set.insert proto
     args' <- args
     pure $ JanusC $ pure $ RVal $ FnCall (Var (Id name noLoc) noLoc) (reverse args') noLoc
@@ -44,13 +49,15 @@ instance (JanusCTyped a) => JanusCFix (JanusCM (JanusC a)) where
 
 instance (JanusCTyped a) => JanusCFix (JanusC a) where
   jcfun name args params _ body = JanusC $ do
-    params' <- local (const name) params
+    backend <- asks _jcfiBackend
+    let funInfo = JCFuncInfo name backend True
+    params' <- localFun funInfo params
     let params'' = Params (reverse params') False noLoc
-    local (const name) $ do
+    localFun funInfo $ do
       modify $ \s -> s & ix name . jcfParams .~ params''
       finishFunction body
     JCType spec dec <- getJanusCType (Proxy @a)
-    let proto = InitGroup spec [] [Init (Id name noLoc) (Proto dec params'' noLoc) Nothing Nothing [] noLoc] noLoc
+    let proto = InitGroup (setTypeQualifiers (jcTypeQuals funInfo) spec) [] [Init (Id name noLoc) (Proto dec params'' noLoc) Nothing Nothing [] noLoc] noLoc
     modifyFunction $ \f -> f & jcfProtos %~ Set.insert proto
     args' <- args
     pure $ RVal $ FnCall (Var (Id name noLoc) noLoc) (reverse args') noLoc
@@ -65,11 +72,14 @@ instance (JanusCTyped a, JanusCFix r) => JanusCFix (JanusC a -> r) where
         RVal y <- getJanusC x
         ys <- args
         pure (y : ys)
-      parms' = local (const name) $ do
-        ys <- parms
-        JCType spec dec <- getJanusCType (Proxy @a)
-        let xid = Id ("arg_" <> show n) noLoc
-        pure (Param (Just xid) spec dec noLoc : ys)
+      parms' = do
+        backend <- asks _jcfiBackend
+        let funInfo = JCFuncInfo name backend True
+        localFun funInfo $ do
+          ys <- parms
+          JCType spec dec <- getJanusCType (Proxy @a)
+          let xid = Id ("arg_" <> show n) noLoc
+          pure (Param (Just xid) spec dec noLoc : ys)
       x' = JanusC $ do
         let xid = Id ("arg_" <> show n) noLoc
             v = Var xid noLoc

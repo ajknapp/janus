@@ -1,7 +1,6 @@
 module Janus.Expression.Let where
 
 import Control.Lens
-import Control.Monad.Reader
 import Control.Monad.State
 import Data.Loc
 import Data.Proxy
@@ -21,7 +20,7 @@ instance ExpLet JanusC where
     let proxify :: JanusC a -> Proxy a
         proxify _ = Proxy
     JCType spec dec <- getJanusCType (proxify j)
-    fname <- ask
+    fname <- askFuncName
     RVal x'' <- x
     fn <- getFunction
     let c = fn ^. jcfVarCounter

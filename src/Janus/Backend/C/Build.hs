@@ -49,8 +49,8 @@ ccName NVCC = "nvcc"
 
 data Query a where
   CacheDir :: FilePath -> Query (Maybe FilePath)
-  ObjectFile :: FilePath -> FilePath -> Query (Maybe FilePath)
-  SharedLibrary :: FilePath -> FilePath -> [FilePath] -> Query (Maybe FilePath)
+  CObjectFile :: FilePath -> FilePath -> Query (Maybe FilePath)
+  CSharedLibrary :: FilePath -> FilePath -> [FilePath] -> Query (Maybe FilePath)
 
 deriving instance Show (Query a)
 
@@ -62,8 +62,8 @@ instance Hashable (Query a) where
   hashWithSalt salt query =
     case query of
       CacheDir fp -> hashWithSalt salt fp
-      ObjectFile dir fp -> hashWithSalt salt (hashWithSalt salt (dir </> fp) + 1)
-      SharedLibrary dir sofile fps -> hashWithSalt salt (hashWithSalt salt (dir : sofile : fps) + 2)
+      CObjectFile dir fp -> hashWithSalt salt (hashWithSalt salt (dir </> fp) + 1)
+      CSharedLibrary dir sofile fps -> hashWithSalt salt (hashWithSalt salt (dir : sofile : fps) + 2)
 
 instance Hashable (Some Query) where
   hashWithSalt salt (Some query) = hashWithSalt salt query
@@ -78,7 +78,7 @@ janusRules key = do
         else do
           liftIO $ createDirectory dir
           pure (Just dir)
-    ObjectFile dir cfile -> do
+    CObjectFile dir cfile -> do
       let (root, _) = splitExtension cfile
           ofile = root <> ".o"
           ofilePath = dir </> ofile
@@ -91,8 +91,8 @@ janusRules key = do
             waitForProcess p >>= \case
               ExitSuccess -> pure (Just ofilePath)
               _exitFailure -> pure Nothing
-    SharedLibrary dir sofile cfiles -> do
-      ofiles <- fetchConcurrently (fmap (ObjectFile dir) cfiles)
+    CSharedLibrary dir sofile cfiles -> do
+      ofiles <- fetchConcurrently (fmap (CObjectFile dir) cfiles)
       let success = all isJust ofiles
           sofilePath = dir </> sofile
       if not success
@@ -130,7 +130,7 @@ acquireJanusCDL dir cfiles = do
   memoVar <- newIORef mempty
   let filesHash = B16.encode (SHA256.hash $ Text.encodeUtf8 (foldMap Text.pack cfiles))
       sofile_ = unpack filesHash <> ".so"
-  result <- Rock.runTask (Rock.memoise memoVar janusRules) . Rock.fetch $ SharedLibrary dir sofile_ cfiles
+  result <- Rock.runTask (Rock.memoise memoVar janusRules) . Rock.fetch $ CSharedLibrary dir sofile_ cfiles
   case result of
     Just sofile -> dlopen sofile [RTLD_LAZY, RTLD_LOCAL]
     Nothing -> error "withJanusDL: compilation failed!"

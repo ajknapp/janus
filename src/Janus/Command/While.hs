@@ -4,7 +4,6 @@ module Janus.Command.While where
 
 import Control.Lens
 import Control.Monad
-import Control.Monad.Reader
 import Control.Monad.State
 import Data.Loc
 import Data.Monoid
@@ -28,7 +27,7 @@ instance CmdWhile JanusCM JanusC where
   whileM c body = do
     ref@(JanusCRef (LVal r)) <- newRef c
     fn <- getFunction
-    fname <- ask
+    fname <- askFuncName
     let block = fn ^. jcfBlock
         fn' = fn & jcfBlock .~ mempty
     modify $ \s -> s & ix fname .~ fn'

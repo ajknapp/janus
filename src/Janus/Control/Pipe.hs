@@ -185,6 +185,7 @@ delayP' = Pipe $ do
         k (Yield a')
     x -> pure x
 
+-- only use this at the beginning of a pipeline
 source :: Stream m a -> Source m a
 source (Stream s) = Pipe $ pure $ Kleisli $ \case
   Yield _ -> s

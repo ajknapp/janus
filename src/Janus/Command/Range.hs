@@ -8,7 +8,6 @@
 module Janus.Command.Range where
 
 import Control.Lens
-import Control.Monad.Reader
 import Control.Monad.State
 import Data.Int
 import Data.Loc
@@ -59,7 +58,7 @@ instance CmdRange JanusCM JanusC where
             idx = Var idxId noLoc
             fn' = fn & jcfBlock .~ mempty
                      & jcfVarCounter +~ 1
-        fname <- ask
+        fname <- askFuncName
         modify $ \s -> s & ix fname .~ fn'
         body $ JanusC $ pure $ RVal idx
         fn'' <- getFunction

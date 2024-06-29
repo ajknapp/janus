@@ -12,7 +12,6 @@ module Janus.Command.Format where
 
 import Control.Lens
 import Control.Monad
-import Control.Monad.Reader
 import Control.Monad.State
 import Data.Int
 import Data.Loc
@@ -64,9 +63,6 @@ instance FormatString Float where
 
 instance FormatString Double where
   formatString _ = "%f"
-
-instance (FormatString a) => FormatString (Identity a) where
-  formatString _ = formatString (Proxy @a)
 
 class GFormatString f where
   gformatString :: Proxy (f a) -> String
@@ -185,10 +181,10 @@ instance CmdString JanusCM JanusC where
             fn' = fn
               & jcfBlock .~ appendBlock block [BlockDecl inigroup]
               & jcfVarCounter +~ 1
-        fname <- ask
+        fname <- askFuncName
         modify $ \st -> st & ix fname .~ fn'
         pure $ RVal (Var x noLoc)
-      _ -> error "JanusC.withString: the impossible happened"
+      _antiSpec -> error "JanusC.withString: the impossible happened"
 
 putString :: (CmdPutString m e) => e CString -> m ()
 putString = hputString stdout

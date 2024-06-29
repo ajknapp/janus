@@ -54,6 +54,9 @@ import System.Posix
 import Text.PrettyPrint.Mainland (pretty)
 import Text.PrettyPrint.Mainland.Class
 
+data JanusCBackend = JC | JCUDA
+  deriving (Eq, Ord, Show)
+
 newtype LVal a = LVal {getLVal :: Exp}
 
 newtype RVal a = RVal {getRVal :: Exp}
@@ -81,16 +84,38 @@ $(makeLenses ''JCFunc)
 
 type JanusCMState = Map.Map String JCFunc
 
+data JCFuncInfo
+  = JCFuncInfo
+  { _jcfiName :: String
+  , _jcfiBackend :: JanusCBackend
+  , _jcfiIsLocal :: Bool
+  } deriving (Eq, Ord, Show)
+
+$(makeLenses ''JCFuncInfo)
+
 newtype JanusC a = JanusC {getJanusC :: JanusCM (RVal a)}
 
-newtype JanusCM a = JanusCM {getJanusCM :: ReaderT String (State JanusCMState) a}
-  deriving newtype (Functor, Applicative, Monad, MonadFix, MonadState JanusCMState, MonadReader String)
+newtype JanusCM a = JanusCM {getJanusCM :: ReaderT JCFuncInfo (State JanusCMState) a}
+  deriving newtype (Functor, Applicative, Monad, MonadFix, MonadState JanusCMState, MonadReader JCFuncInfo)
+
+askFuncName :: JanusCM String
+askFuncName = asks _jcfiName
+
+jcTypeQuals :: JCFuncInfo -> [TypeQual]
+jcTypeQuals (JCFuncInfo _ JC _) = []
+jcTypeQuals (JCFuncInfo _ JCUDA isLocal) = if isLocal then [TCUDAdevice noLoc] else [TCUDAglobal noLoc]
+askTypeQuals :: JanusCM [TypeQual]
+askTypeQuals = asks jcTypeQuals
 
 defaultJanusState :: JanusCMState
 defaultJanusState = Map.empty
 
 appendBlock :: Endo [BlockItem] -> [BlockItem] -> Endo [BlockItem]
 appendBlock block items = Endo (<> items) <> block
+
+setTypeQualifiers :: [TypeQual] -> DeclSpec -> DeclSpec
+setTypeQualifiers tqs (DeclSpec sto _ ts loc) = DeclSpec sto tqs ts loc
+setTypeQualifiers _ _ = error "setTypeQualifiers: the impossible happened"
 
 renderJCFunc :: JCFunc -> String
 renderJCFunc (JCFunc fname headerSet typedefSet _ funcSet (Just (JCType spec dec)) params block e _) =
@@ -113,7 +138,7 @@ renderJCFunc _ = error "renderJCFunc: function has no type specified!"
 
 modifyFunction :: (JCFunc -> JCFunc) -> JanusCM ()
 modifyFunction f = do
-  fname <- ask
+  fname <- askFuncName
   modify $ \s -> s & ix fname %~ f
 
 class (Typeable a) => JanusCTyped a where
@@ -121,17 +146,18 @@ class (Typeable a) => JanusCTyped a where
 
 finishFunction :: forall a. (JanusCTyped a) => JanusC a -> JanusCM ()
 finishFunction a = do
-  ty <- getJanusCType (Proxy @a)
+  JCType spec dec <- getJanusCType (Proxy @a)
   RVal e <- getJanusC a
-  fname <- ask
+  fname <- askFuncName
+  tqs <- askTypeQuals
   jcs <- get
   case Map.lookup fname jcs of
-    Just f -> put $ flip (Map.insert fname) jcs $ f & jcfExp ?~ e & jcfType ?~ ty
+    Just f -> put $ flip (Map.insert fname) jcs $ f & jcfExp ?~ e & jcfType ?~ JCType (setTypeQualifiers tqs spec) dec
     Nothing -> error "finishFunction: the impossible happened"
 
 finishFunction_ :: JanusCM ()
 finishFunction_ = do
-  fname <- ask
+  fname <- askFuncName
   jcs <- get
   case Map.lookup fname jcs of
     Just f ->
@@ -157,15 +183,6 @@ defaultJCFunc name params =
 mkArgId :: Int -> Id
 mkArgId m = Id ("arg_" <> show m) noLoc
 
-janusCFunctions :: forall a. (JanusCTyped a) => String -> JanusCM (JanusC a) -> [JCFunc]
-janusCFunctions name a = Map.elems $ flip execState defaultJanusState $ flip runReaderT name $ getJanusCM $ do
-  fname <- ask
-  _ <- getJanusCType (Proxy @a)
-  modify $ \s -> s & ix fname .~ defaultJCFunc fname (Params [] False noLoc)
-  a' <- a
-  finishFunction a'
-  getJanusCType (Proxy @a)
-
 type family JanusCEval a where
   JanusCEval (JanusC a -> r) = a -> JanusCEval r
   -- TODO figure out why the unsafePerformIO required for this allows the DL to be closed before use
@@ -173,46 +190,47 @@ type family JanusCEval a where
   JanusCEval (JanusCM (JanusC a)) = IO a
 
 type family JanusCRetType a where
--- -- TODO figure out why the unsafePerformIO required for this allows the DL to be closed before use
   JanusCRetType (JanusC a) = a
   JanusCRetType (JanusCM (JanusC a)) = a
   JanusCRetType (JanusC a -> r) = JanusCRetType r
 
 class JanusCParam r where
-  jcparam :: String -> Int -> r -> [JCFunc]
+  jcparam :: String -> Int -> JanusCM [Param] -> JanusCBackend -> r -> [JCFunc]
   jceval :: FunPtr r -> [Arg] -> r -> JanusCEval r
 
 -- TODO figure out why the unsafePerformIO required for this allows the DL to be closed before use
 instance (FFIRet a, JanusCTyped a) => JanusCParam (JanusC a) where
-  jcparam name n a = Map.elems $ flip execState defaultJanusState $ flip runReaderT name $ getJanusCM $ do
-    fname <- ask
-    JCType spec dec <- getJanusCType (Proxy @a)
-    let params' = [Param (Just (mkArgId i)) spec dec noLoc | i <- [0..n-1::Int]]
-    modify $ \s -> s & ix fname .~ defaultJCFunc fname (Params params' False noLoc)
+  jcparam name _ params backend a = Map.elems $ flip execState defaultJanusState $ flip runReaderT (JCFuncInfo name backend False) $ getJanusCM $ do
+    fname <- askFuncName
+    params' <- params
+    modify $ \s -> s & ix fname . jcfParams .~ Params (reverse params') False noLoc
     finishFunction a
     getJanusCType (Proxy @a)
   jceval fp args _ = callFFI fp (ret (Proxy @a)) (reverse args)
 
 instance (FFIRet a, JanusCTyped a) => JanusCParam (JanusCM (JanusC a)) where
-  jcparam name n a = Map.elems $ flip execState defaultJanusState $ flip runReaderT name $ getJanusCM $ do
-    fname <- ask
-    JCType spec dec <- getJanusCType (Proxy @a)
-    let params' = [Param (Just (mkArgId i)) spec dec noLoc | i <- [0..n-1::Int]]
-    modify $ \s -> s & ix fname .~ defaultJCFunc fname (Params params' False noLoc)
-    a' <- a
-    finishFunction a'
+  jcparam name _ params backend a = Map.elems $ flip execState defaultJanusState $ flip runReaderT (JCFuncInfo name backend False) $ getJanusCM $ do
+    fname <- askFuncName
+    params' <- params
+    modify $ \s -> s & ix fname . jcfParams .~ Params (reverse params') False noLoc
+    a >>= finishFunction
     getJanusCType (Proxy @a)
   jceval fp args _ = callFFI fp (ret (Proxy @a)) (reverse args)
 
-instance (FFIArg a, JanusCParam r) => JanusCParam (JanusC a -> r) where
-  jcparam name n f = jcparam name (n + 1) (f $ JanusC $ pure $ RVal $ Var (Id ("arg_" <> show n) noLoc) noLoc)
+instance (JanusCTyped a, FFIArg a, JanusCParam r) => JanusCParam (JanusC a -> r) where
+  jcparam name n args tqs f = jcparam name (n + 1) args' tqs (f $ JanusC $ pure $ RVal $ Var (mkArgId n) noLoc)
+    where
+      args' = do
+        JCType spec dec <- getJanusCType (Proxy @a)
+        args'' <- args
+        pure $ Param (Just (mkArgId n)) spec dec noLoc:args''
   jceval fp args f a = jceval (castFunPtr fp) (arg a:args) (f $ JanusC $ pure $ RVal $ Var (Id "this_is_a_bug_if_you_see_this" noLoc) noLoc)
 
 -- this mostly exists for use with hedgehog withResource
 acquireJanusC :: forall r. JanusCParam r => r -> IO (JanusCEval r, DL)
 acquireJanusC a = do
   let dir = "_cache"
-  files <- writeJanusCFiles dir (jcparam "janus_main" 0 a)
+  files <- writeJanusCFiles dir (jcparam "janus_main" 0 (pure []) JC a)
   dl <- acquireJanusCDL dir files
   fp <- dlsym dl "janus_main"
   if fp == nullFunPtr
@@ -226,9 +244,9 @@ releaseJanusC = releaseJanusCDL . snd
 withJanusC :: forall a r. (JanusCParam r, FFIRet (JanusCRetType r)) => r -> (JanusCEval r -> IO a) -> IO a
 withJanusC a k = bracket (acquireJanusC a) releaseJanusC (k . fst)
 
-showJanusC :: forall a. (JanusCParam a) => String -> a -> String
-showJanusC name a =
-  let jcs = jcparam name 0 a
+showJanusC :: forall a. (JanusCParam a) => String -> JanusCBackend -> a -> String
+showJanusC name backend a =
+  let jcs = jcparam name 0 (pure []) backend a
       strChar 0 = '\n'
       strChar 81 = '\n'
       strChar _ = '-'
@@ -236,7 +254,10 @@ showJanusC name a =
    in foldMap ((<> str) . renderJCFunc) jcs
 
 printJanusC :: (JanusCParam r) => r -> IO ()
-printJanusC = putStrLn . showJanusC "janus_main"
+printJanusC = putStrLn . showJanusC "janus_main" JC
+
+printJanusCUDA :: (JanusCParam r) => r -> IO ()
+printJanusCUDA = putStrLn . showJanusC "janus_main" JCUDA
 
 writeJanusCFiles :: FilePath -> [JCFunc] -> IO [String]
 writeJanusCFiles dir funcs = do
@@ -253,7 +274,7 @@ writeJanusCFiles dir funcs = do
 
 getFunction :: JanusCM JCFunc
 getFunction = do
-  fname <- ask
+  fname <- askFuncName
   jcs <- get
   case Map.lookup fname jcs of
     Just f -> pure f
@@ -265,7 +286,7 @@ getFunction = do
 -- NOTE the memoization here is mandatory for fixpoints to work
 getJanusCType :: (Typeable a, JanusCTyped a) => Proxy a -> JanusCM JCType
 getJanusCType p = do
-  fname <- ask
+  fname <- askFuncName
   f <- getFunction
   let tyrep = typeRep p
   case Map.lookup tyrep (f ^. jcfTypeCache) of
@@ -299,7 +320,7 @@ getJanusCType p = do
 
 addHeader :: String -> JanusCM ()
 addHeader header = do
-  fname <- ask
+  fname <- askFuncName
   modify $ \s -> s & ix fname . jcfHeaders %~ Set.insert header
 
 instance JanusCTyped Bool where
@@ -542,7 +563,7 @@ instance (JanusCTyped a) => JanusCFFICall (JanusCM (JanusC a)) where
       Nothing -> pure ()
     JCType spec dec <- getJanusCType (Proxy @a)
     fn <- getFunction
-    fname <- ask
+    fname <- askFuncName
     let c = fn ^. jcfVarCounter
         var = Id ("x_" <> show c) noLoc
         val = FnCall (Var (Id name noLoc) noLoc) (reverse args') noLoc
@@ -562,7 +583,7 @@ instance {-# OVERLAPS #-} JanusCFFICall (JanusCM (JanusC (Ptr ()))) where
       Nothing -> pure ()
     let JCType spec dec = voidPtrType
     fn <- getFunction
-    fname <- ask
+    fname <- askFuncName
     let c = fn ^. jcfVarCounter
         var = Id ("x_" <> show c) noLoc
         val = FnCall (Var (Id name noLoc) noLoc) (reverse args') noLoc

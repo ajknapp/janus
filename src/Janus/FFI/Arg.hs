@@ -13,6 +13,9 @@ import Foreign.Ptr
 class FFIArg a where
   arg :: a -> Arg
 
+instance FFIArg Bool where
+  arg = argCChar . fromIntegral . fromEnum
+
 instance FFIArg CInt where
   arg = argCInt
 

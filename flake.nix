@@ -26,9 +26,9 @@
           , base16-bytestring
           , containers
           , cryptohash-sha256
-          , cudatoolkit
+          , cudaPackages_12_3
           , dependent-sum-template
-          , gcc
+          , gcc12
           , hashable
           , lens
           , language-c-quote
@@ -69,7 +69,7 @@
                 vector
                 zstd
               ];
-            librarySystemDepends = [ cudatoolkit gcc linuxPackages.nvidia_x11 ];
+            librarySystemDepends = [ cudaPackages_12_3.cudatoolkit cudaPackages_12_3.libnvjitlink gcc12 linuxPackages.nvidia_x11 ];
             testHaskellDepends = [tasty-discover tasty-hedgehog tasty-hunit];
             description = "An extensible EDSL for high-performance computing.";
             license = "unknown";
@@ -98,8 +98,9 @@
           # shellHook = "export LIBRARY_PATH=${pkgs.lib.getLib pkgs.stdenv.cc.libc}/lib";
           withHoogle = true;
           shellHook = ''
-            export CUDA_PATH=${pkgs.cudatoolkit}
-            export LD_LIBRARY_PATH=${pkgs.linuxPackages.nvidia_x11}/lib
+            export PATH=${pkgs.gcc12}/bin:$PATH
+            export CUDA_PATH=${pkgs.cudaPackages_12_3.cudatoolkit}
+            export LD_LIBRARY_PATH=${pkgs.linuxPackages.nvidia_x11}/lib:${pkgs.cudaPackages_12_3.libnvjitlink}/lib
             export EXTRA_LDFLAGS="-L/lib -L${pkgs.linuxPackages.nvidia_x11}/lib"
             export EXTRA_CCFLAGS="-I/usr/include"
          '';

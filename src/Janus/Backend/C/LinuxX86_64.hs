@@ -48,7 +48,7 @@ import Language.C.Quote
 newtype LinuxX86_64C a = LinuxX86_64C {getLinuxX86_64C :: JanusC a}
 
 newtype LinuxX86_64CM a = LinuxX86_64CM {getLinuxX86_64CM :: JanusCM a}
-  deriving (Functor, Applicative, Monad, MonadFix, MonadState JanusCMState, MonadReader String) via JanusCM
+  deriving (Functor, Applicative, Monad, MonadFix, MonadState JanusCMState, MonadReader JCFuncInfo) via JanusCM
 
 type instance JanusTyped LinuxX86_64C = JanusCTyped
 
@@ -173,7 +173,7 @@ instance CmdWhile LinuxX86_64CM LinuxX86_64C where
 ticTocAsmBlock ::
   (LinuxX86_64C a -> b) -> String -> LinuxX86_64CM b
 ticTocAsmBlock newty str = LinuxX86_64CM $ do
-  fname <- ask
+  fname <- askFuncName
   JCType spec dec <- getJanusCType (Proxy @Word64)
   jcs <- get
   case Map.lookup fname jcs of
