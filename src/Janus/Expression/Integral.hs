@@ -1,6 +1,8 @@
 {-# LANGUAGE FlexibleInstances #-}
 {-# LANGUAGE MultiParamTypeClasses #-}
 {-# LANGUAGE TemplateHaskell #-}
+-- TODO file cabal bug report, extra-libraries not passed to template haskell
+{-# OPTIONS_GHC -lcuda -lnvJitLink #-}
 
 module Janus.Expression.Integral where
 

@@ -1,6 +1,7 @@
 {-# LANGUAGE DataKinds #-}
 {-# LANGUAGE DeriveGeneric #-}
 {-# LANGUAGE DerivingVia #-}
+{-# LANGUAGE FlexibleContexts #-}
 {-# LANGUAGE FlexibleInstances #-}
 {-# LANGUAGE GADTs #-}
 {-# LANGUAGE GeneralizedNewtypeDeriving #-}
@@ -10,7 +11,6 @@
 {-# LANGUAGE TemplateHaskell #-}
 {-# LANGUAGE TypeApplications #-}
 {-# LANGUAGE TypeFamilies #-}
-{-# LANGUAGE FlexibleContexts #-}
 
 module Janus.Backend.C where
 
@@ -104,11 +104,12 @@ askFuncName = asks _jcfiName
 jcTypeQuals :: JCFuncInfo -> [TypeQual]
 jcTypeQuals (JCFuncInfo _ JC _) = []
 jcTypeQuals (JCFuncInfo _ JCUDA isLocal) = if isLocal then [TCUDAdevice noLoc] else [TCUDAglobal noLoc]
+
 askTypeQuals :: JanusCM [TypeQual]
 askTypeQuals = asks jcTypeQuals
 
 defaultJanusState :: JanusCMState
-defaultJanusState = Map.empty
+defaultJanusState = Map.fromList [("janus_main", defaultJCFunc "janus_main" (Params [] False noLoc))]
 
 appendBlock :: Endo [BlockItem] -> [BlockItem] -> Endo [BlockItem]
 appendBlock block items = Endo (<> items) <> block
@@ -133,7 +134,9 @@ renderJCFunc (JCFunc fname headerSet typedefSet _ funcSet (Just (JCType spec dec
       typedefs = foldMap ((<> "\n") . pretty 120 . ppr . tdef) typedefSet
       block' = appendBlock block [BlockStm $ Return e noLoc]
       body = pretty 120 $ ppr $ Func spec (Id fname noLoc) dec params (appEndo block' []) noLoc
-   in headers <> ['\n' | not (null headers)] <> typedefs <> ['\n' | not (null typedefs)] <> protos <> ['\n' | not (null protos)] <> body
+      externCBegin = "#ifdef __cplusplus\nextern \"C\" {\n#endif\n\n"
+      externCEnd = "\n\n#ifdef __cplusplus\n}\n#endif\n"
+   in headers <> ['\n' | not (null headers)] <> externCBegin <> typedefs <> ['\n' | not (null typedefs)] <> protos <> ['\n' | not (null protos)] <> body <> externCEnd
 renderJCFunc _ = error "renderJCFunc: function has no type specified!"
 
 modifyFunction :: (JCFunc -> JCFunc) -> JanusCM ()
@@ -158,11 +161,12 @@ finishFunction a = do
 finishFunction_ :: JanusCM ()
 finishFunction_ = do
   fname <- askFuncName
+  tqs <- askTypeQuals
   jcs <- get
   case Map.lookup fname jcs of
     Just f ->
-      let voidty = JCType (DeclSpec [] [] (Tvoid noLoc) noLoc) (DeclRoot noLoc)
-       in put $ flip (Map.insert fname) jcs $ f & jcfExp .~ Nothing & jcfType ?~ voidty
+      let voidty = JCType (DeclSpec [] tqs (Tvoid noLoc) noLoc) (DeclRoot noLoc)
+       in put $ flip (Map.insert fname) jcs $ f & jcfType ?~ voidty
     Nothing -> error "finishFunction_: the impossible happened"
 
 defaultJCFunc :: String -> Params -> JCFunc
@@ -196,6 +200,8 @@ type family JanusCRetType a where
 
 class JanusCParam r where
   jcparam :: String -> Int -> JanusCM [Param] -> JanusCBackend -> r -> [JCFunc]
+
+class JanusCEvaluate r where
   jceval :: FunPtr r -> [Arg] -> r -> JanusCEval r
 
 -- TODO figure out why the unsafePerformIO required for this allows the DL to be closed before use
@@ -206,6 +212,8 @@ instance (FFIRet a, JanusCTyped a) => JanusCParam (JanusC a) where
     modify $ \s -> s & ix fname . jcfParams .~ Params (reverse params') False noLoc
     finishFunction a
     getJanusCType (Proxy @a)
+
+instance (FFIRet a, JanusCTyped a) => JanusCEvaluate (JanusC a) where
   jceval fp args _ = callFFI fp (ret (Proxy @a)) (reverse args)
 
 instance (FFIRet a, JanusCTyped a) => JanusCParam (JanusCM (JanusC a)) where
@@ -215,22 +223,34 @@ instance (FFIRet a, JanusCTyped a) => JanusCParam (JanusCM (JanusC a)) where
     modify $ \s -> s & ix fname . jcfParams .~ Params (reverse params') False noLoc
     a >>= finishFunction
     getJanusCType (Proxy @a)
+
+instance (FFIRet a, JanusCTyped a) => JanusCEvaluate (JanusCM (JanusC a)) where
   jceval fp args _ = callFFI fp (ret (Proxy @a)) (reverse args)
 
-instance (JanusCTyped a, FFIArg a, JanusCParam r) => JanusCParam (JanusC a -> r) where
+instance JanusCParam (JanusCM ()) where
+  jcparam name _ params backend a = Map.elems $ flip execState defaultJanusState $ flip runReaderT (JCFuncInfo name backend False) $ getJanusCM $ do
+    fname <- askFuncName
+    params' <- params
+    modify $ \s -> s & ix fname . jcfParams .~ Params (reverse params') False noLoc
+    a >> finishFunction_
+    -- getJanusCType (Proxy @a)
+
+instance (JanusCTyped a, JanusCParam r) => JanusCParam (JanusC a -> r) where
   jcparam name n args tqs f = jcparam name (n + 1) args' tqs (f $ JanusC $ pure $ RVal $ Var (mkArgId n) noLoc)
     where
       args' = do
         JCType spec dec <- getJanusCType (Proxy @a)
         args'' <- args
         pure $ Param (Just (mkArgId n)) spec dec noLoc:args''
+
+instance (JanusCTyped a, FFIArg a, JanusCEvaluate r) => JanusCEvaluate (JanusC a -> r) where
   jceval fp args f a = jceval (castFunPtr fp) (arg a:args) (f $ JanusC $ pure $ RVal $ Var (Id "this_is_a_bug_if_you_see_this" noLoc) noLoc)
 
 -- this mostly exists for use with hedgehog withResource
-acquireJanusC :: forall r. JanusCParam r => r -> IO (JanusCEval r, DL)
-acquireJanusC a = do
+acquireJanusC :: forall r. (JanusCParam r, JanusCEvaluate r) => JanusCBackend -> r -> IO (JanusCEval r, DL)
+acquireJanusC backend a = do
   let dir = "_cache"
-  files <- writeJanusCFiles dir (jcparam "janus_main" 0 (pure []) JC a)
+  files <- writeJanusCFiles backend dir (jcparam "janus_main" 0 (pure []) backend a)
   dl <- acquireJanusCDL dir files
   fp <- dlsym dl "janus_main"
   if fp == nullFunPtr
@@ -241,8 +261,8 @@ acquireJanusC a = do
 releaseJanusC :: (a, DL) -> IO ()
 releaseJanusC = releaseJanusCDL . snd
 
-withJanusC :: forall a r. (JanusCParam r, FFIRet (JanusCRetType r)) => r -> (JanusCEval r -> IO a) -> IO a
-withJanusC a k = bracket (acquireJanusC a) releaseJanusC (k . fst)
+withJanusC :: forall a r. (JanusCParam r, JanusCEvaluate r, FFIRet (JanusCRetType r)) => r -> (JanusCEval r -> IO a) -> IO a
+withJanusC a k = bracket (acquireJanusC JC a) releaseJanusC (k . fst)
 
 showJanusC :: forall a. (JanusCParam a) => String -> JanusCBackend -> a -> String
 showJanusC name backend a =
@@ -256,15 +276,16 @@ showJanusC name backend a =
 printJanusC :: (JanusCParam r) => r -> IO ()
 printJanusC = putStrLn . showJanusC "janus_main" JC
 
-printJanusCUDA :: (JanusCParam r) => r -> IO ()
-printJanusCUDA = putStrLn . showJanusC "janus_main" JCUDA
+backendExt :: JanusCBackend -> String
+backendExt JC = ".c"
+backendExt JCUDA = ".cu"
 
-writeJanusCFiles :: FilePath -> [JCFunc] -> IO [String]
-writeJanusCFiles dir funcs = do
+writeJanusCFiles :: JanusCBackend -> FilePath -> [JCFunc] -> IO [String]
+writeJanusCFiles backend dir funcs = do
   for funcs $ \f -> do
     let body = renderJCFunc f
         sha = SHA256.hash (Text.encodeUtf8 $ Text.pack body)
-        filename = unpack (B16.encode sha) <> ".c"
+        filename = unpack (B16.encode sha) <> backendExt backend
         path = dir </> filename
     exist <- fileExist path
     unless exist $ do

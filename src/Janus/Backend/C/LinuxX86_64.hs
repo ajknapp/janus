@@ -48,7 +48,7 @@ import Language.C.Quote
 newtype LinuxX86_64C a = LinuxX86_64C {getLinuxX86_64C :: JanusC a}
 
 newtype LinuxX86_64CM a = LinuxX86_64CM {getLinuxX86_64CM :: JanusCM a}
-  deriving (Functor, Applicative, Monad, MonadFix, MonadState JanusCMState, MonadReader JCFuncInfo) via JanusCM
+  deriving (Functor, Applicative, Monad, MonadFix) via JanusCM
 
 type instance JanusTyped LinuxX86_64C = JanusCTyped
 
@@ -77,6 +77,9 @@ instance (ExpBits JanusC a) => ExpBits LinuxX86_64C a where
 instance (ExpBoolCast JanusC a) => ExpBoolCast LinuxX86_64C a where
   toBool = coerce (toBool @JanusC @a)
   fromBool = coerce (fromBool @JanusC @a)
+
+instance ExpIntegralCast JanusC a b => ExpIntegralCast LinuxX86_64C a b where
+  toIntegral = coerce (toIntegral @JanusC @a @b)
 
 instance (ExpFloatingCast JanusC a b) => ExpFloatingCast LinuxX86_64C a b where
   toFloating = coerce (toFloating @JanusC @a @b)
@@ -157,6 +160,7 @@ newtype LinuxX86_64CRef a = LinuxX86_64CRef {getLinuxX86_64CRef :: JanusCRef a}
 
 instance CmdRef LinuxX86_64CM LinuxX86_64C where
   type Ref LinuxX86_64CM LinuxX86_64C a = LinuxX86_64CRef a
+  letM (LinuxX86_64C a) = LinuxX86_64CM $ LinuxX86_64C <$> letM a
   newRef (LinuxX86_64C a) = LinuxX86_64CM (LinuxX86_64CRef <$> newRef a)
   newRef' = LinuxX86_64CM (LinuxX86_64CRef <$> newRef')
   readRef (LinuxX86_64CRef r) = LinuxX86_64CM (LinuxX86_64C <$> readRef r)

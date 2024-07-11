@@ -48,7 +48,7 @@ compiledFacEqualsSpecFac f = property $ do
   k === m
 
 test_fix :: TestTree
-test_fix = withResource (acquireJanusC (fac @JanusC @Int64)) releaseJanusC $ \k ->
+test_fix = withResource (acquireJanusC JC (fac @JanusC @Int64)) releaseJanusC $ \k ->
   let k' = fst <$> k
    in testGroup
         "fix"

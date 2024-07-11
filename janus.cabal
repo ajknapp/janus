@@ -114,6 +114,7 @@ test-suite janus-test
 
     -- Modules included in this executable, other than Main.
     other-modules:    Test.Janus.Fix
+                      Test.Janus.Backend.C.CUDA
                       Test.Janus.Expression.Let
 
     -- LANGUAGE extensions used by modules in this package.
@@ -132,7 +133,9 @@ test-suite janus-test
     build-depends:    base ^>=4.18
                     , hedgehog
                     , janus
+                    , mtl
                     , tasty
                     , tasty-hedgehog
                     , tasty-hunit
+                    , transformers
                     , vector

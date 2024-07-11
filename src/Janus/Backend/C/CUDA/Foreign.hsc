@@ -1,15 +1,21 @@
 {-# LANGUAGE GeneralizedNewtypeDeriving #-}
 {-# LANGUAGE LambdaCase #-}
 {-# LANGUAGE PatternSynonyms #-}
+{-# LANGUAGE RecordWildCards #-}
+{-# LANGUAGE TemplateHaskell #-}
 
 module Janus.Backend.C.CUDA.Foreign where
 
 import Control.Exception
+import Control.Lens
+import Control.Monad
+import Data.IORef
 import Data.Word
 import Foreign.C
 import Foreign.Marshal.Alloc
 import Foreign.Ptr
 import Foreign.Storable
+import System.IO.Unsafe
 
 #include <cuda.h>
 #include <nvJitLink.h>
@@ -406,6 +412,17 @@ newtype CUdevice = CUdevice CInt
 
 foreign import ccall unsafe "cuDeviceGet" c_cuDeviceGet :: Ptr CUdevice -> CInt -> IO CUresult
 
+cuInitialized :: IORef Bool
+cuInitialized = unsafePerformIO $ newIORef False
+{-# NOINLINE cuInitialized #-}
+
+withCudaDevice :: Int -> (CUdevice -> IO a) -> IO a
+withCudaDevice i k = bracket malloc free $ \pdev -> do
+  ini <- readIORef cuInitialized
+  unless ini $ cuInit 0 >> writeIORef cuInitialized True
+  dev <- cuDeviceGet pdev (fromIntegral i) >> peek pdev
+  k dev
+
 cuDeviceGet :: Ptr CUdevice -> CInt -> IO ()
 cuDeviceGet dev i = cudaCheck (c_cuDeviceGet dev i)
 
@@ -578,7 +595,7 @@ nvJitLinkComplete h = nvJitLinkCheck (c_nvJitLinkComplete h)
 foreign import ccall unsafe "nvJitLinkGetLinkedCubinSize" c_nvJitLinkGetLinkedCubinSize :: NVJitLinkHandle -> Ptr CSize -> IO NVJitLinkResult
 
 nvJitLinkGetLinkedCubinSize :: NVJitLinkHandle -> IO CSize
-nvJitLinkGetLinkedCubinSize h = alloca $ \p -> do
+nvJitLinkGetLinkedCubinSize h = bracket malloc free $ \p -> do
   nvJitLinkCheck (c_nvJitLinkGetLinkedCubinSize h p)
   peek p
 
@@ -641,3 +658,50 @@ foreign import ccall "cuCtxSynchronize" c_cuCtxSynchronize :: IO CUresult
 
 cuCtxSynchronize :: IO ()
 cuCtxSynchronize = cudaCheck c_cuCtxSynchronize
+
+-- TODO add flag field/flag count
+data CUlaunchConfig
+  = CUlaunchConfig
+  { _cuLaunchConfigGridDimX :: CUInt
+  , _cuLaunchConfigGridDimY :: CUInt
+  , _cuLaunchConfigGridDimZ :: CUInt
+  , _cuLaunchConfigBlockDimX :: CUInt
+  , _cuLaunchConfigBlockDimY :: CUInt
+  , _cuLaunchConfigBlockDimZ :: CUInt
+  , _cuLaunchConfigSharedMemBytes :: CUInt
+  , _cuLaunchConfigStream :: CUstream
+  } deriving (Eq, Ord, Show)
+
+$(makeLenses ''CUlaunchConfig)
+
+instance Storable CUlaunchConfig where
+  sizeOf _ = #{size CUlaunchConfig}
+  alignment _ = #{alignment CUlaunchConfig}
+  peek p = do
+    _cuLaunchConfigGridDimX <- #{peek CUlaunchConfig, gridDimX} p
+    _cuLaunchConfigGridDimY <- #{peek CUlaunchConfig, gridDimY} p
+    _cuLaunchConfigGridDimZ <- #{peek CUlaunchConfig, gridDimZ} p
+    _cuLaunchConfigBlockDimX <- #{peek CUlaunchConfig, blockDimX} p
+    _cuLaunchConfigBlockDimY <- #{peek CUlaunchConfig, blockDimY} p
+    _cuLaunchConfigBlockDimZ <- #{peek CUlaunchConfig, blockDimZ} p
+    _cuLaunchConfigSharedMemBytes <- #{peek CUlaunchConfig, sharedMemBytes} p
+    _cuLaunchConfigStream <- #{peek CUlaunchConfig, hStream} p
+    pure CUlaunchConfig {..}
+  poke p CUlaunchConfig {..} = do
+    #{poke CUlaunchConfig, gridDimX} p _cuLaunchConfigGridDimX
+    #{poke CUlaunchConfig, gridDimY} p _cuLaunchConfigGridDimY
+    #{poke CUlaunchConfig, gridDimZ} p _cuLaunchConfigGridDimZ
+    #{poke CUlaunchConfig, blockDimX} p _cuLaunchConfigBlockDimX
+    #{poke CUlaunchConfig, blockDimY} p _cuLaunchConfigBlockDimY
+    #{poke CUlaunchConfig, blockDimZ} p _cuLaunchConfigBlockDimZ
+    #{poke CUlaunchConfig, sharedMemBytes} p _cuLaunchConfigSharedMemBytes
+    #{poke CUlaunchConfig, hStream} p _cuLaunchConfigStream
+
+foreign import ccall unsafe "cuOccupancyMaxPotentialBlockSize" c_cuOccupancyMaxPotentialBlockSize
+  :: Ptr CInt -> Ptr CInt -> CUfunction -> FunPtr (CInt -> CSize) -> CSize -> CInt -> IO CUresult
+
+cuOccupancyMaxPotentialBlockSize :: CUfunction -> FunPtr (CInt -> CSize) -> CSize -> CInt -> IO (CInt, CInt)
+cuOccupancyMaxPotentialBlockSize fn blockSizeToDynamicSMemSize dynamicSMemSize blockSizeLimit =
+  bracket malloc free $ \pmingrid -> bracket malloc free $ \pblockSize -> do
+    cudaCheck $ c_cuOccupancyMaxPotentialBlockSize pmingrid pblockSize fn blockSizeToDynamicSMemSize dynamicSMemSize blockSizeLimit
+    (,) <$> peek pmingrid <*> peek pblockSize

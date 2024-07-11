@@ -43,8 +43,8 @@ pownCompiledEqualsInterpreted p n = property $ do
   y === z
 
 test_let :: TestTree
-test_let = withResource (acquireJanusC (pow5 @JanusC @Int64)) releaseJanusC $ \cpow5 ->
-  withResource (acquireJanusC (pow6 @JanusC @Int64)) releaseJanusC $ \cpow6 ->
+test_let = withResource (acquireJanusC JC (pow5 @JanusC @Int64)) releaseJanusC $ \cpow5 ->
+  withResource (acquireJanusC JC (pow6 @JanusC @Int64)) releaseJanusC $ \cpow6 ->
     let cpow5' = fst <$> cpow5
         cpow6' = fst <$> cpow6
      in testGroup

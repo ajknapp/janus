@@ -101,7 +101,7 @@
             export PATH=${pkgs.gcc12}/bin:$PATH
             export CUDA_PATH=${pkgs.cudaPackages_12_3.cudatoolkit}
             export LD_LIBRARY_PATH=${pkgs.linuxPackages.nvidia_x11}/lib:${pkgs.cudaPackages_12_3.libnvjitlink}/lib
-            export EXTRA_LDFLAGS="-L/lib -L${pkgs.linuxPackages.nvidia_x11}/lib"
+            export EXTRA_LDFLAGS="-L${pkgs.linuxPackages.nvidia_x11}/lib"
             export EXTRA_CCFLAGS="-I/usr/include"
          '';
         };
