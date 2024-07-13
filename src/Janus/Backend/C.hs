@@ -237,6 +237,9 @@ instance JanusCParam (JanusCM ()) where
     a >> finishFunction_
     -- getJanusCType (Proxy @a)
 
+instance JanusCEvaluate (JanusCM ()) where
+  jceval fp args _ = callFFI fp (ret (Proxy @())) (reverse args)
+
 instance (JanusCTyped a, JanusCParam r) => JanusCParam (JanusC a -> r) where
   jcparam name n args tqs f = jcparam name (n + 1) args' tqs (f $ JanusC $ pure $ RVal $ Var (mkArgId n) noLoc)
     where
