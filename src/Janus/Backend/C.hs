@@ -193,6 +193,7 @@ type family JanusCEval a where
   -- TODO figure out why the unsafePerformIO required for this allows the DL to be closed before use
   JanusCEval (JanusC a) = IO a
   JanusCEval (JanusCM (JanusC a)) = IO a
+  JanusCEval (JanusCM ()) = IO ()
 
 type family JanusCRetType a where
   JanusCRetType (JanusC a) = a
