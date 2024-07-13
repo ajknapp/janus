@@ -48,6 +48,7 @@ import Janus.Backend.C.Build
 import Janus.FFI.Arg
 import Janus.FFI.Ret
 import Language.C.Quote as C
+import qualified Rock
 import System.FilePath
 import System.IO
 import System.Posix
@@ -282,6 +283,7 @@ backendExt JCUDA = ".cu"
 
 writeJanusCFiles :: JanusCBackend -> FilePath -> [JCFunc] -> IO [String]
 writeJanusCFiles backend dir funcs = do
+  _ <- Rock.runTask janusRules (Rock.fetch $ CacheDir dir)
   for funcs $ \f -> do
     let body = renderJCFunc f
         sha = SHA256.hash (Text.encodeUtf8 $ Text.pack body)

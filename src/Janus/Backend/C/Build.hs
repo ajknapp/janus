@@ -104,18 +104,21 @@ janusRules key = do
           pure (Just dir)
 
     CObjectFile dir cfile -> do
-      let (root, _) = splitExtension cfile
-          ofile = root <> ".o"
-          ofilePath = dir </> ofile
-      liftIO $ do
-        ofileExists <- doesPathExist ofilePath
-        if ofileExists
-          then pure (Just ofilePath)
-          else do
-            p <- spawnProcess (ccName GCC) ["-O3", "-fPIC", "-flto", "-o", ofilePath, "-c", dir </> cfile]
-            waitForProcess p >>= \case
-              ExitSuccess -> pure (Just ofilePath)
-              _exitFailure -> pure Nothing
+      Rock.fetch (CacheDir dir) >>= \case
+        Just _ -> do
+          let (root, _) = splitExtension cfile
+              ofile = root <> ".o"
+              ofilePath = dir </> ofile
+          liftIO $ do
+            ofileExists <- doesPathExist ofilePath
+            if ofileExists
+              then pure (Just ofilePath)
+              else do
+                p <- spawnProcess (ccName GCC) ["-O3", "-fPIC", "-flto", "-o", ofilePath, "-c", dir </> cfile]
+                waitForProcess p >>= \case
+                  ExitSuccess -> pure (Just ofilePath)
+                  _exitFailure -> pure Nothing
+        Nothing -> pure Nothing
 
     CSharedLibrary dir sofile cfiles -> do
       ofiles <- fetchConcurrently (fmap (CObjectFile dir) cfiles)
@@ -133,19 +136,22 @@ janusRules key = do
               _exitFailure -> pure Nothing
 
     CUPTXFile dir cufile major minor -> do
-      let (root, _) = splitExtension cufile
-          ptxfile = root <> ".ptx"
-          ptxfilePath = dir </> ptxfile
-      liftIO $ do
-        ptxFileExists <- doesPathExist ptxfilePath
-        if ptxFileExists
-          then pure (Just ptxfilePath)
-          else do
-            let arch = "-arch=sm_" <> show major <> show minor
-            p <- spawnProcess "nvcc" ["-O3", "-rdc=true", "--ptx", arch, "-o", ptxfilePath, dir </> cufile]
-            waitForProcess p >>= \case
-              ExitSuccess -> pure (Just ptxfilePath)
-              _exitFailure -> pure Nothing
+      Rock.fetch (CacheDir dir) >>= \case
+        Just _ -> do
+          let (root, _) = splitExtension cufile
+              ptxfile = root <> ".ptx"
+              ptxfilePath = dir </> ptxfile
+          liftIO $ do
+            ptxFileExists <- doesPathExist ptxfilePath
+            if ptxFileExists
+              then pure (Just ptxfilePath)
+              else do
+                let arch = "-arch=sm_" <> show major <> show minor
+                p <- spawnProcess "nvcc" ["-O3", "-rdc=true", "--ptx", arch, "-o", ptxfilePath, dir </> cufile]
+                waitForProcess p >>= \case
+                  ExitSuccess -> pure (Just ptxfilePath)
+                  _exitFailure -> pure Nothing
+        Nothing -> pure Nothing
 
     CUBinFile dir cubinfile cufiles major minor -> do
       ptxfiles <- fetchConcurrently (fmap (\cf -> CUPTXFile dir cf major minor) cufiles)

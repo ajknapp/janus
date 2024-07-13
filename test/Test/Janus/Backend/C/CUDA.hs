@@ -1,4 +1,5 @@
 {-# LANGUAGE FlexibleContexts #-}
+{-# LANGUAGE LambdaCase #-}
 {-# LANGUAGE TypeApplications #-}
 module Test.Janus.Backend.C.CUDA where
 
@@ -43,35 +44,41 @@ saxpy n a x y = do
       A.pokeElemOff y (a * xi + yi) (toIntegral i)
 
 unit_saxpy :: IO ()
-unit_saxpy = bracket malloc free $ \pctx ->
-  withCudaDevice 0 $ \dev -> withCuCtx pctx 0 dev $ \ctx -> do
-    let n = 1024
-        nbytes = n * Foreign.Storable.sizeOf (undefined :: Float)
-        fill p i
-          | i >= n = pure ()
-          | otherwise = pokeElemOff p i (fromIntegral i :: Float) >> fill p (i + 1)
-    bracket (mallocBytes nbytes) free $ \px -> bracket (mallocBytes nbytes) free $ \py -> do
-      fill px 0 >> fill py 0
-      cuCtxSetCurrent ctx
-      withCudaDeviceArray nbytes $ \d_x ->
-        withCudaDeviceArray nbytes $ \d_y -> do
-          cuMemcpyHtoD d_x (castPtr px) (fromIntegral nbytes)
-          cuMemcpyHtoD d_y (castPtr py) (fromIntegral nbytes)
-          withJanusCUDAFn dev ctx (\m a x y -> runCUDAT_ $ saxpy @_ @_ @Float m a x y) $ \fn k -> do
-            (minGrid, _) <- cuOccupancyMaxPotentialBlockSize fn nullFunPtr 0 0
-            let kernelLaunch =
-                  CUlaunchConfig
-                    { _cuLaunchConfigBlockDimX = fromIntegral $ n `div` fromIntegral minGrid + 1,
-                      _cuLaunchConfigBlockDimY = 1,
-                      _cuLaunchConfigBlockDimZ = 1,
-                      _cuLaunchConfigGridDimX = fromIntegral minGrid,
-                      _cuLaunchConfigGridDimY = 1,
-                      _cuLaunchConfigGridDimZ = 1,
-                      _cuLaunchConfigSharedMemBytes = 0,
-                      _cuLaunchConfigStream = CUstream Foreign.Ptr.nullPtr
-                    }
-            k kernelLaunch (fromIntegral n) 1.0 d_x d_y
-            cuMemcpyDtoH (castPtr px) d_x (fromIntegral nbytes)
-            cuMemcpyDtoH (castPtr py) d_y (fromIntegral nbytes)
-            forM_ [0 .. n - 1 :: Int] $ \i -> do
-              peekElemOff py i >>= (@?= (fromIntegral $ 2*i))
+unit_saxpy = do
+  try (cuInit 0) >>= \case
+    Left (CUException CUDA_ERROR_STUB_LIBRARY) -> pure ()
+    Left (CUException CUDA_ERROR_NO_DEVICE) -> pure ()
+    Left e -> throwIO e
+    Right _ -> do
+      bracket malloc free $ \pctx ->
+        withCudaDevice 0 $ \dev -> withCuCtx pctx 0 dev $ \ctx -> do
+          let n = 1024
+              nbytes = n * Foreign.Storable.sizeOf (undefined :: Float)
+              fill p i
+                | i >= n = pure ()
+                | otherwise = pokeElemOff p i (fromIntegral i :: Float) >> fill p (i + 1)
+          bracket (mallocBytes nbytes) free $ \px -> bracket (mallocBytes nbytes) free $ \py -> do
+            fill px 0 >> fill py 0
+            cuCtxSetCurrent ctx
+            withCudaDeviceArray nbytes $ \d_x ->
+              withCudaDeviceArray nbytes $ \d_y -> do
+                cuMemcpyHtoD d_x (castPtr px) (fromIntegral nbytes)
+                cuMemcpyHtoD d_y (castPtr py) (fromIntegral nbytes)
+                withJanusCUDAFn dev ctx (\m a x y -> runCUDAT_ $ saxpy @_ @_ @Float m a x y) $ \fn k -> do
+                  (minGrid, _) <- cuOccupancyMaxPotentialBlockSize fn nullFunPtr 0 0
+                  let kernelLaunch =
+                        CUlaunchConfig
+                          { _cuLaunchConfigBlockDimX = fromIntegral $ n `div` fromIntegral minGrid + 1,
+                            _cuLaunchConfigBlockDimY = 1,
+                            _cuLaunchConfigBlockDimZ = 1,
+                            _cuLaunchConfigGridDimX = fromIntegral minGrid,
+                            _cuLaunchConfigGridDimY = 1,
+                            _cuLaunchConfigGridDimZ = 1,
+                            _cuLaunchConfigSharedMemBytes = 0,
+                            _cuLaunchConfigStream = CUstream Foreign.Ptr.nullPtr
+                          }
+                  k kernelLaunch (fromIntegral n) 1.0 d_x d_y
+                  cuMemcpyDtoH (castPtr px) d_x (fromIntegral nbytes)
+                  cuMemcpyDtoH (castPtr py) d_y (fromIntegral nbytes)
+                  forM_ [0 .. n - 1 :: Int] $ \i -> do
+                    peekElemOff py i >>= (@?= (fromIntegral $ 2*i))
