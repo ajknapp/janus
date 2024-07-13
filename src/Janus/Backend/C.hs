@@ -196,7 +196,7 @@ type family JanusCEval a where
   JanusCEval (JanusCM ()) = IO ()
 
 type family JanusCRetType a where
-  JanusCRetType (JanusC ()) = ()
+  JanusCRetType (JanusCM ()) = ()
   JanusCRetType (JanusC a) = a
   JanusCRetType (JanusCM (JanusC a)) = a
   JanusCRetType (JanusC a -> r) = JanusCRetType r
