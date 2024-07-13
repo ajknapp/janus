@@ -95,7 +95,6 @@
             cabal-install
             haskell-language-server
           ];
-          # shellHook = "export LIBRARY_PATH=${pkgs.lib.getLib pkgs.stdenv.cc.libc}/lib";
           withHoogle = true;
           shellHook = ''
             export PATH=${pkgs.gcc12}/bin:$PATH

@@ -1,9 +1,10 @@
 {-# LANGUAGE DefaultSignatures #-}
+{-# LANGUAGE FlexibleContexts #-}
 {-# LANGUAGE FunctionalDependencies #-}
 {-# LANGUAGE InstanceSigs #-}
 {-# LANGUAGE ScopedTypeVariables #-}
 {-# LANGUAGE TypeApplications #-}
-{-# LANGUAGE FlexibleContexts #-}
+{-# LANGUAGE UndecidableSuperClasses #-}
 
 module Janus.Command.Range where
 
@@ -20,10 +21,10 @@ import Janus.Expression.Ord
 import Janus.Typed
 import Language.C.Quote
 
-class CmdRange m e | m -> e, e -> m where
-  rangeM :: (JanusTyped e Int64, ExpOrd e Int64, Num (e Int64)) => e Int64 -> e Int64 -> (e Int64 -> m ()) -> m ()
+class (JanusTyped e Int64, ExpOrd e Int64, Num (e Int64)) => CmdRange m e | m -> e, e -> m where
+  rangeM :: e Int64 -> e Int64 -> (e Int64 -> m ()) -> m ()
   default rangeM ::
-    (JanusTyped e Bool, JanusTyped e Int64, CmdRef m e, CmdWhile m e, ExpOrd e Int64, Num (e Int64)) =>
+    (JanusTyped e Bool, CmdRef m e, CmdWhile m e) =>
     e Int64 ->
     e Int64 ->
     (e Int64 -> m ()) ->
