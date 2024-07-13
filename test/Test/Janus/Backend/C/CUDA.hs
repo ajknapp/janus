@@ -52,6 +52,7 @@ unit_saxpy = bracket malloc free $ \pctx ->
           | otherwise = pokeElemOff p i (fromIntegral i :: Float) >> fill p (i + 1)
     bracket (mallocBytes nbytes) free $ \px -> bracket (mallocBytes nbytes) free $ \py -> do
       fill px 0 >> fill py 0
+      cuCtxSetCurrent ctx
       withCudaDeviceArray nbytes $ \d_x ->
         withCudaDeviceArray nbytes $ \d_y -> do
           cuMemcpyHtoD d_x (castPtr px) (fromIntegral nbytes)

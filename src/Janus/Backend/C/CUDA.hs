@@ -18,7 +18,6 @@ module Janus.Backend.C.CUDA where
 
 import Control.Exception
 import Control.Lens
-import Control.Monad
 import Control.Monad.Fix
 import Control.Monad.Reader
 import Control.Monad.State

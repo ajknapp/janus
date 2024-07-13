@@ -460,8 +460,28 @@ foreign import ccall unsafe "cuCtxDestroy" c_cuCtxDestroy :: CUctx -> IO CUresul
 cuCtxDestroy :: CUctx -> IO ()
 cuCtxDestroy ctx = cudaCheck (c_cuCtxDestroy ctx)
 
+foreign import ccall unsafe "cuDevicePrimaryCtxRetain" c_cuDevicePrimaryCtxRetain :: Ptr CUctx -> CUdevice -> IO CUresult
+
+cuDevicePrimaryCtxRetain :: Ptr CUctx -> CUdevice -> IO ()
+cuDevicePrimaryCtxRetain ctx dev = cudaCheck $ c_cuDevicePrimaryCtxRetain ctx dev
+
+foreign import ccall unsafe "cuDevicePrimaryCtxRelease" c_cuDevicePrimaryCtxRelease :: CUdevice -> IO CUresult
+
+cuDevicePrimaryCtxRelease :: CUdevice -> IO ()
+cuDevicePrimaryCtxRelease dev = cudaCheck $ c_cuDevicePrimaryCtxRelease dev
+
+foreign import ccall unsafe "cuCtxPushCurrent" c_cuCtxPushCurrent :: CUctx -> IO CUresult
+
+cuCtxPushCurrent :: CUctx -> IO ()
+cuCtxPushCurrent ctx = cudaCheck $ c_cuCtxPushCurrent ctx
+
+foreign import ccall unsafe "cuDevicePrimaryCtxGetState" c_cuDevicePrimaryCtxGetState :: CUdevice -> Ptr CUInt -> Ptr CInt -> IO CUresult
+
+cuDevicePrimaryCtxGetState :: CUdevice -> IO (CUInt, CInt)
+cuDevicePrimaryCtxGetState dev = alloca $ \pflags -> alloca $ \pactive -> cudaCheck (c_cuDevicePrimaryCtxGetState dev pflags pactive) >> (,) <$> peek pflags <*> peek pactive
+
 withCuCtx :: Ptr CUctx -> CUInt -> CUdevice -> (CUctx -> IO a) -> IO a
-withCuCtx pctx i dev = bracket (cuCtxCreate pctx i dev >> peek pctx) cuCtxDestroy -- (\_ -> peek pctx >>= \ctx -> cuCtxSetCurrent ctx >> cuCtxDestroy ctx)
+withCuCtx pctx i dev = bracket (cuCtxCreate pctx i dev >> peek pctx) cuCtxDestroy
 
 newtype CUdeviceptr = CUdeviceptr (Ptr ())
   deriving (Eq, Ord, Show, Storable)
