@@ -54,6 +54,9 @@ $( let inst t =
 class ExpFloatingCast e a b where
   toFloating :: e a -> e b
 
+instance (Real a, Fractional b) => ExpFloatingCast Identity a b where
+  toFloating = fromRational . toRational
+
 $( let inst ta tb =
          [d|
            instance ExpFloatingCast JanusC $ta $tb where
