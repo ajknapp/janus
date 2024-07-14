@@ -78,7 +78,7 @@ instance (Storable.Storable a) => ExpPtr Identity a where
   nullPtr = Identity Ptr.nullPtr
   ptrAdd (Identity p) (Identity i) = Identity $ plusPtr p (fromIntegral i)
 
-instance ExpPtr JanusC a where
+instance JanusCTyped a => ExpPtr JanusC a where
   nullPtr = JanusC $ do
     addHeader "stddef.h"
     pure $ RVal $ Var (Id "NULL" noLoc) noLoc
@@ -86,7 +86,8 @@ instance ExpPtr JanusC a where
     RVal p' <- p
     RVal i' <- i
     let JCType spec dec = voidPtrType
-    pure $ RVal $ BinOp Add (Cast (Type spec dec noLoc) p' noLoc) i' noLoc
+    JCType spec' dec' <- getJanusCType (Proxy @(Ptr a))
+    pure $ RVal $ Cast (Type spec' dec' noLoc) (BinOp Add (Cast (Type spec dec noLoc) p' noLoc) i' noLoc) noLoc
 
 class CmdMem m e | m -> e, e -> m where
   malloc :: e Int64 -> m (e (Ptr ()))
