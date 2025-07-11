@@ -1,5 +1,4 @@
 {-# LANGUAGE DataKinds #-}
-{-# LANGUAGE DeriveGeneric #-}
 {-# LANGUAGE FlexibleContexts #-}
 {-# LANGUAGE FlexibleInstances #-}
 {-# LANGUAGE InstanceSigs #-}
@@ -12,7 +11,6 @@
 module Janus.Expression.Inject where
 
 import Control.Lens
-import Data.Complex
 import Data.Loc
 import Data.Proxy
 import GHC.Generics
@@ -26,9 +24,9 @@ class ExpInject e a where
 instance ExpInject Identity a where
   inject = pure
 
-instance (JanusLitC (Complex a)) => ExpInject JanusC (Complex a) where
+instance (JanusLitC a) => ExpInject JanusC a where
   inject a = JanusC $ do
-    a' <- jlitc @(Complex a) a
+    a' <- jlitc @a a
     pure $ RVal a'
 
 class GJanusCInject f where

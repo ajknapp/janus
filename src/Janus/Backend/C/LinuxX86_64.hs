@@ -115,13 +115,14 @@ instance (ExpOrd JanusC a) => ExpOrd LinuxX86_64C a where
   gt = coerce (gt @JanusC @a)
   ge = coerce (ge @JanusC @a)
 
-instance (ExpSized JanusC a) => ExpSized LinuxX86_64C a where
+instance (JanusCTyped a, ExpSized JanusC a) => ExpSized LinuxX86_64C a where
   sizeOf = coerce (sizeOf @JanusC @a)
   alignOf = coerce (alignOf @JanusC @a)
 
 instance (ExpPtr JanusC a) => ExpPtr LinuxX86_64C a where
   nullPtr = coerce (nullPtr @JanusC @a)
   ptrAdd = coerce (ptrAdd @JanusC @a)
+  ptrIndex = coerce (ptrIndex @JanusC @a)
 
 instance CmdMem LinuxX86_64CM LinuxX86_64C where
   malloc = coerce (malloc @JanusCM @JanusC)

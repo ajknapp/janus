@@ -59,9 +59,10 @@ import Language.C.Quote
 cudaArgMaxSize :: Int
 cudaArgMaxSize = 4096
 
--- NOTE device pointers have to be allocated with C malloc/free to avoid cuda error 700
-withCudaDeviceArray :: Int -> (CUdeviceptr -> IO a) -> IO a
-withCudaDeviceArray nbytes k = bracket malloc free $ \dp -> bracket (cuMemAlloc dp (fromIntegral nbytes) >> peek dp) cuMemFree k
+-- TODO figure out why the first four bytes of the device pointer aren't written sometimes
+withCuDeviceArray :: Int -> (CUdeviceptr -> IO a) -> IO a
+withCuDeviceArray nbytes k = alloca $ \dp -> -- poke dp (CUdeviceptr nullPtr) >>
+  bracket (cuMemAlloc dp (fromIntegral nbytes) >> peek dp) cuMemFree k
 
 --------------------------------------------------------------------------------
 
@@ -152,13 +153,14 @@ instance (ExpOrd JanusC a) => ExpOrd JanusCUDA a where
   gt = coerce (gt @JanusC @a)
   ge = coerce (ge @JanusC @a)
 
-instance (A.ExpSized JanusC a) => A.ExpSized JanusCUDA a where
+instance (JanusCTyped a, A.ExpSized JanusC a) => A.ExpSized JanusCUDA a where
   sizeOf = coerce (A.sizeOf @JanusC @a)
   alignOf = coerce (A.alignOf @JanusC @a)
 
 instance (A.ExpPtr JanusC a) => A.ExpPtr JanusCUDA a where
   nullPtr = coerce (A.nullPtr @JanusC @a)
   ptrAdd = coerce (A.ptrAdd @JanusC @a)
+  ptrIndex = coerce (A.ptrIndex @JanusC @a)
 
 instance A.CmdMem JanusCUDAM JanusCUDA where
   malloc = coerce (A.malloc @JanusCM @JanusC)
@@ -258,13 +260,14 @@ instance (Storable (JanusCUDAEval' a), JanusCUDAEvaluate r) => JanusCUDAEvaluate
     jcudaeval
       fn
       argBuf
-      (nbuf + sizeOf (undefined :: JanusCUDAEval' a))
+      (nbuf + sizeOf proxy)
       argPtrs
       (nptrs + 1)
       pack'
       cuargs
       (k $ JanusCUDA $ JanusC $ pure $ RVal $ Var (Id "this_is_a_bug_if_you_see_this" noLoc) noLoc)
     where
+      proxy = undefined :: JanusCUDAEval' a
       pack' = do
         if nbuf >= cudaArgMaxSize
           then error "jcudaeval: too much space used"
@@ -299,7 +302,8 @@ withJanusCUDAFn dev ctx f k = do
   withJanusCUmodule dev ctx dir cufiles $ \pmod ->
     bracket (mallocBytes cudaArgMaxSize) free $ \argbuf ->
       bracket (mallocBytes (cudaArgMaxSize * sizeOf (undefined :: Ptr ()))) free $ \argPtrs ->
-        bracket malloc free $ \pfn -> withCString "janus_main" $ \s -> do
+        -- bracket malloc free $ \pfn -> withCString "janus_main" $ \s -> do
+        alloca $ \pfn -> withCString "janus_main" $ \s -> do
           m <- peek pmod
           fn <- cuModuleGetFunction pfn m s >> peek pfn
           k fn (\kernelArgs -> jcudaeval fn argbuf 0 argPtrs 0 (pure ()) kernelArgs f)

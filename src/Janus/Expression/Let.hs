@@ -1,3 +1,5 @@
+{-# LANGUAGE FlexibleInstances #-}
+{-# LANGUAGE UndecidableInstances #-}
 module Janus.Expression.Let where
 
 import Control.Lens
@@ -33,7 +35,3 @@ instance ExpLet JanusC where
             & jcfVarCounter +~ 1
     modify $ \s -> s & ix fname .~ fn'
     getJanusC $ f $ JanusC $ pure $ RVal (Var var1 noLoc)
-
-share :: (ExpLet e, JanusTyped e a) => e a -> e a
-share = flip let_ id
-{-# INLINE share #-}

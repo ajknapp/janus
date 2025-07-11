@@ -404,22 +404,26 @@ cudaCheck m = m >>= \case
 
 foreign import ccall unsafe "cuInit" c_cuInit :: CUInt -> IO CUresult
 
+-- foreign import ccall unsafe "enable_constructors" c_enable_constructors :: IO ()
+
 cuInit :: CUInt -> IO ()
-cuInit = cudaCheck . c_cuInit
+cuInit n = do 
+  -- c_enable_constructors
+  cudaCheck $ c_cuInit n
 
 newtype CUdevice = CUdevice CInt
   deriving (Eq, Ord, Show, Storable)
 
 foreign import ccall unsafe "cuDeviceGet" c_cuDeviceGet :: Ptr CUdevice -> CInt -> IO CUresult
 
-cuInitialized :: IORef Bool
-cuInitialized = unsafePerformIO $ newIORef False
-{-# NOINLINE cuInitialized #-}
+-- cuInitialized :: IORef Bool
+-- cuInitialized = unsafePerformIO $ newIORef False
+-- {-# NOINLINE cuInitialized #-}
 
-withCudaDevice :: Int -> (CUdevice -> IO a) -> IO a
-withCudaDevice i k = bracket malloc free $ \pdev -> do
-  ini <- readIORef cuInitialized
-  unless ini $ cuInit 0 >> writeIORef cuInitialized True
+withCuDevice :: Int -> (CUdevice -> IO a) -> IO a
+withCuDevice i k = bracket malloc free $ \pdev -> do
+  -- ini <- readIORef cuInitialized
+  -- unless ini $ cuInit 0 >> writeIORef cuInitialized True
   dev <- cuDeviceGet pdev (fromIntegral i) >> peek pdev
   k dev
 
@@ -478,7 +482,7 @@ cuCtxPushCurrent ctx = cudaCheck $ c_cuCtxPushCurrent ctx
 foreign import ccall unsafe "cuDevicePrimaryCtxGetState" c_cuDevicePrimaryCtxGetState :: CUdevice -> Ptr CUInt -> Ptr CInt -> IO CUresult
 
 cuDevicePrimaryCtxGetState :: CUdevice -> IO (CUInt, CInt)
-cuDevicePrimaryCtxGetState dev = alloca $ \pflags -> alloca $ \pactive -> cudaCheck (c_cuDevicePrimaryCtxGetState dev pflags pactive) >> (,) <$> peek pflags <*> peek pactive
+cuDevicePrimaryCtxGetState dev = bracket malloc free $ \pflags -> bracket malloc free $ \pactive -> cudaCheck (c_cuDevicePrimaryCtxGetState dev pflags pactive) >> (,) <$> peek pflags <*> peek pactive
 
 withCuCtx :: Ptr CUctx -> CUInt -> CUdevice -> (CUctx -> IO a) -> IO a
 withCuCtx pctx i dev = bracket (cuCtxCreate pctx i dev >> peek pctx) cuCtxDestroy

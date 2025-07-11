@@ -10,6 +10,7 @@
 {-# LANGUAGE TypeApplications #-}
 {-# LANGUAGE TypeOperators #-}
 {-# LANGUAGE UndecidableInstances #-}
+{-# LANGUAGE UndecidableSuperClasses #-}
 
 module Janus.Command.Array where
 
@@ -44,11 +45,7 @@ import Prelude hiding (id, (.))
 import Text.PrettyPrint.Mainland (pretty)
 import Text.PrettyPrint.Mainland.Class
 
--- TODO
--- class CmdRefPtr m e | m -> e, e -> m where
---   withRefPtr :: (ExpSized e a, JanusTyped e a) => Ref m e a -> (e (Ptr a) -> m b) -> m b
-
-class ExpSized e a where
+class JanusTyped e a => ExpSized e a where
   sizeOf :: Proxy a -> e Int64
   alignOf :: Proxy a -> e Int64
 
@@ -73,10 +70,12 @@ instance JanusCTyped a => ExpSized JanusC a where
 class ExpPtr e a where
   nullPtr :: e (Ptr a)
   ptrAdd :: e (Ptr a) -> e Int64 -> e (Ptr a)
+  ptrIndex :: e (Ptr a) -> e Int64 -> e (Ptr a)
 
 instance (Storable.Storable a) => ExpPtr Identity a where
   nullPtr = Identity Ptr.nullPtr
   ptrAdd (Identity p) (Identity i) = Identity $ plusPtr p (fromIntegral i)
+  ptrIndex (Identity p) (Identity i) = Identity $ plusPtr p (fromIntegral i*Storable.sizeOf (undefined :: a))
 
 instance JanusCTyped a => ExpPtr JanusC a where
   nullPtr = JanusC $ do
@@ -88,6 +87,10 @@ instance JanusCTyped a => ExpPtr JanusC a where
     let JCType spec dec = voidPtrType
     JCType spec' dec' <- getJanusCType (Proxy @(Ptr a))
     pure $ RVal $ Cast (Type spec' dec' noLoc) (BinOp Add (Cast (Type spec dec noLoc) p' noLoc) i' noLoc) noLoc
+  ptrIndex (JanusC p) (JanusC i) = JanusC $ do
+    RVal p' <- p
+    RVal i' <- i
+    pure $ RVal $ BinOp Add p' i' noLoc
 
 class CmdMem m e | m -> e, e -> m where
   malloc :: e Int64 -> m (e (Ptr ()))
@@ -140,6 +143,22 @@ instance JanusCTyped a => CmdStorable JanusCM JanusC a where
     modifyFunction $ \f ->
       let pokestm = [BlockStm $ Exp (Just $ Assign (Index p' i' noLoc) JustAssign e' noLoc) noLoc]
       in f & jcfBlock %~ flip appendBlock pokestm
+
+-- using the ref while the pointer in scope is undefined behavior
+class (CmdRef m e, CmdStorable m e a) => CmdRefPtr m e a | m -> e, e -> m where
+  withRefPtr :: Ref m e a -> (e (Ptr a) -> m b) -> m b
+
+instance Storable.Storable a => CmdRefPtr IO Identity a where
+  withRefPtr r f = do
+    Identity r' <- readRef r
+    Alloc.alloca $ \p -> do
+      Storable.poke p r'
+      b <- f (Identity p)
+      Storable.peek p >>= writeRef r . Identity
+      pure b
+
+instance JanusCTyped a => CmdRefPtr JanusCM JanusC a where
+  withRefPtr (JanusCRef (LVal r)) f = f $ JanusC $ pure $ RVal $ UnOp AddrOf r noLoc
 
 data Tensor (ds :: [Nat]) e a where
   Tensor :: TensorBound ds e -> e (Ptr a) -> Tensor ds e a
@@ -198,7 +217,8 @@ tiToList Z = []
 tiToList (i :. is) = i : tiToList is
 
 rowIndex :: (Num (e Int64)) => [e Int64] -> [e Int64] -> e Int64
-rowIndex ti tb = foldl' (\s (i, b) -> i + b * s) 0 $ zip ti (1 : tail tb)
+rowIndex ti (_:tb) = foldl' (\s (i, b) -> i + b * s) 0 $ zip ti (1 : tb)
+rowIndex _ _ = error "rowIndex: the impossible happened"
 
 readTensor :: (Num (e Int64), CmdStorable m e a) => Tensor ds e a -> TensorIndex ds e -> m (e a)
 readTensor (Tensor tb p) ti = peekElemOff p (rowIndex ti' tb')

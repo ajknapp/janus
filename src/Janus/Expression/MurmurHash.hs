@@ -6,12 +6,14 @@
 {-# LANGUAGE TypeOperators #-}
 {-# LANGUAGE ConstraintKinds #-}
 {-# LANGUAGE UndecidableInstances #-}
+{-# OPTIONS_GHC -lcuda -lnvJitLink #-}
 
 module Janus.Expression.MurmurHash where
 
 import Data.Functor.Identity
 import qualified Data.Set as Set
 import Data.Word
+import GHC.Float
 import GHC.Generics
 import Janus.Backend.C
 import Janus.Expression.Bits
@@ -19,7 +21,6 @@ import Janus.Expression.Cast
 import Janus.Expression.Let
 import Janus.Typed
 import Language.Haskell.TH
-import GHC.Float
 
 type ExpHash' e = (JanusTyped e Word64, ExpBits e Word64, ExpLet e, Num (e Word64))
 

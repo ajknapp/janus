@@ -46,8 +46,8 @@ instance FMA (JanusC Double) where
     RVal c' <- c
     pure $ RVal $ FnCall (Var (Id "fma" noLoc) noLoc) [a', b', c'] noLoc
 
-foreign import ccall "fma" c_fma :: CDouble -> CDouble -> CDouble -> CDouble
-foreign import ccall "fmaf" c_fmaf :: CFloat -> CFloat -> CFloat -> CFloat
+foreign import ccall unsafe "fma" c_fma :: CDouble -> CDouble -> CDouble -> CDouble
+foreign import ccall unsafe "fmaf" c_fmaf :: CFloat -> CFloat -> CFloat -> CFloat
 
 class Floating a => Hypot a where
   hypot :: a -> a -> a
@@ -81,8 +81,8 @@ instance Hypot CDouble where
 instance Hypot a => Hypot (Identity a) where
   hypot (Identity a) (Identity b) = Identity (hypot a b)
 
-foreign import ccall "hypot" c_hypot :: CDouble -> CDouble -> CDouble
-foreign import ccall "hypotf" c_hypotf :: CFloat -> CFloat -> CFloat
+foreign import ccall unsafe "hypot" c_hypot :: CDouble -> CDouble -> CDouble
+foreign import ccall unsafe "hypotf" c_hypotf :: CFloat -> CFloat -> CFloat
 
 class ExpComplex e a where
   rePart :: e (Complex a) -> e a

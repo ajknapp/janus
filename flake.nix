@@ -2,7 +2,7 @@
   description = "An extensible EDSL for high-performance computing.";
 
   inputs = {
-    nixpkgs.url = "github:NixOS/nixpkgs/nixos-24.05";
+    nixpkgs.url = "github:NixOS/nixpkgs/nixos-25.05";
     flake-utils.url = "github:numtide/flake-utils";
   };
 
@@ -26,9 +26,9 @@
           , base16-bytestring
           , containers
           , cryptohash-sha256
-          , cudaPackages_12_3
+          , cudaPackages
           , dependent-sum-template
-          , gcc12
+          , gcc
           , hashable
           , lens
           , language-c-quote
@@ -69,7 +69,7 @@
                 vector
                 zstd
               ];
-            librarySystemDepends = [ cudaPackages_12_3.cudatoolkit cudaPackages_12_3.libnvjitlink gcc12 linuxPackages.nvidia_x11 ];
+            librarySystemDepends = [ cudaPackages.cudatoolkit cudaPackages.libnvjitlink gcc linuxPackages.nvidia_x11 ];
             testHaskellDepends = [tasty-discover tasty-hedgehog tasty-hunit];
             description = "An extensible EDSL for high-performance computing.";
             license = "unknown";
@@ -97,9 +97,9 @@
           ];
           withHoogle = true;
           shellHook = ''
-            export PATH=${pkgs.gcc12}/bin:$PATH
-            export CUDA_PATH=${pkgs.cudaPackages_12_3.cudatoolkit}
-            export LD_LIBRARY_PATH=${pkgs.linuxPackages.nvidia_x11}/lib:${pkgs.cudaPackages_12_3.libnvjitlink}/lib
+            export PATH=${pkgs.gcc}/bin:$PATH
+            export CUDA_PATH=${pkgs.cudaPackages.cudatoolkit}
+            export LD_LIBRARY_PATH=${pkgs.linuxPackages.nvidia_x11}/lib:${pkgs.cudaPackages.libnvjitlink.lib}/lib
             export EXTRA_LDFLAGS="-L${pkgs.linuxPackages.nvidia_x11}/lib"
             export EXTRA_CCFLAGS="-I/usr/include"
          '';
