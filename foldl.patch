@@ -1,0 +1,13 @@
+diff --git a/src/Data/Dependent/HashMap.hs b/src/Data/Dependent/HashMap.hs
+index 93f952c..26af700 100644
+--- a/src/Data/Dependent/HashMap.hs
++++ b/src/Data/Dependent/HashMap.hs
+@@ -89,7 +89,7 @@ module Data.Dependent.HashMap
+   )
+   where
+ 
+-import Prelude hiding (lookup, null, map, traverse, foldMap, foldl, foldr, filter)
++import Prelude hiding (lookup, null, map, traverse, foldMap, foldl, foldl', foldr, filter)
+ import qualified Prelude
+ 
+ import Data.Constraint.Extras

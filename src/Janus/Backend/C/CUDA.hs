@@ -2,9 +2,9 @@
 {-# LANGUAGE DerivingVia #-}
 {-# LANGUAGE FlexibleContexts #-}
 {-# LANGUAGE FlexibleInstances #-}
+{-# LANGUAGE FunctionalDependencies #-}
 {-# LANGUAGE GADTs #-}
 {-# LANGUAGE GeneralizedNewtypeDeriving #-}
-{-# LANGUAGE MultiParamTypeClasses #-}
 {-# LANGUAGE RecordWildCards #-}
 {-# LANGUAGE ScopedTypeVariables #-}
 {-# LANGUAGE StandaloneDeriving #-}
@@ -18,12 +18,15 @@ module Janus.Backend.C.CUDA where
 
 import Control.Exception
 import Control.Lens
+import Control.Monad
 import Control.Monad.Fix
 import Control.Monad.Reader
 import Control.Monad.State
 import Data.Coerce
 import Data.Complex
 import Data.Int
+import Data.Kind as K
+import Data.List
 import Data.Loc
 import Data.Proxy
 import Foreign.C
@@ -61,7 +64,8 @@ cudaArgMaxSize = 4096
 
 -- TODO figure out why the first four bytes of the device pointer aren't written sometimes
 withCuDeviceArray :: Int -> (CUdeviceptr -> IO a) -> IO a
-withCuDeviceArray nbytes k = alloca $ \dp -> -- poke dp (CUdeviceptr nullPtr) >>
+withCuDeviceArray nbytes k = alloca $ \dp ->
+  -- poke dp (CUdeviceptr nullPtr) >>
   bracket (cuMemAlloc dp (fromIntegral nbytes) >> peek dp) cuMemFree k
 
 --------------------------------------------------------------------------------
@@ -277,6 +281,12 @@ instance (Storable (JanusCUDAEval' a), JanusCUDAEvaluate r) => JanusCUDAEvaluate
             pokeElemOff argPtrs nptrs (castPtr pa)
             pack
 
+class CmdCudaSync m (e :: K.Type -> K.Type) | m -> e where
+  syncthreads :: m ()
+
+instance CmdCudaSync JanusCUDAM JanusCUDA where
+  syncthreads = JanusCUDAM $ janusCFFICall Nothing "__syncthreads"
+
 showJanusCUDA :: forall a. (JanusCUDAParam a) => String -> a -> String
 showJanusCUDA name a =
   let jcs = jcudaparam name 0 (pure []) a
@@ -302,7 +312,6 @@ withJanusCUDAFn dev ctx f k = do
   withJanusCUmodule dev ctx dir cufiles $ \pmod ->
     bracket (mallocBytes cudaArgMaxSize) free $ \argbuf ->
       bracket (mallocBytes (cudaArgMaxSize * sizeOf (undefined :: Ptr ()))) free $ \argPtrs ->
-        -- bracket malloc free $ \pfn -> withCString "janus_main" $ \s -> do
         alloca $ \pfn -> withCString "janus_main" $ \s -> do
           m <- peek pmod
           fn <- cuModuleGetFunction pfn m s >> peek pfn
@@ -374,23 +383,48 @@ runEmulatedCUDAT_ conf (CUDAT m) =
                     _cudaThreadInfoGridDimZ = fromIntegral (conf ^. cuLaunchConfigGridDimZ)
                   }
 
-newtype CUDABlock m e = CUDABlock {getCUDABlock :: [CUDAT e m ()]}
-  deriving (Semigroup, Monoid)
+newtype CUDABlockT m e a = CUDABlockT {getCUDABlock :: StateT [CUDAT e m ()] m a}
+  deriving (Functor, Applicative, Monad)
 
-cudaBlock :: CUDAT e m () -> CUDABlock m e
-cudaBlock m = CUDABlock (pure m)
+cudaSync :: (Monad m) => CUDAT e m () -> CUDABlockT m e ()
+cudaSync m = CUDABlockT (modify (m :))
 
-runEmulatedCUDABlock_ ::
-  ( JanusTyped e Int64,
-    ExpOrd e Int64,
+runCUDABlockT_
+  :: CUDABlockT JanusCUDAM JanusCUDA a -> JanusCUDAM ()
+runCUDABlockT_ (CUDABlockT blocks) = do
+  (_, ms) <- runStateT blocks []
+  forM_ (intersperse (lift syncthreads) (reverse ms)) runCUDAT_
+
+runEmulatedCUDABlockT_ ::
+  ( Monad m,
     CmdRange m e,
-    Num (e Int64),
     Num (e Int32),
-    ExpIntegralCast e Int64 Int32,
-    Monad m
+    ExpIntegralCast e Int64 Int32
   ) =>
   CUlaunchConfig ->
-  CUDABlock m e ->
+  CUDABlockT m e a ->
   m ()
-runEmulatedCUDABlock_ _ (CUDABlock []) = pure ()
-runEmulatedCUDABlock_ conf (CUDABlock (m : ms)) = runEmulatedCUDAT_ conf m >> runEmulatedCUDABlock_ conf (CUDABlock ms)
+runEmulatedCUDABlockT_ conf (CUDABlockT blocks) = do
+  (_, ms) <- runStateT blocks []
+  forM_ (reverse ms) (runEmulatedCUDAT_ conf)
+
+foo :: (CmdCond m e, CmdString m e, CmdFormat m e Int32, Monad m, ExpEq e Int32, Num (e Int32), CmdPutString m e) => CUDABlockT m e ()
+foo = do
+  cudaSync $ ask >>= \i -> lift $ format (i ^. cudaThreadInfoThreadIdxX)
+  cudaSync $ ask >>= \i -> lift $ whenM_ (i ^. cudaThreadInfoThreadIdxX `eq` 0) $ withString "---\n" $ \s -> putString s
+  cudaSync $ ask >>= \i -> lift $ format (i ^. cudaThreadInfoThreadIdxY)
+
+blah :: IO ()
+blah = runEmulatedCUDABlockT_ conf foo
+  where
+    conf =
+      CUlaunchConfig
+        { _cuLaunchConfigGridDimX = 1,
+          _cuLaunchConfigGridDimY = 1,
+          _cuLaunchConfigGridDimZ = 1,
+          _cuLaunchConfigBlockDimX = 16,
+          _cuLaunchConfigBlockDimY = 1,
+          _cuLaunchConfigBlockDimZ = 1,
+          _cuLaunchConfigSharedMemBytes = 0,
+          _cuLaunchConfigStream = CUstream nullPtr
+        }

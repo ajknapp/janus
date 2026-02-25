@@ -95,6 +95,12 @@ primFormatJanusC :: forall a. (FormatString a) => JanusC (Ptr CFile) -> JanusC a
 primFormatJanusC h a term = withString (formatString (Proxy @a) <> term) $ \s -> do
   janusCFFICall (Just "stdio.h") "fprintf" h s a
 
+instance CmdFormat JanusCM JanusC Int32 where
+  hformat = primFormatJanusC
+
+instance CmdFormat JanusCM JanusC Word32 where
+  hformat = primFormatJanusC
+
 instance CmdFormat JanusCM JanusC Int64 where
   hformat = primFormatJanusC
 

@@ -69,7 +69,7 @@ library
 
     -- LANGUAGE extensions used by modules in this package.
     -- other-extensions:
-    build-depends:    base ^>=4.19
+    build-depends:    base ^>=4.20
                     , async
                     , base16-bytestring
                     , bytestring
@@ -131,7 +131,7 @@ test-suite janus-test
     ghc-options:      -fno-ghci-sandbox -threaded
 
     -- Test dependencies.
-    build-depends:    base ^>=4.19
+    build-depends:    base ^>=4.20
                     , hedgehog
                     , janus
                     , mtl

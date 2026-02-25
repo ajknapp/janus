@@ -2,7 +2,7 @@
   description = "An extensible EDSL for high-performance computing.";
 
   inputs = {
-    nixpkgs.url = "github:NixOS/nixpkgs/nixos-25.05";
+    nixpkgs.url = "github:NixOS/nixpkgs/nixos-25.11";
     flake-utils.url = "github:numtide/flake-utils";
   };
 
@@ -78,7 +78,7 @@
 
         pkg = (haskellPackages.override {
           overrides = self: super: rec {
-            dependent-hashmap = pkgs.haskell.lib.dontCheck (super.dependent-hashmap.overrideAttrs (_ : { meta = { broken = false; }; }));
+            dependent-hashmap = pkgs.haskell.lib.dontCheck (super.dependent-hashmap.overrideAttrs (a : { meta = { broken = false; }; patches = (a.patches or []) ++ [./foldl.patch]; }));
             rock = jailbreakUnbreak super.rock;
             semilattices = jailbreakUnbreak super.semilattices;
           };
