@@ -7,11 +7,10 @@ module Janus.Expression.Eq where
 
 import Data.Functor.Identity
 import qualified Data.Set as Set
-import Language.C.Quote
-import Language.Haskell.TH
-
 import Janus.Backend.C
 import Janus.Typed
+import Language.C.Quote
+import Language.Haskell.TH
 
 class ExpEq e a where
   eq :: e a -> e a -> e Bool
@@ -19,7 +18,7 @@ class ExpEq e a where
 
 infix 4 `eq`, `ne`
 
-instance Eq a => ExpEq Identity a where
+instance (Eq a) => ExpEq Identity a where
   eq a b = (==) <$> a <*> b
   ne a b = (/=) <$> a <*> b
 
@@ -34,5 +33,5 @@ $( let inst t =
              ne = janusCBoolBinOp Ne
            |]
        tys = Set.toList (foldl1 Set.union [janusSignedIntTypes, janusUnsignedIntTypes, janusFloatTypes])
-    in traverse (fmap head . inst . pure . ConT) tys
+    in traverse (fmap (!! 0) . inst . pure . ConT) tys
  )

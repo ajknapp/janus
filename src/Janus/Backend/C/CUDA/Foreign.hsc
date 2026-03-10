@@ -8,14 +8,11 @@ module Janus.Backend.C.CUDA.Foreign where
 
 import Control.Exception
 import Control.Lens
-import Control.Monad
-import Data.IORef
 import Data.Word
 import Foreign.C
 import Foreign.Marshal.Alloc
 import Foreign.Ptr
 import Foreign.Storable
-import System.IO.Unsafe
 
 #include <cuda.h>
 #include <nvJitLink.h>

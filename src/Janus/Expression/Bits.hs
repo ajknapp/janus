@@ -46,5 +46,5 @@ $( let inst t =
              rshift = janusCBinOp Rsh
            |]
        tys = Set.toList (Set.union janusSignedIntTypes janusUnsignedIntTypes)
-    in traverse (fmap head . inst . pure . ConT) tys
+    in traverse (fmap (!! 0) . inst . pure . ConT) tys
  )

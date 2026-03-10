@@ -6,15 +6,14 @@ module Janus.Expression.Ord where
 
 import Data.Functor.Identity
 import qualified Data.Set as Set
+import Janus.Backend.C
+import Janus.Expression.Cond (ExpCond (ifThenElse))
+import Janus.Expression.Eq
+import Janus.Typed
 import Language.C.Quote
 import Language.Haskell.TH
 
-import Janus.Backend.C
-import Janus.Expression.Eq
-import Janus.Expression.Cond (ExpCond(ifThenElse))
-import Janus.Typed
-
-class ExpEq e a => ExpOrd e a where
+class (ExpEq e a) => ExpOrd e a where
   lt :: e a -> e a -> e Bool
   le :: e a -> e a -> e Bool
   gt :: e a -> e a -> e Bool
@@ -22,7 +21,7 @@ class ExpEq e a => ExpOrd e a where
 
 infix 4 `lt`, `le`, `gt`, `ge`
 
-instance Ord a => ExpOrd Identity a where
+instance (Ord a) => ExpOrd Identity a where
   lt a b = (<) <$> a <*> b
   le a b = (<=) <$> a <*> b
   gt a b = (>) <$> a <*> b
@@ -37,7 +36,7 @@ $( let inst t =
              ge = janusCBoolBinOp Ge
            |]
        tys = Set.toList (foldl1 Set.union [janusSignedIntTypes, janusUnsignedIntTypes, janusFloatTypes])
-    in traverse (fmap head . inst . pure . ConT) tys
+    in traverse (fmap (!! 0) . inst . pure . ConT) tys
  )
 
 min' :: (ExpCond e, ExpOrd e a, JanusTyped e a) => e a -> e a -> e a

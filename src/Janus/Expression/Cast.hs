@@ -48,7 +48,7 @@ $( let inst t =
              toBool = janusCUnsafeCast
            |]
        tys = Set.toList (foldl1 Set.union [janusSignedIntTypes, janusUnsignedIntTypes, janusFloatTypes])
-    in traverse (fmap head . inst . pure . ConT) tys
+    in traverse (fmap (!! 0) . inst . pure . ConT) tys
  )
 
 class ExpFloatingCast e a b where
@@ -66,7 +66,7 @@ $( let inst ta tb =
        ftys = Set.toList janusFloatTypes
        tys = [(s, f) | s <- sourcetys, f <- ftys]
        mkTy = pure . ConT
-    in traverse (fmap head . uncurry inst . (mkTy *** mkTy)) tys
+    in traverse (fmap (!! 0) . uncurry inst . (mkTy *** mkTy)) tys
  )
 
 class ExpIntegralCast e a b where
@@ -84,15 +84,15 @@ $( let inst ta tb =
        itys = Set.toList (Set.union janusSignedIntTypes janusUnsignedIntTypes)
        tys = [(s, i) | s <- sourcetys, i <- itys]
        mkTy = pure . ConT
-    in traverse (fmap head . uncurry inst . (mkTy *** mkTy)) tys
+    in traverse (fmap (!! 0) . uncurry inst . (mkTy *** mkTy)) tys
  )
 
 -- to/fromVoidPtr are required to avoid overlapping instances for JanusCTyped (Ptr ())/JanusCTyped (Ptr a)
 -- this also stops you from peeking/poking a void pointer
 class ExpPtrCast e where
   ptrCast :: (JanusTyped e a, JanusTyped e b) => e (Ptr a) -> e (Ptr b)
-  toVoidPtr :: JanusTyped e a => e (Ptr a) -> e (Ptr ())
-  fromVoidPtr :: JanusTyped e a => e (Ptr ()) -> e (Ptr a)
+  toVoidPtr :: (JanusTyped e a) => e (Ptr a) -> e (Ptr ())
+  fromVoidPtr :: (JanusTyped e a) => e (Ptr ()) -> e (Ptr a)
 
 instance ExpPtrCast Identity where
   ptrCast = fmap castPtr
@@ -113,7 +113,7 @@ instance ExpPtrCast JanusC where
     RVal a' <- a
     let JCType spec dec = voidPtrType
     pure $ RVal $ Cast (Type spec dec noLoc) a' noLoc
-  fromVoidPtr :: forall a. JanusTyped JanusC a => JanusC (Ptr ()) -> JanusC (Ptr a)
+  fromVoidPtr :: forall a. (JanusTyped JanusC a) => JanusC (Ptr ()) -> JanusC (Ptr a)
   fromVoidPtr (JanusC a) = JanusC $ do
     RVal a' <- a
     JCType spec dec <- getJanusCType (Proxy @a)
