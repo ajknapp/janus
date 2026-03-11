@@ -26,7 +26,6 @@ import Data.Coerce
 import Data.Complex
 import Data.Int
 import Data.Loc
-import qualified Data.Map as Map
 import Data.Proxy
 import Foreign.C
 import Foreign.Marshal.Alloc
@@ -56,7 +55,6 @@ import Janus.Expression.Let
 import Janus.Expression.Math
 import Janus.Expression.MurmurHash
 import Janus.Expression.Ord
-import Janus.FFI.Ret
 import Janus.Typed
 import Language.C.Quote
 
@@ -219,39 +217,26 @@ instance CmdWhile JanusCUDAM JanusCUDA where
 
 --------------------------------------------------------------------------------
 
+instance JanusCBackendTypes JanusCUDA JanusCUDAM where
+  toJanusC = getJanusCUDA
+  fromJanusC = JanusCUDA
+  toJanusCM = getJanusCUDAM
+  fromJanusCM = JanusCUDAM
+
 class JanusCUDAParam r where
   jcudaparam :: String -> Int -> JanusCUDAM [Param] -> JanusCBackend -> r -> [JCFunc]
 
-instance (FFIRet a, JanusCTyped a) => JanusCUDAParam (JanusCUDA a) where
-  jcudaparam name _ params backend a = Map.elems $ flip execState defaultJanusState $ flip runReaderT (JCFuncInfo name backend False) $ getJanusCM $ do
-    fname <- askFuncName
-    params' <- getJanusCUDAM params
-    modify $ \s -> s & ix fname . jcfParams .~ Params (reverse params') False noLoc
-    finishFunction $ getJanusCUDA a
-    getJanusCType (Proxy @a)
+instance (JanusCTyped a) => JanusCUDAParam (JanusCUDA a) where
+  jcudaparam = jcparamImpl (Proxy @JanusCUDA)
 
-instance (FFIRet a, JanusCTyped a) => JanusCUDAParam (JanusCUDAM (JanusCUDA a)) where
-  jcudaparam name _ params backend a = Map.elems $ flip execState defaultJanusState $ flip runReaderT (JCFuncInfo name backend False) $ getJanusCM $ do
-    fname <- askFuncName
-    params' <- getJanusCUDAM params
-    modify $ \s -> s & ix fname . jcfParams .~ Params (reverse params') False noLoc
-    getJanusCUDAM a >>= finishFunction . getJanusCUDA
-    getJanusCType (Proxy @a)
+instance (JanusCTyped a) => JanusCUDAParam (JanusCUDAM (JanusCUDA a)) where
+  jcudaparam = jcparamImpl (Proxy @JanusCUDA)
 
 instance JanusCUDAParam (JanusCUDAM ()) where
-  jcudaparam name _ params backend a = Map.elems $ flip execState defaultJanusState $ flip runReaderT (JCFuncInfo name backend False) $ getJanusCM $ do
-    fname <- askFuncName
-    params' <- getJanusCUDAM params
-    modify $ \s -> s & ix fname . jcfParams .~ Params (reverse params') False noLoc
-    getJanusCUDAM a >> finishFunction_
+  jcudaparam = jcparamImpl (Proxy @JanusCUDA)
 
-instance (JanusCTyped a, JanusCUDAParam r) => JanusCUDAParam (JanusCUDA a -> r) where
-  jcudaparam name n args tqs f = jcudaparam name (n + 1) args' tqs (f $ JanusCUDA $ JanusC $ pure $ RVal $ Var (mkArgId n) noLoc)
-    where
-      args' = JanusCUDAM $ do
-        JCType spec dec <- getJanusCType (Proxy @a)
-        args'' <- getJanusCUDAM args
-        pure $ Param (Just (mkArgId n)) spec dec noLoc : args''
+instance (JanusCTyped a, JanusCUDAParam r, JanusCParamImpl JanusCUDA JanusCUDAM r) => JanusCUDAParam (JanusCUDA a -> r) where
+  jcudaparam = jcparamImpl (Proxy @JanusCUDA)
 
 type family JanusCUDAEval r where
   JanusCUDAEval (JanusCUDAM ()) = IO ()

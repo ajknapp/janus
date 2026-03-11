@@ -3,14 +3,18 @@
 {-# LANGUAGE DerivingVia #-}
 {-# LANGUAGE FlexibleContexts #-}
 {-# LANGUAGE FlexibleInstances #-}
+{-# LANGUAGE FunctionalDependencies #-}
 {-# LANGUAGE GADTs #-}
 {-# LANGUAGE GeneralizedNewtypeDeriving #-}
 {-# LANGUAGE ImpredicativeTypes #-}
+{-# LANGUAGE KindSignatures #-}
 {-# LANGUAGE LambdaCase #-}
+{-# LANGUAGE MultiParamTypeClasses #-}
 {-# LANGUAGE ScopedTypeVariables #-}
 {-# LANGUAGE TemplateHaskell #-}
 {-# LANGUAGE TypeApplications #-}
 {-# LANGUAGE TypeFamilies #-}
+{-# LANGUAGE UndecidableInstances #-}
 
 module Janus.Backend.C where
 
@@ -26,6 +30,7 @@ import Data.ByteString.Char8 (unpack)
 import Data.Coerce
 import Data.Complex
 import Data.Int
+import qualified Data.Kind as K
 import Data.Loc
 import qualified Data.Map as Map
 import Data.Monoid
@@ -148,6 +153,52 @@ modifyFunction f = do
 class (Typeable a) => JanusCTyped a where
   jctype :: Proxy a -> JanusCM JCType
 
+class JanusCBackendTypes (e :: K.Type -> K.Type) (m :: K.Type -> K.Type) | e -> m, m -> e where
+  toJanusC :: e a -> JanusC a
+  fromJanusC :: JanusC a -> e a
+  toJanusCM :: m a -> JanusCM a
+  fromJanusCM :: JanusCM a -> m a
+
+instance JanusCBackendTypes JanusC JanusCM where
+  toJanusC = id
+  fromJanusC = id
+  toJanusCM = id
+  fromJanusCM = id
+
+class JanusCParamImpl (e :: K.Type -> K.Type) (m :: K.Type -> K.Type) r where
+  jcparamImpl :: Proxy e -> String -> Int -> m [Param] -> JanusCBackend -> r -> [JCFunc]
+
+instance (JanusCBackendTypes e m, JanusCTyped a) => JanusCParamImpl e m (e a) where
+  jcparamImpl _ name _ params backend a = Map.elems $ flip execState defaultJanusState $ flip runReaderT (JCFuncInfo name backend False) $ getJanusCM $ do
+    fname <- askFuncName
+    params' <- toJanusCM params
+    modify $ \s -> s & ix fname . jcfParams .~ Params (reverse params') False noLoc
+    finishFunction (toJanusC a)
+    getJanusCType (Proxy @a)
+
+instance (JanusCBackendTypes e m, JanusCTyped a) => JanusCParamImpl e m (m (e a)) where
+  jcparamImpl _ name _ params backend a = Map.elems $ flip execState defaultJanusState $ flip runReaderT (JCFuncInfo name backend False) $ getJanusCM $ do
+    fname <- askFuncName
+    params' <- toJanusCM params
+    modify $ \s -> s & ix fname . jcfParams .~ Params (reverse params') False noLoc
+    toJanusCM a >>= finishFunction . toJanusC
+    getJanusCType (Proxy @a)
+
+instance (JanusCBackendTypes e m) => JanusCParamImpl e m (m ()) where
+  jcparamImpl _ name _ params backend a = Map.elems $ flip execState defaultJanusState $ flip runReaderT (JCFuncInfo name backend False) $ getJanusCM $ do
+    fname <- askFuncName
+    params' <- toJanusCM params
+    modify $ \s -> s & ix fname . jcfParams .~ Params (reverse params') False noLoc
+    toJanusCM a >> finishFunction_
+
+instance (JanusCBackendTypes e m, JanusCTyped a, JanusCParamImpl e m r) => JanusCParamImpl e m (e a -> r) where
+  jcparamImpl p name n args backend f = jcparamImpl p name (n + 1) args' backend (f $ fromJanusC $ JanusC $ pure $ RVal $ Var (mkArgId n) noLoc)
+    where
+      args' = fromJanusCM @e $ do
+        JCType spec dec <- getJanusCType (Proxy @a)
+        args'' <- toJanusCM args
+        pure $ Param (Just (mkArgId n)) spec dec noLoc:args''
+
 finishFunction :: forall a. (JanusCTyped a) => JanusC a -> JanusCM ()
 finishFunction a = do
   JCType spec dec <- getJanusCType (Proxy @a)
@@ -209,45 +260,25 @@ class JanusCEvaluate r where
 
 -- TODO figure out why the unsafePerformIO required for this allows the DL to be closed before use
 instance (FFIRet a, JanusCTyped a) => JanusCParam (JanusC a) where
-  jcparam name _ params backend a = Map.elems $ flip execState defaultJanusState $ flip runReaderT (JCFuncInfo name backend False) $ getJanusCM $ do
-    fname <- askFuncName
-    params' <- params
-    modify $ \s -> s & ix fname . jcfParams .~ Params (reverse params') False noLoc
-    finishFunction a
-    getJanusCType (Proxy @a)
+  jcparam = jcparamImpl (Proxy @JanusC)
 
 instance (FFIRet a, JanusCTyped a) => JanusCEvaluate (JanusC a) where
   jceval fp args _ = callFFI fp (ret (Proxy @a)) (reverse args)
 
 instance (FFIRet a, JanusCTyped a) => JanusCParam (JanusCM (JanusC a)) where
-  jcparam name _ params backend a = Map.elems $ flip execState defaultJanusState $ flip runReaderT (JCFuncInfo name backend False) $ getJanusCM $ do
-    fname <- askFuncName
-    params' <- params
-    modify $ \s -> s & ix fname . jcfParams .~ Params (reverse params') False noLoc
-    a >>= finishFunction
-    getJanusCType (Proxy @a)
+  jcparam = jcparamImpl (Proxy @JanusC)
 
 instance (FFIRet a, JanusCTyped a) => JanusCEvaluate (JanusCM (JanusC a)) where
   jceval fp args _ = callFFI fp (ret (Proxy @a)) (reverse args)
 
 instance JanusCParam (JanusCM ()) where
-  jcparam name _ params backend a = Map.elems $ flip execState defaultJanusState $ flip runReaderT (JCFuncInfo name backend False) $ getJanusCM $ do
-    fname <- askFuncName
-    params' <- params
-    modify $ \s -> s & ix fname . jcfParams .~ Params (reverse params') False noLoc
-    a >> finishFunction_
-    -- getJanusCType (Proxy @a)
+  jcparam = jcparamImpl (Proxy @JanusC)
 
 instance JanusCEvaluate (JanusCM ()) where
   jceval fp args _ = callFFI fp (ret (Proxy @())) (reverse args)
 
-instance (JanusCTyped a, JanusCParam r) => JanusCParam (JanusC a -> r) where
-  jcparam name n args tqs f = jcparam name (n + 1) args' tqs (f $ JanusC $ pure $ RVal $ Var (mkArgId n) noLoc)
-    where
-      args' = do
-        JCType spec dec <- getJanusCType (Proxy @a)
-        args'' <- args
-        pure $ Param (Just (mkArgId n)) spec dec noLoc:args''
+instance (JanusCTyped a, JanusCParam r, JanusCParamImpl JanusC JanusCM r) => JanusCParam (JanusC a -> r) where
+  jcparam = jcparamImpl (Proxy @JanusC)
 
 instance (JanusCTyped a, FFIArg a, JanusCEvaluate r) => JanusCEvaluate (JanusC a -> r) where
   jceval fp args f a = jceval (castFunPtr fp) (arg a:args) (f $ JanusC $ pure $ RVal $ Var (Id "this_is_a_bug_if_you_see_this" noLoc) noLoc)
