@@ -69,8 +69,9 @@
                 vector
                 zstd
               ];
-            librarySystemDepends = [ cudaPackages.cudatoolkit cudaPackages.libnvjitlink gcc linuxPackages.nvidia_x11 ];
-            testHaskellDepends = [tasty-discover tasty-hedgehog tasty-hunit];
+            libraryPkgconfigDepends = [ cudaPackages.libnvjitlink ];
+            librarySystemDepends = [ cudaPackages.cudatoolkit gcc linuxPackages.nvidia_x11 ];
+            testHaskellDepends = [ tasty-discover tasty-hedgehog tasty-hunit ];
             description = "An extensible EDSL for high-performance computing.";
             license = "unknown";
             hydraPlatforms = lib.platforms.none;
@@ -99,9 +100,8 @@
           shellHook = ''
             export PATH=${pkgs.gcc}/bin:$PATH
             export CUDA_PATH=${pkgs.cudaPackages.cudatoolkit}
-            export LD_LIBRARY_PATH=${pkgs.linuxPackages.nvidia_x11}/lib:${pkgs.cudaPackages.libnvjitlink.lib}/lib
+            export LD_LIBRARY_PATH=${pkgs.lib.makeLibraryPath pkg.env.buildInputs}:$LD_LIBRARY_PATH
             export EXTRA_LDFLAGS="-L${pkgs.linuxPackages.nvidia_x11}/lib"
-            export EXTRA_CCFLAGS="-I/usr/include"
          '';
         };
 
