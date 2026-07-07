@@ -10,6 +10,7 @@ import Hedgehog
 import qualified Hedgehog.Gen as Gen
 import qualified Hedgehog.Range as Range
 import Janus.Backend.C
+import Janus.Backend.C.Build
 import Janus.Expression.Let
 import Janus.Typed
 import Test.Tasty
@@ -43,8 +44,8 @@ pownCompiledEqualsInterpreted p n = property $ do
   y === z
 
 test_let :: TestTree
-test_let = withResource (acquireJanusC JC (pow5 @JanusC @Int64)) releaseJanusC $ \cpow5 ->
-  withResource (acquireJanusC JC (pow6 @JanusC @Int64)) releaseJanusC $ \cpow6 ->
+test_let = withResource (acquireJanusC JC defaultCBuildConfig (pow5 @JanusC @Int64)) releaseJanusC $ \cpow5 ->
+  withResource (acquireJanusC JC defaultCBuildConfig (pow6 @JanusC @Int64)) releaseJanusC $ \cpow6 ->
     let cpow5' = fst <$> cpow5
         cpow6' = fst <$> cpow6
      in testGroup

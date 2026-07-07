@@ -26,7 +26,8 @@ common warnings
 
 library
     import:           warnings
-    extra-libraries:  cuda nvJitLink
+    extra-libraries:  cuda
+    pkgconfig-depends:   nvjitlink
     exposed-modules:  Janus
                       Janus.Backend.C
                       Janus.Backend.C.Build

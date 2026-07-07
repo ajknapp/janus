@@ -1,11 +1,14 @@
+{-# LANGUAGE BlockArguments #-}
 {-# LANGUAGE DeriveFunctor #-}
 {-# LANGUAGE DeriveGeneric #-}
+{-# LANGUAGE DeriveTraversable #-}
 {-# LANGUAGE DerivingVia #-}
 {-# LANGUAGE FlexibleContexts #-}
 {-# LANGUAGE FlexibleInstances #-}
 {-# LANGUAGE FunctionalDependencies #-}
 {-# LANGUAGE GADTs #-}
 {-# LANGUAGE GeneralizedNewtypeDeriving #-}
+{-# LANGUAGE LambdaCase #-}
 {-# LANGUAGE RecordWildCards #-}
 {-# LANGUAGE ScopedTypeVariables #-}
 {-# LANGUAGE StandaloneDeriving #-}
@@ -17,8 +20,11 @@
 
 module Janus.Backend.C.CUDA where
 
+import Control.Concurrent
+import Control.Concurrent.Async
 import Control.Exception
 import Control.Lens
+import Control.Monad
 import Control.Monad.Fix
 import Control.Monad.Reader
 import Control.Monad.State
@@ -27,6 +33,7 @@ import Data.Complex
 import Data.Int
 import Data.Loc
 import Data.Proxy
+import qualified Data.Vector as V
 import Foreign.C
 import Foreign.Marshal.Alloc
 import Foreign.Ptr
@@ -57,6 +64,7 @@ import Janus.Expression.MurmurHash
 import Janus.Expression.Ord
 import Janus.Typed
 import Language.C.Quote
+import qualified System.IO as SIO
 
 cudaArgMaxSize :: Int
 cudaArgMaxSize = 4096
@@ -83,14 +91,35 @@ data CUDAThreadInfo e = CUDAThreadInfo
     _cudaThreadInfoGridDimX :: e Int32,
     _cudaThreadInfoGridDimY :: e Int32,
     _cudaThreadInfoGridDimZ :: e Int32
-  } deriving Generic
+  } deriving (Generic)
+
+deriving instance Show (e Int32) => Show (CUDAThreadInfo e)
 
 $(makeLenses ''CUDAThreadInfo)
 
 newtype JanusCUDA a = JanusCUDA {getJanusCUDA :: JanusC a}
 
-newtype JanusCUDAM a = JanusCUDAM {getJanusCUDAM :: JanusCM a}
-  deriving (Functor, Applicative, Monad, MonadFix) via JanusCM
+newtype JanusCUDAM a = JanusCUDAM {getJanusCUDAM :: ReaderT (CUDAThreadInfo JanusCUDA) JanusCM a}
+  deriving newtype (Functor, Applicative, Monad, MonadFix, MonadReader (CUDAThreadInfo JanusCUDA))
+
+runJanusCUDAM :: JanusCUDAM a -> JanusCM a
+runJanusCUDAM (JanusCUDAM m) = runReaderT m magicThreadInfo
+  where
+    magicCUDAVar var mem = JanusCUDA $ JanusC $ pure $ RVal (Member (Var (Id var noLoc) noLoc) (Id mem noLoc) noLoc)
+    magicThreadInfo = CUDAThreadInfo
+      { _cudaThreadInfoBlockDimX = magicCUDAVar "blockDim" "x",
+        _cudaThreadInfoBlockDimY = magicCUDAVar "blockDim" "y",
+        _cudaThreadInfoBlockDimZ = magicCUDAVar "blockDim" "z",
+        _cudaThreadInfoBlockIdxX = magicCUDAVar "blockIdx" "x",
+        _cudaThreadInfoBlockIdxY = magicCUDAVar "blockIdx" "y",
+        _cudaThreadInfoBlockIdxZ = magicCUDAVar "blockIdx" "z",
+        _cudaThreadInfoThreadIdxX = magicCUDAVar "threadIdx" "x",
+        _cudaThreadInfoThreadIdxY = magicCUDAVar "threadIdx" "y",
+        _cudaThreadInfoThreadIdxZ = magicCUDAVar "threadIdx" "z",
+        _cudaThreadInfoGridDimX = magicCUDAVar "gridDim" "x",
+        _cudaThreadInfoGridDimY = magicCUDAVar "gridDim" "y",
+        _cudaThreadInfoGridDimZ = magicCUDAVar "gridDim" "z"
+      }
 
 type instance JanusTyped JanusCUDA = JanusCTyped
 
@@ -167,61 +196,61 @@ instance (A.ExpPtr JanusC a) => A.ExpPtr JanusCUDA a where
   ptrIndex = coerce (A.ptrIndex @JanusC @a)
 
 instance A.CmdMem JanusCUDAM JanusCUDA where
-  malloc = coerce (A.malloc @JanusCM @JanusC)
-  calloc = coerce (A.calloc @JanusCM @JanusC)
-  realloc = coerce (A.realloc @JanusCM @JanusC)
-  free = coerce (A.free @JanusCM @JanusC)
+  malloc n = JanusCUDAM $ lift $ coerce (A.malloc @JanusCM @JanusC) n
+  calloc n m = JanusCUDAM $ lift $ coerce (A.calloc @JanusCM @JanusC) n m
+  realloc p n = JanusCUDAM $ lift $ coerce (A.realloc @JanusCM @JanusC) p n
+  free p = JanusCUDAM $ lift $ coerce (A.free @JanusCM @JanusC) p
 
 instance (A.ExpSized JanusCUDA a, JanusCTyped a) => A.CmdStorable JanusCUDAM JanusCUDA a where
-  peek = coerce (A.peek @JanusCM @JanusC @a)
-  poke = coerce (A.poke @JanusCM @JanusC @a)
-  peekElemOff = coerce (A.peekElemOff @JanusCM @JanusC @a)
-  pokeElemOff = coerce (A.pokeElemOff @JanusCM @JanusC @a)
+  peek p = JanusCUDAM $ lift $ coerce (A.peek @JanusCM @JanusC @a) p
+  poke p a = JanusCUDAM $ lift $ coerce (A.poke @JanusCM @JanusC @a) p a
+  peekElemOff p n = JanusCUDAM $ lift $ coerce (A.peekElemOff @JanusCM @JanusC @a) p n
+  pokeElemOff p a n = JanusCUDAM $ lift $ coerce (A.pokeElemOff @JanusCM @JanusC @a) p a n
 
 instance CmdCase JanusCUDAM JanusCUDA where
-  switchCase_ = coerce (switchCase_ @JanusCM @JanusC)
+  switchCase_ tag cases def = JanusCUDAM $ lift $ switchCase_ (getJanusCUDA tag) (fmap (\(i,m) -> (i,runJanusCUDAM m)) cases) (runJanusCUDAM def)
 
 instance CmdCond JanusCUDAM JanusCUDA where
-  ifThenElseM_ = coerce (ifThenElseM_ @JanusCM @JanusC)
+  ifThenElseM_ b t f = JanusCUDAM $ lift $ ifThenElseM_ (getJanusCUDA b) (runJanusCUDAM t) (runJanusCUDAM f)
 
 instance CmdIO JanusCUDAM JanusCUDA where
   stdout = coerce (stdout @JanusCM @JanusC)
   stderr = coerce (stderr @JanusCM @JanusC)
-  fopen = coerce (fopen @JanusCM @JanusC)
-  fclose = coerce (fclose @JanusCM @JanusC)
+  fopen h m = JanusCUDAM $ lift $ JanusCUDA <$> fopen @JanusCM @JanusC (getJanusCUDA h) (getJanusCUDA m)
+  fclose h = JanusCUDAM $ lift $ JanusCUDA <$> fclose (getJanusCUDA h)
 
 instance CmdString JanusCUDAM JanusCUDA where
-  withString s f = JanusCUDAM (withString @JanusCM @JanusC s $ getJanusCUDAM . f . JanusCUDA)
+  withString s f = JanusCUDAM $ lift $ withString s (runJanusCUDAM . f . JanusCUDA)
 
 instance CmdPutString JanusCUDAM JanusCUDA where
-  hputString = coerce (hputString @JanusCM @JanusC)
+  hputString h s = JanusCUDAM $ lift $ hputString (getJanusCUDA h) (getJanusCUDA s)
 
 instance (CmdFormat JanusCM JanusC a) => CmdFormat JanusCUDAM JanusCUDA a where
-  hformat = coerce (hformat @JanusCM @JanusC @a)
+  hformat h a s = JanusCUDAM $ lift $ hformat (getJanusCUDA h) (getJanusCUDA a) s
 
 newtype JanusCUDARef a = JanusCUDARef {getJanusCUDARef :: JanusCRef a}
 
 instance CmdRef JanusCUDAM JanusCUDA where
   type Ref JanusCUDAM JanusCUDA a = JanusCUDARef a
-  letM (JanusCUDA a) = JanusCUDAM $ JanusCUDA <$> letM a
-  newRef (JanusCUDA a) = JanusCUDAM (JanusCUDARef <$> newRef a)
-  newRef' = JanusCUDAM (JanusCUDARef <$> newRef')
-  readRef (JanusCUDARef r) = JanusCUDAM (JanusCUDA <$> readRef r)
-  writeRef (JanusCUDARef r) (JanusCUDA a) = JanusCUDAM (writeRef r a)
+  letM (JanusCUDA a) = JanusCUDAM $ lift $ JanusCUDA <$> letM a
+  newRef (JanusCUDA a) = JanusCUDAM $ lift $ JanusCUDARef <$> newRef a
+  newRef' = JanusCUDAM $ lift $ JanusCUDARef <$> newRef'
+  readRef (JanusCUDARef r) = JanusCUDAM $ lift $ JanusCUDA <$> readRef r
+  writeRef (JanusCUDARef r) (JanusCUDA a) = JanusCUDAM $ lift $ writeRef r a
 
 instance CmdRange JanusCUDAM JanusCUDA where
-  rangeM = coerce (rangeM @JanusCM @JanusC)
+  rangeM l u f = JanusCUDAM $ lift $ rangeM (getJanusCUDA l) (getJanusCUDA u) (runJanusCUDAM . f . JanusCUDA)
 
 instance CmdWhile JanusCUDAM JanusCUDA where
-  whileM = coerce (whileM @JanusCM @JanusC)
+  whileM i f = JanusCUDAM $ lift $ whileM (getJanusCUDA i) (runJanusCUDAM . f . JanusCUDARef)
 
 --------------------------------------------------------------------------------
 
 instance JanusCBackendTypes JanusCUDA JanusCUDAM where
   toJanusC = getJanusCUDA
   fromJanusC = JanusCUDA
-  toJanusCM = getJanusCUDAM
-  fromJanusCM = JanusCUDAM
+  toJanusCM = runJanusCUDAM
+  fromJanusCM = JanusCUDAM . lift
 
 class JanusCUDAParam r where
   jcudaparam :: String -> Int -> JanusCUDAM [Param] -> JanusCBackend -> r -> [JCFunc]
@@ -304,11 +333,12 @@ withJanusCUDAFn ::
   (JanusCUDAParam r, JanusCUDAEvaluate r) =>
   CUdevice ->
   CUctx ->
+  CBuildConfig ->
   r ->
   (CUfunction -> (CUlaunchConfig -> JanusCUDAEval r) -> IO a) ->
   IO a
-withJanusCUDAFn dev ctx f k = do
-  let dir = "_cache"
+withJanusCUDAFn dev ctx config f k = do
+  let dir = cBuildConfigCacheDir config
   cufiles <- writeJanusCFiles JCUDA dir (jcudaparam "janus_main" 0 (pure []) JCUDA f)
   withJanusCUmodule dev ctx dir cufiles $ \pmod ->
     bracket (mallocBytes cudaArgMaxSize) free $ \argbuf ->
@@ -322,82 +352,167 @@ withJanusCUDA ::
   (JanusCUDAParam r, JanusCUDAEvaluate r) =>
   CUdevice ->
   CUctx ->
+  CBuildConfig ->
   r ->
   ((CUlaunchConfig -> JanusCUDAEval r) -> IO a) ->
   IO a
-withJanusCUDA dev ctx f k = withJanusCUDAFn dev ctx f (const k)
+withJanusCUDA dev ctx config f k = withJanusCUDAFn dev ctx config f (const k)
 
-class CmdCudaSynchronized m e | m -> e where
-  synchronized :: (CUDAThreadInfo e -> m ()) -> CUDAT e m ()
+-- -- class CmdCudaSynchronized m e | m -> e where
+-- --   synchronized :: (CUDAThreadInfo e -> m ()) -> CUDAT e m ()
 
-newtype CUDAT e m a = CUDAT {getCUDAT :: ReaderT (CUDAThreadInfo e) m a}
-  deriving newtype (Functor, Applicative, Monad, MonadFix, MonadReader (CUDAThreadInfo e), MonadTrans)
+-- -- newtype CUDAT e m a = CUDAT {getCUDAT :: ReaderT (CUDAThreadInfo e) m a}
+-- --   deriving newtype (Functor, Applicative, Monad, MonadFix, MonadReader (CUDAThreadInfo e), MonadTrans)
 
-instance CmdCudaSynchronized JanusCUDAM JanusCUDA where
-  synchronized f = ask >>= lift . f >> lift syncthreads
-    where syncthreads :: JanusCUDAM ()
-          syncthreads = JanusCUDAM $ janusCFFICall Nothing "__syncthreads"
+-- -- instance CmdCudaSynchronized JanusCUDAM JanusCUDA where
+-- --   synchronized f = ask >>= lift . f >> lift syncthreads
+-- --     where syncthreads :: JanusCUDAM ()
+-- --           syncthreads = JanusCUDAM $ janusCFFICall Nothing "__syncthreads"
 
-instance CmdCudaSynchronized JanusCM JanusC where
-  synchronized f = do
-    info <- ask
-    lift $ rangeM (0 :: JanusC Int64) (toIntegral $ info ^. cudaThreadInfoBlockDimX) $ \idxX ->
-      rangeM 0 (toIntegral $ info ^. cudaThreadInfoBlockDimY) $ \idxY ->
-        rangeM 0 (toIntegral $ info ^. cudaThreadInfoBlockDimZ) $ \idxZ ->
-          f $
-            info
-              & cudaThreadInfoThreadIdxX .~ toIntegral idxX
-              & cudaThreadInfoThreadIdxY .~ toIntegral idxY
-              & cudaThreadInfoThreadIdxZ .~ toIntegral idxZ
+-- -- instance CmdCudaSynchronized JanusCM JanusC where
+-- --   synchronized f = do
+-- --     info <- ask
+-- --     lift $ rangeM (0 :: JanusC Int64) (toIntegral $ info ^. cudaThreadInfoBlockDimX) $ \idxX ->
+-- --       rangeM 0 (toIntegral $ info ^. cudaThreadInfoBlockDimY) $ \idxY ->
+-- --         rangeM 0 (toIntegral $ info ^. cudaThreadInfoBlockDimZ) $ \idxZ ->
+-- --           f $
+-- --             info
+-- --               & cudaThreadInfoThreadIdxX .~ toIntegral idxX
+-- --               & cudaThreadInfoThreadIdxY .~ toIntegral idxY
+-- --               & cudaThreadInfoThreadIdxZ .~ toIntegral idxZ
 
-runCUDAT_ :: CUDAT JanusCUDA JanusCUDAM () -> JanusCUDAM ()
-runCUDAT_ (CUDAT m) =
-  runReaderT
-    m
-    CUDAThreadInfo
-      { _cudaThreadInfoBlockDimX = magicCUDAVar "blockDim" "x",
-        _cudaThreadInfoBlockDimY = magicCUDAVar "blockDim" "y",
-        _cudaThreadInfoBlockDimZ = magicCUDAVar "blockDim" "z",
-        _cudaThreadInfoBlockIdxX = magicCUDAVar "blockIdx" "x",
-        _cudaThreadInfoBlockIdxY = magicCUDAVar "blockIdx" "y",
-        _cudaThreadInfoBlockIdxZ = magicCUDAVar "blockIdx" "z",
-        _cudaThreadInfoThreadIdxX = magicCUDAVar "threadIdx" "x",
-        _cudaThreadInfoThreadIdxY = magicCUDAVar "threadIdx" "y",
-        _cudaThreadInfoThreadIdxZ = magicCUDAVar "threadIdx" "z",
-        _cudaThreadInfoGridDimX = magicCUDAVar "gridDim" "x",
-        _cudaThreadInfoGridDimY = magicCUDAVar "gridDim" "y",
-        _cudaThreadInfoGridDimZ = magicCUDAVar "gridDim" "z"
-      }
-  where
-    magicCUDAVar var mem = JanusCUDA $ JanusC $ pure $ RVal (Member (Var (Id var noLoc) noLoc) (Id mem noLoc) noLoc)
+-- -- runCUDAT_ :: CUDAT JanusCUDA JanusCUDAM () -> JanusCUDAM ()
+-- -- runCUDAT_ (CUDAT m) =
+-- --   runReaderT
+-- --     m
+-- --     CUDAThreadInfo
+-- --       { _cudaThreadInfoBlockDimX = magicCUDAVar "blockDim" "x",
+-- --         _cudaThreadInfoBlockDimY = magicCUDAVar "blockDim" "y",
+-- --         _cudaThreadInfoBlockDimZ = magicCUDAVar "blockDim" "z",
+-- --         _cudaThreadInfoBlockIdxX = magicCUDAVar "blockIdx" "x",
+-- --         _cudaThreadInfoBlockIdxY = magicCUDAVar "blockIdx" "y",
+-- --         _cudaThreadInfoBlockIdxZ = magicCUDAVar "blockIdx" "z",
+-- --         _cudaThreadInfoThreadIdxX = magicCUDAVar "threadIdx" "x",
+-- --         _cudaThreadInfoThreadIdxY = magicCUDAVar "threadIdx" "y",
+-- --         _cudaThreadInfoThreadIdxZ = magicCUDAVar "threadIdx" "z",
+-- --         _cudaThreadInfoGridDimX = magicCUDAVar "gridDim" "x",
+-- --         _cudaThreadInfoGridDimY = magicCUDAVar "gridDim" "y",
+-- --         _cudaThreadInfoGridDimZ = magicCUDAVar "gridDim" "z"
+-- --       }
+-- --   where
+-- --     magicCUDAVar var mem = JanusCUDA $ JanusC $ pure $ RVal (Member (Var (Id var noLoc) noLoc) (Id mem noLoc) noLoc)
 
-runEmulatedCUDAT_ ::
-  ( JanusTyped e Int64,
-    ExpOrd e Int64,
-    CmdRange m e,
-    Num (e Int64),
-    Num (e Int32),
-    ExpIntegralCast e Int64 Int32
-  ) =>
-  CUlaunchConfig ->
-  CUDAT e m () ->
-  m ()
-runEmulatedCUDAT_ conf (CUDAT m) =
-  rangeM 0 (fromIntegral $ conf ^. cuLaunchConfigGridDimX) $ \blockIdxX ->
-    rangeM 0 (fromIntegral $ conf ^. cuLaunchConfigGridDimY) $ \blockIdxY ->
-      rangeM 0 (fromIntegral $ conf ^. cuLaunchConfigGridDimZ) $ \blockIdxZ ->
-        runReaderT m $
-          CUDAThreadInfo
-            { _cudaThreadInfoBlockIdxX = toIntegral blockIdxX,
-              _cudaThreadInfoBlockIdxY = toIntegral blockIdxY,
-              _cudaThreadInfoBlockIdxZ = toIntegral blockIdxZ,
-              _cudaThreadInfoBlockDimX = fromIntegral (conf ^. cuLaunchConfigBlockDimX),
-              _cudaThreadInfoBlockDimY = fromIntegral (conf ^. cuLaunchConfigBlockDimY),
-              _cudaThreadInfoBlockDimZ = fromIntegral (conf ^. cuLaunchConfigBlockDimZ),
-              _cudaThreadInfoThreadIdxX = undefined,
-              _cudaThreadInfoThreadIdxY = undefined,
-              _cudaThreadInfoThreadIdxZ = undefined,
-              _cudaThreadInfoGridDimX = fromIntegral (conf ^. cuLaunchConfigGridDimX),
-              _cudaThreadInfoGridDimY = fromIntegral (conf ^. cuLaunchConfigGridDimY),
-              _cudaThreadInfoGridDimZ = fromIntegral (conf ^. cuLaunchConfigGridDimZ)
-            }
+-- -- runEmulatedCUDAT_ ::
+-- --   ( JanusTyped e Int64,
+-- --     ExpOrd e Int64,
+-- --     CmdRange m e,
+-- --     Num (e Int64),
+-- --     Num (e Int32),
+-- --     ExpIntegralCast e Int64 Int32
+-- --   ) =>
+-- --   CUlaunchConfig ->
+-- --   CUDAT e m () ->
+-- --   m ()
+-- -- runEmulatedCUDAT_ conf (CUDAT m) =
+-- --   rangeM 0 (fromIntegral $ conf ^. cuLaunchConfigGridDimX) $ \blockIdxX ->
+-- --     rangeM 0 (fromIntegral $ conf ^. cuLaunchConfigGridDimY) $ \blockIdxY ->
+-- --       rangeM 0 (fromIntegral $ conf ^. cuLaunchConfigGridDimZ) $ \blockIdxZ ->
+-- --         runReaderT m $
+-- --           CUDAThreadInfo
+-- --             { _cudaThreadInfoBlockIdxX = toIntegral blockIdxX,
+-- --               _cudaThreadInfoBlockIdxY = toIntegral blockIdxY,
+-- --               _cudaThreadInfoBlockIdxZ = toIntegral blockIdxZ,
+-- --               _cudaThreadInfoBlockDimX = fromIntegral (conf ^. cuLaunchConfigBlockDimX),
+-- --               _cudaThreadInfoBlockDimY = fromIntegral (conf ^. cuLaunchConfigBlockDimY),
+-- --               _cudaThreadInfoBlockDimZ = fromIntegral (conf ^. cuLaunchConfigBlockDimZ),
+-- --               _cudaThreadInfoThreadIdxX = undefined,
+-- --               _cudaThreadInfoThreadIdxY = undefined,
+-- --               _cudaThreadInfoThreadIdxZ = undefined,
+-- --               _cudaThreadInfoGridDimX = fromIntegral (conf ^. cuLaunchConfigGridDimX),
+-- --               _cudaThreadInfoGridDimY = fromIntegral (conf ^. cuLaunchConfigGridDimY),
+-- --               _cudaThreadInfoGridDimZ = fromIntegral (conf ^. cuLaunchConfigGridDimZ)
+-- --             }
+
+cudaWarpSize :: Int
+cudaWarpSize = 32
+
+type instance JanusTyped CUDAExp = IdConstraint
+
+newtype CUDAExp a = CUDAExp { getCUDAExp :: a }
+  deriving (Eq, Ord, Show, Generic, Functor, Foldable, Traversable)
+  deriving (Applicative, Monad) via Identity
+
+data Barrier = Barrier { _barrierMVar :: MVar (Int, [MVar ()]), _barrierResetCount :: Int }
+
+newBarrier :: Int -> IO Barrier
+newBarrier n = flip Barrier n <$> newMVar (n,[])
+
+syncBarrier :: Barrier -> IO ()
+syncBarrier (Barrier b reset) = do
+  m <- modifyMVarMasked b \case
+    (0, _) -> pure ((0, []), Nothing)
+    (1, ms) -> forM_ ms (flip putMVar ()) >> pure ((reset, []), Nothing)
+    (n, ms) -> do
+      m <- newEmptyMVar
+      pure ((n-1,m:ms), Just m)
+  case m of
+    Just m' -> takeMVar m'
+    Nothing -> pure ()
+
+data Thread = Thread { _threadWarpBarrier :: Barrier, _threadBlockBarrier :: Barrier, _threadActive :: Bool, _threadInfo :: CUDAThreadInfo CUDAExp }
+
+newtype CUDAM a = CUDAM { runCUDAM :: ReaderT Thread IO a }
+  deriving newtype (Functor, Applicative, Monad, MonadReader Thread, MonadIO)
+
+class CmdSync m where
+  syncWarp :: m ()
+  syncBlock :: m ()
+
+instance CmdSync CUDAM where
+  syncWarp = ask >>= liftIO . syncBarrier . _threadWarpBarrier
+  syncBlock = ask >>= liftIO . syncBarrier . _threadBlockBarrier
+
+instance CmdSync JanusCUDA where
+  syncWarp = JanusCUDA $ janusCFFICall Nothing "__syncwarp"
+  syncBlock = JanusCUDA $ janusCFFICall Nothing "__syncthreads"
+
+foo :: CUDAM ()
+foo = do
+  info <- _threadInfo <$> ask
+  liftIO $ print (getCUDAExp $ _cudaThreadInfoThreadIdxX info, getCUDAExp $ _cudaThreadInfoThreadIdxY info, getCUDAExp $ _cudaThreadInfoThreadIdxZ info, getCUDAExp $ _cudaThreadInfoBlockIdxX info, getCUDAExp $ _cudaThreadInfoBlockIdxY info, getCUDAExp $ _cudaThreadInfoBlockIdxZ info)
+  syncWarp
+  liftIO $ print (getCUDAExp $ _cudaThreadInfoThreadIdxX info, getCUDAExp $ _cudaThreadInfoThreadIdxY info, getCUDAExp $ _cudaThreadInfoThreadIdxZ info, getCUDAExp $ _cudaThreadInfoBlockIdxX info, getCUDAExp $ _cudaThreadInfoBlockIdxY info, getCUDAExp $ _cudaThreadInfoBlockIdxZ info)
+  syncWarp
+
+launchCUDAM :: CUlaunchConfig -> CUDAM () -> IO ()
+launchCUDAM conf (CUDAM m) = do
+  SIO.hSetBuffering SIO.stdout SIO.LineBuffering
+  let blockSize = fromIntegral $ conf ^. cuLaunchConfigBlockDimX * conf ^. cuLaunchConfigBlockDimY * conf ^. cuLaunchConfigBlockDimZ :: Int
+      gridSize = fromIntegral $ conf ^. cuLaunchConfigGridDimX * conf ^. cuLaunchConfigGridDimY * conf ^. cuLaunchConfigGridDimZ :: Int
+      warpCount = gridSize `quot` cudaWarpSize
+      blockCount = gridSize `quot` blockSize
+      threadCount = warpCount * cudaWarpSize
+  warpBarriers <- V.generateM warpCount $ \_ -> newBarrier cudaWarpSize
+  blockBarriers <- V.generateM blockCount $ \_ -> newBarrier blockSize
+  forConcurrently_ [0..threadCount-1] $ \i -> do
+    let blockIdx = i `rem` blockSize
+        info = CUDAThreadInfo
+          { _cudaThreadInfoBlockIdxX = CUDAExp $ fromIntegral blockIdx `rem` (fromIntegral $ conf ^. cuLaunchConfigBlockDimX)
+          , _cudaThreadInfoBlockIdxY = CUDAExp $ (fromIntegral blockIdx `quot` (fromIntegral $ conf ^. cuLaunchConfigBlockDimX)) `rem` (fromIntegral $ conf ^. cuLaunchConfigBlockDimY)
+          , _cudaThreadInfoBlockIdxZ = CUDAExp $ (fromIntegral blockIdx `quot` (fromIntegral $ conf ^. cuLaunchConfigBlockDimX * conf ^. cuLaunchConfigBlockDimY)) `rem` (fromIntegral $ conf ^. cuLaunchConfigBlockDimZ)
+          , _cudaThreadInfoBlockDimX = CUDAExp $ fromIntegral (conf ^. cuLaunchConfigBlockDimX)
+          , _cudaThreadInfoBlockDimY = CUDAExp $ fromIntegral (conf ^. cuLaunchConfigBlockDimY)
+          , _cudaThreadInfoBlockDimZ = CUDAExp $ fromIntegral (conf ^. cuLaunchConfigBlockDimZ)
+          , _cudaThreadInfoThreadIdxX = CUDAExp $ fromIntegral i `rem` (fromIntegral $ conf ^. cuLaunchConfigGridDimX)
+          , _cudaThreadInfoThreadIdxY = CUDAExp $ (fromIntegral i `quot` (fromIntegral $ conf ^. cuLaunchConfigGridDimX)) `rem` (fromIntegral $ conf ^. cuLaunchConfigGridDimY)
+          , _cudaThreadInfoThreadIdxZ = CUDAExp $ (fromIntegral i `quot` (fromIntegral $ conf ^. cuLaunchConfigGridDimX * conf ^. cuLaunchConfigGridDimY)) `rem` fromIntegral (conf ^. cuLaunchConfigGridDimZ)
+          , _cudaThreadInfoGridDimX = CUDAExp $ fromIntegral (conf ^. cuLaunchConfigGridDimX)
+          , _cudaThreadInfoGridDimY = CUDAExp $ fromIntegral (conf ^. cuLaunchConfigGridDimY)
+          , _cudaThreadInfoGridDimZ = CUDAExp $ fromIntegral (conf ^. cuLaunchConfigGridDimZ)
+          }
+        thread = Thread { _threadWarpBarrier = warpBarriers V.! (i `quot` cudaWarpSize)
+                        , _threadBlockBarrier = blockBarriers V.! (i `quot` blockSize)
+                        , _threadActive = True
+                        , _threadInfo = info
+                        }
+    runReaderT m thread

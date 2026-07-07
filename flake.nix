@@ -2,14 +2,14 @@
   description = "An extensible EDSL for high-performance computing.";
 
   inputs = {
-    nixpkgs.url = "github:NixOS/nixpkgs/nixos-25.11";
+    nixpkgs.url = "github:NixOS/nixpkgs/nixos-26.05";
     flake-utils.url = "github:numtide/flake-utils";
   };
 
   outputs = { self, nixpkgs, flake-utils }:
     flake-utils.lib.eachDefaultSystem (system:
       let
-        pkgs = import nixpkgs { system = "x86_64-linux"; config.allowUnfree = true; };
+        pkgs = import nixpkgs { system = system; config.allowUnfree = true; };
         haskellPackages = pkgs.haskellPackages;
 
         jailbreakUnbreak = pkg:
@@ -69,7 +69,11 @@
                 vector
                 zstd
               ];
-            libraryPkgconfigDepends = [ cudaPackages.libnvjitlink ];
+            libraryPkgconfigDepends = [ (pkgs.cudaPackages.libnvjitlink.overrideAttrs (oldAttrs: {
+              postFixup = (oldAttrs.postFixup or "") + ''
+substituteInPlace $dev/share/pkgconfig/nvjitlink.pc --replace "-lnvjitlink" "-lnvJitLink"
+substituteInPlace $dev/share/pkgconfig/nvjitlink-12.9.pc --replace "-lnvjitlink" "-lnvJitLink"'';
+            })) ];
             librarySystemDepends = [ cudaPackages.cudatoolkit gcc linuxPackages.nvidia_x11 ];
             testHaskellDepends = [ tasty-discover tasty-hedgehog tasty-hunit ];
             description = "An extensible EDSL for high-performance computing.";
@@ -98,7 +102,7 @@
           ];
           withHoogle = true;
           shellHook = ''
-            export PATH=${pkgs.gcc}/bin:$PATH
+            export PATH=/run/current-system/sw/bin:${pkgs.gcc}/bin:$PATH
             export CUDA_PATH=${pkgs.cudaPackages.cudatoolkit}
             export LD_LIBRARY_PATH=${pkgs.lib.makeLibraryPath pkg.env.buildInputs}:$LD_LIBRARY_PATH
             export EXTRA_LDFLAGS="-L${pkgs.linuxPackages.nvidia_x11}/lib"

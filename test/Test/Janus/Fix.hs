@@ -12,6 +12,7 @@ import Hedgehog
 import qualified Hedgehog.Gen as Gen
 import qualified Hedgehog.Range as Range
 import Janus.Backend.C
+import Janus.Backend.C.Build
 import Janus.Expression.Cond
 import Janus.Expression.Ord
 import Janus.Fix
@@ -48,7 +49,7 @@ compiledFacEqualsSpecFac f = property $ do
   k === m
 
 test_fix :: TestTree
-test_fix = withResource (acquireJanusC JC (fac @JanusC @Int64)) releaseJanusC $ \k ->
+test_fix = withResource (acquireJanusC JC defaultCBuildConfig (fac @JanusC @Int64)) releaseJanusC $ \k ->
   let k' = fst <$> k
    in testGroup
         "fix"

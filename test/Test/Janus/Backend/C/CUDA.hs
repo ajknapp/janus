@@ -13,6 +13,7 @@ import Foreign.Marshal.Alloc
 import Foreign.Storable
 import Janus.Backend.C.CUDA
 import Janus.Backend.C.CUDA.Foreign
+import Janus.Backend.C.Build
 import qualified Janus.Command.Array as A
 import Janus.Command.Cond
 import Janus.Command.Ref
@@ -23,6 +24,7 @@ import Test.Tasty.HUnit
 
 saxpy ::
   ( Monad m,
+    MonadReader (CUDAThreadInfo e) m,
     JanusTyped e Int32,
     CmdCond m e,
     CmdRef m e,
@@ -32,17 +34,16 @@ saxpy ::
     Num (e Int32),
     Num (e a)
   ) =>
-  e Int32 -> e a -> e (Ptr a) -> e (Ptr a) -> CUDAT e m ()
+  e Int32 -> e a -> e (Ptr a) -> e (Ptr a) -> m ()
 saxpy n a x y = do
   blockDim <- asks _cudaThreadInfoBlockDimX
   blockIdx <- asks _cudaThreadInfoBlockIdxX
   threadIdx <- asks _cudaThreadInfoThreadIdxX
-  lift $ do
-    i <- letM $ blockDim * blockIdx + threadIdx
-    whenM_ (i `lt` n) $ do
-      xi <- A.peekElemOff x (toIntegral i)
-      yi <- A.peekElemOff y (toIntegral i)
-      A.pokeElemOff y (a * xi + yi) (toIntegral i)
+  i <- letM $ blockDim * blockIdx + threadIdx
+  whenM_ (i `lt` n) $ do
+    xi <- A.peekElemOff x (toIntegral i)
+    yi <- A.peekElemOff y (toIntegral i)
+    A.pokeElemOff y (a * xi + yi) (toIntegral i)
 
 unit_saxpy :: IO ()
 unit_saxpy = runInBoundThread $ try (cuInit 0) >>= \case
@@ -62,7 +63,7 @@ unit_saxpy = runInBoundThread $ try (cuInit 0) >>= \case
           withCuDeviceArray nbytes $ \d_y -> do
             cuMemcpyHtoD d_x (castPtr px) (fromIntegral nbytes)
             cuMemcpyHtoD d_y (castPtr py) (fromIntegral nbytes)
-            withJanusCUDAFn dev ctx (\m a x y -> runCUDAT_ $ saxpy @_ @_ @Float m a x y) $ \fn k -> do
+            withJanusCUDAFn dev ctx defaultCBuildConfig (\m a x y -> saxpy @JanusCUDAM @JanusCUDA @Float m a x y) $ \fn k -> do
               (minGrid, _) <- cuOccupancyMaxPotentialBlockSize fn nullFunPtr 0 0
               let kernelLaunch =
                     CUlaunchConfig

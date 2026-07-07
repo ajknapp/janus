@@ -51,6 +51,13 @@ import System.Process
 data JanusCC = Clang | GCC
   deriving (Eq, Ord, Show, Generic)
 
+data CBuildConfig = CBuildConfig
+  { cBuildConfigCacheDir :: FilePath
+  }
+
+defaultCBuildConfig :: CBuildConfig
+defaultCBuildConfig = CBuildConfig "_cache"
+
 ccName :: JanusCC -> String
 ccName Clang = "clang"
 ccName GCC = "gcc"

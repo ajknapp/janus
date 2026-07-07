@@ -284,9 +284,9 @@ instance (JanusCTyped a, FFIArg a, JanusCEvaluate r) => JanusCEvaluate (JanusC a
   jceval fp args f a = jceval (castFunPtr fp) (arg a:args) (f $ JanusC $ pure $ RVal $ Var (Id "this_is_a_bug_if_you_see_this" noLoc) noLoc)
 
 -- this mostly exists for use with hedgehog withResource
-acquireJanusC :: forall r. (JanusCParam r, JanusCEvaluate r) => JanusCBackend -> r -> IO (JanusCEval r, DL)
-acquireJanusC backend a = do
-  let dir = "_cache"
+acquireJanusC :: forall r. (JanusCParam r, JanusCEvaluate r) => JanusCBackend -> CBuildConfig -> r -> IO (JanusCEval r, DL)
+acquireJanusC backend config a = do
+  let dir = cBuildConfigCacheDir config
   files <- writeJanusCFiles backend dir (jcparam "janus_main" 0 (pure []) backend a)
   dl <- acquireJanusCDL dir files
   fp <- dlsym dl "janus_main"
@@ -298,8 +298,8 @@ acquireJanusC backend a = do
 releaseJanusC :: (a, DL) -> IO ()
 releaseJanusC = releaseJanusCDL . snd
 
-withJanusC :: forall a r. (JanusCParam r, JanusCEvaluate r, FFIRet (JanusCRetType r)) => r -> (JanusCEval r -> IO a) -> IO a
-withJanusC a k = bracket (acquireJanusC JC a) releaseJanusC (k . fst)
+withJanusC :: forall a r. (JanusCParam r, JanusCEvaluate r, FFIRet (JanusCRetType r)) => CBuildConfig -> r -> (JanusCEval r -> IO a) -> IO a
+withJanusC config a k = bracket (acquireJanusC JC config a) releaseJanusC (k . fst)
 
 showJanusC :: forall a. (JanusCParam a) => String -> JanusCBackend -> a -> String
 showJanusC name backend a =
