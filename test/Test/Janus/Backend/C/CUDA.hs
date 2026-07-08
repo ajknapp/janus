@@ -21,6 +21,7 @@ import Janus.Expression.Cast
 import Janus.Expression.Ord
 import Janus.Typed
 import Test.Tasty.HUnit
+import System.Environment
 
 saxpy ::
   ( Monad m,
@@ -63,7 +64,9 @@ unit_saxpy = runInBoundThread $ try (cuInit 0) >>= \case
           withCuDeviceArray nbytes $ \d_y -> do
             cuMemcpyHtoD d_x (castPtr px) (fromIntegral nbytes)
             cuMemcpyHtoD d_y (castPtr py) (fromIntegral nbytes)
-            withJanusCUDAFn dev ctx defaultCBuildConfig (\m a x y -> saxpy @JanusCUDAM @JanusCUDA @Float m a x y) $ \fn k -> do
+            tmpdir <- getEnv "TMPDIR"
+            let buildConfig = defaultCBuildConfig { _cBuildConfigCacheDir = tmpdir }
+            withJanusCUDAFn dev ctx buildConfig (\m a x y -> saxpy @JanusCUDAM @JanusCUDA @Float m a x y) $ \fn k -> do
               (minGrid, _) <- cuOccupancyMaxPotentialBlockSize fn nullFunPtr 0 0
               let kernelLaunch =
                     CUlaunchConfig

@@ -4,8 +4,8 @@
 
 module Test.Janus.Fix where
 
+import Control.Lens
 import Control.Monad.IO.Class
-import Data.Functor.Identity
 import Data.Int
 import Data.Proxy
 import Hedgehog
@@ -19,6 +19,7 @@ import Janus.Fix
 import Janus.Typed
 import Test.Tasty
 import Test.Tasty.Hedgehog
+import System.Environment
 
 fac ::
   forall e a.
@@ -49,9 +50,13 @@ compiledFacEqualsSpecFac f = property $ do
   k === m
 
 test_fix :: TestTree
-test_fix = withResource (acquireJanusC JC defaultCBuildConfig (fac @JanusC @Int64)) releaseJanusC $ \k ->
-  let k' = fst <$> k
-   in testGroup
+test_fix = do
+  let acquire f = do
+        tmpdir <- getEnv "TMPDIR"
+        acquireJanusC JC (defaultCBuildConfig & cBuildConfigCacheDir .~ tmpdir) f
+  withResource (acquire (fac @JanusC @Int64)) releaseJanusC $ \k ->
+    let k' = fst <$> k
+     in testGroup
         "fix"
         [ testProperty "compiled fac = interpreted fac" (compiledFacEqualsInterpretedFac k'),
           testProperty "compiled fac = spec fac" (compiledFacEqualsSpecFac k')

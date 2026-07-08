@@ -286,7 +286,7 @@ instance (JanusCTyped a, FFIArg a, JanusCEvaluate r) => JanusCEvaluate (JanusC a
 -- this mostly exists for use with hedgehog withResource
 acquireJanusC :: forall r. (JanusCParam r, JanusCEvaluate r) => JanusCBackend -> CBuildConfig -> r -> IO (JanusCEval r, DL)
 acquireJanusC backend config a = do
-  let dir = cBuildConfigCacheDir config
+  let dir = config ^. cBuildConfigCacheDir
   files <- writeJanusCFiles backend dir (jcparam "janus_main" 0 (pure []) backend a)
   dl <- acquireJanusCDL dir files
   fp <- dlsym dl "janus_main"

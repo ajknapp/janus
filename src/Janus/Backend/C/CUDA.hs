@@ -338,7 +338,7 @@ withJanusCUDAFn ::
   (CUfunction -> (CUlaunchConfig -> JanusCUDAEval r) -> IO a) ->
   IO a
 withJanusCUDAFn dev ctx config f k = do
-  let dir = cBuildConfigCacheDir config
+  let dir = config ^. cBuildConfigCacheDir
   cufiles <- writeJanusCFiles JCUDA dir (jcudaparam "janus_main" 0 (pure []) JCUDA f)
   withJanusCUmodule dev ctx dir cufiles $ \pmod ->
     bracket (mallocBytes cudaArgMaxSize) free $ \argbuf ->

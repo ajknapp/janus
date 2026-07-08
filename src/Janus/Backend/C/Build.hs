@@ -17,6 +17,7 @@ import Control.Concurrent
 import Control.Concurrent.Async
 import Control.Concurrent.STM
 import Control.Exception
+import Control.Lens
 import Control.Monad.Reader
 import Control.Monad.Trans.Control
 import Crypto.Hash.SHA256 as SHA256
@@ -52,8 +53,10 @@ data JanusCC = Clang | GCC
   deriving (Eq, Ord, Show, Generic)
 
 data CBuildConfig = CBuildConfig
-  { cBuildConfigCacheDir :: FilePath
+  { _cBuildConfigCacheDir :: FilePath
   }
+
+$(makeLenses ''CBuildConfig)
 
 defaultCBuildConfig :: CBuildConfig
 defaultCBuildConfig = CBuildConfig "_cache"

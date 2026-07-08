@@ -135,6 +135,7 @@ test-suite janus-test
     build-depends:    base ^>=4.20
                     , hedgehog
                     , janus
+                    , lens
                     , mtl
                     , tasty
                     , tasty-hedgehog
