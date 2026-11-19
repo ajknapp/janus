@@ -34,11 +34,7 @@ import Prelude hiding (id, (.))
 newtype Pipe m a b = Pipe {getPipe :: Codensity m (Kleisli (ContT () m) (Step a) (Step b))}
   deriving (Functor)
 
-type Source m a = Pipe m () a
-
 type Sink m a = Pipe m a ()
-
-type Effect m = Pipe m () ()
 
 instance Applicative (Pipe m a) where
   pure a = Pipe $ pure $ Kleisli $ const (pure (Yield a))
@@ -126,16 +122,6 @@ instance (Floating b) => Floating (Pipe m a b) where
   log1pexp = fmap log1pexp
   log1mexp = fmap log1mexp
 
-rangeP :: (JanusTyped e a, CmdRef m e, CmdCond m e, ExpOrd e a, Num (e a)) => e a -> e a -> Source m (e a)
-rangeP l u = Pipe $ do
-  r <- lift $ newRef l
-  pure $ Kleisli $ \case
-    Yield _ -> ContT $ \k -> do
-      r' <- readRef r
-      ifThenElseM_ (r' `lt` u) (writeRef r (r' + 1) >> k (Yield r')) (k Stop)
-    Skip -> pure Skip
-    Stop -> pure Stop
-
 filterP :: (CmdCond m e) => (a -> e Bool) -> Pipe m a a
 filterP f = Pipe $ pure $ Kleisli $ \case
   Yield a -> ContT $ \k -> ifThenElseM_ (f a) (k (Yield a)) (k Skip)
@@ -185,13 +171,6 @@ delayP' = Pipe $ do
         k (Yield a')
     x -> pure x
 
--- only use this at the beginning of a pipeline
-source :: Stream m a -> Source m a
-source (Stream s) = Pipe $ pure $ Kleisli $ \case
-  Yield _ -> s
-  Skip -> pure Skip
-  Stop -> pure Stop
-
 -- for debugging purposes only
 traceShowP :: (CmdPutString m e, Monad m, Show a) => Pipe m a a
 traceShowP = Pipe $ pure $ Kleisli $ \case
@@ -234,13 +213,13 @@ joinP = Pipe $ pure $ Kleisli $ \case
   Skip -> pure Skip
   Stop -> pure Stop
 
-newtype Drain m a r = Drain {getDrain :: Source m a -> m r}
-  deriving (Functor, Applicative, Monad, MonadFix) via ReaderT (Source m a) m
+newtype Drain m a r = Drain {getDrain :: Stream m a -> m r}
+  deriving (Functor, Applicative, Monad, MonadFix) via ReaderT (Stream m a) m
 
 drain_ :: (CmdRef m e, CmdWhile m e, ExpBool e, JanusTyped e Bool) => Drain m a ()
-drain_ = Drain $ \(Pipe p) -> runCodensity p $ \k -> do
+drain_ = Drain $ \(Stream s) -> runCodensity s $ \body -> do
   whileM true $ \c -> do
-    runContT (runKleisli k (Yield ())) $ \case
+    runContT body $ \case
       Yield _ -> pure ()
       Skip -> pure ()
       Stop -> writeRef c false
@@ -255,11 +234,11 @@ drainFold ::
   e b ->
   (e b -> a -> e b) ->
   Drain m a (e b)
-drainFold b0 f = Drain $ \(Pipe p) -> do
+drainFold b0 f = Drain $ \(Stream s) -> do
   r <- newRef b0
-  runCodensity p $ \k -> do
+  runCodensity s $ \body -> do
     whileM true $ \c -> do
-      runContT (runKleisli k (Yield ())) $ \case
+      runContT body $ \case
         Yield a -> modifyRef r (`f` a)
         Skip -> pure ()
         Stop -> writeRef c false
@@ -337,5 +316,11 @@ drainLength ::
   Drain m a (e Int64)
 drainLength = drainFold 0 $ \s _ -> s + 1
 
-runPipe :: Drain m a r -> Source m a -> m r
-runPipe (Drain d) = d
+runDrain :: Drain m a r -> Stream m a -> m r
+runDrain (Drain d) = d
+
+runPipe :: (Monad m) => Pipe m a b -> Stream m a -> Stream m b
+runPipe (Pipe p) (Stream s) = Stream $ do
+  s' <- s
+  p' <- p
+  pure $ s' >>= runKleisli p'

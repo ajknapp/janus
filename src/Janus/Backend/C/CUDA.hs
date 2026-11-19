@@ -8,7 +8,10 @@
 {-# LANGUAGE FunctionalDependencies #-}
 {-# LANGUAGE GADTs #-}
 {-# LANGUAGE GeneralizedNewtypeDeriving #-}
+{-# LANGUAGE InstanceSigs #-}
+{-# LANGUAGE KindSignatures #-}
 {-# LANGUAGE LambdaCase #-}
+{-# LANGUAGE MultiParamTypeClasses #-}
 {-# LANGUAGE RecordWildCards #-}
 {-# LANGUAGE ScopedTypeVariables #-}
 {-# LANGUAGE StandaloneDeriving #-}
@@ -16,24 +19,30 @@
 {-# LANGUAGE TupleSections #-}
 {-# LANGUAGE TypeApplications #-}
 {-# LANGUAGE TypeFamilies #-}
+{-# LANGUAGE TypeFamilyDependencies #-}
 {-# LANGUAGE UndecidableInstances #-}
 
 module Janus.Backend.C.CUDA where
 
-import Control.Concurrent
-import Control.Concurrent.Async
-import Control.Exception
+import qualified Control.Concurrent.Classy as CC
+import qualified Control.Concurrent.Classy.Async as CCA
+import Control.Exception (bracket)
 import Control.Lens
 import Control.Monad
+import qualified Control.Monad.Catch as Catch
 import Control.Monad.Fix
 import Control.Monad.Reader
-import Control.Monad.State
+import Control.Monad.State (StateT (..))
+import Data.Bits (Bits)
 import Data.Coerce
 import Data.Complex
+import Data.IORef
 import Data.Int
+import qualified Data.Kind as K
 import Data.Loc
 import Data.Proxy
 import qualified Data.Vector as V
+import Data.Word (Word64)
 import Foreign.C
 import Foreign.Marshal.Alloc
 import Foreign.Ptr
@@ -49,6 +58,7 @@ import Janus.Command.Format
 import Janus.Command.IO
 import Janus.Command.Range
 import Janus.Command.Ref
+import Janus.Command.TicToc
 import Janus.Command.While
 import Janus.Expression.Bits
 import Janus.Expression.Bool
@@ -65,6 +75,9 @@ import Janus.Expression.Ord
 import Janus.Typed
 import Language.C.Quote
 import qualified System.IO as SIO
+import Test.DejaFu.Conc (ConcIO, Condition, MemType, Trace, runConcurrent)
+import Test.DejaFu.Schedule (Scheduler, roundRobinSched)
+import Test.DejaFu.Settings (defaultMemType)
 
 cudaArgMaxSize :: Int
 cudaArgMaxSize = 4096
@@ -436,83 +449,502 @@ withJanusCUDA dev ctx config f k = withJanusCUDAFn dev ctx config f (const k)
 cudaWarpSize :: Int
 cudaWarpSize = 32
 
-type instance JanusTyped CUDAExp = IdConstraint
+mapCUDAThreadInfo :: (e Int32 -> f Int32) -> CUDAThreadInfo e -> CUDAThreadInfo f
+mapCUDAThreadInfo f CUDAThreadInfo {..} =
+  CUDAThreadInfo
+    { _cudaThreadInfoBlockIdxX = f _cudaThreadInfoBlockIdxX,
+      _cudaThreadInfoBlockIdxY = f _cudaThreadInfoBlockIdxY,
+      _cudaThreadInfoBlockIdxZ = f _cudaThreadInfoBlockIdxZ,
+      _cudaThreadInfoBlockDimX = f _cudaThreadInfoBlockDimX,
+      _cudaThreadInfoBlockDimY = f _cudaThreadInfoBlockDimY,
+      _cudaThreadInfoBlockDimZ = f _cudaThreadInfoBlockDimZ,
+      _cudaThreadInfoThreadIdxX = f _cudaThreadInfoThreadIdxX,
+      _cudaThreadInfoThreadIdxY = f _cudaThreadInfoThreadIdxY,
+      _cudaThreadInfoThreadIdxZ = f _cudaThreadInfoThreadIdxZ,
+      _cudaThreadInfoGridDimX = f _cudaThreadInfoGridDimX,
+      _cudaThreadInfoGridDimY = f _cudaThreadInfoGridDimY,
+      _cudaThreadInfoGridDimZ = f _cudaThreadInfoGridDimZ
+    }
 
-newtype CUDAExp a = CUDAExp { getCUDAExp :: a }
-  deriving (Eq, Ord, Show, Generic, Functor, Foldable, Traversable)
-  deriving (Applicative, Monad) via Identity
+data Barrier m = Barrier
+  { _barrierMVar :: CC.MVar m (Int, [CC.MVar m ()]),
+    _barrierResetCount :: Int
+  }
 
-data Barrier = Barrier { _barrierMVar :: MVar (Int, [MVar ()]), _barrierResetCount :: Int }
+newBarrier :: (CC.MonadConc m) => Int -> m (Barrier m)
+newBarrier n = flip Barrier n <$> CC.newMVar (n, [])
 
-newBarrier :: Int -> IO Barrier
-newBarrier n = flip Barrier n <$> newMVar (n,[])
-
-syncBarrier :: Barrier -> IO ()
+syncBarrier :: (CC.MonadConc m) => Barrier m -> m ()
 syncBarrier (Barrier b reset) = do
-  m <- modifyMVarMasked b \case
+  m <- CC.modifyMVarMasked b \case
     (0, _) -> pure ((0, []), Nothing)
-    (1, ms) -> forM_ ms (flip putMVar ()) >> pure ((reset, []), Nothing)
+    (1, ms) -> forM_ ms (flip CC.putMVar ()) >> pure ((reset, []), Nothing)
     (n, ms) -> do
-      m <- newEmptyMVar
-      pure ((n-1,m:ms), Just m)
+      m <- CC.newEmptyMVar
+      pure ((n - 1, m : ms), Just m)
   case m of
-    Just m' -> takeMVar m'
+    Just m' -> CC.takeMVar m'
     Nothing -> pure ()
 
-data Thread = Thread { _threadWarpBarrier :: Barrier, _threadBlockBarrier :: Barrier, _threadActive :: Bool, _threadInfo :: CUDAThreadInfo CUDAExp }
+data Thread m = Thread
+  { _threadWarpBarrier :: Barrier m,
+    _threadBlockBarrier :: Barrier m,
+    _threadActive :: Bool,
+    _threadInfo :: CUDAThreadInfo Identity
+  }
 
-newtype CUDAM a = CUDAM { runCUDAM :: ReaderT Thread IO a }
-  deriving newtype (Functor, Applicative, Monad, MonadReader Thread, MonadIO)
+newtype CUDAM (m :: K.Type -> K.Type) a = CUDAM {runCUDAM :: ReaderT (Thread m) m a}
+  deriving newtype
+    ( Functor,
+      Applicative,
+      Monad,
+      MonadFix,
+      MonadReader (Thread m),
+      MonadIO,
+      Catch.MonadThrow,
+      Catch.MonadCatch,
+      Catch.MonadMask
+    )
+
+instance MonadTrans CUDAM where
+  lift = CUDAM . lift
 
 class CmdSync m where
   syncWarp :: m ()
   syncBlock :: m ()
 
-instance CmdSync CUDAM where
-  syncWarp = ask >>= liftIO . syncBarrier . _threadWarpBarrier
-  syncBlock = ask >>= liftIO . syncBarrier . _threadBlockBarrier
+instance (CC.MonadConc m) => CmdSync (CUDAM m) where
+  syncWarp = ask >>= lift . syncBarrier . _threadWarpBarrier
+  syncBlock = ask >>= lift . syncBarrier . _threadBlockBarrier
 
-instance CmdSync JanusCUDA where
-  syncWarp = JanusCUDA $ janusCFFICall Nothing "__syncwarp"
-  syncBlock = JanusCUDA $ janusCFFICall Nothing "__syncthreads"
+instance CmdSync JanusCUDAM where
+  syncWarp = JanusCUDAM $ lift $ janusCFFICall Nothing "__syncwarp"
+  syncBlock = JanusCUDAM $ lift $ janusCFFICall Nothing "__syncthreads"
 
-foo :: CUDAM ()
+foo :: (CC.MonadConc m, MonadIO m) => CUDAM m ()
 foo = do
   info <- _threadInfo <$> ask
-  liftIO $ print (getCUDAExp $ _cudaThreadInfoThreadIdxX info, getCUDAExp $ _cudaThreadInfoThreadIdxY info, getCUDAExp $ _cudaThreadInfoThreadIdxZ info, getCUDAExp $ _cudaThreadInfoBlockIdxX info, getCUDAExp $ _cudaThreadInfoBlockIdxY info, getCUDAExp $ _cudaThreadInfoBlockIdxZ info)
+  liftIO $
+    print
+      ( runIdentity $ _cudaThreadInfoThreadIdxX info,
+        runIdentity $ _cudaThreadInfoThreadIdxY info,
+        runIdentity $ _cudaThreadInfoThreadIdxZ info,
+        runIdentity $ _cudaThreadInfoBlockIdxX info,
+        runIdentity $ _cudaThreadInfoBlockIdxY info,
+        runIdentity $ _cudaThreadInfoBlockIdxZ info
+      )
   syncWarp
-  liftIO $ print (getCUDAExp $ _cudaThreadInfoThreadIdxX info, getCUDAExp $ _cudaThreadInfoThreadIdxY info, getCUDAExp $ _cudaThreadInfoThreadIdxZ info, getCUDAExp $ _cudaThreadInfoBlockIdxX info, getCUDAExp $ _cudaThreadInfoBlockIdxY info, getCUDAExp $ _cudaThreadInfoBlockIdxZ info)
+  liftIO $
+    print
+      ( runIdentity $ _cudaThreadInfoThreadIdxX info,
+        runIdentity $ _cudaThreadInfoThreadIdxY info,
+        runIdentity $ _cudaThreadInfoThreadIdxZ info,
+        runIdentity $ _cudaThreadInfoBlockIdxX info,
+        runIdentity $ _cudaThreadInfoBlockIdxY info,
+        runIdentity $ _cudaThreadInfoBlockIdxZ info
+      )
   syncWarp
 
-launchCUDAM :: CUlaunchConfig -> CUDAM () -> IO ()
+launchCUDAM :: (CC.MonadConc m, MonadIO m) => CUlaunchConfig -> CUDAM m () -> m ()
 launchCUDAM conf (CUDAM m) = do
-  SIO.hSetBuffering SIO.stdout SIO.LineBuffering
-  let blockSize = fromIntegral $ conf ^. cuLaunchConfigBlockDimX * conf ^. cuLaunchConfigBlockDimY * conf ^. cuLaunchConfigBlockDimZ :: Int
-      gridSize = fromIntegral $ conf ^. cuLaunchConfigGridDimX * conf ^. cuLaunchConfigGridDimY * conf ^. cuLaunchConfigGridDimZ :: Int
-      warpCount = gridSize `quot` cudaWarpSize
-      blockCount = gridSize `quot` blockSize
-      threadCount = warpCount * cudaWarpSize
-  warpBarriers <- V.generateM warpCount $ \_ -> newBarrier cudaWarpSize
+  liftIO $ SIO.hSetBuffering SIO.stdout SIO.LineBuffering
+  let gridDimX = fromIntegral (conf ^. cuLaunchConfigGridDimX) :: Int
+      gridDimY = fromIntegral (conf ^. cuLaunchConfigGridDimY) :: Int
+      gridDimZ = fromIntegral (conf ^. cuLaunchConfigGridDimZ) :: Int
+      blockDimX = fromIntegral (conf ^. cuLaunchConfigBlockDimX) :: Int
+      blockDimY = fromIntegral (conf ^. cuLaunchConfigBlockDimY) :: Int
+      blockDimZ = fromIntegral (conf ^. cuLaunchConfigBlockDimZ) :: Int
+      blockCount = gridDimX * gridDimY * gridDimZ
+      blockSize = blockDimX * blockDimY * blockDimZ
+      warpsPerBlock = (blockSize + cudaWarpSize - 1) `quot` cudaWarpSize
   blockBarriers <- V.generateM blockCount $ \_ -> newBarrier blockSize
-  forConcurrently_ [0..threadCount-1] $ \i -> do
-    let blockIdx = i `rem` blockSize
-        info = CUDAThreadInfo
-          { _cudaThreadInfoBlockIdxX = CUDAExp $ fromIntegral blockIdx `rem` (fromIntegral $ conf ^. cuLaunchConfigBlockDimX)
-          , _cudaThreadInfoBlockIdxY = CUDAExp $ (fromIntegral blockIdx `quot` (fromIntegral $ conf ^. cuLaunchConfigBlockDimX)) `rem` (fromIntegral $ conf ^. cuLaunchConfigBlockDimY)
-          , _cudaThreadInfoBlockIdxZ = CUDAExp $ (fromIntegral blockIdx `quot` (fromIntegral $ conf ^. cuLaunchConfigBlockDimX * conf ^. cuLaunchConfigBlockDimY)) `rem` (fromIntegral $ conf ^. cuLaunchConfigBlockDimZ)
-          , _cudaThreadInfoBlockDimX = CUDAExp $ fromIntegral (conf ^. cuLaunchConfigBlockDimX)
-          , _cudaThreadInfoBlockDimY = CUDAExp $ fromIntegral (conf ^. cuLaunchConfigBlockDimY)
-          , _cudaThreadInfoBlockDimZ = CUDAExp $ fromIntegral (conf ^. cuLaunchConfigBlockDimZ)
-          , _cudaThreadInfoThreadIdxX = CUDAExp $ fromIntegral i `rem` (fromIntegral $ conf ^. cuLaunchConfigGridDimX)
-          , _cudaThreadInfoThreadIdxY = CUDAExp $ (fromIntegral i `quot` (fromIntegral $ conf ^. cuLaunchConfigGridDimX)) `rem` (fromIntegral $ conf ^. cuLaunchConfigGridDimY)
-          , _cudaThreadInfoThreadIdxZ = CUDAExp $ (fromIntegral i `quot` (fromIntegral $ conf ^. cuLaunchConfigGridDimX * conf ^. cuLaunchConfigGridDimY)) `rem` fromIntegral (conf ^. cuLaunchConfigGridDimZ)
-          , _cudaThreadInfoGridDimX = CUDAExp $ fromIntegral (conf ^. cuLaunchConfigGridDimX)
-          , _cudaThreadInfoGridDimY = CUDAExp $ fromIntegral (conf ^. cuLaunchConfigGridDimY)
-          , _cudaThreadInfoGridDimZ = CUDAExp $ fromIntegral (conf ^. cuLaunchConfigGridDimZ)
-          }
-        thread = Thread { _threadWarpBarrier = warpBarriers V.! (i `quot` cudaWarpSize)
-                        , _threadBlockBarrier = blockBarriers V.! (i `quot` blockSize)
-                        , _threadActive = True
-                        , _threadInfo = info
-                        }
+  warpBarriers <- V.generateM blockCount $ \_ ->
+    V.generateM warpsPerBlock $ \w ->
+      newBarrier (min cudaWarpSize (blockSize - w * cudaWarpSize))
+  CCA.forConcurrently_ [(b, t) | b <- [0 .. blockCount - 1], t <- [0 .. blockSize - 1]] $ \(b, t) -> do
+    let info =
+          CUDAThreadInfo
+            { _cudaThreadInfoBlockIdxX = Identity $ fromIntegral (b `rem` gridDimX),
+              _cudaThreadInfoBlockIdxY = Identity $ fromIntegral ((b `quot` gridDimX) `rem` gridDimY),
+              _cudaThreadInfoBlockIdxZ = Identity $ fromIntegral ((b `quot` (gridDimX * gridDimY)) `rem` gridDimZ),
+              _cudaThreadInfoBlockDimX = Identity $ fromIntegral blockDimX,
+              _cudaThreadInfoBlockDimY = Identity $ fromIntegral blockDimY,
+              _cudaThreadInfoBlockDimZ = Identity $ fromIntegral blockDimZ,
+              _cudaThreadInfoThreadIdxX = Identity $ fromIntegral (t `rem` blockDimX),
+              _cudaThreadInfoThreadIdxY = Identity $ fromIntegral ((t `quot` blockDimX) `rem` blockDimY),
+              _cudaThreadInfoThreadIdxZ = Identity $ fromIntegral ((t `quot` (blockDimX * blockDimY)) `rem` blockDimZ),
+              _cudaThreadInfoGridDimX = Identity $ fromIntegral gridDimX,
+              _cudaThreadInfoGridDimY = Identity $ fromIntegral gridDimY,
+              _cudaThreadInfoGridDimZ = Identity $ fromIntegral gridDimZ
+            }
+        thread =
+          Thread
+            { _threadWarpBarrier = (warpBarriers V.! b) V.! (t `quot` cudaWarpSize),
+              _threadBlockBarrier = blockBarriers V.! b,
+              _threadActive = True,
+              _threadInfo = info
+            }
     runReaderT m thread
+
+--------------------------------------------------------------------------------
+-- Shared CUDAM Command Helpers
+
+cudaAskThreadInfo :: forall m e. (Monad m, Coercible (Identity Int32) (e Int32)) => CUDAM m (CUDAThreadInfo e)
+cudaAskThreadInfo = asks (mapCUDAThreadInfo (coerce :: Identity Int32 -> e Int32) . _threadInfo)
+
+cudaLocalThreadInfo ::
+  forall m e a.
+  (Monad m, Coercible (Identity Int32) (e Int32)) =>
+  (CUDAThreadInfo e -> CUDAThreadInfo e) ->
+  CUDAM m a ->
+  CUDAM m a
+cudaLocalThreadInfo f =
+  local
+    ( \th ->
+        th
+          { _threadInfo =
+              mapCUDAThreadInfo
+                (coerce :: e Int32 -> Identity Int32)
+                (f (mapCUDAThreadInfo (coerce :: Identity Int32 -> e Int32) (_threadInfo th)))
+          }
+    )
+
+cudaMalloc :: (MonadIO m) => Identity Int64 -> CUDAM m (Identity (Ptr ()))
+cudaMalloc = liftIO . A.malloc @IO @Identity
+
+cudaCalloc :: (MonadIO m) => Identity Int64 -> Identity Int64 -> CUDAM m (Identity (Ptr ()))
+cudaCalloc n s = liftIO $ A.calloc @IO @Identity n s
+
+cudaRealloc :: (MonadIO m) => Identity (Ptr ()) -> Identity Int64 -> CUDAM m (Identity (Ptr ()))
+cudaRealloc p n = liftIO $ A.realloc @IO @Identity p n
+
+cudaFree :: (MonadIO m) => Identity (Ptr ()) -> CUDAM m ()
+cudaFree = liftIO . A.free @IO @Identity
+
+cudaPeek :: (MonadIO m, Storable a) => Identity (Ptr a) -> CUDAM m (Identity a)
+cudaPeek = liftIO . A.peek @IO @Identity
+
+cudaPoke :: (MonadIO m, Storable a) => Identity (Ptr a) -> Identity a -> CUDAM m ()
+cudaPoke p a = liftIO $ A.poke @IO @Identity p a
+
+cudaPeekElemOff :: (MonadIO m, Storable a) => Identity (Ptr a) -> Identity Int64 -> CUDAM m (Identity a)
+cudaPeekElemOff p i = liftIO $ A.peekElemOff @IO @Identity p i
+
+cudaPokeElemOff :: (MonadIO m, Storable a) => Identity (Ptr a) -> Identity a -> Identity Int64 -> CUDAM m ()
+cudaPokeElemOff p a i = liftIO $ A.pokeElemOff @IO @Identity p a i
+
+cudaWithRefPtr ::
+  (Catch.MonadMask m, MonadIO m, Storable a) =>
+  IORef a ->
+  (Identity (Ptr a) -> CUDAM m b) ->
+  CUDAM m b
+cudaWithRefPtr r f = do
+  r' <- liftIO $ readIORef r
+  Catch.bracket (liftIO malloc) (liftIO . Foreign.Marshal.Alloc.free) $ \p -> do
+    liftIO $ poke p r'
+    b <- f (Identity p)
+    liftIO (peek p >>= writeIORef r)
+    pure b
+
+cudaSwitchCase_ :: (Monad m) => Identity Int64 -> [(Int, CUDAM m ())] -> CUDAM m () -> CUDAM m ()
+cudaSwitchCase_ _ [] def = def
+cudaSwitchCase_ i' ((i, c) : cs) def =
+  if fromIntegral (runIdentity i') == i
+    then c
+    else cudaSwitchCase_ i' cs def
+
+cudaIfThenElseM_ :: (Monad m) => Identity Bool -> CUDAM m () -> CUDAM m () -> CUDAM m ()
+cudaIfThenElseM_ (Identity p) a b = if p then a else b
+
+cudaFopen :: (MonadIO m) => Identity (Ptr CChar) -> Identity (Ptr CChar) -> CUDAM m (Identity (Ptr CFile))
+cudaFopen h mode = liftIO $ fopen @IO @Identity h mode
+
+cudaFclose :: (MonadIO m) => Identity (Ptr CFile) -> CUDAM m (Identity CInt)
+cudaFclose = liftIO . fclose @IO @Identity
+
+cudaWithString :: (Catch.MonadMask m, MonadIO m) => String -> (Identity CString -> CUDAM m a) -> CUDAM m a
+cudaWithString s f =
+  Catch.bracket (liftIO $ newCString s) (liftIO . Foreign.Marshal.Alloc.free) (f . Identity)
+
+cudaHputString :: (MonadIO m) => Identity (Ptr CFile) -> Identity CString -> CUDAM m ()
+cudaHputString h s = liftIO $ hputString @IO @Identity h s
+
+cudaHformat :: (MonadIO m, Show a) => Identity (Ptr CFile) -> Identity a -> String -> CUDAM m ()
+cudaHformat h a term = liftIO $ hformat @IO @Identity h a term
+
+cudaNewRef :: (MonadIO m) => Identity a -> CUDAM m (IORef a)
+cudaNewRef (Identity a) = liftIO $ newIORef a
+
+cudaNewRef' :: (MonadIO m) => CUDAM m (IORef a)
+cudaNewRef' = liftIO $ newIORef undefined
+
+cudaReadRef :: (MonadIO m) => IORef a -> CUDAM m (Identity a)
+cudaReadRef r = Identity <$> liftIO (readIORef r)
+
+cudaWriteRef :: (MonadIO m) => IORef a -> Identity a -> CUDAM m ()
+cudaWriteRef r (Identity a) = liftIO $ writeIORef r a
+
+cudaWhileM :: (MonadIO m) => Identity Bool -> (IORef Bool -> CUDAM m ()) -> CUDAM m ()
+cudaWhileM (Identity c) body = do
+  r <- liftIO $ newIORef c
+  let go = do
+        r' <- liftIO $ readIORef r
+        when r' $ body r >> go
+  go
+
+cudaTic :: (MonadIO m) => CUDAM m Word64
+cudaTic = runIdentity . getTic <$> liftIO (tic @IO @Identity)
+
+cudaToc :: (MonadIO m) => CUDAM m Word64
+cudaToc = runIdentity . getToc <$> liftIO (toc @IO @Identity)
+
+--------------------------------------------------------------------------------
+-- Concrete IO and DejaFu CPU CUDA Backends
+
+newtype CUDAIO a = CUDAIO {getCUDAIO :: a}
+  deriving stock (Eq, Ord, Show, Generic, Functor, Foldable, Traversable)
+  deriving (Applicative, Monad, ExpBool) via Identity
+
+newtype CUDAIOM a = CUDAIOM {getCUDAIOM :: CUDAM IO a}
+  deriving newtype
+    ( Functor,
+      Applicative,
+      Monad,
+      MonadFix,
+      MonadIO,
+      Catch.MonadThrow,
+      Catch.MonadCatch,
+      Catch.MonadMask,
+      CmdSync
+    )
+
+newtype CUDAIORef a = CUDAIORef {getCUDAIORef :: IORef a}
+
+newtype CUDADejaFu a = CUDADejaFu {getCUDADejaFu :: a}
+  deriving stock (Eq, Ord, Show, Generic, Functor, Foldable, Traversable)
+  deriving (Applicative, Monad, ExpBool) via Identity
+
+newtype CUDADejaFuM a = CUDADejaFuM {getCUDADejaFuM :: CUDAM ConcIO a}
+  deriving newtype
+    ( Functor,
+      Applicative,
+      Monad,
+      MonadIO,
+      Catch.MonadThrow,
+      Catch.MonadCatch,
+      Catch.MonadMask,
+      CmdSync
+    )
+
+newtype CUDADejaFuRef a = CUDADejaFuRef {getCUDADejaFuRef :: IORef a}
+
+$( let mkCUDACPUBackend expTy monadTy refTy baseM =
+         [d|
+           type instance JanusTyped $expTy = IdConstraint
+
+           deriving via Identity instance ExpCond $expTy
+
+           deriving via Identity instance ExpLet $expTy
+
+           deriving via Identity instance ExpPtrCast $expTy
+
+           deriving via Identity a instance (Num a) => Num ($expTy a)
+
+           deriving via Identity a instance (Fractional a) => Fractional ($expTy a)
+
+           deriving via Identity a instance (Floating a) => Floating ($expTy a)
+
+           deriving via Identity a instance (FMA a) => FMA ($expTy a)
+
+           deriving via Identity a instance (Hypot a) => Hypot ($expTy a)
+
+           instance (Bits a, Integral a) => ExpBits $expTy a where
+             iand :: $expTy a -> $expTy a -> $expTy a
+             iand = coerce (iand @Identity @a)
+             ior :: $expTy a -> $expTy a -> $expTy a
+             ior = coerce (ior @Identity @a)
+             ieor :: $expTy a -> $expTy a -> $expTy a
+             ieor = coerce (ieor @Identity @a)
+             inot :: $expTy a -> $expTy a
+             inot = coerce (inot @Identity @a)
+             lshift :: $expTy a -> $expTy a -> $expTy a
+             lshift = coerce (lshift @Identity @a)
+             rshift :: $expTy a -> $expTy a -> $expTy a
+             rshift = coerce (rshift @Identity @a)
+
+           instance (Num a, Eq a) => ExpBoolCast $expTy a where
+             fromBool :: $expTy Bool -> $expTy a
+             fromBool = coerce (fromBool @Identity @a)
+             toBool :: $expTy a -> $expTy Bool
+             toBool = coerce (toBool @Identity @a)
+
+           instance (Real a, Fractional b) => ExpFloatingCast $expTy a b where
+             toFloating :: $expTy a -> $expTy b
+             toFloating = coerce (toFloating @Identity @a @b)
+
+           instance (Integral a, Num b) => ExpIntegralCast $expTy a b where
+             toIntegral :: $expTy a -> $expTy b
+             toIntegral = coerce (toIntegral @Identity @a @b)
+
+           instance (Eq a) => ExpEq $expTy a where
+             eq :: $expTy a -> $expTy a -> $expTy Bool
+             eq = coerce (eq @Identity @a)
+             ne :: $expTy a -> $expTy a -> $expTy Bool
+             ne = coerce (ne @Identity @a)
+
+           instance ExpExtract $expTy a where
+             extract :: $expTy a -> a
+             extract = coerce (extract @Identity @a)
+
+           instance ExpInject $expTy a where
+             inject :: a -> $expTy a
+             inject = coerce (inject @Identity @a)
+
+           instance (Integral a) => ExpIntegral $expTy a where
+             quotient :: $expTy a -> $expTy a -> $expTy a
+             quotient = coerce (quotient @Identity @a)
+             remainder :: $expTy a -> $expTy a -> $expTy a
+             remainder = coerce (remainder @Identity @a)
+
+           instance ExpComplex $expTy a where
+             rePart :: $expTy (Complex a) -> $expTy a
+             rePart = coerce (rePart @Identity @a)
+             imPart :: $expTy (Complex a) -> $expTy a
+             imPart = coerce (imPart @Identity @a)
+
+           instance (ExpMurmurHash Identity (Identity a)) => ExpMurmurHash $expTy ($expTy a) where
+             murmurHashWithSalt :: $expTy Word64 -> $expTy a -> $expTy Word64
+             murmurHashWithSalt = coerce (murmurHashWithSalt @Identity @(Identity a))
+
+           instance (Ord a) => ExpOrd $expTy a where
+             lt :: $expTy a -> $expTy a -> $expTy Bool
+             lt = coerce (lt @Identity @a)
+             le :: $expTy a -> $expTy a -> $expTy Bool
+             le = coerce (le @Identity @a)
+             gt :: $expTy a -> $expTy a -> $expTy Bool
+             gt = coerce (gt @Identity @a)
+             ge :: $expTy a -> $expTy a -> $expTy Bool
+             ge = coerce (ge @Identity @a)
+
+           instance (Storable a) => A.ExpSized $expTy a where
+             sizeOf :: Proxy a -> $expTy Int64
+             sizeOf = coerce (A.sizeOf @Identity @a)
+             alignOf :: Proxy a -> $expTy Int64
+             alignOf = coerce (A.alignOf @Identity @a)
+
+           instance (Storable a) => A.ExpPtr $expTy a where
+             nullPtr :: $expTy (Ptr a)
+             nullPtr = coerce (A.nullPtr @Identity @a)
+             ptrAdd :: $expTy (Ptr a) -> $expTy Int64 -> $expTy (Ptr a)
+             ptrAdd = coerce (A.ptrAdd @Identity @a)
+             ptrIndex :: $expTy (Ptr a) -> $expTy Int64 -> $expTy (Ptr a)
+             ptrIndex = coerce (A.ptrIndex @Identity @a)
+
+           instance MonadReader (CUDAThreadInfo $expTy) $monadTy where
+             ask :: $monadTy (CUDAThreadInfo $expTy)
+             ask = coerce (cudaAskThreadInfo @($baseM) @($expTy))
+             local :: forall a. (CUDAThreadInfo $expTy -> CUDAThreadInfo $expTy) -> $monadTy a -> $monadTy a
+             local = coerce (cudaLocalThreadInfo @($baseM) @($expTy) @a)
+
+           instance A.CmdMem $monadTy $expTy where
+             malloc :: $expTy Int64 -> $monadTy ($expTy (Ptr ()))
+             malloc = coerce (cudaMalloc @($baseM))
+             calloc :: $expTy Int64 -> $expTy Int64 -> $monadTy ($expTy (Ptr ()))
+             calloc = coerce (cudaCalloc @($baseM))
+             realloc :: $expTy (Ptr ()) -> $expTy Int64 -> $monadTy ($expTy (Ptr ()))
+             realloc = coerce (cudaRealloc @($baseM))
+             free :: $expTy (Ptr ()) -> $monadTy ()
+             free = coerce (cudaFree @($baseM))
+
+           instance (Storable a) => A.CmdStorable $monadTy $expTy a where
+             peek :: $expTy (Ptr a) -> $monadTy ($expTy a)
+             peek = coerce (cudaPeek @($baseM) @a)
+             poke :: $expTy (Ptr a) -> $expTy a -> $monadTy ()
+             poke = coerce (cudaPoke @($baseM) @a)
+             peekElemOff :: $expTy (Ptr a) -> $expTy Int64 -> $monadTy ($expTy a)
+             peekElemOff = coerce (cudaPeekElemOff @($baseM) @a)
+             pokeElemOff :: $expTy (Ptr a) -> $expTy a -> $expTy Int64 -> $monadTy ()
+             pokeElemOff = coerce (cudaPokeElemOff @($baseM) @a)
+
+           instance (Storable a) => A.CmdRefPtr $monadTy $expTy a where
+             withRefPtr :: forall b. $refTy a -> ($expTy (Ptr a) -> $monadTy b) -> $monadTy b
+             withRefPtr = coerce (cudaWithRefPtr @($baseM) @a @b)
+
+           instance CmdCase $monadTy $expTy where
+             switchCase_ :: $expTy Int64 -> [(Int, $monadTy ())] -> $monadTy () -> $monadTy ()
+             switchCase_ = coerce (cudaSwitchCase_ @($baseM))
+
+           instance CmdCond $monadTy $expTy where
+             ifThenElseM_ :: $expTy Bool -> $monadTy () -> $monadTy () -> $monadTy ()
+             ifThenElseM_ = coerce (cudaIfThenElseM_ @($baseM))
+
+           instance CmdIO $monadTy $expTy where
+             stdout :: $expTy (Ptr CFile)
+             stdout = coerce (stdout @IO @Identity)
+             stderr :: $expTy (Ptr CFile)
+             stderr = coerce (stderr @IO @Identity)
+             fopen :: $expTy (Ptr CChar) -> $expTy (Ptr CChar) -> $monadTy ($expTy (Ptr CFile))
+             fopen = coerce (cudaFopen @($baseM))
+             fclose :: $expTy (Ptr CFile) -> $monadTy ($expTy CInt)
+             fclose = coerce (cudaFclose @($baseM))
+
+           instance CmdString $monadTy $expTy where
+             withString :: forall a. String -> ($expTy CString -> $monadTy a) -> $monadTy a
+             withString = coerce (cudaWithString @($baseM) @a)
+
+           instance CmdPutString $monadTy $expTy where
+             hputString :: $expTy (Ptr CFile) -> $expTy CString -> $monadTy ()
+             hputString = coerce (cudaHputString @($baseM))
+
+           instance (Show a) => CmdFormat $monadTy $expTy a where
+             hformat :: $expTy (Ptr CFile) -> $expTy a -> String -> $monadTy ()
+             hformat = coerce (cudaHformat @($baseM) @a)
+
+           instance CmdRef $monadTy $expTy where
+             type Ref $monadTy $expTy a = $refTy a
+             letM = pure
+             newRef :: forall a. (JanusTyped $expTy a) => $expTy a -> $monadTy ($refTy a)
+             newRef = coerce (cudaNewRef @($baseM) @a)
+             newRef' :: forall a. (JanusTyped $expTy a) => $monadTy ($refTy a)
+             newRef' = coerce (cudaNewRef' @($baseM) @a)
+             readRef :: forall a. (JanusTyped $expTy a) => $refTy a -> $monadTy ($expTy a)
+             readRef = coerce (cudaReadRef @($baseM) @a)
+             writeRef :: forall a. (JanusTyped $expTy a) => $refTy a -> $expTy a -> $monadTy ()
+             writeRef = coerce (cudaWriteRef @($baseM) @a)
+
+           instance CmdRange $monadTy $expTy
+
+           instance CmdWhile $monadTy $expTy where
+             whileM :: $expTy Bool -> ($refTy Bool -> $monadTy ()) -> $monadTy ()
+             whileM = coerce (cudaWhileM @($baseM))
+
+           instance CmdTicToc $monadTy $expTy where
+             tic :: $monadTy (Tic $expTy)
+             tic = coerce (cudaTic @($baseM))
+             toc :: $monadTy (Toc $expTy)
+             toc = coerce (cudaToc @($baseM))
+           |]
+    in fmap concat $
+         sequence
+           [ mkCUDACPUBackend [t|CUDAIO|] [t|CUDAIOM|] [t|CUDAIORef|] [t|IO|],
+             mkCUDACPUBackend [t|CUDADejaFu|] [t|CUDADejaFuM|] [t|CUDADejaFuRef|] [t|ConcIO|]
+           ]
+ )
+
+launchCUDAIOM :: CUlaunchConfig -> CUDAIOM () -> IO ()
+launchCUDAIOM conf (CUDAIOM m) = launchCUDAM conf m
+
+launchCUDADejaFuMWith ::
+  Scheduler s ->
+  MemType ->
+  s ->
+  CUlaunchConfig ->
+  CUDADejaFuM () ->
+  IO (Either Condition (), s, Trace)
+launchCUDADejaFuMWith sched mem s conf (CUDADejaFuM m) =
+  runConcurrent sched mem s (launchCUDAM conf m)
+
+launchCUDADejaFuM :: CUlaunchConfig -> CUDADejaFuM () -> IO (Either Condition (), Trace)
+launchCUDADejaFuM conf m = do
+  (res, (), trace) <- launchCUDADejaFuMWith roundRobinSched defaultMemType () conf m
+  pure (res, trace)

@@ -24,10 +24,13 @@
           , base
           , async
           , base16-bytestring
+          , concurrency
           , containers
           , cryptohash-sha256
           , cudaPackages
+          , dejafu
           , dependent-sum-template
+          , exceptions
           , gcc
           , hashable
           , lens
@@ -38,6 +41,7 @@
           , rock
           , semigroupoids
           , semilattices
+          , tasty-dejafu
           , tasty-discover
           , tasty-hedgehog
           , tasty-hunit
@@ -54,9 +58,12 @@
                 base
                 async
                 base16-bytestring
+                concurrency
                 containers
                 cryptohash-sha256
+                dejafu
                 dependent-sum-template
+                exceptions
                 hashable
                 lens
                 language-c-quote
@@ -75,7 +82,7 @@ substituteInPlace $dev/share/pkgconfig/nvjitlink.pc --replace "-lnvjitlink" "-ln
 substituteInPlace $dev/share/pkgconfig/nvjitlink-12.9.pc --replace "-lnvjitlink" "-lnvJitLink"'';
             })) ];
             librarySystemDepends = [ cudaPackages.cudatoolkit gcc linuxPackages.nvidia_x11 ];
-            testHaskellDepends = [ tasty-discover tasty-hedgehog tasty-hunit ];
+            testHaskellDepends = [ concurrency dejafu tasty-dejafu tasty-discover tasty-hedgehog tasty-hunit ];
             description = "An extensible EDSL for high-performance computing.";
             license = "unknown";
             hydraPlatforms = lib.platforms.none;

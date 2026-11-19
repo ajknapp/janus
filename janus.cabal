@@ -74,10 +74,13 @@ library
                     , async
                     , base16-bytestring
                     , bytestring
+                    , concurrency
                     , containers
                     , cryptohash-sha256
+                    , dejafu
                     , dependent-sum-template
                     , directory
+                    , exceptions
                     , hashable
                     , filepath
                     , kan-extensions
@@ -116,6 +119,7 @@ test-suite janus-test
     -- Modules included in this executable, other than Main.
     other-modules:    Test.Janus.Fix
                       Test.Janus.Backend.C.CUDA
+                      Test.Janus.Control.StreamPipe
                       Test.Janus.Expression.Let
 
     -- LANGUAGE extensions used by modules in this package.
@@ -133,11 +137,14 @@ test-suite janus-test
 
     -- Test dependencies.
     build-depends:    base ^>=4.20
+                    , concurrency
+                    , dejafu
                     , hedgehog
                     , janus
                     , lens
                     , mtl
                     , tasty
+                    , tasty-dejafu
                     , tasty-hedgehog
                     , tasty-hunit
                     , transformers

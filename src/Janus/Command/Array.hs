@@ -271,7 +271,7 @@ tensorIndices ::
   ) =>
   Tensor ds e a ->
   Stream m (TensorIndex ds e)
-tensorIndices (Tensor bds _) = Stream $ ContT $ \k -> do
+tensorIndices (Tensor bds _) = Stream $ pure $ ContT $ \k -> do
   iterateTensorBounds bds (k . Yield)
   k Stop
 
@@ -336,10 +336,10 @@ innerProduct ::
   Vector n e a ->
   Vector n e a ->
   m (e a)
-innerProduct x y = runPipe drainSum $ (source (tensorIndices x) >>>) $ pipeM $ \idx -> do
+innerProduct x y = runDrain drainSum $ runPipe (pipeM $ \idx -> do
   xi <- readTensor x idx
   yi <- readTensor y idx
-  letM (xi * yi)
+  letM (xi * yi)) (tensorIndices x)
 
 vectorNorm2 ::
   ( JanusTyped e Bool,
@@ -355,9 +355,9 @@ vectorNorm2 ::
   ) =>
   Vector n e a ->
   m (e a)
-vectorNorm2 x = runPipe drainSum $ (source (tensorIndices x) >>>) $ pipeM $ \idx -> do
+vectorNorm2 x = runDrain drainSum $ runPipe (pipeM $ \idx -> do
   xi <- readTensor x idx
-  letM (xi * xi)
+  letM (xi * xi)) (tensorIndices x)
 
 vectorNorm ::
   ( JanusTyped e Bool,
