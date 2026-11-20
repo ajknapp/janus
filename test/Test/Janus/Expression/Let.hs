@@ -28,20 +28,20 @@ pow5 x = pow x 5
 pow6 :: forall e a. (Num (e a), JanusTyped e a, ExpLet e) => e a -> e a
 pow6 x = pow x 6
 
-pownEqualsStandard :: IO (Int64 -> IO Int64) -> Int -> Property
+pownEqualsStandard :: IO (Int64 -> Int64) -> Int -> Property
 pownEqualsStandard p n = property $ do
   p' <- liftIO p
   x <- forAll (Gen.int64 $ Range.linear 0 1000)
-  y <- liftIO (p' x)
-  let z = x ^ n
+  let y = p' x
+      z = x ^ n
   y === z
 
-pownCompiledEqualsInterpreted :: IO (Int64 -> IO Int64) -> Int -> Property
+pownCompiledEqualsInterpreted :: IO (Int64 -> Int64) -> Int -> Property
 pownCompiledEqualsInterpreted p n = property $ do
   p' <- liftIO p
   x <- forAll (Gen.int64 $ Range.linear 0 1000)
-  y <- liftIO (p' x)
-  let z = runIdentity $ pow (Identity x) n
+  let y = p' x
+      z = runIdentity $ pow (Identity x) n
   y === z
 
 test_let :: TestTree

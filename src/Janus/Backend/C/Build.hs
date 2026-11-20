@@ -36,6 +36,8 @@ import qualified Data.Text as Text
 import qualified Data.Text.Encoding as Text
 import Data.Traversable
 import Foreign.C
+import qualified Foreign.Concurrent as FC
+import Foreign.ForeignPtr (ForeignPtr)
 import Foreign.Marshal.Alloc
 import Foreign.Marshal.Array
 import Foreign.Ptr
@@ -242,6 +244,21 @@ acquireJanusCDL dir = acquireJanusCDLWithFlags dir [] []
 
 releaseJanusCDL :: DL -> IO ()
 releaseJanusCDL = dlclose
+
+acquireJanusCFunPtrWithFlags :: FilePath -> [String] -> [String] -> [FilePath] -> String -> IO (ForeignPtr ())
+acquireJanusCFunPtrWithFlags dir cflags ldflags cfiles sym =
+  mask $ \restore -> do
+    dl <- restore (acquireJanusCDLWithFlags dir cflags ldflags cfiles)
+    ( do
+        fp <- dlsym dl sym
+        if fp == nullFunPtr
+          then error ("acquireJanusCFunPtrWithFlags: null function pointer for " <> sym)
+          else FC.newForeignPtr (castFunPtrToPtr fp) (releaseJanusCDL dl)
+      )
+      `onException` releaseJanusCDL dl
+
+acquireJanusCFunPtr :: FilePath -> [FilePath] -> String -> IO (ForeignPtr ())
+acquireJanusCFunPtr dir = acquireJanusCFunPtrWithFlags dir [] []
 
 acquireJanusCUmoduleWithFeatures :: CUDAFeatures -> CUdevice -> CUctx -> FilePath -> [FilePath] -> IO (Ptr CUmodule)
 acquireJanusCUmoduleWithFeatures reqFeatures dev _ctx dir cfiles = do

@@ -16,7 +16,6 @@
 
 module Janus.Backend.C.LinuxX86_64 where
 
-import Control.Exception (bracket)
 import Control.Lens
 import Control.Monad (forM_, when)
 import Control.Monad.Fix
@@ -36,9 +35,10 @@ import Data.Semilattice.Meet (Meet (..))
 import Data.Semilattice.Upper (Upper (..))
 import Data.Typeable (Typeable)
 import Data.Word
+import Foreign.ForeignPtr (ForeignPtr, withForeignPtr)
 import Foreign.LibFFI (Arg, argPtr, callFFI, retVoid)
 import Foreign.Marshal.Alloc (allocaBytes)
-import Foreign.Ptr (FunPtr, Ptr, castFunPtr, nullFunPtr)
+import Foreign.Ptr (FunPtr, Ptr, castPtrToFunPtr)
 import qualified Foreign.Storable as Storable
 import GHC.Float (expm1, log1p)
 import GHC.TypeLits (natVal)
@@ -72,7 +72,7 @@ import Janus.FFI.Arg (FFIArg (..))
 import Janus.FFI.Ret (FFIRet (..))
 import Janus.Typed
 import Language.C.Quote as C
-import System.Posix (DL, dlsym)
+import System.IO.Unsafe (unsafePerformIO)
 
 newtype LinuxX86_64C a = LinuxX86_64C {getLinuxX86_64C :: JanusC a}
 
@@ -247,7 +247,7 @@ instance CmdTicToc LinuxX86_64CM LinuxX86_64C where
 
 type family LinuxX86_64CEval a where
   LinuxX86_64CEval (LinuxX86_64C a -> r) = a -> LinuxX86_64CEval r
-  LinuxX86_64CEval (LinuxX86_64C a) = IO a
+  LinuxX86_64CEval (LinuxX86_64C a) = a
   LinuxX86_64CEval (LinuxX86_64CM (LinuxX86_64C a)) = IO a
   LinuxX86_64CEval (LinuxX86_64CM ()) = IO ()
 
@@ -303,7 +303,13 @@ class LinuxX86_64Param r where
   x86param :: X86Features -> String -> Int -> JanusCM [Param] -> r -> [JCFunc]
 
 class LinuxX86_64Evaluate r where
-  x86eval :: FunPtr () -> (([Arg] -> IO b) -> [Arg] -> IO b) -> [Arg] -> r -> LinuxX86_64CEval r
+  x86eval :: ForeignPtr () -> (([Arg] -> IO b) -> [Arg] -> IO b) -> [Arg] -> r -> LinuxX86_64CEval r
+
+{-# NOINLINE evalPureLinuxX86_64FFI #-}
+evalPureLinuxX86_64FFI :: ForeignPtr () -> (FunPtr () -> IO a) -> a
+evalPureLinuxX86_64FFI dlFPtr k = unsafePerformIO $
+  withForeignPtr dlFPtr $ \p ->
+    k (castPtrToFunPtr p)
 
 runX86Codegen :: X86Features -> String -> JanusCM () -> [JCFunc]
 runX86Codegen fs name action =
@@ -318,7 +324,7 @@ instance (LinuxX86_64ABIRet a) => LinuxX86_64Param (LinuxX86_64C a) where
     modify $ \s -> s & ix name . jcfParams .~ Params (reverse ps <> extra) False noLoc
 
 instance (LinuxX86_64ABIRet a) => LinuxX86_64Evaluate (LinuxX86_64C a) where
-  x86eval fp _ args _ = x86CallReturn (Proxy @a) fp args
+  x86eval dlFPtr _ args _ = evalPureLinuxX86_64FFI dlFPtr $ \fp -> x86CallReturn (Proxy @a) fp args
 
 instance (LinuxX86_64ABIRet a) => LinuxX86_64Param (LinuxX86_64CM (LinuxX86_64C a)) where
   x86param fs name _ mparams (LinuxX86_64CM ma) = runX86Codegen fs name $ do
@@ -328,7 +334,8 @@ instance (LinuxX86_64ABIRet a) => LinuxX86_64Param (LinuxX86_64CM (LinuxX86_64C 
     modify $ \s -> s & ix name . jcfParams .~ Params (reverse ps <> extra) False noLoc
 
 instance (LinuxX86_64ABIRet a) => LinuxX86_64Evaluate (LinuxX86_64CM (LinuxX86_64C a)) where
-  x86eval fp _ args _ = x86CallReturn (Proxy @a) fp args
+  x86eval dlFPtr _ args _ =
+    withForeignPtr dlFPtr $ \p -> x86CallReturn (Proxy @a) (castPtrToFunPtr p) args
 
 instance LinuxX86_64Param (LinuxX86_64CM ()) where
   x86param fs name _ mparams (LinuxX86_64CM ma) = runX86Codegen fs name $ do
@@ -337,7 +344,8 @@ instance LinuxX86_64Param (LinuxX86_64CM ()) where
     ma >> finishFunction_
 
 instance LinuxX86_64Evaluate (LinuxX86_64CM ()) where
-  x86eval fp _ args _ = callFFI fp retVoid (reverse args)
+  x86eval dlFPtr _ args _ =
+    withForeignPtr dlFPtr $ \p -> callFFI (castPtrToFunPtr p) retVoid (reverse args)
 
 instance (LinuxX86_64ABIParam a, LinuxX86_64Param r) => LinuxX86_64Param (LinuxX86_64C a -> r) where
   x86param fs name n mparams f =
@@ -353,29 +361,32 @@ instance (LinuxX86_64ABIParam a, LinuxX86_64Param r) => LinuxX86_64Param (LinuxX
      in x86param fs name (n + 1) mparams' (f (LinuxX86_64C $ JanusC $ pure $ RVal $ Var stateVarId noLoc))
 
 instance (LinuxX86_64ABIParam a, LinuxX86_64Evaluate r, X86DeferCall r) => LinuxX86_64Evaluate (LinuxX86_64C a -> r) where
-  x86eval fp _ args f val =
+  x86eval dlFPtr _ args f val =
     let dummy = LinuxX86_64C $ JanusC $ pure $ RVal $ Var (Id "this_is_a_bug_if_you_see_this" noLoc) noLoc
-     in x86DeferArg val fp args (f dummy)
+     in x86DeferArg val dlFPtr args (f dummy)
 
 class X86DeferCall r where
-  x86DeferArg :: (LinuxX86_64ABIParam a) => a -> FunPtr () -> [Arg] -> r -> LinuxX86_64CEval r
+  x86DeferArg :: (LinuxX86_64ABIParam a) => a -> ForeignPtr () -> [Arg] -> r -> LinuxX86_64CEval r
 
 instance (LinuxX86_64ABIRet b) => X86DeferCall (LinuxX86_64C b) where
-  x86DeferArg x fp args _ = x86WithArg x $ \a -> x86CallReturn (Proxy @b) fp (a : args)
+  x86DeferArg x dlFPtr args _ =
+    evalPureLinuxX86_64FFI dlFPtr $ \fp -> x86WithArg x $ \a -> x86CallReturn (Proxy @b) fp (a : args)
 
 instance (LinuxX86_64ABIRet b) => X86DeferCall (LinuxX86_64CM (LinuxX86_64C b)) where
-  x86DeferArg x fp args _ = x86WithArg x $ \a -> x86CallReturn (Proxy @b) fp (a : args)
+  x86DeferArg x dlFPtr args _ =
+    withForeignPtr dlFPtr $ \p -> x86WithArg x $ \a -> x86CallReturn (Proxy @b) (castPtrToFunPtr p) (a : args)
 
 instance X86DeferCall (LinuxX86_64CM ()) where
-  x86DeferArg x fp args _ = x86WithArg x $ \a -> callFFI fp retVoid (reverse (a : args))
+  x86DeferArg x dlFPtr args _ =
+    withForeignPtr dlFPtr $ \p -> x86WithArg x $ \a -> callFFI (castPtrToFunPtr p) retVoid (reverse (a : args))
 
 instance (LinuxX86_64ABIParam b, X86DeferCall r, X86DeferCont r, LinuxX86_64Evaluate r) => X86DeferCall (LinuxX86_64C b -> r) where
-  x86DeferArg x fp args f y =
+  x86DeferArg x dlFPtr args f y =
     let dummy = LinuxX86_64C $ JanusC $ pure $ RVal $ Var (Id "this_is_a_bug_if_you_see_this" noLoc) noLoc
-     in x86DeferCont (\k -> x86WithArg x $ \ax -> x86WithArg y $ \ay -> k (ay : ax : args)) fp (f dummy)
+     in x86DeferCont (\k -> x86WithArg x $ \ax -> x86WithArg y $ \ay -> k (ay : ax : args)) dlFPtr (f dummy)
 
 class X86DeferCont r where
-  x86DeferCont :: (([Arg] -> IO (LinuxX86_64BaseRet r)) -> IO (LinuxX86_64BaseRet r)) -> FunPtr () -> r -> LinuxX86_64CEval r
+  x86DeferCont :: (([Arg] -> IO (LinuxX86_64BaseRet r)) -> IO (LinuxX86_64BaseRet r)) -> ForeignPtr () -> r -> LinuxX86_64CEval r
 
 type family LinuxX86_64BaseRet r where
   LinuxX86_64BaseRet (LinuxX86_64C a) = a
@@ -384,18 +395,21 @@ type family LinuxX86_64BaseRet r where
   LinuxX86_64BaseRet (LinuxX86_64C _ -> r) = LinuxX86_64BaseRet r
 
 instance (LinuxX86_64ABIRet a) => X86DeferCont (LinuxX86_64C a) where
-  x86DeferCont withArgs fp _ = withArgs (x86CallReturn (Proxy @a) fp)
+  x86DeferCont withArgs dlFPtr _ =
+    evalPureLinuxX86_64FFI dlFPtr $ \fp -> withArgs (x86CallReturn (Proxy @a) fp)
 
 instance (LinuxX86_64ABIRet a) => X86DeferCont (LinuxX86_64CM (LinuxX86_64C a)) where
-  x86DeferCont withArgs fp _ = withArgs (x86CallReturn (Proxy @a) fp)
+  x86DeferCont withArgs dlFPtr _ =
+    withForeignPtr dlFPtr $ \p -> withArgs (x86CallReturn (Proxy @a) (castPtrToFunPtr p))
 
 instance X86DeferCont (LinuxX86_64CM ()) where
-  x86DeferCont withArgs fp _ = withArgs (callFFI fp retVoid . reverse)
+  x86DeferCont withArgs dlFPtr _ =
+    withForeignPtr dlFPtr $ \p -> withArgs (callFFI (castPtrToFunPtr p) retVoid . reverse)
 
 instance (LinuxX86_64ABIParam a, X86DeferCont r) => X86DeferCont (LinuxX86_64C a -> r) where
-  x86DeferCont withArgs fp f val =
+  x86DeferCont withArgs dlFPtr f val =
     let dummy = LinuxX86_64C $ JanusC $ pure $ RVal $ Var (Id "this_is_a_bug_if_you_see_this" noLoc) noLoc
-     in x86DeferCont (\k -> withArgs $ \as -> x86WithArg val $ \av -> k (av : as)) fp (f dummy)
+     in x86DeferCont (\k -> withArgs $ \as -> x86WithArg val $ \av -> k (av : as)) dlFPtr (f dummy)
 
 showLinuxX86_64CWith :: (LinuxX86_64Param r) => X86Features -> String -> r -> String
 showLinuxX86_64CWith fs name a =
@@ -415,13 +429,31 @@ printLinuxX86_64CWith fs = putStrLn . showLinuxX86_64CWith fs "janus_main"
 printLinuxX86_64C :: (LinuxX86_64Param r) => r -> IO ()
 printLinuxX86_64C a = showLinuxX86_64C "janus_main" a >>= putStrLn
 
+compileLinuxX86_64CWith ::
+  forall r.
+  (LinuxX86_64Param r, X86DeferCont r) =>
+  X86Features ->
+  CBuildConfig ->
+  r ->
+  IO (LinuxX86_64CEval r)
+compileLinuxX86_64CWith reqFeatures config a = fst <$> acquireLinuxX86_64CWith reqFeatures config a
+
+compileLinuxX86_64C ::
+  (LinuxX86_64Param r, X86DeferCont r) =>
+  CBuildConfig ->
+  r ->
+  IO (LinuxX86_64CEval r)
+compileLinuxX86_64C config a = do
+  fs <- observeHostX86Features
+  compileLinuxX86_64CWith fs config a
+
 acquireLinuxX86_64CWith ::
   forall r.
   (LinuxX86_64Param r, X86DeferCont r) =>
   X86Features ->
   CBuildConfig ->
   r ->
-  IO (LinuxX86_64CEval r, DL)
+  IO (LinuxX86_64CEval r, ForeignPtr ())
 acquireLinuxX86_64CWith reqFeatures config a = do
   observed <- observeHostX86Features
   ensureX86Admitted observed reqFeatures
@@ -431,23 +463,20 @@ acquireLinuxX86_64CWith reqFeatures config a = do
   (sleefCFlags, sleefLDFlags) <- if needsSleef then observeSleefFlags else pure ([], [])
   let cflags = x86CompilerFlags reqFeatures <> sleefCFlags
   files <- writeJanusCFiles JC dir funcs
-  dl <- acquireJanusCDLWithFlags dir cflags sleefLDFlags files
-  fp <- dlsym dl "janus_main"
-  if fp == nullFunPtr
-    then error "withLinuxX86_64C: null function pointer"
-    else pure (x86DeferCont ($ []) (castFunPtr fp) a, dl)
+  dlFPtr <- acquireJanusCFunPtrWithFlags dir cflags sleefLDFlags files "janus_main"
+  pure (x86DeferCont ($ []) dlFPtr a, dlFPtr)
 
 acquireLinuxX86_64C ::
   (LinuxX86_64Param r, X86DeferCont r) =>
   CBuildConfig ->
   r ->
-  IO (LinuxX86_64CEval r, DL)
+  IO (LinuxX86_64CEval r, ForeignPtr ())
 acquireLinuxX86_64C config a = do
   fs <- observeHostX86Features
   acquireLinuxX86_64CWith fs config a
 
-releaseLinuxX86_64C :: (a, DL) -> IO ()
-releaseLinuxX86_64C = releaseJanusCDL . snd
+releaseLinuxX86_64C :: (a, ForeignPtr ()) -> IO ()
+releaseLinuxX86_64C _ = pure ()
 
 withLinuxX86_64CWith ::
   (LinuxX86_64Param r, X86DeferCont r) =>
@@ -457,7 +486,7 @@ withLinuxX86_64CWith ::
   (LinuxX86_64CEval r -> IO a) ->
   IO a
 withLinuxX86_64CWith fs config a k =
-  bracket (acquireLinuxX86_64CWith fs config a) releaseLinuxX86_64C (k . fst)
+  compileLinuxX86_64CWith fs config a >>= k
 
 withLinuxX86_64C ::
   (LinuxX86_64Param r, X86DeferCont r) =>

@@ -188,8 +188,8 @@ floatx8Composite a b c =
      in vselect (f `vge` 0.0) (rounded + sq) (vfms a b c / pos)
 
 propInt8x16AllTiers ::
-  IO (SIMDVector LinuxX86_64C 16 Int8 -> SIMDVector LinuxX86_64C 16 Int8 -> IO (SIMDVector LinuxX86_64C 16 Int8)) ->
-  IO (SIMDVector LinuxX86_64C 16 Int8 -> SIMDVector LinuxX86_64C 16 Int8 -> IO (SIMDVector LinuxX86_64C 16 Int8)) ->
+  IO (SIMDVector LinuxX86_64C 16 Int8 -> SIMDVector LinuxX86_64C 16 Int8 -> SIMDVector LinuxX86_64C 16 Int8) ->
+  IO (SIMDVector LinuxX86_64C 16 Int8 -> SIMDVector LinuxX86_64C 16 Int8 -> SIMDVector LinuxX86_64C 16 Int8) ->
   Property
 propInt8x16AllTiers getSSE2Fn getHostFn = property $ do
   fnSSE2 <- liftIO getSSE2Fn
@@ -209,14 +209,14 @@ propInt8x16AllTiers getSSE2Fn getHostFn = property $ do
         pure (simdToList r)
       ffiOut === cpuOut
 
-  cSSE2Out <- liftIO $ simdToList <$> fnSSE2 (simdFromList xs) (simdFromList ys)
-  cHostOut <- liftIO $ simdToList <$> fnHost (simdFromList xs) (simdFromList ys)
+  let cSSE2Out = simdToList $ fnSSE2 (simdFromList xs) (simdFromList ys)
+      cHostOut = simdToList $ fnHost (simdFromList xs) (simdFromList ys)
   cSSE2Out === cpuOut
   cHostOut === cpuOut
 
 propFloatx8AllTiers ::
-  IO (SIMDVector LinuxX86_64C 8 Float -> SIMDVector LinuxX86_64C 8 Float -> SIMDVector LinuxX86_64C 8 Float -> IO (SIMDVector LinuxX86_64C 8 Float)) ->
-  IO (SIMDVector LinuxX86_64C 8 Float -> SIMDVector LinuxX86_64C 8 Float -> SIMDVector LinuxX86_64C 8 Float -> IO (SIMDVector LinuxX86_64C 8 Float)) ->
+  IO (SIMDVector LinuxX86_64C 8 Float -> SIMDVector LinuxX86_64C 8 Float -> SIMDVector LinuxX86_64C 8 Float -> SIMDVector LinuxX86_64C 8 Float) ->
+  IO (SIMDVector LinuxX86_64C 8 Float -> SIMDVector LinuxX86_64C 8 Float -> SIMDVector LinuxX86_64C 8 Float -> SIMDVector LinuxX86_64C 8 Float) ->
   Property
 propFloatx8AllTiers getSSE2Fn getHostFn = property $ do
   fnSSE2 <- liftIO getSSE2Fn
@@ -245,8 +245,8 @@ propFloatx8AllTiers getSSE2Fn getHostFn = property $ do
         pure (simdToList r)
       ffiOut === cpuOut
 
-  cSSE2Out <- liftIO $ simdToList <$> fnSSE2 (simdFromList as) (simdFromList bs) (simdFromList cs)
-  cHostOut <- liftIO $ simdToList <$> fnHost (simdFromList as) (simdFromList bs) (simdFromList cs)
+  let cSSE2Out = simdToList $ fnSSE2 (simdFromList as) (simdFromList bs) (simdFromList cs)
+      cHostOut = simdToList $ fnHost (simdFromList as) (simdFromList bs) (simdFromList cs)
   cSSE2Out === cpuOut
   cHostOut === cpuOut
 
@@ -300,7 +300,7 @@ unit_simd_categories_exhaustive = do
 
   simdToList rShiftFFI @?= simdToList rShiftCPU
   rShiftC <- withLinuxX86_64C cfg (shiftExpr @LinuxX86_64C) $ \f ->
-    simdToList <$> f (simdFromList vIn) (simdFromList cIn)
+    pure $ simdToList $ f (simdFromList vIn) (simdFromList cIn)
   rShiftC @?= simdToList rShiftCPU
 
   -- B. Permutations, Byte Shuffles, Split/Concat, & Horizontal Reductions
@@ -332,7 +332,7 @@ unit_simd_categories_exhaustive = do
 
   redFFI @?= redCPU
   redC <- withLinuxX86_64C cfg (shufRedExpr @LinuxX86_64C) $ \f ->
-    f (simdFromList xs4) (simdFromList ix4)
+    pure $ f (simdFromList xs4) (simdFromList ix4)
   redC @?= redCPU
 
   -- C. Mask Queries (mmovemask, mpopcount, mfirstTrue, mallOf, manyOf, mnoneOf)
@@ -352,7 +352,7 @@ unit_simd_categories_exhaustive = do
 
   mqFFI @?= mqCPU
   mqC <- withLinuxX86_64C cfg (maskQueryExpr @LinuxX86_64C) $ \f ->
-    f (simdFromList ma8) (simdFromList mb8)
+    pure $ f (simdFromList ma8) (simdFromList mb8)
   mqC @?= mqCPU
 
   -- D. Dot Products (dp4aS, dp4aU, dp4aVecS, dp2aLoS, dp2aHiS, vsad8) & NarrowSat
@@ -396,7 +396,7 @@ unit_simd_categories_exhaustive = do
 
   dotFFI @?= dotCPU
   dotC <- withLinuxX86_64C cfg (dotExpr @LinuxX86_64C) $ \f ->
-    f (simdFromList da4) (simdFromList db4) (simdFromList dv16s) (simdFromList dv16u) (simdFromList ds2)
+    pure $ f (simdFromList da4) (simdFromList db4) (simdFromList dv16s) (simdFromList dv16u) (simdFromList ds2)
   dotC @?= dotCPU
 
 --------------------------------------------------------------------------------
@@ -801,9 +801,9 @@ unit_sleef_linux_floating = do
       ffiHost = simdToList ffiHostVec
 
   cOutSSE2 <- withLinuxX86_64CWith x86Baseline cfg f8Expr $ \fn ->
-    fn (simdFromList xsF) (simdFromList ysF)
+    pure $ fn (simdFromList xsF) (simdFromList ysF)
   cOutHost <- withLinuxX86_64C cfg f8Expr $ \fn ->
-    fn (simdFromList xsF) (simdFromList ysF)
+    pure $ fn (simdFromList xsF) (simdFromList ysF)
 
   -- Exact tier-for-tier match between Identity FFI and LinuxX86_64C SLEEF calls
   simdToList cOutSSE2 @?= ffiSSE2
@@ -812,7 +812,7 @@ unit_sleef_linux_floating = do
   hostX86 <- observeHostX86Features
   when (admitsX86Features hostX86 x86AVX) $ do
     cOutAVX <- withLinuxX86_64CWith x86AVX cfg f8Expr $ \fn ->
-      fn (simdFromList xsF) (simdFromList ysF)
+      pure $ fn (simdFromList xsF) (simdFromList ysF)
     ffiAVX <-
       withHostX86Features x86AVX $ do
         let Identity v =
@@ -834,9 +834,9 @@ unit_sleef_linux_floating = do
       refD = zipWith sleefTranscendentalExpr xsD ysD
 
   cD4SSE2 <- withLinuxX86_64CWith x86Baseline cfg d4Expr $ \fn ->
-    fn (simdFromList xsD) (simdFromList ysD)
+    pure $ fn (simdFromList xsD) (simdFromList ysD)
   cD4Host <- withLinuxX86_64C cfg d4Expr $ \fn ->
-    fn (simdFromList xsD) (simdFromList ysD)
+    pure $ fn (simdFromList xsD) (simdFromList ysD)
   let Identity ffiD4Host =
         sleefTranscendentalExpr
           (Identity (simdFromList @(SIMDVector Identity 4 Double) xsD))

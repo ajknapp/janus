@@ -46,6 +46,7 @@ import Data.Traversable
 import Data.Typeable
 import Data.Word
 import Foreign.C
+import Foreign.ForeignPtr (ForeignPtr, withForeignPtr)
 import Foreign.LibFFI
 import Foreign.Ptr
 import GHC.Float
@@ -57,6 +58,7 @@ import Language.C.Quote as C
 import qualified Rock
 import System.FilePath
 import System.IO
+import System.IO.Unsafe (unsafePerformIO)
 import System.Posix
 import Text.PrettyPrint.Mainland (pretty)
 import Text.PrettyPrint.Mainland.Class
@@ -264,8 +266,7 @@ mkArgId m = Id ("arg_" <> show m) noLoc
 
 type family JanusCEval a where
   JanusCEval (JanusC a -> r) = a -> JanusCEval r
-  -- TODO figure out why the unsafePerformIO required for this allows the DL to be closed before use
-  JanusCEval (JanusC a) = IO a
+  JanusCEval (JanusC a) = a
   JanusCEval (JanusCM (JanusC a)) = IO a
   JanusCEval (JanusCM ()) = IO ()
 
@@ -279,50 +280,60 @@ class JanusCParam r where
   jcparam :: String -> Int -> JanusCM [Param] -> JanusCBackend -> r -> [JCFunc]
 
 class JanusCEvaluate r where
-  jceval :: FunPtr r -> [Arg] -> r -> JanusCEval r
+  jceval :: ForeignPtr () -> [Arg] -> r -> JanusCEval r
 
--- TODO figure out why the unsafePerformIO required for this allows the DL to be closed before use
+{-# NOINLINE evalPureJanusCFFI #-}
+evalPureJanusCFFI :: forall a. (FFIRet a) => ForeignPtr () -> [Arg] -> a
+evalPureJanusCFFI dlFPtr args = unsafePerformIO $
+  withForeignPtr dlFPtr $ \p ->
+    callFFI (castPtrToFunPtr p) (ret (Proxy @a)) (reverse args)
+
 instance (FFIRet a, JanusCTyped a) => JanusCParam (JanusC a) where
   jcparam = jcparamImpl (Proxy @JanusC)
 
 instance (FFIRet a, JanusCTyped a) => JanusCEvaluate (JanusC a) where
-  jceval fp args _ = callFFI fp (ret (Proxy @a)) (reverse args)
+  jceval dlFPtr args _ = evalPureJanusCFFI @a dlFPtr args
 
 instance (FFIRet a, JanusCTyped a) => JanusCParam (JanusCM (JanusC a)) where
   jcparam = jcparamImpl (Proxy @JanusC)
 
 instance (FFIRet a, JanusCTyped a) => JanusCEvaluate (JanusCM (JanusC a)) where
-  jceval fp args _ = callFFI fp (ret (Proxy @a)) (reverse args)
+  jceval dlFPtr args _ =
+    withForeignPtr dlFPtr $ \p ->
+      callFFI (castPtrToFunPtr p) (ret (Proxy @a)) (reverse args)
 
 instance JanusCParam (JanusCM ()) where
   jcparam = jcparamImpl (Proxy @JanusC)
 
 instance JanusCEvaluate (JanusCM ()) where
-  jceval fp args _ = callFFI fp (ret (Proxy @())) (reverse args)
+  jceval dlFPtr args _ =
+    withForeignPtr dlFPtr $ \p ->
+      callFFI (castPtrToFunPtr p) (ret (Proxy @())) (reverse args)
 
 instance (JanusCTyped a, JanusCParam r, JanusCParamImpl JanusC JanusCM r) => JanusCParam (JanusC a -> r) where
   jcparam = jcparamImpl (Proxy @JanusC)
 
 instance (JanusCTyped a, FFIArg a, JanusCEvaluate r) => JanusCEvaluate (JanusC a -> r) where
-  jceval fp args f a = jceval (castFunPtr fp) (arg a:args) (f $ JanusC $ pure $ RVal $ Var (Id "this_is_a_bug_if_you_see_this" noLoc) noLoc)
+  jceval dlFPtr args f a = jceval dlFPtr (arg a : args) (f $ JanusC $ pure $ RVal $ Var (Id "this_is_a_bug_if_you_see_this" noLoc) noLoc)
+
+compileJanusC :: forall r. (JanusCParam r, JanusCEvaluate r) => JanusCBackend -> CBuildConfig -> r -> IO (JanusCEval r)
+compileJanusC backend config a = fst <$> acquireJanusC backend config a
 
 -- this mostly exists for use with hedgehog withResource
-acquireJanusC :: forall r. (JanusCParam r, JanusCEvaluate r) => JanusCBackend -> CBuildConfig -> r -> IO (JanusCEval r, DL)
+acquireJanusC :: forall r. (JanusCParam r, JanusCEvaluate r) => JanusCBackend -> CBuildConfig -> r -> IO (JanusCEval r, ForeignPtr ())
 acquireJanusC backend config a = do
   let dir = config ^. cBuildConfigCacheDir
   files <- writeJanusCFiles backend dir (jcparam "janus_main" 0 (pure []) backend a)
-  dl <- acquireJanusCDL dir files
-  fp <- dlsym dl "janus_main"
-  if fp == nullFunPtr
-    then error "withJanusC: null function pointer"
-    else pure (jceval fp [] a :: JanusCEval r, dl)
+  dlFPtr <- acquireJanusCFunPtr dir files "janus_main"
+  pure (jceval dlFPtr [] a :: JanusCEval r, dlFPtr)
 
--- this mostly exists for use with hedgehog withResource
-releaseJanusC :: (a, DL) -> IO ()
-releaseJanusC = releaseJanusCDL . snd
+-- this mostly exists for use with hedgehog withResource; the DL is closed by
+-- the ForeignPtr finalizer once all closures/thunks referencing it become unreachable
+releaseJanusC :: (a, ForeignPtr ()) -> IO ()
+releaseJanusC _ = pure ()
 
 withJanusC :: forall a r. (JanusCParam r, JanusCEvaluate r, FFIRet (JanusCRetType r)) => CBuildConfig -> r -> (JanusCEval r -> IO a) -> IO a
-withJanusC config a k = bracket (acquireJanusC JC config a) releaseJanusC (k . fst)
+withJanusC config a k = compileJanusC JC config a >>= k
 
 showJanusC :: forall a. (JanusCParam a) => String -> JanusCBackend -> a -> String
 showJanusC name backend a =
