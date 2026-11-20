@@ -17,6 +17,10 @@ import Foreign.Storable
 #include <cuda.h>
 #include <nvJitLink.h>
 
+#define JANUS_CUDA_SYM_(x) #x
+#define JANUS_CUDA_SYM(x) JANUS_CUDA_SYM_(x)
+#let cuda_sym x = "\"%s\"", JANUS_CUDA_SYM(x)
+
 newtype CUresult = CUresult CInt
   deriving (Eq, Ord, Show)
 
@@ -399,7 +403,7 @@ cudaCheck m = m >>= \case
   CUDA_SUCCESS -> pure ()
   e -> throwIO (CUException e)
 
-foreign import ccall unsafe "cuInit" c_cuInit :: CUInt -> IO CUresult
+foreign import ccall unsafe #{cuda_sym cuInit} c_cuInit :: CUInt -> IO CUresult
 
 -- foreign import ccall unsafe "enable_constructors" c_enable_constructors :: IO ()
 
@@ -411,7 +415,7 @@ cuInit n = do
 newtype CUdevice = CUdevice CInt
   deriving (Eq, Ord, Show, Storable)
 
-foreign import ccall unsafe "cuDeviceGet" c_cuDeviceGet :: Ptr CUdevice -> CInt -> IO CUresult
+foreign import ccall unsafe #{cuda_sym cuDeviceGet} c_cuDeviceGet :: Ptr CUdevice -> CInt -> IO CUresult
 
 -- cuInitialized :: IORef Bool
 -- cuInitialized = unsafePerformIO $ newIORef False
@@ -436,7 +440,7 @@ pattern CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR = CUdevice_attribute #{cons
 pattern CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR :: CUdevice_attribute
 pattern CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR = CUdevice_attribute #{const CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR}
 
-foreign import ccall unsafe "cuDeviceGetAttribute" c_cuDeviceGetAttribute :: Ptr CInt -> CUdevice_attribute -> CUdevice -> IO CUresult
+foreign import ccall unsafe #{cuda_sym cuDeviceGetAttribute} c_cuDeviceGetAttribute :: Ptr CInt -> CUdevice_attribute -> CUdevice -> IO CUresult
 
 cuDeviceGetAttribute :: Ptr CInt -> CUdevice_attribute -> CUdevice -> IO ()
 cuDeviceGetAttribute i a d = cudaCheck (c_cuDeviceGetAttribute i a d)
@@ -446,37 +450,37 @@ data CUctx_st
 newtype CUctx = CUCtx (Ptr CUctx_st)
   deriving (Eq, Ord, Show, Storable)
 
-foreign import ccall unsafe "cuCtxCreate" c_cuCtxCreate :: Ptr CUctx -> CUInt -> CUdevice -> IO CUresult
+foreign import ccall #{cuda_sym cuCtxCreate} c_cuCtxCreate :: Ptr CUctx -> CUInt -> CUdevice -> IO CUresult
 
 cuCtxCreate :: Ptr CUctx -> CUInt -> CUdevice -> IO ()
 cuCtxCreate ctx flags dev = cudaCheck (c_cuCtxCreate ctx flags dev)
 
-foreign import ccall unsafe "cuCtxSetCurrent" c_cuCtxSetCurrent :: CUctx -> IO CUresult
+foreign import ccall unsafe #{cuda_sym cuCtxSetCurrent} c_cuCtxSetCurrent :: CUctx -> IO CUresult
 
 cuCtxSetCurrent :: CUctx -> IO ()
 cuCtxSetCurrent ctx = cudaCheck (c_cuCtxSetCurrent ctx)
 
-foreign import ccall unsafe "cuCtxDestroy" c_cuCtxDestroy :: CUctx -> IO CUresult
+foreign import ccall #{cuda_sym cuCtxDestroy} c_cuCtxDestroy :: CUctx -> IO CUresult
 
 cuCtxDestroy :: CUctx -> IO ()
 cuCtxDestroy ctx = cudaCheck (c_cuCtxDestroy ctx)
 
-foreign import ccall unsafe "cuDevicePrimaryCtxRetain" c_cuDevicePrimaryCtxRetain :: Ptr CUctx -> CUdevice -> IO CUresult
+foreign import ccall #{cuda_sym cuDevicePrimaryCtxRetain} c_cuDevicePrimaryCtxRetain :: Ptr CUctx -> CUdevice -> IO CUresult
 
 cuDevicePrimaryCtxRetain :: Ptr CUctx -> CUdevice -> IO ()
 cuDevicePrimaryCtxRetain ctx dev = cudaCheck $ c_cuDevicePrimaryCtxRetain ctx dev
 
-foreign import ccall unsafe "cuDevicePrimaryCtxRelease" c_cuDevicePrimaryCtxRelease :: CUdevice -> IO CUresult
+foreign import ccall #{cuda_sym cuDevicePrimaryCtxRelease} c_cuDevicePrimaryCtxRelease :: CUdevice -> IO CUresult
 
 cuDevicePrimaryCtxRelease :: CUdevice -> IO ()
 cuDevicePrimaryCtxRelease dev = cudaCheck $ c_cuDevicePrimaryCtxRelease dev
 
-foreign import ccall unsafe "cuCtxPushCurrent" c_cuCtxPushCurrent :: CUctx -> IO CUresult
+foreign import ccall unsafe #{cuda_sym cuCtxPushCurrent} c_cuCtxPushCurrent :: CUctx -> IO CUresult
 
 cuCtxPushCurrent :: CUctx -> IO ()
 cuCtxPushCurrent ctx = cudaCheck $ c_cuCtxPushCurrent ctx
 
-foreign import ccall unsafe "cuDevicePrimaryCtxGetState" c_cuDevicePrimaryCtxGetState :: CUdevice -> Ptr CUInt -> Ptr CInt -> IO CUresult
+foreign import ccall unsafe #{cuda_sym cuDevicePrimaryCtxGetState} c_cuDevicePrimaryCtxGetState :: CUdevice -> Ptr CUInt -> Ptr CInt -> IO CUresult
 
 cuDevicePrimaryCtxGetState :: CUdevice -> IO (CUInt, CInt)
 cuDevicePrimaryCtxGetState dev = bracket malloc free $ \pflags -> bracket malloc free $ \pactive -> cudaCheck (c_cuDevicePrimaryCtxGetState dev pflags pactive) >> (,) <$> peek pflags <*> peek pactive
@@ -484,25 +488,25 @@ cuDevicePrimaryCtxGetState dev = bracket malloc free $ \pflags -> bracket malloc
 withCuCtx :: Ptr CUctx -> CUInt -> CUdevice -> (CUctx -> IO a) -> IO a
 withCuCtx pctx i dev = bracket (cuCtxCreate pctx i dev >> peek pctx) cuCtxDestroy
 
-newtype CUdeviceptr = CUdeviceptr (Ptr ())
+newtype CUdeviceptr = CUdeviceptr #{type CUdeviceptr}
   deriving (Eq, Ord, Show, Storable)
 
-foreign import ccall unsafe "cuMemAlloc" c_cuMemAlloc :: Ptr CUdeviceptr -> CSize -> IO CUresult
+foreign import ccall #{cuda_sym cuMemAlloc} c_cuMemAlloc :: Ptr CUdeviceptr -> CSize -> IO CUresult
 
 cuMemAlloc :: Ptr CUdeviceptr -> CSize -> IO ()
 cuMemAlloc p n = cudaCheck (c_cuMemAlloc p n)
 
-foreign import ccall unsafe "cuMemFree" c_cuMemFree :: CUdeviceptr -> IO CUresult
+foreign import ccall #{cuda_sym cuMemFree} c_cuMemFree :: CUdeviceptr -> IO CUresult
 
 cuMemFree :: CUdeviceptr -> IO ()
 cuMemFree p = cudaCheck (c_cuMemFree p)
 
-foreign import ccall unsafe "cuMemcpyHtoD" c_cuMemcpyHtoD :: CUdeviceptr -> Ptr () -> CSize -> IO CUresult
+foreign import ccall #{cuda_sym cuMemcpyHtoD} c_cuMemcpyHtoD :: CUdeviceptr -> Ptr () -> CSize -> IO CUresult
 
 cuMemcpyHtoD :: CUdeviceptr -> Ptr () -> CSize -> IO ()
 cuMemcpyHtoD dev ptr n = cudaCheck (c_cuMemcpyHtoD dev ptr n)
 
-foreign import ccall unsafe "cuMemcpyDtoH" c_cuMemcpyDtoH :: Ptr () -> CUdeviceptr -> CSize -> IO CUresult
+foreign import ccall #{cuda_sym cuMemcpyDtoH} c_cuMemcpyDtoH :: Ptr () -> CUdeviceptr -> CSize -> IO CUresult
 
 cuMemcpyDtoH :: Ptr () -> CUdeviceptr -> CSize -> IO ()
 cuMemcpyDtoH ptr dev n = cudaCheck (c_cuMemcpyDtoH ptr dev n)
@@ -630,12 +634,12 @@ data CUmod_st
 newtype CUmodule = CUmodule (Ptr CUmod_st)
   deriving (Eq, Ord, Show, Storable)
 
-foreign import ccall unsafe "cuModuleLoadData" c_cuModuleLoadData :: Ptr CUmodule -> Ptr () -> IO CUresult
+foreign import ccall #{cuda_sym cuModuleLoadData} c_cuModuleLoadData :: Ptr CUmodule -> Ptr () -> IO CUresult
 
 cuModuleLoadData :: Ptr CUmodule -> Ptr () -> IO ()
 cuModuleLoadData m p = cudaCheck (c_cuModuleLoadData m p)
 
-foreign import ccall unsafe "cuModuleUnload" c_cuModuleUnload :: CUmodule -> IO CUresult
+foreign import ccall #{cuda_sym cuModuleUnload} c_cuModuleUnload :: CUmodule -> IO CUresult
 
 cuModuleUnload :: CUmodule -> IO ()
 cuModuleUnload m = cudaCheck (c_cuModuleUnload m)
@@ -645,7 +649,7 @@ data CUfunc_st
 newtype CUfunction = CUfunction (Ptr CUfunc_st)
   deriving (Eq, Ord, Show, Storable)
 
-foreign import ccall unsafe "cuModuleGetFunction" c_cuModuleGetFunction :: Ptr CUfunction -> CUmodule -> Ptr CChar -> IO CUresult
+foreign import ccall unsafe #{cuda_sym cuModuleGetFunction} c_cuModuleGetFunction :: Ptr CUfunction -> CUmodule -> Ptr CChar -> IO CUresult
 
 cuModuleGetFunction :: Ptr CUfunction -> CUmodule -> Ptr CChar -> IO ()
 cuModuleGetFunction p m s = cudaCheck (c_cuModuleGetFunction p m s)
@@ -655,7 +659,7 @@ data CUstream_st
 newtype CUstream = CUstream (Ptr CUstream_st)
   deriving (Eq, Ord, Show, Storable)
 
-foreign import ccall "cuLaunchKernel" c_cuLaunchKernel
+foreign import ccall #{cuda_sym cuLaunchKernel} c_cuLaunchKernel
   :: CUfunction
   -> CUInt -> CUInt -> CUInt
   -> CUInt -> CUInt -> CUInt
@@ -675,7 +679,7 @@ cuLaunchKernel
 cuLaunchKernel fn gridx gridy gridz blockx blocky blockz shmemBytes stream params extra = cudaCheck $
   c_cuLaunchKernel fn gridx gridy gridz blockx blocky blockz shmemBytes stream params extra
 
-foreign import ccall "cuCtxSynchronize" c_cuCtxSynchronize :: IO CUresult
+foreign import ccall #{cuda_sym cuCtxSynchronize} c_cuCtxSynchronize :: IO CUresult
 
 cuCtxSynchronize :: IO ()
 cuCtxSynchronize = cudaCheck c_cuCtxSynchronize
@@ -718,7 +722,7 @@ instance Storable CUlaunchConfig where
     #{poke CUlaunchConfig, sharedMemBytes} p _cuLaunchConfigSharedMemBytes
     #{poke CUlaunchConfig, hStream} p _cuLaunchConfigStream
 
-foreign import ccall unsafe "cuOccupancyMaxPotentialBlockSize" c_cuOccupancyMaxPotentialBlockSize
+foreign import ccall unsafe #{cuda_sym cuOccupancyMaxPotentialBlockSize} c_cuOccupancyMaxPotentialBlockSize
   :: Ptr CInt -> Ptr CInt -> CUfunction -> FunPtr (CInt -> CSize) -> CSize -> CInt -> IO CUresult
 
 cuOccupancyMaxPotentialBlockSize :: CUfunction -> FunPtr (CInt -> CSize) -> CSize -> CInt -> IO (CInt, CInt)

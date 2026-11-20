@@ -37,7 +37,27 @@
     "root": {
       "inputs": {
         "flake-utils": "flake-utils",
-        "nixpkgs": "nixpkgs"
+        "nixpkgs": "nixpkgs",
+        "sleef-src": "sleef-src"
+      }
+    },
+    "sleef-src": {
+      "flake": false,
+      "locked": {
+        "lastModified": 1743005958,
+        "narHash": "sha256-0y/pRcxJmd+w9lbsVcjumjV5lQmpnmgfsMJPMCGpRm8=",
+        "ref": "refs/tags/3.9.0",
+        "rev": "906ca7512ee483296780a81a21b9ca715d40dfe1",
+        "revCount": 549,
+        "submodules": true,
+        "type": "git",
+        "url": "https://github.com/shibatch/sleef"
+      },
+      "original": {
+        "ref": "refs/tags/3.9.0",
+        "submodules": true,
+        "type": "git",
+        "url": "https://github.com/shibatch/sleef"
       }
     },
     "systems": {

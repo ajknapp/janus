@@ -50,6 +50,7 @@ import Foreign.LibFFI
 import Foreign.Ptr
 import GHC.Float
 import Janus.Backend.C.Build
+import Janus.Backend.C.Target
 import Janus.FFI.Arg
 import Janus.FFI.Ret
 import Language.C.Quote as C
@@ -95,9 +96,21 @@ data JCFuncInfo
   { _jcfiName :: String
   , _jcfiBackend :: JanusCBackend
   , _jcfiIsLocal :: Bool
+  , _jcfiX86Features :: X86Features
+  , _jcfiCUDAFeatures :: CUDAFeatures
   } deriving (Eq, Ord, Show)
 
 $(makeLenses ''JCFuncInfo)
+
+mkJCFuncInfo :: String -> JanusCBackend -> Bool -> JCFuncInfo
+mkJCFuncInfo name backend isLocal =
+  JCFuncInfo
+    { _jcfiName = name
+    , _jcfiBackend = backend
+    , _jcfiIsLocal = isLocal
+    , _jcfiX86Features = lowerBound
+    , _jcfiCUDAFeatures = lowerBound
+    }
 
 newtype JanusC a = JanusC {getJanusC :: JanusCM (RVal a)}
 
@@ -107,9 +120,16 @@ newtype JanusCM a = JanusCM {getJanusCM :: ReaderT JCFuncInfo (State JanusCMStat
 askFuncName :: JanusCM String
 askFuncName = asks _jcfiName
 
+askX86Features :: JanusCM X86Features
+askX86Features = asks _jcfiX86Features
+
+askCUDAFeatures :: JanusCM CUDAFeatures
+askCUDAFeatures = asks _jcfiCUDAFeatures
+
 jcTypeQuals :: JCFuncInfo -> [TypeQual]
-jcTypeQuals (JCFuncInfo _ JC _) = []
-jcTypeQuals (JCFuncInfo _ JCUDA isLocal) = if isLocal then [TCUDAdevice noLoc] else [TCUDAglobal noLoc]
+jcTypeQuals JCFuncInfo {_jcfiBackend = JC} = []
+jcTypeQuals JCFuncInfo {_jcfiBackend = JCUDA, _jcfiIsLocal = isLocal} =
+  if isLocal then [TCUDAdevice noLoc] else [TCUDAglobal noLoc]
 
 askTypeQuals :: JanusCM [TypeQual]
 askTypeQuals = asks jcTypeQuals
@@ -166,10 +186,13 @@ instance JanusCBackendTypes JanusC JanusCM where
   fromJanusCM = id
 
 class JanusCParamImpl (e :: K.Type -> K.Type) (m :: K.Type -> K.Type) r where
-  jcparamImpl :: Proxy e -> String -> Int -> m [Param] -> JanusCBackend -> r -> [JCFunc]
+  jcparamImplWithInfo :: Proxy e -> JCFuncInfo -> Int -> m [Param] -> r -> [JCFunc]
+
+jcparamImpl :: (JanusCParamImpl e m r) => Proxy e -> String -> Int -> m [Param] -> JanusCBackend -> r -> [JCFunc]
+jcparamImpl p name n params backend = jcparamImplWithInfo p (mkJCFuncInfo name backend False) n params
 
 instance (JanusCBackendTypes e m, JanusCTyped a) => JanusCParamImpl e m (e a) where
-  jcparamImpl _ name _ params backend a = Map.elems $ flip execState defaultJanusState $ flip runReaderT (JCFuncInfo name backend False) $ getJanusCM $ do
+  jcparamImplWithInfo _ info _ params a = Map.elems $ flip execState (Map.singleton (_jcfiName info) (defaultJCFunc (_jcfiName info) (Params [] False noLoc))) $ flip runReaderT info $ getJanusCM $ do
     fname <- askFuncName
     params' <- toJanusCM params
     modify $ \s -> s & ix fname . jcfParams .~ Params (reverse params') False noLoc
@@ -177,7 +200,7 @@ instance (JanusCBackendTypes e m, JanusCTyped a) => JanusCParamImpl e m (e a) wh
     getJanusCType (Proxy @a)
 
 instance (JanusCBackendTypes e m, JanusCTyped a) => JanusCParamImpl e m (m (e a)) where
-  jcparamImpl _ name _ params backend a = Map.elems $ flip execState defaultJanusState $ flip runReaderT (JCFuncInfo name backend False) $ getJanusCM $ do
+  jcparamImplWithInfo _ info _ params a = Map.elems $ flip execState (Map.singleton (_jcfiName info) (defaultJCFunc (_jcfiName info) (Params [] False noLoc))) $ flip runReaderT info $ getJanusCM $ do
     fname <- askFuncName
     params' <- toJanusCM params
     modify $ \s -> s & ix fname . jcfParams .~ Params (reverse params') False noLoc
@@ -185,14 +208,14 @@ instance (JanusCBackendTypes e m, JanusCTyped a) => JanusCParamImpl e m (m (e a)
     getJanusCType (Proxy @a)
 
 instance (JanusCBackendTypes e m) => JanusCParamImpl e m (m ()) where
-  jcparamImpl _ name _ params backend a = Map.elems $ flip execState defaultJanusState $ flip runReaderT (JCFuncInfo name backend False) $ getJanusCM $ do
+  jcparamImplWithInfo _ info _ params a = Map.elems $ flip execState (Map.singleton (_jcfiName info) (defaultJCFunc (_jcfiName info) (Params [] False noLoc))) $ flip runReaderT info $ getJanusCM $ do
     fname <- askFuncName
     params' <- toJanusCM params
     modify $ \s -> s & ix fname . jcfParams .~ Params (reverse params') False noLoc
     toJanusCM a >> finishFunction_
 
 instance (JanusCBackendTypes e m, JanusCTyped a, JanusCParamImpl e m r) => JanusCParamImpl e m (e a -> r) where
-  jcparamImpl p name n args backend f = jcparamImpl p name (n + 1) args' backend (f $ fromJanusC $ JanusC $ pure $ RVal $ Var (mkArgId n) noLoc)
+  jcparamImplWithInfo p info n args f = jcparamImplWithInfo p info (n + 1) args' (f $ fromJanusC $ JanusC $ pure $ RVal $ Var (mkArgId n) noLoc)
     where
       args' = fromJanusCM @e $ do
         JCType spec dec <- getJanusCType (Proxy @a)
@@ -327,8 +350,13 @@ writeJanusCFiles backend dir funcs = do
         path = dir </> filename
     exist <- fileExist path
     unless exist $ do
-      withFile path WriteMode $ \hndl -> do
-        hPutStrLn hndl body
+      bracketOnError
+        (openTempFile dir ("janus_src" <> backendExt backend))
+        (\(tmpPath, hndl) -> hClose hndl >> removeLink tmpPath)
+        $ \(tmpPath, hndl) -> do
+          hPutStrLn hndl body
+          hClose hndl
+          rename tmpPath path
     pure filename
 
 getFunction :: JanusCM JCFunc
@@ -362,15 +390,17 @@ getJanusCType p = do
           modify $ \s -> s & at fname ?~ f''
           pure t
         else do
+          -- have to get this again because jctype can insert headers
+          fUpdated <- getFunction
           -- TODO generate name by hashing typerep
-          let c = f ^. jcfVarCounter
+          let c = fUpdated ^. jcfVarCounter
               tyname = "type_" <> show c
               tyId = Id tyname noLoc
               spec' = DeclSpec [] [] (Tnamed tyId [] noLoc) noLoc
               dec' = DeclRoot noLoc
               t' = JCType spec' dec'
               f' =
-                f
+                fUpdated
                   & jcfTypeCache %~ Map.insert tyrep t'
                   & jcfVarCounter +~ 1
                   & jcfTypedefs %~ Set.insert (JCTypedef spec tyname)
@@ -381,6 +411,23 @@ addHeader :: String -> JanusCM ()
 addHeader header = do
   fname <- askFuncName
   modify $ \s -> s & ix fname . jcfHeaders %~ Set.insert header
+
+-- | Bind an expression to a fresh SSA-style local variable in the current C
+-- function block and return its variable reference expression.
+emitLocalVal :: JCType -> Exp -> JanusCM Exp
+emitLocalVal (JCType spec dec) rhs = do
+  fn <- getFunction
+  fname <- askFuncName
+  let c = fn ^. jcfVarCounter
+      vid = Id ("x_" <> show c) noLoc
+      ini = Init vid dec Nothing (Just $ ExpInitializer rhs noLoc) [] noLoc
+      decl = BlockDecl $ InitGroup spec [] [ini] noLoc
+      fn' =
+        fn
+          & jcfBlock %~ flip appendBlock [decl]
+          & jcfVarCounter +~ 1
+  modify $ \st -> st & ix fname .~ fn'
+  pure (Var vid noLoc)
 
 instance JanusCTyped Bool where
   jctype _ = do

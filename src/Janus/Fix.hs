@@ -30,8 +30,8 @@ localFun x = local (const x)
 
 instance (JanusCTyped a) => JanusCFix (JanusCM (JanusC a)) where
   jcfun name args params _ body = do
-    backend <- asks _jcfiBackend
-    let funInfo = JCFuncInfo name backend True
+    fi <- ask
+    let funInfo = fi & jcfiName .~ name & jcfiIsLocal .~ True
     params' <- localFun funInfo params
     let params'' = Params (reverse params') False noLoc
     localFun funInfo $ do
@@ -49,8 +49,8 @@ instance (JanusCTyped a) => JanusCFix (JanusCM (JanusC a)) where
 
 instance (JanusCTyped a) => JanusCFix (JanusC a) where
   jcfun name args params _ body = JanusC $ do
-    backend <- asks _jcfiBackend
-    let funInfo = JCFuncInfo name backend True
+    fi <- ask
+    let funInfo = fi & jcfiName .~ name & jcfiIsLocal .~ True
     params' <- localFun funInfo params
     let params'' = Params (reverse params') False noLoc
     localFun funInfo $ do
@@ -73,8 +73,8 @@ instance (JanusCTyped a, JanusCFix r) => JanusCFix (JanusC a -> r) where
         ys <- args
         pure (y : ys)
       parms' = do
-        backend <- asks _jcfiBackend
-        let funInfo = JCFuncInfo name backend True
+        fi <- ask
+        let funInfo = fi & jcfiName .~ name & jcfiIsLocal .~ True
         localFun funInfo $ do
           ys <- parms
           JCType spec dec <- getJanusCType (Proxy @a)

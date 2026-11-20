@@ -6,7 +6,6 @@
 {-# LANGUAGE TypeOperators #-}
 {-# LANGUAGE ConstraintKinds #-}
 {-# LANGUAGE UndecidableInstances #-}
-{-# OPTIONS_GHC -lcuda -lnvJitLink #-}
 
 module Janus.Expression.MurmurHash where
 

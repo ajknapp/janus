@@ -1,7 +1,10 @@
+{-# LANGUAGE AllowAmbiguousTypes #-}
 {-# LANGUAGE BlockArguments #-}
+{-# LANGUAGE DataKinds #-}
 {-# LANGUAGE DeriveFunctor #-}
 {-# LANGUAGE DeriveGeneric #-}
 {-# LANGUAGE DeriveTraversable #-}
+{-# LANGUAGE DerivingStrategies #-}
 {-# LANGUAGE DerivingVia #-}
 {-# LANGUAGE FlexibleContexts #-}
 {-# LANGUAGE FlexibleInstances #-}
@@ -32,8 +35,8 @@ import Control.Monad
 import qualified Control.Monad.Catch as Catch
 import Control.Monad.Fix
 import Control.Monad.Reader
-import Control.Monad.State (StateT (..))
-import Data.Bits (Bits)
+import Control.Monad.State (StateT (..), modify)
+import Data.Bits (Bits (..))
 import Data.Coerce
 import Data.Complex
 import Data.IORef
@@ -41,16 +44,23 @@ import Data.Int
 import qualified Data.Kind as K
 import Data.Loc
 import Data.Proxy
+import Data.Semilattice.Join (Join (..))
+import Data.Semilattice.Lower (Lower (..))
+import Data.Semilattice.Meet (Meet (..))
+import Data.Semilattice.Upper (Upper (..))
+import Data.Typeable (Typeable)
 import qualified Data.Vector as V
-import Data.Word (Word64)
+import Data.Word (Word32, Word64, Word8)
 import Foreign.C
 import Foreign.Marshal.Alloc
 import Foreign.Ptr
 import Foreign.Storable
 import GHC.Generics
+import GHC.TypeLits (natVal)
 import Janus.Backend.C
 import Janus.Backend.C.Build
 import Janus.Backend.C.CUDA.Foreign
+import Janus.Backend.C.Target
 import qualified Janus.Command.Array as A
 import Janus.Command.Case
 import Janus.Command.Cond
@@ -72,8 +82,11 @@ import Janus.Expression.Let
 import Janus.Expression.Math
 import Janus.Expression.MurmurHash
 import Janus.Expression.Ord
+import Janus.Expression.SIMD
+import Janus.Expression.SIMD.CPU
+import Janus.Expression.SIMD.Types (rawMaskFromBools, rawMaskToBools, rawSIMDFromList, rawSIMDToList)
 import Janus.Typed
-import Language.C.Quote
+import Language.C.Quote as C
 import qualified System.IO as SIO
 import Test.DejaFu.Conc (ConcIO, Condition, MemType, Trace, runConcurrent)
 import Test.DejaFu.Schedule (Scheduler, roundRobinSched)
@@ -82,9 +95,6 @@ import Test.DejaFu.Settings (defaultMemType)
 cudaArgMaxSize :: Int
 cudaArgMaxSize = 4096
 
--- TODO figure out why the first four bytes of the device pointer aren't written sometimes
--- this happened but I haven't been able to reproduce it for months...
--- hopefully this was because it was fixed upstream in CUDA
 withCuDeviceArray :: Int -> (CUdeviceptr -> IO a) -> IO a
 withCuDeviceArray nbytes k = alloca $ \dp ->
   bracket (cuMemAlloc dp (fromIntegral nbytes) >> peek dp) cuMemFree k
@@ -266,32 +276,46 @@ instance JanusCBackendTypes JanusCUDA JanusCUDAM where
   fromJanusCM = JanusCUDAM . lift
 
 class JanusCUDAParam r where
-  jcudaparam :: String -> Int -> JanusCUDAM [Param] -> JanusCBackend -> r -> [JCFunc]
+  jcudaparamWithFeatures :: CUDAFeatures -> String -> Int -> JanusCUDAM [Param] -> r -> [JCFunc]
+
+jcudaparam :: (JanusCUDAParam r) => String -> Int -> JanusCUDAM [Param] -> JanusCBackend -> r -> [JCFunc]
+jcudaparam name n params _ = jcudaparamWithFeatures cudaSM80 name n params
 
 instance (JanusCTyped a) => JanusCUDAParam (JanusCUDA a) where
-  jcudaparam = jcparamImpl (Proxy @JanusCUDA)
+  jcudaparamWithFeatures fs name n params =
+    jcparamImplWithInfo (Proxy @JanusCUDA) ((mkJCFuncInfo name JCUDA False) {_jcfiCUDAFeatures = fs}) n params
 
 instance (JanusCTyped a) => JanusCUDAParam (JanusCUDAM (JanusCUDA a)) where
-  jcudaparam = jcparamImpl (Proxy @JanusCUDA)
+  jcudaparamWithFeatures fs name n params =
+    jcparamImplWithInfo (Proxy @JanusCUDA) ((mkJCFuncInfo name JCUDA False) {_jcfiCUDAFeatures = fs}) n params
 
 instance JanusCUDAParam (JanusCUDAM ()) where
-  jcudaparam = jcparamImpl (Proxy @JanusCUDA)
+  jcudaparamWithFeatures fs name n params =
+    jcparamImplWithInfo (Proxy @JanusCUDA) ((mkJCFuncInfo name JCUDA False) {_jcfiCUDAFeatures = fs}) n params
 
 instance (JanusCTyped a, JanusCUDAParam r, JanusCParamImpl JanusCUDA JanusCUDAM r) => JanusCUDAParam (JanusCUDA a -> r) where
-  jcudaparam = jcparamImpl (Proxy @JanusCUDA)
+  jcudaparamWithFeatures fs name n params =
+    jcparamImplWithInfo (Proxy @JanusCUDA) ((mkJCFuncInfo name JCUDA False) {_jcfiCUDAFeatures = fs}) n params
 
 type family JanusCUDAEval r where
   JanusCUDAEval (JanusCUDAM ()) = IO ()
   JanusCUDAEval (JanusCUDA a -> r) = JanusCUDAEval' a -> JanusCUDAEval r
 
-showJanusCUDA :: forall a. (JanusCUDAParam a) => String -> a -> String
-showJanusCUDA name a =
-  let jcs = jcudaparam name 0 (pure []) JCUDA a
+showJanusCUDAWith :: forall a. (JanusCUDAParam a) => CUDAFeatures -> String -> a -> String
+showJanusCUDAWith fs name a =
+  let jcs = jcudaparamWithFeatures fs name 0 (pure []) a
+      banner = "/* janus-cuda-target: sm_" <> show (cudaSMMajor fs) <> show (cudaSMMinor fs) <> " */\n"
       strChar 0 = '\n'
       strChar 81 = '\n'
       strChar _ = '-'
       str = fmap strChar [0 .. 81 :: Int]
-   in foldMap ((<> str) . renderJCFunc) jcs
+   in banner <> foldMap ((<> str) . renderJCFunc) jcs
+
+showJanusCUDA :: forall a. (JanusCUDAParam a) => String -> a -> String
+showJanusCUDA = showJanusCUDAWith cudaSM80
+
+printJanusCUDAWith :: (JanusCUDAParam r) => CUDAFeatures -> r -> IO ()
+printJanusCUDAWith fs = putStrLn . showJanusCUDAWith fs "janus_main"
 
 printJanusCUDA :: (JanusCUDAParam r) => r -> IO ()
 printJanusCUDA = putStrLn . showJanusCUDA "janus_main"
@@ -325,7 +349,7 @@ instance (Storable (JanusCUDAEval' a), JanusCUDAEvaluate r) => JanusCUDAEvaluate
     jcudaeval
       fn
       argBuf
-      (nbuf + sizeOf proxy)
+      (alignedOff + sizeOf proxy)
       argPtrs
       (nptrs + 1)
       pack'
@@ -333,14 +357,49 @@ instance (Storable (JanusCUDAEval' a), JanusCUDAEvaluate r) => JanusCUDAEvaluate
       (k $ JanusCUDA $ JanusC $ pure $ RVal $ Var (Id "this_is_a_bug_if_you_see_this" noLoc) noLoc)
     where
       proxy = undefined :: JanusCUDAEval' a
+      al = max 1 (alignment proxy)
+      alignedOff = (nbuf + al - 1) .&. complement (al - 1)
       pack' = do
-        if nbuf >= cudaArgMaxSize
+        if alignedOff + sizeOf proxy > cudaArgMaxSize
           then error "jcudaeval: too much space used"
           else do
-            let pa = castPtr (argBuf `plusPtr` nbuf)
+            let pa = castPtr (argBuf `plusPtr` alignedOff)
             poke @(JanusCUDAEval' a) pa a
             pokeElemOff argPtrs nptrs (castPtr pa)
             pack
+
+withJanusCUDAFnWith ::
+  (JanusCUDAParam r, JanusCUDAEvaluate r) =>
+  CUDAFeatures ->
+  CUdevice ->
+  CUctx ->
+  CBuildConfig ->
+  r ->
+  (CUfunction -> (CUlaunchConfig -> JanusCUDAEval r) -> IO a) ->
+  IO a
+withJanusCUDAFnWith reqFeatures dev ctx config f k = do
+  observed <- observeCUDAFeatures dev
+  ensureCUDAAdmitted observed reqFeatures
+  let dir = config ^. cBuildConfigCacheDir
+  cufiles <- writeJanusCFiles JCUDA dir (jcudaparamWithFeatures reqFeatures "janus_main" 0 (pure []) f)
+  withJanusCUmoduleWithFeatures reqFeatures dev ctx dir cufiles $ \pmod ->
+    bracket (mallocBytes cudaArgMaxSize) free $ \argbuf ->
+      bracket (mallocBytes (cudaArgMaxSize * sizeOf (undefined :: Ptr ()))) free $ \argPtrs ->
+        alloca $ \pfn -> withCString "janus_main" $ \s -> do
+          m <- peek pmod
+          fn <- cuModuleGetFunction pfn m s >> peek pfn
+          k fn (\kernelArgs -> jcudaeval fn argbuf 0 argPtrs 0 (pure ()) kernelArgs f)
+
+withJanusCUDAWith ::
+  (JanusCUDAParam r, JanusCUDAEvaluate r) =>
+  CUDAFeatures ->
+  CUdevice ->
+  CUctx ->
+  CBuildConfig ->
+  r ->
+  ((CUlaunchConfig -> JanusCUDAEval r) -> IO a) ->
+  IO a
+withJanusCUDAWith fs dev ctx config f k = withJanusCUDAFnWith fs dev ctx config f (const k)
 
 withJanusCUDAFn ::
   (JanusCUDAParam r, JanusCUDAEvaluate r) =>
@@ -351,15 +410,8 @@ withJanusCUDAFn ::
   (CUfunction -> (CUlaunchConfig -> JanusCUDAEval r) -> IO a) ->
   IO a
 withJanusCUDAFn dev ctx config f k = do
-  let dir = config ^. cBuildConfigCacheDir
-  cufiles <- writeJanusCFiles JCUDA dir (jcudaparam "janus_main" 0 (pure []) JCUDA f)
-  withJanusCUmodule dev ctx dir cufiles $ \pmod ->
-    bracket (mallocBytes cudaArgMaxSize) free $ \argbuf ->
-      bracket (mallocBytes (cudaArgMaxSize * sizeOf (undefined :: Ptr ()))) free $ \argPtrs ->
-        alloca $ \pfn -> withCString "janus_main" $ \s -> do
-          m <- peek pmod
-          fn <- cuModuleGetFunction pfn m s >> peek pfn
-          k fn (\kernelArgs -> jcudaeval fn argbuf 0 argPtrs 0 (pure ()) kernelArgs f)
+  fs <- observeCUDAFeatures dev
+  withJanusCUDAFnWith fs dev ctx config f k
 
 withJanusCUDA ::
   (JanusCUDAParam r, JanusCUDAEvaluate r) =>
@@ -490,7 +542,8 @@ data Thread m = Thread
   { _threadWarpBarrier :: Barrier m,
     _threadBlockBarrier :: Barrier m,
     _threadActive :: Bool,
-    _threadInfo :: CUDAThreadInfo Identity
+    _threadInfo :: CUDAThreadInfo Identity,
+    _threadFeatures :: CUDAFeatures
   }
 
 newtype CUDAM (m :: K.Type -> K.Type) a = CUDAM {runCUDAM :: ReaderT (Thread m) m a}
@@ -545,8 +598,8 @@ foo = do
       )
   syncWarp
 
-launchCUDAM :: (CC.MonadConc m, MonadIO m) => CUlaunchConfig -> CUDAM m () -> m ()
-launchCUDAM conf (CUDAM m) = do
+launchCUDAMWithFeatures :: (CC.MonadConc m, MonadIO m) => CUDAFeatures -> CUlaunchConfig -> CUDAM m () -> m ()
+launchCUDAMWithFeatures fs conf (CUDAM m) = do
   liftIO $ SIO.hSetBuffering SIO.stdout SIO.LineBuffering
   let gridDimX = fromIntegral (conf ^. cuLaunchConfigGridDimX) :: Int
       gridDimY = fromIntegral (conf ^. cuLaunchConfigGridDimY) :: Int
@@ -582,9 +635,13 @@ launchCUDAM conf (CUDAM m) = do
             { _threadWarpBarrier = (warpBarriers V.! b) V.! (t `quot` cudaWarpSize),
               _threadBlockBarrier = blockBarriers V.! b,
               _threadActive = True,
-              _threadInfo = info
+              _threadInfo = info,
+              _threadFeatures = fs
             }
     runReaderT m thread
+
+launchCUDAM :: (CC.MonadConc m, MonadIO m) => CUlaunchConfig -> CUDAM m () -> m ()
+launchCUDAM = launchCUDAMWithFeatures cudaSM80
 
 --------------------------------------------------------------------------------
 -- Shared CUDAM Command Helpers
@@ -931,8 +988,24 @@ $( let mkCUDACPUBackend expTy monadTy refTy baseM =
            ]
  )
 
+launchCUDAIOMWithFeatures :: CUDAFeatures -> CUlaunchConfig -> CUDAIOM () -> IO ()
+launchCUDAIOMWithFeatures fs conf (CUDAIOM m) = launchCUDAMWithFeatures fs conf m
+
 launchCUDAIOM :: CUlaunchConfig -> CUDAIOM () -> IO ()
-launchCUDAIOM conf (CUDAIOM m) = launchCUDAM conf m
+launchCUDAIOM conf m = do
+  fs <- observeDefaultCUDAFeatures
+  launchCUDAIOMWithFeatures fs conf m
+
+launchCUDADejaFuMWithFeatures ::
+  CUDAFeatures ->
+  Scheduler s ->
+  MemType ->
+  s ->
+  CUlaunchConfig ->
+  CUDADejaFuM () ->
+  IO (Either Condition (), s, Trace)
+launchCUDADejaFuMWithFeatures fs sched mem s conf (CUDADejaFuM m) =
+  runConcurrent sched mem s (launchCUDAMWithFeatures fs conf m)
 
 launchCUDADejaFuMWith ::
   Scheduler s ->
@@ -941,10 +1014,2026 @@ launchCUDADejaFuMWith ::
   CUlaunchConfig ->
   CUDADejaFuM () ->
   IO (Either Condition (), s, Trace)
-launchCUDADejaFuMWith sched mem s conf (CUDADejaFuM m) =
-  runConcurrent sched mem s (launchCUDAM conf m)
+launchCUDADejaFuMWith = launchCUDADejaFuMWithFeatures cudaSM80
 
 launchCUDADejaFuM :: CUlaunchConfig -> CUDADejaFuM () -> IO (Either Condition (), Trace)
 launchCUDADejaFuM conf m = do
   (res, (), trace) <- launchCUDADejaFuMWith roundRobinSched defaultMemType () conf m
   pure (res, trace)
+
+askCUDAIOFeatures :: CUDAIOM CUDAFeatures
+askCUDAIOFeatures = CUDAIOM (asks _threadFeatures)
+
+askCUDADejaFuFeatures :: CUDADejaFuM CUDAFeatures
+askCUDADejaFuFeatures = CUDADejaFuM (asks _threadFeatures)
+
+--------------------------------------------------------------------------------
+-- CPU-Emulated SIMD Instances for CUDAIO & CUDADejaFu
+--------------------------------------------------------------------------------
+
+instance ExpSIMD CUDAIO where
+  newtype SIMDVector CUDAIO n a = CUDAIOSIMDVector {getCUDAIOSIMDVector :: CPUSIMD n a}
+    deriving stock (Eq, Ord, Show)
+  newtype SIMDMask CUDAIO n a = CUDAIOSIMDMask {getCUDAIOSIMDMask :: CPUMask n a}
+    deriving stock (Eq, Ord, Show)
+
+deriving newtype instance (SIMDShape n a) => Storable (SIMDVector CUDAIO n a)
+deriving newtype instance (SIMDShape n a) => Storable (SIMDMask CUDAIO n a)
+deriving newtype instance (SIMDShape n a, CPUSIMDElem a) => Num (SIMDVector CUDAIO n a)
+deriving newtype instance (SIMDShape n a, CPUSIMDElem a, Fractional a) => Fractional (SIMDVector CUDAIO n a)
+deriving newtype instance (SIMDShape n a, CPUSIMDElem a, Floating a) => Floating (SIMDVector CUDAIO n a)
+deriving newtype instance (SIMDShape n a, CPUSIMDElem a, FMA a) => FMA (SIMDVector CUDAIO n a)
+deriving newtype instance (SIMDShape n a) => Join (SIMDMask CUDAIO n a)
+deriving newtype instance (SIMDShape n a) => Meet (SIMDMask CUDAIO n a)
+deriving newtype instance (SIMDShape n a) => Lower (SIMDMask CUDAIO n a)
+deriving newtype instance (SIMDShape n a) => Upper (SIMDMask CUDAIO n a)
+
+instance (SIMDShape n a) => HostSIMDValue (SIMDVector CUDAIO n a) n a where
+  simdFromList = CUDAIOSIMDVector . cpuFromLanes
+  simdToList = unCPUSIMD . getCUDAIOSIMDVector
+
+instance (SIMDShape n a) => HostSIMDMask (SIMDMask CUDAIO n a) n a where
+  simdMaskFromBools = CUDAIOSIMDMask . CPUMask
+  simdMaskToBools = unCPUMask . getCUDAIOSIMDMask
+
+instance (SIMDShape n a) => Join (CUDAIO (SIMDMask CUDAIO n a)) where (\/) = coerce (cpuMaskOr @n @a)
+instance (SIMDShape n a) => Meet (CUDAIO (SIMDMask CUDAIO n a)) where (/\) = coerce (cpuMaskAnd @n @a)
+instance (SIMDShape n a) => Lower (CUDAIO (SIMDMask CUDAIO n a)) where lowerBound = CUDAIO (CUDAIOSIMDMask cpuMaskFalse)
+instance (SIMDShape n a) => Upper (CUDAIO (SIMDMask CUDAIO n a)) where upperBound = CUDAIO (CUDAIOSIMDMask cpuMaskTrue)
+
+instance ExpSIMD CUDADejaFu where
+  newtype SIMDVector CUDADejaFu n a = CUDADejaFuSIMDVector {getCUDADejaFuSIMDVector :: CPUSIMD n a}
+    deriving stock (Eq, Ord, Show)
+  newtype SIMDMask CUDADejaFu n a = CUDADejaFuSIMDMask {getCUDADejaFuSIMDMask :: CPUMask n a}
+    deriving stock (Eq, Ord, Show)
+
+deriving newtype instance (SIMDShape n a) => Storable (SIMDVector CUDADejaFu n a)
+deriving newtype instance (SIMDShape n a) => Storable (SIMDMask CUDADejaFu n a)
+deriving newtype instance (SIMDShape n a, CPUSIMDElem a) => Num (SIMDVector CUDADejaFu n a)
+deriving newtype instance (SIMDShape n a, CPUSIMDElem a, Fractional a) => Fractional (SIMDVector CUDADejaFu n a)
+deriving newtype instance (SIMDShape n a, CPUSIMDElem a, Floating a) => Floating (SIMDVector CUDADejaFu n a)
+deriving newtype instance (SIMDShape n a, CPUSIMDElem a, FMA a) => FMA (SIMDVector CUDADejaFu n a)
+deriving newtype instance (SIMDShape n a) => Join (SIMDMask CUDADejaFu n a)
+deriving newtype instance (SIMDShape n a) => Meet (SIMDMask CUDADejaFu n a)
+deriving newtype instance (SIMDShape n a) => Lower (SIMDMask CUDADejaFu n a)
+deriving newtype instance (SIMDShape n a) => Upper (SIMDMask CUDADejaFu n a)
+
+instance (SIMDShape n a) => HostSIMDValue (SIMDVector CUDADejaFu n a) n a where
+  simdFromList = CUDADejaFuSIMDVector . cpuFromLanes
+  simdToList = unCPUSIMD . getCUDADejaFuSIMDVector
+
+instance (SIMDShape n a) => HostSIMDMask (SIMDMask CUDADejaFu n a) n a where
+  simdMaskFromBools = CUDADejaFuSIMDMask . CPUMask
+  simdMaskToBools = unCPUMask . getCUDADejaFuSIMDMask
+
+instance (SIMDShape n a) => Join (CUDADejaFu (SIMDMask CUDADejaFu n a)) where (\/) = coerce (cpuMaskOr @n @a)
+instance (SIMDShape n a) => Meet (CUDADejaFu (SIMDMask CUDADejaFu n a)) where (/\) = coerce (cpuMaskAnd @n @a)
+instance (SIMDShape n a) => Lower (CUDADejaFu (SIMDMask CUDADejaFu n a)) where lowerBound = CUDADejaFu (CUDADejaFuSIMDMask cpuMaskFalse)
+instance (SIMDShape n a) => Upper (CUDADejaFu (SIMDMask CUDADejaFu n a)) where upperBound = CUDADejaFu (CUDADejaFuSIMDMask cpuMaskTrue)
+
+$( let mkCPUSIMDInstances expTy monadTy =
+         [d|
+           instance (SIMDShape n a, Num a) => ExpSIMDVec $expTy n a where
+             vzero = coerce (cpuZero @n @a)
+             vsplat = coerce (cpuSplat @n @a)
+             viota = coerce (cpuIota @n @a)
+             vfromLanes xs = coerce (cpuFromLanes @n @a (coerce xs))
+             vextractLane p v =
+               let i = fromIntegral (natVal p) :: Int
+                in coerce (cpuExtractLane @n @a i) v
+             vinsertLane p x v =
+               let i = fromIntegral (natVal p) :: Int
+                in coerce (cpuInsertLane @n @a i) x v
+
+           instance (SIMDShape n a) => ExpSIMDMask $expTy n a where
+             mfalse = coerce (cpuMaskFalse @n @a)
+             mtrue = coerce (cpuMaskTrue @n @a)
+             mand = coerce (cpuMaskAnd @n @a)
+             mor = coerce (cpuMaskOr @n @a)
+             mxor = coerce (cpuMaskXor @n @a)
+             mandnot = coerce (cpuMaskAndNot @n @a)
+             mnot = coerce (cpuMaskNot @n @a)
+             vselect = coerce (cpuSelect @n @a)
+             mmovemask = coerce (cpuMovemask @n @a)
+             mpopcount = coerce (cpuMaskPopcount @n @a)
+             mfirstTrue = coerce (cpuMaskFirstTrue @n @a)
+             mallOf = coerce (cpuAllOf @n @a)
+             manyOf = coerce (cpuAnyOf @n @a)
+             mnoneOf = coerce (cpuNoneOf @n @a)
+
+           instance (SIMDShape n a, Ord a) => ExpSIMDCmp $expTy n a where
+             veq = coerce (cpuEq @n @a)
+             vne = coerce (cpuNe @n @a)
+             vlt = coerce (cpuLt @n @a)
+             vle = coerce (cpuLe @n @a)
+             vgt = coerce (cpuGt @n @a)
+             vge = coerce (cpuGe @n @a)
+
+           instance (SIMDShape n a, CPUSIMDElem a) => ExpSIMDArith $expTy n a where
+             vadd = coerce (cpuAdd @n @a)
+             vsub = coerce (cpuSub @n @a)
+             vmul = coerce (cpuMul @n @a)
+             vneg = coerce (cpuNeg @n @a)
+             vabs = coerce (cpuAbs @n @a)
+             vmin = coerce (cpuMin @n @a)
+             vmax = coerce (cpuMax @n @a)
+
+           instance (SIMDShape n a, CPUSIMDElem a) => ExpSIMDSat $expTy n a where
+             vadds = coerce (cpuAdds @n @a)
+             vsubs = coerce (cpuSubs @n @a)
+             vabss = coerce (cpuAbss @n @a)
+             vavg = coerce (cpuAvg @n @a)
+             vabsdiff = coerce (cpuAbsDiff @n @a)
+
+           instance (SIMDShape n a, CPUSIMDElem a, RealFloat a, FMA a) => ExpSIMDFloat $expTy n a where
+             vdiv = coerce (cpuDiv @n @a)
+             vsqrt = coerce (cpuSqrt @n @a)
+             vrsqrtApprox = coerce (cpuRsqrtApprox @n @a)
+             vrcpApprox = coerce (cpuRcpApprox @n @a)
+             vfma = coerce (cpuFma @n @a)
+             vfms = coerce (cpuFms @n @a)
+             vfnma = coerce (cpuFnma @n @a)
+             vfnms = coerce (cpuFnms @n @a)
+             vmulAdd = coerce (cpuMulAdd @n @a)
+             vfloor = coerce (cpuFloor @n @a)
+             vceil = coerce (cpuCeil @n @a)
+             vtrunc = coerce (cpuTrunc @n @a)
+             vroundNearest = coerce (cpuRoundNearest @n @a)
+
+           instance (SIMDShape n a, CPUSIMDElem a) => ExpSIMDBits $expTy n a where
+             vand = coerce (cpuBitAnd @n @a)
+             vor = coerce (cpuBitOr @n @a)
+             vxor = coerce (cpuBitXor @n @a)
+             vandnot = coerce (cpuBitAndNot @n @a)
+             vnot = coerce (cpuBitNot @n @a)
+             vshl = coerce (cpuShl @n @a)
+             vshr = coerce (cpuShr @n @a)
+             vshlImm p v = vshl v (fromIntegral (natVal p))
+             vshrImm p v = vshr v (fromIntegral (natVal p))
+             vshlVar = coerce (cpuShlVar @n @a)
+             vshrVar = coerce (cpuShrVar @n @a)
+             vpopcnt = coerce (cpuPopcnt @n @a)
+
+           instance (SIMDShape n a, CPUSIMDElem a) => ExpSIMDShuffle $expTy n a where
+             vshuffleLanes idxs = coerce (\v -> cpuPermuteLanes @n @a v (Left idxs))
+             vpermuteVar = coerce (\v idx -> cpuPermuteLanes @n @a v (Right idx))
+             vshuffleBytes ::
+               forall b.
+               (SIMDShape b Word8) =>
+               $expTy (SIMDVector $expTy n a) ->
+               $expTy (SIMDVector $expTy b Word8) ->
+               $expTy (SIMDVector $expTy n a)
+             vshuffleBytes = coerce (cpuShuffleBytes @n @a @b)
+             vzipLo = coerce (cpuZipLo @n @a)
+             vzipHi = coerce (cpuZipHi @n @a)
+
+           instance (SIMDHalfPair n2 n a) => ExpSIMDSplit $expTy n2 n a where
+             vsplit = coerce (cpuSplit @n2 @n @a)
+             vconcat = coerce (cpuConcat @n @n2 @a)
+
+           instance (SIMDShape n a, CPUSIMDElem a) => ExpSIMDReduce $expTy n a where
+             vreduceAdd = coerce (cpuReduceAdd @n @a)
+             vreduceMin = coerce (cpuReduceMin @n @a)
+             vreduceMax = coerce (cpuReduceMax @n @a)
+             vreduceAnd = coerce (cpuReduceAnd @n @a)
+             vreduceOr = coerce (cpuReduceOr @n @a)
+             vreduceXor = coerce (cpuReduceXor @n @a)
+
+           instance ExpSIMDDot $expTy where
+             vdp4aS = coerce cpuDp4aS
+             vdp4aU = coerce cpuDp4aU
+             vdp4aVecS ::
+               forall m k.
+               (SIMDDp4aShape m k) =>
+               $expTy (SIMDVector $expTy m Int8) ->
+               $expTy (SIMDVector $expTy m Int8) ->
+               $expTy (SIMDVector $expTy k Int32) ->
+               $expTy (SIMDVector $expTy k Int32)
+             vdp4aVecS = coerce (cpuDp4aVecS @m @k)
+             vdp4aVecU ::
+               forall m k.
+               (SIMDDp4aShape m k) =>
+               $expTy (SIMDVector $expTy m Word8) ->
+               $expTy (SIMDVector $expTy m Word8) ->
+               $expTy (SIMDVector $expTy k Word32) ->
+               $expTy (SIMDVector $expTy k Word32)
+             vdp4aVecU = coerce (cpuDp4aVecU @m @k)
+             vdp2aLoS = coerce (cpuDp2aS False)
+             vdp2aHiS = coerce (cpuDp2aS True)
+             vdp2aLoU = coerce (cpuDp2aU False)
+             vdp2aHiU = coerce (cpuDp2aU True)
+             vsad8 ::
+               forall n.
+               (SIMDShape n Word8) =>
+               $expTy (SIMDVector $expTy n Word8) ->
+               $expTy (SIMDVector $expTy n Word8) ->
+               $expTy Word32
+             vsad8 = coerce (cpuSadU8 @n)
+
+           instance ExpSIMDCast $expTy where
+             vbitcast ::
+               forall n a m b.
+               (SIMDShape n a, SIMDShape m b) =>
+               $expTy (SIMDVector $expTy n a) ->
+               $expTy (SIMDVector $expTy m b)
+             vbitcast = coerce (cpuBitcast @n @a @m @b)
+             vcvt ::
+               forall n a b.
+               (SIMDShape n a, SIMDShape n b, CPUSIMDElem a, CPUSIMDElem b) =>
+               $expTy (SIMDVector $expTy n a) ->
+               $expTy (SIMDVector $expTy n b)
+             vcvt = coerce (cpuCvt @n @a @b)
+             vnarrowSat ::
+               forall n m a b.
+               (SIMDPackShape n m a b) =>
+               $expTy (SIMDVector $expTy n a) ->
+               $expTy (SIMDVector $expTy n a) ->
+               $expTy (SIMDVector $expTy m b)
+             vnarrowSat = coerce (cpuPackSat @n @m @a @b)
+
+           instance (SIMDShape n a) => CmdSIMDMem $monadTy $expTy n a where
+             vload p = liftIO (coerce (cpuLoad @IO @n @a) p)
+             vloadAligned p = liftIO (coerce (cpuLoadAligned @IO @n @a) p)
+             vstore p v = liftIO (coerce (cpuStore @IO @n @a) p v)
+             vstoreAligned p v = liftIO (coerce (cpuStoreAligned @IO @n @a) p v)
+             vloadMasked m fb p = liftIO (coerce (cpuLoadMasked @IO @n @a) m fb p)
+             vstoreMasked m p v = liftIO (coerce (cpuStoreMasked @IO @n @a) m p v)
+             vgather p idx = liftIO (coerce (cpuGather @IO @n @a) p idx)
+             vgatherMasked m fb p idx = liftIO (coerce (cpuGatherMasked @IO @n @a) m fb p idx)
+           |]
+    in fmap concat $
+         sequence
+           [ mkCPUSIMDInstances [t|CUDAIO|] [t|CUDAIOM|],
+             mkCPUSIMDInstances [t|CUDADejaFu|] [t|CUDADejaFuM|]
+           ]
+ )
+
+--------------------------------------------------------------------------------
+-- JanusCUDA Device SIMD Codegen (__v*2, __v*4, __dp4a, __dp2a, uint4/float4)
+--------------------------------------------------------------------------------
+
+instance ExpSIMD JanusCUDA where
+  newtype SIMDVector JanusCUDA n a = JanusCUDASIMDVector {getJanusCUDASIMDVector :: RawSIMD n a}
+    deriving stock (Eq, Ord)
+  newtype SIMDMask JanusCUDA n a = JanusCUDASIMDMask {getJanusCUDASIMDMask :: RawMask n a}
+    deriving stock (Eq, Ord)
+
+deriving newtype instance (SIMDShape n a) => Show (SIMDVector JanusCUDA n a)
+deriving newtype instance (SIMDShape n a) => Show (SIMDMask JanusCUDA n a)
+deriving newtype instance (SIMDShape n a) => Storable (SIMDVector JanusCUDA n a)
+deriving newtype instance (SIMDShape n a) => Storable (SIMDMask JanusCUDA n a)
+
+instance (SIMDShape n a) => HostSIMDValue (SIMDVector JanusCUDA n a) n a where
+  simdFromList = JanusCUDASIMDVector . rawSIMDFromList
+  simdToList = rawSIMDToList . getJanusCUDASIMDVector
+
+instance (SIMDShape n a) => HostSIMDMask (SIMDMask JanusCUDA n a) n a where
+  simdMaskFromBools = JanusCUDASIMDMask . rawMaskFromBools
+  simdMaskToBools = rawMaskToBools . getJanusCUDASIMDMask
+
+cuNamedType :: String -> JCType
+cuNamedType nm = JCType (DeclSpec [] [] (Tnamed (Id nm noLoc) [] noLoc) noLoc) (DeclRoot noLoc)
+
+cu16BVecName :: forall a. (SIMDElem a) => Proxy a -> String
+cu16BVecName p = case simdElemTag p of
+  8 -> "float4"
+  9 -> "double2"
+  4 -> "int4"
+  6 -> "longlong2"
+  7 -> "ulonglong2"
+  _ -> "uint4"
+
+cu8BVecName :: forall a. (SIMDElem a) => Proxy a -> String
+cu8BVecName p = case simdElemTag p of
+  8 -> "float2"
+  4 -> "int2"
+  _ -> "uint2"
+
+cudaSIMDType :: forall n a. (SIMDShape n a) => JanusCM JCType
+cudaSIMDType = do
+  addHeader "stdint.h"
+  addHeader "string.h"
+  case simdBytes (Proxy @n) (Proxy @a) of
+    4 -> pure (cuNamedType "uint32_t")
+    8 -> pure (cuNamedType (cu8BVecName (Proxy @a)))
+    16 -> pure (cuNamedType (cu16BVecName (Proxy @a)))
+    32 -> do
+      let JCType hspec _ = cuNamedType (cu16BVecName (Proxy @a))
+          fgs =
+            [ FieldGroup hspec [Field (Just (Id "lo" noLoc)) (Just (DeclRoot noLoc)) Nothing noLoc] noLoc,
+              FieldGroup hspec [Field (Just (Id "hi" noLoc)) (Just (DeclRoot noLoc)) Nothing noLoc] noLoc
+            ]
+      pure $ JCType (DeclSpec [] [] (Tstruct Nothing (Just fgs) [] noLoc) noLoc) (DeclRoot noLoc)
+    _ -> error "cudaSIMDType: unsupported byte size"
+
+cudaMaskType :: forall n a. (SIMDShape n a) => JanusCM JCType
+cudaMaskType = do
+  addHeader "stdint.h"
+  addHeader "string.h"
+  case simdBytes (Proxy @n) (Proxy @a) of
+    4 -> pure (cuNamedType "uint32_t")
+    8 -> pure (cuNamedType "uint2")
+    16 -> pure (cuNamedType "uint4")
+    32 -> do
+      let JCType hspec _ = cuNamedType "uint4"
+          fgs =
+            [ FieldGroup hspec [Field (Just (Id "lo" noLoc)) (Just (DeclRoot noLoc)) Nothing noLoc] noLoc,
+              FieldGroup hspec [Field (Just (Id "hi" noLoc)) (Just (DeclRoot noLoc)) Nothing noLoc] noLoc
+            ]
+      pure $ JCType (DeclSpec [] [] (Tstruct Nothing (Just fgs) [] noLoc) noLoc) (DeclRoot noLoc)
+    _ -> error "cudaMaskType: unsupported byte size"
+
+instance (SIMDShape n a) => JanusCTyped (SIMDVector JanusCUDA n a) where
+  jctype _ = cudaSIMDType @n @a
+
+instance (SIMDShape n a) => JanusCTyped (SIMDMask JanusCUDA n a) where
+  jctype _ = cudaMaskType @n @a
+
+cuVar :: String -> Exp
+cuVar s = Var (Id s noLoc) noLoc
+
+cuCall :: String -> [Exp] -> Exp
+cuCall fn args = FnCall (cuVar fn) args noLoc
+
+cuCast :: String -> Exp -> Exp
+cuCast ty e =
+  let JCType spec dec = cuNamedType ty
+   in Cast (Type spec dec noLoc) e noLoc
+
+cuPtrCast :: String -> Exp -> Exp
+cuPtrCast ty e =
+  let JCType spec dec = cuNamedType ty
+   in Cast (Type spec (Ptr [] dec noLoc) noLoc) e noLoc
+
+cuConstPtrCast :: String -> Exp -> Exp
+cuConstPtrCast ty e =
+  Cast (Type (DeclSpec [] [Tconst noLoc] (Tnamed (Id ty noLoc) [] noLoc) noLoc) (Ptr [] (DeclRoot noLoc) noLoc) noLoc) e noLoc
+
+cuInt :: Int -> Exp
+cuInt = signedIntConst
+
+cuMem :: Exp -> String -> Exp
+cuMem e f = Member e (Id f noLoc) noLoc
+
+cuStmt :: Stm -> JanusCM ()
+cuStmt s = modifyFunction $ \fn -> fn & jcfBlock %~ flip appendBlock [BlockStm s]
+
+cuUninit :: JCType -> JanusCM Exp
+cuUninit (JCType spec dec) = do
+  fn <- getFunction
+  fname <- askFuncName
+  let c = fn ^. jcfVarCounter
+      vid = Id ("x_" <> show c) noLoc
+      ini = Init vid dec Nothing Nothing [] noLoc
+      decl = BlockDecl $ InitGroup spec [] [ini] noLoc
+  modify $ \st -> st & ix fname .~ (fn & jcfVarCounter +~ 1 & jcfBlock %~ flip appendBlock [decl])
+  pure (Var vid noLoc)
+
+-- Apply a 32-bit CUDA SIMD intrinsic (e.g. __vadd4, __vadd2, __vcmpgts4) across
+-- 4B (uint32_t), 8B (uint2), 16B (uint4), or 32B ({ uint4 lo; uint4 hi; })
+emitCUDAPackedWordBin ::
+  forall resTy.
+  (JanusCTyped resTy) =>
+  Int ->
+  (Exp -> Exp -> Exp) ->
+  Exp ->
+  Exp ->
+  JanusCM Exp
+emitCUDAPackedWordBin bytes opWord ea0 eb0 = do
+  rty <- getJanusCType (Proxy @resTy)
+  ea <- emitLocalVal rty ea0
+  eb <- emitLocalVal rty eb0
+  case bytes of
+    4 -> emitLocalVal rty (opWord ea eb)
+    8 ->
+      emitLocalVal rty $
+        cuCall
+          "make_uint2"
+          [ opWord (cuMem ea "x") (cuMem eb "x"),
+            opWord (cuMem ea "y") (cuMem eb "y")
+          ]
+    16 ->
+      emitLocalVal rty $
+        cuCall
+          "make_uint4"
+          [ opWord (cuMem ea "x") (cuMem eb "x"),
+            opWord (cuMem ea "y") (cuMem eb "y"),
+            opWord (cuMem ea "z") (cuMem eb "z"),
+            opWord (cuMem ea "w") (cuMem eb "w")
+          ]
+    32 -> do
+      out <- cuUninit rty
+      let mk4 l r =
+            cuCall
+              "make_uint4"
+              [ opWord (cuMem l "x") (cuMem r "x"),
+                opWord (cuMem l "y") (cuMem r "y"),
+                opWord (cuMem l "z") (cuMem r "z"),
+                opWord (cuMem l "w") (cuMem r "w")
+              ]
+      cuStmt $ Exp (Just $ Assign (cuMem out "lo") JustAssign (mk4 (cuMem ea "lo") (cuMem eb "lo")) noLoc) noLoc
+      cuStmt $ Exp (Just $ Assign (cuMem out "hi") JustAssign (mk4 (cuMem ea "hi") (cuMem eb "hi")) noLoc) noLoc
+      pure out
+    _ -> error "emitCUDAPackedWordBin: invalid byte count"
+
+emitCUDAPackedWordUn ::
+  forall resTy.
+  (JanusCTyped resTy) =>
+  Int ->
+  (Exp -> Exp) ->
+  Exp ->
+  JanusCM Exp
+emitCUDAPackedWordUn bytes opWord ea0 = do
+  rty <- getJanusCType (Proxy @resTy)
+  ea <- emitLocalVal rty ea0
+  case bytes of
+    4 -> emitLocalVal rty (opWord ea)
+    8 -> emitLocalVal rty $ cuCall "make_uint2" [opWord (cuMem ea "x"), opWord (cuMem ea "y")]
+    16 ->
+      emitLocalVal rty $
+        cuCall "make_uint4" [opWord (cuMem ea "x"), opWord (cuMem ea "y"), opWord (cuMem ea "z"), opWord (cuMem ea "w")]
+    32 -> do
+      out <- cuUninit rty
+      let mk4 v = cuCall "make_uint4" [opWord (cuMem v "x"), opWord (cuMem v "y"), opWord (cuMem v "z"), opWord (cuMem v "w")]
+      cuStmt $ Exp (Just $ Assign (cuMem out "lo") JustAssign (mk4 (cuMem ea "lo")) noLoc) noLoc
+      cuStmt $ Exp (Just $ Assign (cuMem out "hi") JustAssign (mk4 (cuMem ea "hi")) noLoc) noLoc
+      pure out
+    _ -> error "emitCUDAPackedWordUn: invalid byte count"
+
+emitCUDALaneBin ::
+  forall n a.
+  (SIMDShape n a) =>
+  (Exp -> Exp -> Exp) ->
+  Exp ->
+  Exp ->
+  JanusCM Exp
+emitCUDALaneBin fn ea0 eb0 = do
+  addHeader "string.h"
+  ty <- getJanusCType (Proxy @(SIMDVector JanusCUDA n a))
+  ea <- emitLocalVal ty ea0
+  eb <- emitLocalVal ty eb0
+  let lanes = simdLanes (Proxy @n) (Proxy @a)
+      bytes = simdBytes (Proxy @n) (Proxy @a)
+      JCType espec _ = cuNamedType (simdElemCTypeName (Proxy @a))
+      arrDec = Array [] (ArraySize False (signedIntConst lanes) noLoc) (DeclRoot noLoc) noLoc
+      arrTy = JCType espec arrDec
+  aa <- cuUninit arrTy
+  ab <- cuUninit arrTy
+  ar <- cuUninit arrTy
+  res <- cuUninit ty
+  cuStmt $ Exp (Just $ cuCall "memcpy" [aa, UnOp AddrOf ea noLoc, signedIntConst bytes]) noLoc
+  cuStmt $ Exp (Just $ cuCall "memcpy" [ab, UnOp AddrOf eb noLoc, signedIntConst bytes]) noLoc
+  forM_ [0 .. lanes - 1] $ \i -> do
+    let idx = signedIntConst i
+    cuStmt $ Exp (Just $ Assign (Index ar idx noLoc) JustAssign (fn (Index aa idx noLoc) (Index ab idx noLoc)) noLoc) noLoc
+  cuStmt $ Exp (Just $ cuCall "memcpy" [UnOp AddrOf res noLoc, ar, signedIntConst bytes]) noLoc
+  pure res
+
+emitCUDALaneUn ::
+  forall n a.
+  (SIMDShape n a) =>
+  (Exp -> Exp) ->
+  Exp ->
+  JanusCM Exp
+emitCUDALaneUn fn ea0 = do
+  addHeader "string.h"
+  ty <- getJanusCType (Proxy @(SIMDVector JanusCUDA n a))
+  ea <- emitLocalVal ty ea0
+  let lanes = simdLanes (Proxy @n) (Proxy @a)
+      bytes = simdBytes (Proxy @n) (Proxy @a)
+      JCType espec _ = cuNamedType (simdElemCTypeName (Proxy @a))
+      arrDec = Array [] (ArraySize False (signedIntConst lanes) noLoc) (DeclRoot noLoc) noLoc
+      arrTy = JCType espec arrDec
+  aa <- cuUninit arrTy
+  ar <- cuUninit arrTy
+  res <- cuUninit ty
+  cuStmt $ Exp (Just $ cuCall "memcpy" [aa, UnOp AddrOf ea noLoc, signedIntConst bytes]) noLoc
+  forM_ [0 .. lanes - 1] $ \i -> do
+    let idx = signedIntConst i
+    cuStmt $ Exp (Just $ Assign (Index ar idx noLoc) JustAssign (fn (Index aa idx noLoc)) noLoc) noLoc
+  cuStmt $ Exp (Just $ cuCall "memcpy" [UnOp AddrOf res noLoc, ar, signedIntConst bytes]) noLoc
+  pure res
+
+instance {-# OVERLAPPING #-} (SIMDShape n a, CPUSIMDElem a, JanusLitC a) => Num (JanusCUDA (SIMDVector JanusCUDA n a)) where
+  (+) = vadd
+  (-) = vsub
+  (*) = vmul
+  negate = vneg
+  abs = vabs
+  signum (JanusCUDA (JanusC mv)) = JanusCUDA $ JanusC $ do
+    RVal ev <- mv
+    let z = cuInt 0
+        one = if simdElemIsFloat (Proxy @a) then C.Const (FloatConst "1.0f" 1.0 noLoc) noLoc else cuInt 1
+        negOne = UnOp Negate one noLoc
+        body x
+          | not (simdElemSigned (Proxy @a)) = Cond (BinOp Gt x z noLoc) (cuInt 1) z noLoc
+          | simdElemIsFloat (Proxy @a) = Cond (BinOp Gt x z noLoc) one (Cond (BinOp Lt x z noLoc) negOne x noLoc) noLoc
+          | otherwise = cCastElem (BinOp Sub (BinOp Gt x z noLoc) (BinOp Lt x z noLoc) noLoc)
+        cCastElem = cuCast (simdElemCTypeName (Proxy @a))
+    RVal <$> emitCUDALaneUn @n @a body ev
+  fromInteger k = vsplat (fromInteger k)
+
+instance {-# OVERLAPPING #-} (SIMDShape n a, CPUSIMDElem a, Floating a, FMA a, JanusLitC a) => Fractional (JanusCUDA (SIMDVector JanusCUDA n a)) where
+  (/) = vdiv
+  recip x = fromRational 1 / x
+  fromRational q = vsplat (fromRational q)
+
+instance (SIMDShape n Float) => Floating (JanusCUDA (SIMDVector JanusCUDA n Float)) where
+  pi = vsplat pi
+  sqrt = vsqrt
+  exp (JanusCUDA (JanusC m)) = JanusCUDA $ JanusC $ m >>= \(RVal e) -> RVal <$> emitCUDALaneUn @n @Float (\x -> cuCall "expf" [x]) e
+  log (JanusCUDA (JanusC m)) = JanusCUDA $ JanusC $ m >>= \(RVal e) -> RVal <$> emitCUDALaneUn @n @Float (\x -> cuCall "logf" [x]) e
+  (JanusCUDA (JanusC ma)) ** (JanusCUDA (JanusC mb)) = JanusCUDA $ JanusC $ do
+    RVal a <- ma
+    RVal b <- mb
+    RVal <$> emitCUDALaneBin @n @Float (\x y -> cuCall "powf" [x, y]) a b
+  sin (JanusCUDA (JanusC m)) = JanusCUDA $ JanusC $ m >>= \(RVal e) -> RVal <$> emitCUDALaneUn @n @Float (\x -> cuCall "sinf" [x]) e
+  cos (JanusCUDA (JanusC m)) = JanusCUDA $ JanusC $ m >>= \(RVal e) -> RVal <$> emitCUDALaneUn @n @Float (\x -> cuCall "cosf" [x]) e
+  tan (JanusCUDA (JanusC m)) = JanusCUDA $ JanusC $ m >>= \(RVal e) -> RVal <$> emitCUDALaneUn @n @Float (\x -> cuCall "tanf" [x]) e
+  asin (JanusCUDA (JanusC m)) = JanusCUDA $ JanusC $ m >>= \(RVal e) -> RVal <$> emitCUDALaneUn @n @Float (\x -> cuCall "asinf" [x]) e
+  acos (JanusCUDA (JanusC m)) = JanusCUDA $ JanusC $ m >>= \(RVal e) -> RVal <$> emitCUDALaneUn @n @Float (\x -> cuCall "acosf" [x]) e
+  atan (JanusCUDA (JanusC m)) = JanusCUDA $ JanusC $ m >>= \(RVal e) -> RVal <$> emitCUDALaneUn @n @Float (\x -> cuCall "atanf" [x]) e
+  sinh (JanusCUDA (JanusC m)) = JanusCUDA $ JanusC $ m >>= \(RVal e) -> RVal <$> emitCUDALaneUn @n @Float (\x -> cuCall "sinhf" [x]) e
+  cosh (JanusCUDA (JanusC m)) = JanusCUDA $ JanusC $ m >>= \(RVal e) -> RVal <$> emitCUDALaneUn @n @Float (\x -> cuCall "coshf" [x]) e
+  tanh (JanusCUDA (JanusC m)) = JanusCUDA $ JanusC $ m >>= \(RVal e) -> RVal <$> emitCUDALaneUn @n @Float (\x -> cuCall "tanhf" [x]) e
+  asinh (JanusCUDA (JanusC m)) = JanusCUDA $ JanusC $ m >>= \(RVal e) -> RVal <$> emitCUDALaneUn @n @Float (\x -> cuCall "asinhf" [x]) e
+  acosh (JanusCUDA (JanusC m)) = JanusCUDA $ JanusC $ m >>= \(RVal e) -> RVal <$> emitCUDALaneUn @n @Float (\x -> cuCall "acoshf" [x]) e
+  atanh (JanusCUDA (JanusC m)) = JanusCUDA $ JanusC $ m >>= \(RVal e) -> RVal <$> emitCUDALaneUn @n @Float (\x -> cuCall "atanhf" [x]) e
+
+instance (SIMDShape n Double) => Floating (JanusCUDA (SIMDVector JanusCUDA n Double)) where
+  pi = vsplat pi
+  sqrt = vsqrt
+  exp (JanusCUDA (JanusC m)) = JanusCUDA $ JanusC $ m >>= \(RVal e) -> RVal <$> emitCUDALaneUn @n @Double (\x -> cuCall "exp" [x]) e
+  log (JanusCUDA (JanusC m)) = JanusCUDA $ JanusC $ m >>= \(RVal e) -> RVal <$> emitCUDALaneUn @n @Double (\x -> cuCall "log" [x]) e
+  (JanusCUDA (JanusC ma)) ** (JanusCUDA (JanusC mb)) = JanusCUDA $ JanusC $ do
+    RVal a <- ma
+    RVal b <- mb
+    RVal <$> emitCUDALaneBin @n @Double (\x y -> cuCall "pow" [x, y]) a b
+  sin (JanusCUDA (JanusC m)) = JanusCUDA $ JanusC $ m >>= \(RVal e) -> RVal <$> emitCUDALaneUn @n @Double (\x -> cuCall "sin" [x]) e
+  cos (JanusCUDA (JanusC m)) = JanusCUDA $ JanusC $ m >>= \(RVal e) -> RVal <$> emitCUDALaneUn @n @Double (\x -> cuCall "cos" [x]) e
+  tan (JanusCUDA (JanusC m)) = JanusCUDA $ JanusC $ m >>= \(RVal e) -> RVal <$> emitCUDALaneUn @n @Double (\x -> cuCall "tan" [x]) e
+  asin (JanusCUDA (JanusC m)) = JanusCUDA $ JanusC $ m >>= \(RVal e) -> RVal <$> emitCUDALaneUn @n @Double (\x -> cuCall "asin" [x]) e
+  acos (JanusCUDA (JanusC m)) = JanusCUDA $ JanusC $ m >>= \(RVal e) -> RVal <$> emitCUDALaneUn @n @Double (\x -> cuCall "acos" [x]) e
+  atan (JanusCUDA (JanusC m)) = JanusCUDA $ JanusC $ m >>= \(RVal e) -> RVal <$> emitCUDALaneUn @n @Double (\x -> cuCall "atan" [x]) e
+  sinh (JanusCUDA (JanusC m)) = JanusCUDA $ JanusC $ m >>= \(RVal e) -> RVal <$> emitCUDALaneUn @n @Double (\x -> cuCall "sinh" [x]) e
+  cosh (JanusCUDA (JanusC m)) = JanusCUDA $ JanusC $ m >>= \(RVal e) -> RVal <$> emitCUDALaneUn @n @Double (\x -> cuCall "cosh" [x]) e
+  tanh (JanusCUDA (JanusC m)) = JanusCUDA $ JanusC $ m >>= \(RVal e) -> RVal <$> emitCUDALaneUn @n @Double (\x -> cuCall "tanh" [x]) e
+  asinh (JanusCUDA (JanusC m)) = JanusCUDA $ JanusC $ m >>= \(RVal e) -> RVal <$> emitCUDALaneUn @n @Double (\x -> cuCall "asinh" [x]) e
+  acosh (JanusCUDA (JanusC m)) = JanusCUDA $ JanusC $ m >>= \(RVal e) -> RVal <$> emitCUDALaneUn @n @Double (\x -> cuCall "acosh" [x]) e
+  atanh (JanusCUDA (JanusC m)) = JanusCUDA $ JanusC $ m >>= \(RVal e) -> RVal <$> emitCUDALaneUn @n @Double (\x -> cuCall "atanh" [x]) e
+
+instance {-# OVERLAPPING #-} (SIMDShape n a, CPUSIMDElem a, Floating a, FMA a, JanusLitC a) => FMA (JanusCUDA (SIMDVector JanusCUDA n a)) where
+  fma = vfma
+
+instance (SIMDShape n a) => Join (JanusCUDA (SIMDMask JanusCUDA n a)) where (\/) = mor
+instance (SIMDShape n a) => Meet (JanusCUDA (SIMDMask JanusCUDA n a)) where (/\) = mand
+instance (SIMDShape n a) => Lower (JanusCUDA (SIMDMask JanusCUDA n a)) where lowerBound = mfalse
+instance (SIMDShape n a) => Upper (JanusCUDA (SIMDMask JanusCUDA n a)) where upperBound = mtrue
+
+-- 1. ExpSIMDVec JanusCUDA
+instance (SIMDShape n a, CPUSIMDElem a) => ExpSIMDVec JanusCUDA n a where
+  vzero = JanusCUDA $ JanusC $ do
+    addHeader "string.h"
+    ty <- getJanusCType (Proxy @(SIMDVector JanusCUDA n a))
+    out <- cuUninit ty
+    cuStmt $ Exp (Just $ cuCall "memset" [UnOp AddrOf out noLoc, cuInt 0, signedIntConst (simdBytes (Proxy @n) (Proxy @a))]) noLoc
+    pure (RVal out)
+
+  vsplat (JanusCUDA (JanusC ms)) = JanusCUDA $ JanusC $ do
+    addHeader "string.h"
+    ty <- getJanusCType (Proxy @(SIMDVector JanusCUDA n a))
+    RVal s0 <- ms
+    s <- emitLocalVal (cuNamedType (simdElemCTypeName (Proxy @a))) s0
+    let lanes = simdLanes (Proxy @n) (Proxy @a)
+        bytes = simdBytes (Proxy @n) (Proxy @a)
+        JCType espec _ = cuNamedType (simdElemCTypeName (Proxy @a))
+        arrDec = Array [] (ArraySize False (signedIntConst lanes) noLoc) (DeclRoot noLoc) noLoc
+    arr <- cuUninit (JCType espec arrDec)
+    forM_ [0 .. lanes - 1] $ \i ->
+      cuStmt $ Exp (Just $ Assign (Index arr (signedIntConst i) noLoc) JustAssign s noLoc) noLoc
+    out <- cuUninit ty
+    cuStmt $ Exp (Just $ cuCall "memcpy" [UnOp AddrOf out noLoc, arr, signedIntConst bytes]) noLoc
+    pure (RVal out)
+
+  viota = JanusCUDA $ JanusC $ do
+    addHeader "string.h"
+    ty <- getJanusCType (Proxy @(SIMDVector JanusCUDA n a))
+    let lanes = simdLanes (Proxy @n) (Proxy @a)
+        bytes = simdBytes (Proxy @n) (Proxy @a)
+        JCType espec _ = cuNamedType (simdElemCTypeName (Proxy @a))
+        arrDec = Array [] (ArraySize False (signedIntConst lanes) noLoc) (DeclRoot noLoc) noLoc
+    arr <- cuUninit (JCType espec arrDec)
+    forM_ [0 .. lanes - 1] $ \i ->
+      cuStmt $ Exp (Just $ Assign (Index arr (signedIntConst i) noLoc) JustAssign (cuCast (simdElemCTypeName (Proxy @a)) (signedIntConst i)) noLoc) noLoc
+    out <- cuUninit ty
+    cuStmt $ Exp (Just $ cuCall "memcpy" [UnOp AddrOf out noLoc, arr, signedIntConst bytes]) noLoc
+    pure (RVal out)
+
+  vfromLanes es = JanusCUDA $ JanusC $ do
+    addHeader "string.h"
+    ty <- getJanusCType (Proxy @(SIMDVector JanusCUDA n a))
+    let lanes = simdLanes (Proxy @n) (Proxy @a)
+        bytes = simdBytes (Proxy @n) (Proxy @a)
+        JCType espec _ = cuNamedType (simdElemCTypeName (Proxy @a))
+        arrDec = Array [] (ArraySize False (signedIntConst lanes) noLoc) (DeclRoot noLoc) noLoc
+    when (length es /= lanes) $ error "vfromLanes: lane count mismatch"
+    arr <- cuUninit (JCType espec arrDec)
+    forM_ (zip [0 :: Int ..] es) $ \(i, JanusCUDA (JanusC me)) -> do
+      RVal ev <- me
+      cuStmt $ Exp (Just $ Assign (Index arr (signedIntConst i) noLoc) JustAssign ev noLoc) noLoc
+    out <- cuUninit ty
+    cuStmt $ Exp (Just $ cuCall "memcpy" [UnOp AddrOf out noLoc, arr, signedIntConst bytes]) noLoc
+    pure (RVal out)
+
+  vextractLane p (JanusCUDA (JanusC mv)) = JanusCUDA $ JanusC $ do
+    addHeader "string.h"
+    ty <- getJanusCType (Proxy @(SIMDVector JanusCUDA n a))
+    RVal ev0 <- mv
+    ev <- emitLocalVal ty ev0
+    let idx = fromIntegral (natVal p) :: Int
+        sz = simdElemBytes (Proxy @a)
+    out <- cuUninit (cuNamedType (simdElemCTypeName (Proxy @a)))
+    let srcPtr = BinOp Add (cuConstPtrCast "uint8_t" (UnOp AddrOf ev noLoc)) (signedIntConst (idx * sz)) noLoc
+    cuStmt $ Exp (Just $ cuCall "memcpy" [UnOp AddrOf out noLoc, srcPtr, signedIntConst sz]) noLoc
+    pure (RVal out)
+
+  vinsertLane p (JanusCUDA (JanusC mx)) (JanusCUDA (JanusC mv)) = JanusCUDA $ JanusC $ do
+    addHeader "string.h"
+    ty <- getJanusCType (Proxy @(SIMDVector JanusCUDA n a))
+    RVal ex <- mx
+    RVal ev0 <- mv
+    res <- emitLocalVal ty ev0
+    sx <- emitLocalVal (cuNamedType (simdElemCTypeName (Proxy @a))) ex
+    let idx = fromIntegral (natVal p) :: Int
+        sz = simdElemBytes (Proxy @a)
+        dstPtr = BinOp Add (cuPtrCast "uint8_t" (UnOp AddrOf res noLoc)) (signedIntConst (idx * sz)) noLoc
+    cuStmt $ Exp (Just $ cuCall "memcpy" [dstPtr, UnOp AddrOf sx noLoc, signedIntConst sz]) noLoc
+    pure (RVal res)
+
+-- 2. ExpSIMDMask JanusCUDA
+instance (SIMDShape n a) => ExpSIMDMask JanusCUDA n a where
+  mfalse = JanusCUDA $ JanusC $ do
+    addHeader "string.h"
+    mty <- getJanusCType (Proxy @(SIMDMask JanusCUDA n a))
+    out <- cuUninit mty
+    cuStmt $ Exp (Just $ cuCall "memset" [UnOp AddrOf out noLoc, cuInt 0, signedIntConst (simdBytes (Proxy @n) (Proxy @a))]) noLoc
+    pure (RVal out)
+
+  mtrue = JanusCUDA $ JanusC $ do
+    addHeader "string.h"
+    mty <- getJanusCType (Proxy @(SIMDMask JanusCUDA n a))
+    out <- cuUninit mty
+    cuStmt $ Exp (Just $ cuCall "memset" [UnOp AddrOf out noLoc, cuInt 0xFF, signedIntConst (simdBytes (Proxy @n) (Proxy @a))]) noLoc
+    pure (RVal out)
+
+  mand (JanusCUDA (JanusC ma)) (JanusCUDA (JanusC mb)) = JanusCUDA $ JanusC $ do
+    RVal a <- ma
+    RVal b <- mb
+    RVal <$> emitCUDAPackedWordBin @(SIMDMask JanusCUDA n a) (simdBytes (Proxy @n) (Proxy @a)) (\x y -> BinOp And x y noLoc) a b
+
+  mor (JanusCUDA (JanusC ma)) (JanusCUDA (JanusC mb)) = JanusCUDA $ JanusC $ do
+    RVal a <- ma
+    RVal b <- mb
+    RVal <$> emitCUDAPackedWordBin @(SIMDMask JanusCUDA n a) (simdBytes (Proxy @n) (Proxy @a)) (\x y -> BinOp Or x y noLoc) a b
+
+  mxor (JanusCUDA (JanusC ma)) (JanusCUDA (JanusC mb)) = JanusCUDA $ JanusC $ do
+    RVal a <- ma
+    RVal b <- mb
+    RVal <$> emitCUDAPackedWordBin @(SIMDMask JanusCUDA n a) (simdBytes (Proxy @n) (Proxy @a)) (\x y -> BinOp Xor x y noLoc) a b
+
+  mandnot (JanusCUDA (JanusC ma)) (JanusCUDA (JanusC mb)) = JanusCUDA $ JanusC $ do
+    RVal a <- ma
+    RVal b <- mb
+    RVal <$> emitCUDAPackedWordBin @(SIMDMask JanusCUDA n a) (simdBytes (Proxy @n) (Proxy @a)) (\x y -> BinOp And (UnOp Not x noLoc) y noLoc) a b
+
+  mnot (JanusCUDA (JanusC ma)) = JanusCUDA $ JanusC $ do
+    RVal a <- ma
+    RVal <$> emitCUDAPackedWordUn @(SIMDMask JanusCUDA n a) (simdBytes (Proxy @n) (Proxy @a)) (\x -> UnOp Not x noLoc) a
+
+  vselect (JanusCUDA (JanusC mm)) (JanusCUDA (JanusC mt)) (JanusCUDA (JanusC mf)) =
+    JanusCUDA $ JanusC $ do
+      addHeader "string.h"
+      mty <- getJanusCType (Proxy @(SIMDMask JanusCUDA n a))
+      vty <- getJanusCType (Proxy @(SIMDVector JanusCUDA n a))
+      RVal em0 <- mm
+      RVal et0 <- mt
+      RVal ef0 <- mf
+      em <- emitLocalVal mty em0
+      et <- emitLocalVal vty et0
+      ef <- emitLocalVal vty ef0
+      let bytes = simdBytes (Proxy @n) (Proxy @a)
+          words32 = bytes `div` 4
+          JCType u32spec _ = cuNamedType "uint32_t"
+          arrDec = Array [] (ArraySize False (signedIntConst words32) noLoc) (DeclRoot noLoc) noLoc
+          arrTy = JCType u32spec arrDec
+      mw <- cuUninit arrTy
+      tw <- cuUninit arrTy
+      fw <- cuUninit arrTy
+      rw <- cuUninit arrTy
+      out <- cuUninit vty
+      cuStmt $ Exp (Just $ cuCall "memcpy" [mw, UnOp AddrOf em noLoc, signedIntConst bytes]) noLoc
+      cuStmt $ Exp (Just $ cuCall "memcpy" [tw, UnOp AddrOf et noLoc, signedIntConst bytes]) noLoc
+      cuStmt $ Exp (Just $ cuCall "memcpy" [fw, UnOp AddrOf ef noLoc, signedIntConst bytes]) noLoc
+      forM_ [0 .. words32 - 1] $ \w -> do
+        let wi = signedIntConst w
+            m = Index mw wi noLoc
+            t = Index tw wi noLoc
+            f = Index fw wi noLoc
+            lop3 = BinOp Or (BinOp And m t noLoc) (BinOp And (UnOp Not m noLoc) f noLoc) noLoc
+        cuStmt $ Exp (Just $ Assign (Index rw wi noLoc) JustAssign lop3 noLoc) noLoc
+      cuStmt $ Exp (Just $ cuCall "memcpy" [UnOp AddrOf out noLoc, rw, signedIntConst bytes]) noLoc
+      pure (RVal out)
+
+  mmovemask (JanusCUDA (JanusC mm)) = JanusCUDA $ JanusC $ do
+    mty <- getJanusCType (Proxy @(SIMDMask JanusCUDA n a))
+    RVal em0 <- mm
+    em <- emitLocalVal mty em0
+    let lanes = simdLanes (Proxy @n) (Proxy @a)
+        sz = simdElemBytes (Proxy @a)
+        bytePtr = cuConstPtrCast "uint8_t" (UnOp AddrOf em noLoc)
+    acc <- emitLocalVal (cuNamedType "uint32_t") (unsignedIntConst (0 :: Word32))
+    forM_ [0 .. lanes - 1] $ \i -> do
+      let msb = Index bytePtr (signedIntConst (i * sz + (sz - 1))) noLoc
+          bitE = Cond (BinOp And msb (unsignedIntConst (0x80 :: Word32)) noLoc) (unsignedIntConst (bit i :: Word32)) (unsignedIntConst (0 :: Word32)) noLoc
+      cuStmt $ Exp (Just $ Assign acc OrAssign bitE noLoc) noLoc
+    pure (RVal acc)
+
+  mpopcount m = JanusCUDA $ JanusC $ do
+    RVal bits <- getJanusC (getJanusCUDA (mmovemask m))
+    pure . RVal $ cuCast "int32_t" (cuCall "__popc" [bits])
+
+  mfirstTrue m = JanusCUDA $ JanusC $ do
+    RVal bits <- getJanusC (getJanusCUDA (mmovemask m))
+    bvar <- emitLocalVal (cuNamedType "uint32_t") bits
+    -- CUDA __ffs(0) == 0, and __ffs(x) is 1-based for x != 0; subtracting 1 yields -1 for 0 and 0-based index otherwise!
+    pure . RVal $ BinOp Sub (cuCast "int32_t" (cuCall "__ffs" [bvar])) (signedIntConst (1 :: Int32)) noLoc
+
+  mallOf m =
+    let lanes = simdLanes (Proxy @n) (Proxy @a)
+        full = if lanes == 32 then maxBound else (1 `shiftL` lanes) - 1
+     in mmovemask m `eq` inject full
+  manyOf m = mmovemask m `ne` inject 0
+  mnoneOf m = mmovemask m `eq` inject 0
+
+-- 3. ExpSIMDCmp JanusCUDA (using native __vcmp*2 / __vcmp*4 for 8-bit & 16-bit!)
+emitCUDACmpFallback ::
+  forall n a.
+  (SIMDShape n a) =>
+  BinOp ->
+  Exp ->
+  Exp ->
+  JanusCM Exp
+emitCUDACmpFallback cop ea0 eb0 = do
+  addHeader "string.h"
+  vty <- getJanusCType (Proxy @(SIMDVector JanusCUDA n a))
+  mty <- getJanusCType (Proxy @(SIMDMask JanusCUDA n a))
+  ea <- emitLocalVal vty ea0
+  eb <- emitLocalVal vty eb0
+  let lanes = simdLanes (Proxy @n) (Proxy @a)
+      sz = simdElemBytes (Proxy @a)
+      bytes = lanes * sz
+      uMaskTy = "uint" <> show (sz * 8) <> "_t"
+      JCType espec _ = cuNamedType (simdElemCTypeName (Proxy @a))
+      JCType mspec _ = cuNamedType uMaskTy
+      arrDec = Array [] (ArraySize False (signedIntConst lanes) noLoc) (DeclRoot noLoc) noLoc
+  aa <- cuUninit (JCType espec arrDec)
+  ab <- cuUninit (JCType espec arrDec)
+  am <- cuUninit (JCType mspec arrDec)
+  out <- cuUninit mty
+  cuStmt $ Exp (Just $ cuCall "memcpy" [aa, UnOp AddrOf ea noLoc, signedIntConst bytes]) noLoc
+  cuStmt $ Exp (Just $ cuCall "memcpy" [ab, UnOp AddrOf eb noLoc, signedIntConst bytes]) noLoc
+  let allOnes = UnOp Not (cuCast uMaskTy (unsignedIntConst (0 :: Word64))) noLoc
+      zeroM = cuCast uMaskTy (unsignedIntConst (0 :: Word64))
+  forM_ [0 .. lanes - 1] $ \i -> do
+    let idx = signedIntConst i
+        c = BinOp cop (Index aa idx noLoc) (Index ab idx noLoc) noLoc
+    cuStmt $ Exp (Just $ Assign (Index am idx noLoc) JustAssign (Cond c allOnes zeroM noLoc) noLoc) noLoc
+  cuStmt $ Exp (Just $ cuCall "memcpy" [UnOp AddrOf out noLoc, am, signedIntConst bytes]) noLoc
+  pure out
+
+cudaVideoCmpName :: Int -> BinOp -> Maybe String
+cudaVideoCmpName tag cop = case (tag, cop) of
+  (0, Eq) -> Just "__vcmpeq4"
+  (1, Eq) -> Just "__vcmpeq4"
+  (2, Eq) -> Just "__vcmpeq2"
+  (3, Eq) -> Just "__vcmpeq2"
+  (0, Ne) -> Just "__vcmpne4"
+  (1, Ne) -> Just "__vcmpne4"
+  (2, Ne) -> Just "__vcmpne2"
+  (3, Ne) -> Just "__vcmpne2"
+  (0, Lt) -> Just "__vcmplts4"
+  (1, Lt) -> Just "__vcmpltu4"
+  (2, Lt) -> Just "__vcmplts2"
+  (3, Lt) -> Just "__vcmpltu2"
+  (0, Le) -> Just "__vcmples4"
+  (1, Le) -> Just "__vcmpleu4"
+  (2, Le) -> Just "__vcmples2"
+  (3, Le) -> Just "__vcmpleu2"
+  (0, Gt) -> Just "__vcmpgts4"
+  (1, Gt) -> Just "__vcmpgtu4"
+  (2, Gt) -> Just "__vcmpgts2"
+  (3, Gt) -> Just "__vcmpgtu2"
+  (0, Ge) -> Just "__vcmpges4"
+  (1, Ge) -> Just "__vcmpgeu4"
+  (2, Ge) -> Just "__vcmpges2"
+  (3, Ge) -> Just "__vcmpgeu2"
+  _ -> Nothing
+
+emitCUDACmp ::
+  forall n a.
+  (SIMDShape n a) =>
+  BinOp ->
+  JanusCUDA (SIMDVector JanusCUDA n a) ->
+  JanusCUDA (SIMDVector JanusCUDA n a) ->
+  JanusCUDA (SIMDMask JanusCUDA n a)
+emitCUDACmp cop (JanusCUDA (JanusC ma)) (JanusCUDA (JanusC mb)) = JanusCUDA $ JanusC $ do
+  RVal a <- ma
+  RVal b <- mb
+  case cudaVideoCmpName (simdElemTag (Proxy @a)) cop of
+    Just fn -> RVal <$> emitCUDAPackedWordBin @(SIMDMask JanusCUDA n a) (simdBytes (Proxy @n) (Proxy @a)) (\x y -> cuCall fn [x, y]) a b
+    Nothing -> RVal <$> emitCUDACmpFallback @n @a cop a b
+
+instance (SIMDShape n a) => ExpSIMDCmp JanusCUDA n a where
+  veq = emitCUDACmp Eq
+  vne = emitCUDACmp Ne
+  vlt = emitCUDACmp Lt
+  vle = emitCUDACmp Le
+  vgt = emitCUDACmp Gt
+  vge = emitCUDACmp Ge
+
+-- 4. ExpSIMDArith JanusCUDA (__vadd2/4, __vsub2/4, __vneg2/4, __vabs2/4, __vmin*2/4, __vmax*2/4)
+instance (SIMDShape n a, CPUSIMDElem a) => ExpSIMDArith JanusCUDA n a where
+  vadd (JanusCUDA (JanusC ma)) (JanusCUDA (JanusC mb)) = JanusCUDA $ JanusC $ do
+    RVal a <- ma
+    RVal b <- mb
+    let bytes = simdBytes (Proxy @n) (Proxy @a)
+        tag = simdElemTag (Proxy @a)
+    RVal <$> case tag of
+      0 -> emitCUDAPackedWordBin @(SIMDVector JanusCUDA n a) bytes (\x y -> cuCall "__vadd4" [x, y]) a b
+      1 -> emitCUDAPackedWordBin @(SIMDVector JanusCUDA n a) bytes (\x y -> cuCall "__vadd4" [x, y]) a b
+      2 -> emitCUDAPackedWordBin @(SIMDVector JanusCUDA n a) bytes (\x y -> cuCall "__vadd2" [x, y]) a b
+      3 -> emitCUDAPackedWordBin @(SIMDVector JanusCUDA n a) bytes (\x y -> cuCall "__vadd2" [x, y]) a b
+      _
+        | simdElemIsFloat (Proxy @a) -> emitCUDALaneBin @n @a (\x y -> BinOp Add x y noLoc) a b
+        | otherwise -> do
+            let uTy = "uint" <> show (simdElemBytes (Proxy @a) * 8) <> "_t"
+            emitCUDALaneBin @n @a (\x y -> cuCast (simdElemCTypeName (Proxy @a)) (BinOp Add (cuCast uTy x) (cuCast uTy y) noLoc)) a b
+
+  vsub (JanusCUDA (JanusC ma)) (JanusCUDA (JanusC mb)) = JanusCUDA $ JanusC $ do
+    RVal a <- ma
+    RVal b <- mb
+    let bytes = simdBytes (Proxy @n) (Proxy @a)
+        tag = simdElemTag (Proxy @a)
+    RVal <$> case tag of
+      0 -> emitCUDAPackedWordBin @(SIMDVector JanusCUDA n a) bytes (\x y -> cuCall "__vsub4" [x, y]) a b
+      1 -> emitCUDAPackedWordBin @(SIMDVector JanusCUDA n a) bytes (\x y -> cuCall "__vsub4" [x, y]) a b
+      2 -> emitCUDAPackedWordBin @(SIMDVector JanusCUDA n a) bytes (\x y -> cuCall "__vsub2" [x, y]) a b
+      3 -> emitCUDAPackedWordBin @(SIMDVector JanusCUDA n a) bytes (\x y -> cuCall "__vsub2" [x, y]) a b
+      _
+        | simdElemIsFloat (Proxy @a) -> emitCUDALaneBin @n @a (\x y -> BinOp Sub x y noLoc) a b
+        | otherwise -> do
+            let uTy = "uint" <> show (simdElemBytes (Proxy @a) * 8) <> "_t"
+            emitCUDALaneBin @n @a (\x y -> cuCast (simdElemCTypeName (Proxy @a)) (BinOp Sub (cuCast uTy x) (cuCast uTy y) noLoc)) a b
+
+  vmul (JanusCUDA (JanusC ma)) (JanusCUDA (JanusC mb)) = JanusCUDA $ JanusC $ do
+    RVal a <- ma
+    RVal b <- mb
+    RVal <$> if simdElemIsFloat (Proxy @a)
+      then emitCUDALaneBin @n @a (\x y -> BinOp Mul x y noLoc) a b
+      else do
+        let uTy = "uint" <> show (simdElemBytes (Proxy @a) * 8) <> "_t"
+        emitCUDALaneBin @n @a (\x y -> cuCast (simdElemCTypeName (Proxy @a)) (BinOp Mul (cuCast uTy x) (cuCast uTy y) noLoc)) a b
+
+  vneg (JanusCUDA (JanusC ma)) = JanusCUDA $ JanusC $ do
+    RVal a <- ma
+    let bytes = simdBytes (Proxy @n) (Proxy @a)
+        tag = simdElemTag (Proxy @a)
+    RVal <$> case tag of
+      0 -> emitCUDAPackedWordUn @(SIMDVector JanusCUDA n a) bytes (\x -> cuCall "__vneg4" [x]) a
+      1 -> emitCUDAPackedWordUn @(SIMDVector JanusCUDA n a) bytes (\x -> cuCall "__vneg4" [x]) a
+      2 -> emitCUDAPackedWordUn @(SIMDVector JanusCUDA n a) bytes (\x -> cuCall "__vneg2" [x]) a
+      3 -> emitCUDAPackedWordUn @(SIMDVector JanusCUDA n a) bytes (\x -> cuCall "__vneg2" [x]) a
+      _
+        | simdElemIsFloat (Proxy @a) -> emitCUDALaneUn @n @a (\x -> UnOp Negate x noLoc) a
+        | otherwise -> do
+            let uTy = "uint" <> show (simdElemBytes (Proxy @a) * 8) <> "_t"
+            emitCUDALaneUn @n @a (\x -> cuCast (simdElemCTypeName (Proxy @a)) (BinOp Sub (unsignedIntConst (0 :: Word64)) (cuCast uTy x) noLoc)) a
+
+  vabs v@(JanusCUDA (JanusC ma))
+    | not (simdElemSigned (Proxy @a)) = v
+    | otherwise = JanusCUDA $ JanusC $ do
+        RVal a <- ma
+        let bytes = simdBytes (Proxy @n) (Proxy @a)
+            tag = simdElemTag (Proxy @a)
+        RVal <$> case tag of
+          0 -> emitCUDAPackedWordUn @(SIMDVector JanusCUDA n a) bytes (\x -> cuCall "__vabs4" [x]) a
+          2 -> emitCUDAPackedWordUn @(SIMDVector JanusCUDA n a) bytes (\x -> cuCall "__vabs2" [x]) a
+          8 -> emitCUDALaneUn @n @a (\x -> cuCall "fabsf" [x]) a
+          9 -> emitCUDALaneUn @n @a (\x -> cuCall "fabs" [x]) a
+          _ -> do
+            let uTy = "uint" <> show (simdElemBytes (Proxy @a) * 8) <> "_t"
+            emitCUDALaneUn @n @a (\x -> Cond (BinOp Lt x (cuInt 0) noLoc) (cuCast (simdElemCTypeName (Proxy @a)) (BinOp Sub (unsignedIntConst (0 :: Word64)) (cuCast uTy x) noLoc)) x noLoc) a
+
+  vmin (JanusCUDA (JanusC ma)) (JanusCUDA (JanusC mb)) = JanusCUDA $ JanusC $ do
+    RVal a <- ma
+    RVal b <- mb
+    let bytes = simdBytes (Proxy @n) (Proxy @a)
+        tag = simdElemTag (Proxy @a)
+    RVal <$> case tag of
+      0 -> emitCUDAPackedWordBin @(SIMDVector JanusCUDA n a) bytes (\x y -> cuCall "__vmins4" [x, y]) a b
+      1 -> emitCUDAPackedWordBin @(SIMDVector JanusCUDA n a) bytes (\x y -> cuCall "__vminu4" [x, y]) a b
+      2 -> emitCUDAPackedWordBin @(SIMDVector JanusCUDA n a) bytes (\x y -> cuCall "__vmins2" [x, y]) a b
+      3 -> emitCUDAPackedWordBin @(SIMDVector JanusCUDA n a) bytes (\x y -> cuCall "__vminu2" [x, y]) a b
+      _ -> emitCUDALaneBin @n @a (\x y -> Cond (BinOp Lt x y noLoc) x y noLoc) a b
+
+  vmax (JanusCUDA (JanusC ma)) (JanusCUDA (JanusC mb)) = JanusCUDA $ JanusC $ do
+    RVal a <- ma
+    RVal b <- mb
+    let bytes = simdBytes (Proxy @n) (Proxy @a)
+        tag = simdElemTag (Proxy @a)
+    RVal <$> case tag of
+      0 -> emitCUDAPackedWordBin @(SIMDVector JanusCUDA n a) bytes (\x y -> cuCall "__vmaxs4" [x, y]) a b
+      1 -> emitCUDAPackedWordBin @(SIMDVector JanusCUDA n a) bytes (\x y -> cuCall "__vmaxu4" [x, y]) a b
+      2 -> emitCUDAPackedWordBin @(SIMDVector JanusCUDA n a) bytes (\x y -> cuCall "__vmaxs2" [x, y]) a b
+      3 -> emitCUDAPackedWordBin @(SIMDVector JanusCUDA n a) bytes (\x y -> cuCall "__vmaxu2" [x, y]) a b
+      _ -> emitCUDALaneBin @n @a (\x y -> Cond (BinOp Gt x y noLoc) x y noLoc) a b
+
+-- 5. ExpSIMDSat JanusCUDA (__vaddss*, __vaddus*, __vsubss*, __vsubus*, __vabsss*, __vavgu*, __vabsdiff*)
+instance (SIMDShape n a, CPUSIMDElem a) => ExpSIMDSat JanusCUDA n a where
+  vadds a@(JanusCUDA (JanusC ma)) b@(JanusCUDA (JanusC mb))
+    | simdElemIsFloat (Proxy @a) = vadd a b
+    | otherwise = JanusCUDA $ JanusC $ do
+        RVal ea <- ma
+        RVal eb <- mb
+        let bytes = simdBytes (Proxy @n) (Proxy @a)
+            tag = simdElemTag (Proxy @a)
+        RVal <$> case tag of
+          0 -> emitCUDAPackedWordBin @(SIMDVector JanusCUDA n a) bytes (\x y -> cuCall "__vaddss4" [x, y]) ea eb
+          1 -> emitCUDAPackedWordBin @(SIMDVector JanusCUDA n a) bytes (\x y -> cuCall "__vaddus4" [x, y]) ea eb
+          2 -> emitCUDAPackedWordBin @(SIMDVector JanusCUDA n a) bytes (\x y -> cuCall "__vaddss2" [x, y]) ea eb
+          3 -> emitCUDAPackedWordBin @(SIMDVector JanusCUDA n a) bytes (\x y -> cuCall "__vaddus2" [x, y]) ea eb
+          _ | not (simdElemSigned (Proxy @a)) ->
+            emitCUDALaneBin @n @a (\x y -> Cond (BinOp Lt (BinOp Add x y noLoc) x noLoc) (UnOp Not (cuCast (simdElemCTypeName (Proxy @a)) (unsignedIntConst (0 :: Word64))) noLoc) (BinOp Add x y noLoc) noLoc) ea eb
+          4 -> do
+            let s x y = BinOp Add (cuCast "int64_t" x) (cuCast "int64_t" y) noLoc
+                mx = signedIntConst (fromIntegral (maxBound :: Int32) :: Int64)
+                mn = signedIntConst (fromIntegral (minBound :: Int32) :: Int64)
+            emitCUDALaneBin @n @a (\x y -> cuCast "int32_t" (Cond (BinOp Gt (s x y) mx noLoc) mx (Cond (BinOp Lt (s x y) mn noLoc) mn (s x y) noLoc) noLoc)) ea eb
+          _ -> do
+            -- 64-bit signed saturating add without __int128
+            let body x y =
+                  let sumU = BinOp Add (cuCast "uint64_t" x) (cuCast "uint64_t" y) noLoc
+                      resS = cuCast "int64_t" sumU
+                      ovf = BinOp Ge (BinOp And (UnOp Not (BinOp Xor x y noLoc) noLoc) (BinOp Xor x resS noLoc) noLoc) (cuInt 0) noLoc
+                      satVal = Cond (BinOp Lt x (cuInt 0) noLoc) (cuVar "INT64_MIN") (cuVar "INT64_MAX") noLoc
+                   in Cond ovf resS satVal noLoc
+            emitCUDALaneBin @n @a body ea eb
+
+  vsubs a@(JanusCUDA (JanusC ma)) b@(JanusCUDA (JanusC mb))
+    | simdElemIsFloat (Proxy @a) = vsub a b
+    | otherwise = JanusCUDA $ JanusC $ do
+        RVal ea <- ma
+        RVal eb <- mb
+        let bytes = simdBytes (Proxy @n) (Proxy @a)
+            tag = simdElemTag (Proxy @a)
+        RVal <$> case tag of
+          0 -> emitCUDAPackedWordBin @(SIMDVector JanusCUDA n a) bytes (\x y -> cuCall "__vsubss4" [x, y]) ea eb
+          1 -> emitCUDAPackedWordBin @(SIMDVector JanusCUDA n a) bytes (\x y -> cuCall "__vsubus4" [x, y]) ea eb
+          2 -> emitCUDAPackedWordBin @(SIMDVector JanusCUDA n a) bytes (\x y -> cuCall "__vsubss2" [x, y]) ea eb
+          3 -> emitCUDAPackedWordBin @(SIMDVector JanusCUDA n a) bytes (\x y -> cuCall "__vsubus2" [x, y]) ea eb
+          _ | not (simdElemSigned (Proxy @a)) ->
+            emitCUDALaneBin @n @a (\x y -> Cond (BinOp Ge x y noLoc) (BinOp Sub x y noLoc) (unsignedIntConst (0 :: Word64)) noLoc) ea eb
+          4 -> do
+            let d x y = BinOp Sub (cuCast "int64_t" x) (cuCast "int64_t" y) noLoc
+                mx = signedIntConst (fromIntegral (maxBound :: Int32) :: Int64)
+                mn = signedIntConst (fromIntegral (minBound :: Int32) :: Int64)
+            emitCUDALaneBin @n @a (\x y -> cuCast "int32_t" (Cond (BinOp Gt (d x y) mx noLoc) mx (Cond (BinOp Lt (d x y) mn noLoc) mn (d x y) noLoc) noLoc)) ea eb
+          _ -> do
+            let body x y =
+                  let diffU = BinOp Sub (cuCast "uint64_t" x) (cuCast "uint64_t" y) noLoc
+                      resS = cuCast "int64_t" diffU
+                      noOvf = BinOp Ge (BinOp And (BinOp Xor x y noLoc) (BinOp Xor x resS noLoc) noLoc) (cuInt 0) noLoc
+                      satVal = Cond (BinOp Lt x (cuInt 0) noLoc) (cuVar "INT64_MIN") (cuVar "INT64_MAX") noLoc
+                   in Cond noOvf resS satVal noLoc
+            emitCUDALaneBin @n @a body ea eb
+
+  vabss v@(JanusCUDA (JanusC ma))
+    | not (simdElemSigned (Proxy @a)) || simdElemIsFloat (Proxy @a) = vabs v
+    | otherwise = JanusCUDA $ JanusC $ do
+        RVal ea <- ma
+        let bytes = simdBytes (Proxy @n) (Proxy @a)
+            tag = simdElemTag (Proxy @a)
+        RVal <$> case tag of
+          0 -> emitCUDAPackedWordUn @(SIMDVector JanusCUDA n a) bytes (\x -> cuCall "__vabsss4" [x]) ea
+          2 -> emitCUDAPackedWordUn @(SIMDVector JanusCUDA n a) bytes (\x -> cuCall "__vabsss2" [x]) ea
+          _ -> do
+            let bits = simdElemBytes (Proxy @a) * 8
+                sminE = if bits == 64 then cuVar "INT64_MIN" else cuCast (simdElemCTypeName (Proxy @a)) (signedIntConst (-(1 `shiftL` (bits - 1)) :: Int64))
+                smaxE = if bits == 64 then cuVar "INT64_MAX" else cuCast (simdElemCTypeName (Proxy @a)) (signedIntConst (((1 `shiftL` (bits - 1)) - 1) :: Int64))
+                absBody x = Cond (BinOp Eq x sminE noLoc) smaxE (Cond (BinOp Lt x (cuInt 0) noLoc) (UnOp Negate x noLoc) x noLoc) noLoc
+            emitCUDALaneUn @n @a absBody ea
+
+  vavg (JanusCUDA (JanusC ma)) (JanusCUDA (JanusC mb))
+    | simdElemIsFloat (Proxy @a) = JanusCUDA $ JanusC $ do
+        RVal ea <- ma
+        RVal eb <- mb
+        let halfLit = if simdElemTag (Proxy @a) == 8 then C.Const (FloatConst "0.5f" 0.5 noLoc) noLoc else C.Const (DoubleConst "0.5" 0.5 noLoc) noLoc
+        RVal <$> emitCUDALaneBin @n @a (\x y -> BinOp Mul halfLit (BinOp Add x y noLoc) noLoc) ea eb
+    | otherwise = JanusCUDA $ JanusC $ do
+        RVal ea <- ma
+        RVal eb <- mb
+        let bytes = simdBytes (Proxy @n) (Proxy @a)
+            tag = simdElemTag (Proxy @a)
+            b8 = unsignedIntConst (0x80808080 :: Word32)
+            b16 = unsignedIntConst (0x80008000 :: Word32)
+        RVal <$> case tag of
+          1 -> emitCUDAPackedWordBin @(SIMDVector JanusCUDA n a) bytes (\x y -> cuCall "__vavgu4" [x, y]) ea eb
+          3 -> emitCUDAPackedWordBin @(SIMDVector JanusCUDA n a) bytes (\x y -> cuCall "__vavgu2" [x, y]) ea eb
+          0 -> emitCUDAPackedWordBin @(SIMDVector JanusCUDA n a) bytes (\x y -> BinOp Xor (cuCall "__vavgu4" [BinOp Xor x b8 noLoc, BinOp Xor y b8 noLoc]) b8 noLoc) ea eb
+          2 -> emitCUDAPackedWordBin @(SIMDVector JanusCUDA n a) bytes (\x y -> BinOp Xor (cuCall "__vavgu2" [BinOp Xor x b16 noLoc, BinOp Xor y b16 noLoc]) b16 noLoc) ea eb
+          _ -> do
+            -- Branchless Dietz rounding average: (x | y) - ((x ^ y) >> 1)
+            emitCUDALaneBin @n @a (\x y -> BinOp Sub (BinOp Or x y noLoc) (BinOp Rsh (BinOp Xor x y noLoc) (cuInt 1) noLoc) noLoc) ea eb
+
+  vabsdiff a@(JanusCUDA (JanusC ma)) b@(JanusCUDA (JanusC mb))
+    | simdElemIsFloat (Proxy @a) = vabs (vsub a b)
+    | otherwise = JanusCUDA $ JanusC $ do
+        RVal ea <- ma
+        RVal eb <- mb
+        let bytes = simdBytes (Proxy @n) (Proxy @a)
+            tag = simdElemTag (Proxy @a)
+        RVal <$> case tag of
+          0 -> emitCUDAPackedWordBin @(SIMDVector JanusCUDA n a) bytes (\x y -> cuCall "__vabsdiffs4" [x, y]) ea eb
+          1 -> emitCUDAPackedWordBin @(SIMDVector JanusCUDA n a) bytes (\x y -> cuCall "__vabsdiffu4" [x, y]) ea eb
+          2 -> emitCUDAPackedWordBin @(SIMDVector JanusCUDA n a) bytes (\x y -> cuCall "__vabsdiffs2" [x, y]) ea eb
+          3 -> emitCUDAPackedWordBin @(SIMDVector JanusCUDA n a) bytes (\x y -> cuCall "__vabsdiffu2" [x, y]) ea eb
+          _ -> do
+            let a' = JanusCUDA (JanusC (pure (RVal ea))) :: JanusCUDA (SIMDVector JanusCUDA n a)
+                b' = JanusCUDA (JanusC (pure (RVal eb))) :: JanusCUDA (SIMDVector JanusCUDA n a)
+            RVal eRes <- getJanusC $ getJanusCUDA $ vsub (vmax a' b') (vmin a' b')
+            pure eRes
+
+-- 6. ExpSIMDFloat JanusCUDA
+emitCUDAFloatTern ::
+  forall n a.
+  (SIMDShape n a) =>
+  (Exp -> Exp -> Exp -> Exp) ->
+  JanusCUDA (SIMDVector JanusCUDA n a) ->
+  JanusCUDA (SIMDVector JanusCUDA n a) ->
+  JanusCUDA (SIMDVector JanusCUDA n a) ->
+  JanusCUDA (SIMDVector JanusCUDA n a)
+emitCUDAFloatTern fn (JanusCUDA (JanusC ma)) (JanusCUDA (JanusC mb)) (JanusCUDA (JanusC mc)) =
+  JanusCUDA $ JanusC $ do
+    addHeader "string.h"
+    ty <- getJanusCType (Proxy @(SIMDVector JanusCUDA n a))
+    RVal ea0 <- ma
+    RVal eb0 <- mb
+    RVal ec0 <- mc
+    ea <- emitLocalVal ty ea0
+    eb <- emitLocalVal ty eb0
+    ec <- emitLocalVal ty ec0
+    let lanes = simdLanes (Proxy @n) (Proxy @a)
+        bytes = simdBytes (Proxy @n) (Proxy @a)
+        JCType espec _ = cuNamedType (simdElemCTypeName (Proxy @a))
+        arrDec = Array [] (ArraySize False (signedIntConst lanes) noLoc) (DeclRoot noLoc) noLoc
+        arrTy = JCType espec arrDec
+    aa <- cuUninit arrTy
+    ab <- cuUninit arrTy
+    ac <- cuUninit arrTy
+    ar <- cuUninit arrTy
+    out <- cuUninit ty
+    cuStmt $ Exp (Just $ cuCall "memcpy" [aa, UnOp AddrOf ea noLoc, signedIntConst bytes]) noLoc
+    cuStmt $ Exp (Just $ cuCall "memcpy" [ab, UnOp AddrOf eb noLoc, signedIntConst bytes]) noLoc
+    cuStmt $ Exp (Just $ cuCall "memcpy" [ac, UnOp AddrOf ec noLoc, signedIntConst bytes]) noLoc
+    forM_ [0 .. lanes - 1] $ \i -> do
+      let idx = signedIntConst i
+      cuStmt $ Exp (Just $ Assign (Index ar idx noLoc) JustAssign (fn (Index aa idx noLoc) (Index ab idx noLoc) (Index ac idx noLoc)) noLoc) noLoc
+    cuStmt $ Exp (Just $ cuCall "memcpy" [UnOp AddrOf out noLoc, ar, signedIntConst bytes]) noLoc
+    pure (RVal out)
+
+instance (SIMDShape n a, CPUSIMDElem a, Floating a, FMA a) => ExpSIMDFloat JanusCUDA n a where
+  vdiv (JanusCUDA (JanusC ma)) (JanusCUDA (JanusC mb)) = JanusCUDA $ JanusC $ do
+    RVal a <- ma
+    RVal b <- mb
+    RVal <$> emitCUDALaneBin @n @a (\x y -> BinOp Div x y noLoc) a b
+
+  vsqrt (JanusCUDA (JanusC ma)) = JanusCUDA $ JanusC $ do
+    RVal a <- ma
+    let fn = if simdElemTag (Proxy @a) == 8 then "sqrtf" else "sqrt"
+    RVal <$> emitCUDALaneUn @n @a (\x -> cuCall fn [x]) a
+
+  vrsqrtApprox (JanusCUDA (JanusC ma)) = JanusCUDA $ JanusC $ do
+    RVal a <- ma
+    let fn = if simdElemTag (Proxy @a) == 8 then "rsqrtf" else "rsqrt"
+    RVal <$> emitCUDALaneUn @n @a (\x -> cuCall fn [x]) a
+
+  vrcpApprox (JanusCUDA (JanusC ma)) = JanusCUDA $ JanusC $ do
+    RVal a <- ma
+    let fn x = if simdElemTag (Proxy @a) == 8 then cuCall "__frcp_rn" [x] else cuCall "__drcp_rn" [x]
+    RVal <$> emitCUDALaneUn @n @a fn a
+
+  vfma =
+    let f = if simdElemTag (Proxy @a) == 8 then "fmaf" else "fma"
+     in emitCUDAFloatTern (\x y z -> cuCall f [x, y, z])
+  vfms =
+    let f = if simdElemTag (Proxy @a) == 8 then "fmaf" else "fma"
+     in emitCUDAFloatTern (\x y z -> cuCall f [x, y, UnOp Negate z noLoc])
+  vfnma =
+    let f = if simdElemTag (Proxy @a) == 8 then "fmaf" else "fma"
+     in emitCUDAFloatTern (\x y z -> cuCall f [UnOp Negate x noLoc, y, z])
+  vfnms =
+    let f = if simdElemTag (Proxy @a) == 8 then "fmaf" else "fma"
+     in emitCUDAFloatTern (\x y z -> cuCall f [UnOp Negate x noLoc, y, UnOp Negate z noLoc])
+  vmulAdd = vfma
+
+  vfloor (JanusCUDA (JanusC ma)) = JanusCUDA $ JanusC $ do
+    RVal a <- ma
+    let f = if simdElemTag (Proxy @a) == 8 then "floorf" else "floor"
+    RVal <$> emitCUDALaneUn @n @a (\x -> cuCall f [x]) a
+  vceil (JanusCUDA (JanusC ma)) = JanusCUDA $ JanusC $ do
+    RVal a <- ma
+    let f = if simdElemTag (Proxy @a) == 8 then "ceilf" else "ceil"
+    RVal <$> emitCUDALaneUn @n @a (\x -> cuCall f [x]) a
+  vtrunc (JanusCUDA (JanusC ma)) = JanusCUDA $ JanusC $ do
+    RVal a <- ma
+    let f = if simdElemTag (Proxy @a) == 8 then "truncf" else "trunc"
+    RVal <$> emitCUDALaneUn @n @a (\x -> cuCall f [x]) a
+  vroundNearest (JanusCUDA (JanusC ma)) = JanusCUDA $ JanusC $ do
+    RVal a <- ma
+    let f = if simdElemTag (Proxy @a) == 8 then "rintf" else "rint"
+    RVal <$> emitCUDALaneUn @n @a (\x -> cuCall f [x]) a
+
+-- 7. ExpSIMDBits JanusCUDA
+emitCUDABitWordBin ::
+  forall n a.
+  (SIMDShape n a) =>
+  (Exp -> Exp -> Exp) ->
+  JanusCUDA (SIMDVector JanusCUDA n a) ->
+  JanusCUDA (SIMDVector JanusCUDA n a) ->
+  JanusCUDA (SIMDVector JanusCUDA n a)
+emitCUDABitWordBin opW (JanusCUDA (JanusC ma)) (JanusCUDA (JanusC mb)) = JanusCUDA $ JanusC $ do
+  addHeader "string.h"
+  ty <- getJanusCType (Proxy @(SIMDVector JanusCUDA n a))
+  RVal ea0 <- ma
+  RVal eb0 <- mb
+  ea <- emitLocalVal ty ea0
+  eb <- emitLocalVal ty eb0
+  let bytes = simdBytes (Proxy @n) (Proxy @a)
+      words32 = bytes `div` 4
+      JCType u32spec _ = cuNamedType "uint32_t"
+      arrDec = Array [] (ArraySize False (signedIntConst words32) noLoc) (DeclRoot noLoc) noLoc
+      arrTy = JCType u32spec arrDec
+  aw <- cuUninit arrTy
+  bw <- cuUninit arrTy
+  rw <- cuUninit arrTy
+  out <- cuUninit ty
+  cuStmt $ Exp (Just $ cuCall "memcpy" [aw, UnOp AddrOf ea noLoc, signedIntConst bytes]) noLoc
+  cuStmt $ Exp (Just $ cuCall "memcpy" [bw, UnOp AddrOf eb noLoc, signedIntConst bytes]) noLoc
+  forM_ [0 .. words32 - 1] $ \w -> do
+    let wi = signedIntConst w
+    cuStmt $ Exp (Just $ Assign (Index rw wi noLoc) JustAssign (opW (Index aw wi noLoc) (Index bw wi noLoc)) noLoc) noLoc
+  cuStmt $ Exp (Just $ cuCall "memcpy" [UnOp AddrOf out noLoc, rw, signedIntConst bytes]) noLoc
+  pure (RVal out)
+
+instance (SIMDShape n a, CPUSIMDElem a) => ExpSIMDBits JanusCUDA n a where
+  vand = emitCUDABitWordBin (\x y -> BinOp And x y noLoc)
+  vor = emitCUDABitWordBin (\x y -> BinOp Or x y noLoc)
+  vxor = emitCUDABitWordBin (\x y -> BinOp Xor x y noLoc)
+  vandnot = emitCUDABitWordBin (\x y -> BinOp And (UnOp Not x noLoc) y noLoc)
+  vnot v = vxor v (JanusCUDA $ JanusC $ do
+    addHeader "string.h"
+    ty <- getJanusCType (Proxy @(SIMDVector JanusCUDA n a))
+    out <- cuUninit ty
+    cuStmt $ Exp (Just $ cuCall "memset" [UnOp AddrOf out noLoc, cuInt 0xFF, signedIntConst (simdBytes (Proxy @n) (Proxy @a))]) noLoc
+    pure (RVal out))
+
+  vshl (JanusCUDA (JanusC mv)) (JanusCUDA (JanusC mc)) = JanusCUDA $ JanusC $ do
+    RVal ev <- mv
+    RVal ec0 <- mc
+    c <- emitLocalVal (cuNamedType "uint32_t") (cuCast "uint32_t" ec0)
+    let bits = simdElemBytes (Proxy @a) * 8
+        uTy = "uint" <> show bits <> "_t"
+    if simdElemIsFloat (Proxy @a)
+      then do
+        let lanes = simdLanes (Proxy @n) (Proxy @a)
+            bytes = simdBytes (Proxy @n) (Proxy @a)
+            JCType uspec _ = cuNamedType uTy
+            arrDec = Array [] (ArraySize False (signedIntConst lanes) noLoc) (DeclRoot noLoc) noLoc
+        arrU <- cuUninit (JCType uspec arrDec)
+        out <- getJanusCType (Proxy @(SIMDVector JanusCUDA n a)) >>= cuUninit
+        evLoc <- getJanusCType (Proxy @(SIMDVector JanusCUDA n a)) >>= (`emitLocalVal` ev)
+        cuStmt $ Exp (Just $ cuCall "memcpy" [arrU, UnOp AddrOf evLoc noLoc, signedIntConst bytes]) noLoc
+        forM_ [0 .. lanes - 1] $ \i -> do
+          let idx = signedIntConst i
+              sh = Cond (BinOp Ge c (unsignedIntConst bits) noLoc) (unsignedIntConst (0 :: Word64)) (BinOp Lsh (Index arrU idx noLoc) c noLoc) noLoc
+          cuStmt $ Exp (Just $ Assign (Index arrU idx noLoc) JustAssign sh noLoc) noLoc
+        cuStmt $ Exp (Just $ cuCall "memcpy" [UnOp AddrOf out noLoc, arrU, signedIntConst bytes]) noLoc
+        pure (RVal out)
+      else do
+        let body x = cuCast (simdElemCTypeName (Proxy @a)) $ Cond (BinOp Ge c (unsignedIntConst bits) noLoc) (unsignedIntConst (0 :: Word64)) (BinOp Lsh (cuCast uTy x) c noLoc) noLoc
+        RVal <$> emitCUDALaneUn @n @a body ev
+
+  vshr (JanusCUDA (JanusC mv)) (JanusCUDA (JanusC mc)) = JanusCUDA $ JanusC $ do
+    RVal ev <- mv
+    RVal ec0 <- mc
+    c <- emitLocalVal (cuNamedType "uint32_t") (cuCast "uint32_t" ec0)
+    let bits = simdElemBytes (Proxy @a) * 8
+        uTy = "uint" <> show bits <> "_t"
+        sTy = "int" <> show bits <> "_t"
+    if simdElemIsFloat (Proxy @a)
+      then do
+        let lanes = simdLanes (Proxy @n) (Proxy @a)
+            bytes = simdBytes (Proxy @n) (Proxy @a)
+            JCType uspec _ = cuNamedType uTy
+            arrDec = Array [] (ArraySize False (signedIntConst lanes) noLoc) (DeclRoot noLoc) noLoc
+        arrU <- cuUninit (JCType uspec arrDec)
+        out <- getJanusCType (Proxy @(SIMDVector JanusCUDA n a)) >>= cuUninit
+        evLoc <- getJanusCType (Proxy @(SIMDVector JanusCUDA n a)) >>= (`emitLocalVal` ev)
+        cuStmt $ Exp (Just $ cuCall "memcpy" [arrU, UnOp AddrOf evLoc noLoc, signedIntConst bytes]) noLoc
+        forM_ [0 .. lanes - 1] $ \i -> do
+          let idx = signedIntConst i
+              sh = Cond (BinOp Ge c (unsignedIntConst bits) noLoc) (unsignedIntConst (0 :: Word64)) (BinOp Rsh (Index arrU idx noLoc) c noLoc) noLoc
+          cuStmt $ Exp (Just $ Assign (Index arrU idx noLoc) JustAssign sh noLoc) noLoc
+        cuStmt $ Exp (Just $ cuCall "memcpy" [UnOp AddrOf out noLoc, arrU, signedIntConst bytes]) noLoc
+        pure (RVal out)
+      else do
+        let body x
+              | simdElemSigned (Proxy @a) =
+                  let sx = cuCast sTy x
+                      fill = Cond (BinOp Lt sx (cuInt 0) noLoc) (signedIntConst (-1 :: Int32)) (cuInt 0) noLoc
+                   in cuCast (simdElemCTypeName (Proxy @a)) $ Cond (BinOp Ge c (unsignedIntConst bits) noLoc) fill (BinOp Rsh sx c noLoc) noLoc
+              | otherwise =
+                  cuCast (simdElemCTypeName (Proxy @a)) $ Cond (BinOp Ge c (unsignedIntConst bits) noLoc) (unsignedIntConst (0 :: Word64)) (BinOp Rsh (cuCast uTy x) c noLoc) noLoc
+        RVal <$> emitCUDALaneUn @n @a body ev
+
+  vshlImm p v = vshl v (fromIntegral (natVal p))
+  vshrImm p v = vshr v (fromIntegral (natVal p))
+
+  vshlVar (JanusCUDA (JanusC ma)) (JanusCUDA (JanusC mb)) = JanusCUDA $ JanusC $ do
+    RVal a <- ma
+    RVal b <- mb
+    let bits = simdElemBytes (Proxy @a) * 8
+        uTy = "uint" <> show bits <> "_t"
+        body x y =
+          let uc = cuCast uTy y
+           in cuCast (simdElemCTypeName (Proxy @a)) $ Cond (BinOp Ge uc (unsignedIntConst bits) noLoc) (unsignedIntConst (0 :: Word64)) (BinOp Lsh (cuCast uTy x) uc noLoc) noLoc
+    RVal <$> emitCUDALaneBin @n @a body a b
+
+  vshrVar (JanusCUDA (JanusC ma)) (JanusCUDA (JanusC mb)) = JanusCUDA $ JanusC $ do
+    RVal a <- ma
+    RVal b <- mb
+    let bits = simdElemBytes (Proxy @a) * 8
+        uTy = "uint" <> show bits <> "_t"
+        sTy = "int" <> show bits <> "_t"
+        body x y
+          | simdElemSigned (Proxy @a) =
+              let uc = cuCast uTy y
+                  sx = cuCast sTy x
+                  fill = Cond (BinOp Lt sx (cuInt 0) noLoc) (signedIntConst (-1 :: Int32)) (cuInt 0) noLoc
+               in cuCast (simdElemCTypeName (Proxy @a)) $ Cond (BinOp Ge uc (unsignedIntConst bits) noLoc) fill (BinOp Rsh sx uc noLoc) noLoc
+          | otherwise =
+              let uc = cuCast uTy y
+               in cuCast (simdElemCTypeName (Proxy @a)) $ Cond (BinOp Ge uc (unsignedIntConst bits) noLoc) (unsignedIntConst (0 :: Word64)) (BinOp Rsh (cuCast uTy x) uc noLoc) noLoc
+    RVal <$> emitCUDALaneBin @n @a body a b
+
+  vpopcnt (JanusCUDA (JanusC mv)) = JanusCUDA $ JanusC $ do
+    RVal ev <- mv
+    let bits = simdElemBytes (Proxy @a) * 8
+        uTy = "uint" <> show bits <> "_t"
+        popFn = if bits == 64 then "__popcll" else "__popc"
+        argCast = if bits == 64 then "unsigned long long" else "uint32_t"
+        body x = cuCast (simdElemCTypeName (Proxy @a)) (cuCall popFn [cuCast argCast (cuCast uTy x)])
+    RVal <$> emitCUDALaneUn @n @a body ev
+
+-- 8. ExpSIMDShuffle & ExpSIMDSplit JanusCUDA
+instance (SIMDShape n a, CPUSIMDElem a) => ExpSIMDShuffle JanusCUDA n a where
+  vshuffleLanes idxs (JanusCUDA (JanusC mv)) = JanusCUDA $ JanusC $ do
+    addHeader "string.h"
+    ty <- getJanusCType (Proxy @(SIMDVector JanusCUDA n a))
+    RVal ev0 <- mv
+    ev <- emitLocalVal ty ev0
+    let lanes = simdLanes (Proxy @n) (Proxy @a)
+        bytes = simdBytes (Proxy @n) (Proxy @a)
+        JCType espec _ = cuNamedType (simdElemCTypeName (Proxy @a))
+        arrDec = Array [] (ArraySize False (signedIntConst lanes) noLoc) (DeclRoot noLoc) noLoc
+        arrTy = JCType espec arrDec
+    when (length idxs /= lanes) $ error "vshuffleLanes: index list length mismatch"
+    sa <- cuUninit arrTy
+    da <- cuUninit arrTy
+    out <- cuUninit ty
+    cuStmt $ Exp (Just $ cuCall "memcpy" [sa, UnOp AddrOf ev noLoc, signedIntConst bytes]) noLoc
+    forM_ (zip [0 :: Int ..] idxs) $ \(outI, inI) ->
+      cuStmt $ Exp (Just $ Assign (Index da (signedIntConst outI) noLoc) JustAssign (Index sa (signedIntConst (inI .&. (lanes - 1))) noLoc) noLoc) noLoc
+    cuStmt $ Exp (Just $ cuCall "memcpy" [UnOp AddrOf out noLoc, da, signedIntConst bytes]) noLoc
+    pure (RVal out)
+
+  vpermuteVar (JanusCUDA (JanusC mv)) (JanusCUDA (JanusC midx)) = JanusCUDA $ JanusC $ do
+    addHeader "string.h"
+    ty <- getJanusCType (Proxy @(SIMDVector JanusCUDA n a))
+    ity <- getJanusCType (Proxy @(SIMDVector JanusCUDA n Int32))
+    RVal ev0 <- mv
+    RVal eidx0 <- midx
+    ev <- emitLocalVal ty ev0
+    eidx <- emitLocalVal ity eidx0
+    let lanes = simdLanes (Proxy @n) (Proxy @a)
+        bytes = simdBytes (Proxy @n) (Proxy @a)
+        JCType espec _ = cuNamedType (simdElemCTypeName (Proxy @a))
+        JCType ispec _ = cuNamedType "int32_t"
+        arrDec = Array [] (ArraySize False (signedIntConst lanes) noLoc) (DeclRoot noLoc) noLoc
+    sa <- cuUninit (JCType espec arrDec)
+    ia <- cuUninit (JCType ispec arrDec)
+    da <- cuUninit (JCType espec arrDec)
+    out <- cuUninit ty
+    cuStmt $ Exp (Just $ cuCall "memcpy" [sa, UnOp AddrOf ev noLoc, signedIntConst bytes]) noLoc
+    cuStmt $ Exp (Just $ cuCall "memcpy" [ia, UnOp AddrOf eidx noLoc, signedIntConst (lanes * 4)]) noLoc
+    forM_ [0 .. lanes - 1] $ \i -> do
+      let k = BinOp And (cuCast "uint32_t" (Index ia (signedIntConst i) noLoc)) (unsignedIntConst (lanes - 1)) noLoc
+      cuStmt $ Exp (Just $ Assign (Index da (signedIntConst i) noLoc) JustAssign (Index sa k noLoc) noLoc) noLoc
+    cuStmt $ Exp (Just $ cuCall "memcpy" [UnOp AddrOf out noLoc, da, signedIntConst bytes]) noLoc
+    pure (RVal out)
+
+  vshuffleBytes ::
+    forall b.
+    (SIMDShape b Word8) =>
+    JanusCUDA (SIMDVector JanusCUDA n a) ->
+    JanusCUDA (SIMDVector JanusCUDA b Word8) ->
+    JanusCUDA (SIMDVector JanusCUDA n a)
+  vshuffleBytes (JanusCUDA (JanusC mv)) (JanusCUDA (JanusC mc)) = JanusCUDA $ JanusC $ do
+    addHeader "string.h"
+    ty <- getJanusCType (Proxy @(SIMDVector JanusCUDA n a))
+    cty <- getJanusCType (Proxy @(SIMDVector JanusCUDA b Word8))
+    RVal ev0 <- mv
+    RVal ec0 <- mc
+    ev <- emitLocalVal ty ev0
+    ec <- emitLocalVal cty ec0
+    let bytes = simdBytes (Proxy @n) (Proxy @a)
+    if bytes == 4
+      then do
+        -- Use CUDA __byte_perm for 4-byte vectors + high-bit zero mask!
+        -- Selector nibbles: (c0 & 3) | ((c1 & 3) << 4) | ((c2 & 3) << 8) | ((c3 & 3) << 12)
+        let nib (k :: Int) = BinOp Lsh (BinOp And (BinOp Rsh ec (cuInt (k * 8)) noLoc) (unsignedIntConst (3 :: Word32)) noLoc) (cuInt (k * 4)) noLoc
+            sel = foldl1 (\x y -> BinOp Or x y noLoc) [nib 0, nib 1, nib 2, nib 3]
+            permed = cuCall "__byte_perm" [ev, unsignedIntConst (0 :: Word32), sel]
+            zeroMask = cuCall "__vcmpltu4" [ec, unsignedIntConst (0x80808080 :: Word32)]
+        RVal <$> emitLocalVal ty (BinOp And permed zeroMask noLoc)
+      else do
+        let JCType bspec _ = cuNamedType "uint8_t"
+            arrDec = Array [] (ArraySize False (signedIntConst bytes) noLoc) (DeclRoot noLoc) noLoc
+        sb <- cuUninit (JCType bspec arrDec)
+        cb <- cuUninit (JCType bspec arrDec)
+        db <- cuUninit (JCType bspec arrDec)
+        out <- cuUninit ty
+        cuStmt $ Exp (Just $ cuCall "memcpy" [sb, UnOp AddrOf ev noLoc, signedIntConst bytes]) noLoc
+        cuStmt $ Exp (Just $ cuCall "memcpy" [cb, UnOp AddrOf ec noLoc, signedIntConst bytes]) noLoc
+        forM_ [0 .. bytes - 1] $ \i -> do
+          let ci = Index cb (signedIntConst i) noLoc
+              s = Cond (BinOp And ci (unsignedIntConst (0x80 :: Word32)) noLoc) (unsignedIntConst (0 :: Word32)) (Index sb (BinOp And ci (unsignedIntConst (bytes - 1)) noLoc) noLoc) noLoc
+          cuStmt $ Exp (Just $ Assign (Index db (signedIntConst i) noLoc) JustAssign s noLoc) noLoc
+        cuStmt $ Exp (Just $ cuCall "memcpy" [UnOp AddrOf out noLoc, db, signedIntConst bytes]) noLoc
+        pure (RVal out)
+
+  vzipLo (JanusCUDA (JanusC ma)) (JanusCUDA (JanusC mb)) = JanusCUDA $ JanusC $ do
+    addHeader "string.h"
+    ty <- getJanusCType (Proxy @(SIMDVector JanusCUDA n a))
+    RVal ea0 <- ma
+    RVal eb0 <- mb
+    ea <- emitLocalVal ty ea0
+    eb <- emitLocalVal ty eb0
+    let lanes = simdLanes (Proxy @n) (Proxy @a)
+        half = lanes `div` 2
+        bytes = simdBytes (Proxy @n) (Proxy @a)
+        JCType espec _ = cuNamedType (simdElemCTypeName (Proxy @a))
+        arrDec = Array [] (ArraySize False (signedIntConst lanes) noLoc) (DeclRoot noLoc) noLoc
+    aa <- cuUninit (JCType espec arrDec)
+    ab <- cuUninit (JCType espec arrDec)
+    ar <- cuUninit (JCType espec arrDec)
+    out <- cuUninit ty
+    cuStmt $ Exp (Just $ cuCall "memcpy" [aa, UnOp AddrOf ea noLoc, signedIntConst bytes]) noLoc
+    cuStmt $ Exp (Just $ cuCall "memcpy" [ab, UnOp AddrOf eb noLoc, signedIntConst bytes]) noLoc
+    forM_ [0 .. half - 1] $ \i -> do
+      cuStmt $ Exp (Just $ Assign (Index ar (signedIntConst (2 * i)) noLoc) JustAssign (Index aa (signedIntConst i) noLoc) noLoc) noLoc
+      cuStmt $ Exp (Just $ Assign (Index ar (signedIntConst (2 * i + 1)) noLoc) JustAssign (Index ab (signedIntConst i) noLoc) noLoc) noLoc
+    cuStmt $ Exp (Just $ cuCall "memcpy" [UnOp AddrOf out noLoc, ar, signedIntConst bytes]) noLoc
+    pure (RVal out)
+
+  vzipHi (JanusCUDA (JanusC ma)) (JanusCUDA (JanusC mb)) = JanusCUDA $ JanusC $ do
+    addHeader "string.h"
+    ty <- getJanusCType (Proxy @(SIMDVector JanusCUDA n a))
+    RVal ea0 <- ma
+    RVal eb0 <- mb
+    ea <- emitLocalVal ty ea0
+    eb <- emitLocalVal ty eb0
+    let lanes = simdLanes (Proxy @n) (Proxy @a)
+        half = lanes `div` 2
+        bytes = simdBytes (Proxy @n) (Proxy @a)
+        JCType espec _ = cuNamedType (simdElemCTypeName (Proxy @a))
+        arrDec = Array [] (ArraySize False (signedIntConst lanes) noLoc) (DeclRoot noLoc) noLoc
+    aa <- cuUninit (JCType espec arrDec)
+    ab <- cuUninit (JCType espec arrDec)
+    ar <- cuUninit (JCType espec arrDec)
+    out <- cuUninit ty
+    cuStmt $ Exp (Just $ cuCall "memcpy" [aa, UnOp AddrOf ea noLoc, signedIntConst bytes]) noLoc
+    cuStmt $ Exp (Just $ cuCall "memcpy" [ab, UnOp AddrOf eb noLoc, signedIntConst bytes]) noLoc
+    forM_ [0 .. half - 1] $ \i -> do
+      cuStmt $ Exp (Just $ Assign (Index ar (signedIntConst (2 * i)) noLoc) JustAssign (Index aa (signedIntConst (half + i)) noLoc) noLoc) noLoc
+      cuStmt $ Exp (Just $ Assign (Index ar (signedIntConst (2 * i + 1)) noLoc) JustAssign (Index ab (signedIntConst (half + i)) noLoc) noLoc) noLoc
+    cuStmt $ Exp (Just $ cuCall "memcpy" [UnOp AddrOf out noLoc, ar, signedIntConst bytes]) noLoc
+    pure (RVal out)
+
+instance (SIMDHalfPair n2 n a) => ExpSIMDSplit JanusCUDA n2 n a where
+  vsplit (JanusCUDA (JanusC mv)) =
+    let halfB = simdBytes (Proxy @n) (Proxy @a)
+        extractPart off = JanusCUDA $ JanusC $ do
+          addHeader "string.h"
+          ty2 <- getJanusCType (Proxy @(SIMDVector JanusCUDA n2 a))
+          ty1 <- getJanusCType (Proxy @(SIMDVector JanusCUDA n a))
+          RVal ev0 <- mv
+          ev <- emitLocalVal ty2 ev0
+          out <- cuUninit ty1
+          cuStmt $ Exp (Just $ cuCall "memcpy" [UnOp AddrOf out noLoc, BinOp Add (cuConstPtrCast "uint8_t" (UnOp AddrOf ev noLoc)) (signedIntConst off) noLoc, signedIntConst halfB]) noLoc
+          pure (RVal out)
+     in (extractPart 0, extractPart halfB)
+
+  vconcat (JanusCUDA (JanusC mlo)) (JanusCUDA (JanusC mhi)) = JanusCUDA $ JanusC $ do
+    addHeader "string.h"
+    ty1 <- getJanusCType (Proxy @(SIMDVector JanusCUDA n a))
+    ty2 <- getJanusCType (Proxy @(SIMDVector JanusCUDA n2 a))
+    RVal elo0 <- mlo
+    RVal ehi0 <- mhi
+    elo <- emitLocalVal ty1 elo0
+    ehi <- emitLocalVal ty1 ehi0
+    out <- cuUninit ty2
+    let halfB = simdBytes (Proxy @n) (Proxy @a)
+        dstPtr = cuPtrCast "uint8_t" (UnOp AddrOf out noLoc)
+    cuStmt $ Exp (Just $ cuCall "memcpy" [dstPtr, UnOp AddrOf elo noLoc, signedIntConst halfB]) noLoc
+    cuStmt $ Exp (Just $ cuCall "memcpy" [BinOp Add dstPtr (signedIntConst halfB) noLoc, UnOp AddrOf ehi noLoc, signedIntConst halfB]) noLoc
+    pure (RVal out)
+
+-- 9. ExpSIMDReduce JanusCUDA
+emitCUDAReduce ::
+  forall n a.
+  (SIMDShape n a) =>
+  (Exp -> Exp -> Exp) ->
+  JanusCUDA (SIMDVector JanusCUDA n a) ->
+  JanusCUDA a
+emitCUDAReduce combine (JanusCUDA (JanusC mv)) = JanusCUDA $ JanusC $ do
+  addHeader "string.h"
+  ty <- getJanusCType (Proxy @(SIMDVector JanusCUDA n a))
+  RVal ev0 <- mv
+  ev <- emitLocalVal ty ev0
+  let lanes = simdLanes (Proxy @n) (Proxy @a)
+      bytes = simdBytes (Proxy @n) (Proxy @a)
+      elemName = simdElemCTypeName (Proxy @a)
+      JCType espec _ = cuNamedType elemName
+      arrDec = Array [] (ArraySize False (signedIntConst lanes) noLoc) (DeclRoot noLoc) noLoc
+  arr <- cuUninit (JCType espec arrDec)
+  cuStmt $ Exp (Just $ cuCall "memcpy" [arr, UnOp AddrOf ev noLoc, signedIntConst bytes]) noLoc
+  acc <- emitLocalVal (cuNamedType elemName) (Index arr (cuInt 0) noLoc)
+  forM_ [1 .. lanes - 1] $ \i ->
+    cuStmt $ Exp (Just $ Assign acc JustAssign (combine acc (Index arr (signedIntConst i) noLoc)) noLoc) noLoc
+  pure (RVal acc)
+
+instance (SIMDShape n a, CPUSIMDElem a, JanusCTyped a) => ExpSIMDReduce JanusCUDA n a where
+  vreduceAdd =
+    let uTy = "uint" <> show (simdElemBytes (Proxy @a) * 8) <> "_t"
+        comb x y
+          | simdElemIsFloat (Proxy @a) = BinOp Add x y noLoc
+          | otherwise = cuCast (simdElemCTypeName (Proxy @a)) (BinOp Add (cuCast uTy x) (cuCast uTy y) noLoc)
+     in emitCUDAReduce comb
+  vreduceMin = emitCUDAReduce (\x y -> Cond (BinOp Lt x y noLoc) x y noLoc)
+  vreduceMax = emitCUDAReduce (\x y -> Cond (BinOp Gt x y noLoc) x y noLoc)
+  vreduceAnd (JanusCUDA (JanusC mv)) = JanusCUDA $ JanusC $ do
+    addHeader "string.h"
+    ty <- getJanusCType (Proxy @(SIMDVector JanusCUDA n a))
+    RVal ev0 <- mv
+    ev <- emitLocalVal ty ev0
+    let lanes = simdLanes (Proxy @n) (Proxy @a)
+        sz = simdElemBytes (Proxy @a)
+        uTy = "uint" <> show (sz * 8) <> "_t"
+        JCType uspec _ = cuNamedType uTy
+        arrDec = Array [] (ArraySize False (signedIntConst lanes) noLoc) (DeclRoot noLoc) noLoc
+    arr <- cuUninit (JCType uspec arrDec)
+    cuStmt $ Exp (Just $ cuCall "memcpy" [arr, UnOp AddrOf ev noLoc, signedIntConst (lanes * sz)]) noLoc
+    acc <- emitLocalVal (cuNamedType uTy) (Index arr (cuInt 0) noLoc)
+    forM_ [1 .. lanes - 1] $ \i -> cuStmt $ Exp (Just $ Assign acc AndAssign (Index arr (signedIntConst i) noLoc) noLoc) noLoc
+    out <- cuUninit (cuNamedType (simdElemCTypeName (Proxy @a)))
+    cuStmt $ Exp (Just $ cuCall "memcpy" [UnOp AddrOf out noLoc, UnOp AddrOf acc noLoc, signedIntConst sz]) noLoc
+    pure (RVal out)
+  vreduceOr (JanusCUDA (JanusC mv)) = JanusCUDA $ JanusC $ do
+    addHeader "string.h"
+    ty <- getJanusCType (Proxy @(SIMDVector JanusCUDA n a))
+    RVal ev0 <- mv
+    ev <- emitLocalVal ty ev0
+    let lanes = simdLanes (Proxy @n) (Proxy @a)
+        sz = simdElemBytes (Proxy @a)
+        uTy = "uint" <> show (sz * 8) <> "_t"
+        JCType uspec _ = cuNamedType uTy
+        arrDec = Array [] (ArraySize False (signedIntConst lanes) noLoc) (DeclRoot noLoc) noLoc
+    arr <- cuUninit (JCType uspec arrDec)
+    cuStmt $ Exp (Just $ cuCall "memcpy" [arr, UnOp AddrOf ev noLoc, signedIntConst (lanes * sz)]) noLoc
+    acc <- emitLocalVal (cuNamedType uTy) (Index arr (cuInt 0) noLoc)
+    forM_ [1 .. lanes - 1] $ \i -> cuStmt $ Exp (Just $ Assign acc OrAssign (Index arr (signedIntConst i) noLoc) noLoc) noLoc
+    out <- cuUninit (cuNamedType (simdElemCTypeName (Proxy @a)))
+    cuStmt $ Exp (Just $ cuCall "memcpy" [UnOp AddrOf out noLoc, UnOp AddrOf acc noLoc, signedIntConst sz]) noLoc
+    pure (RVal out)
+  vreduceXor (JanusCUDA (JanusC mv)) = JanusCUDA $ JanusC $ do
+    addHeader "string.h"
+    ty <- getJanusCType (Proxy @(SIMDVector JanusCUDA n a))
+    RVal ev0 <- mv
+    ev <- emitLocalVal ty ev0
+    let lanes = simdLanes (Proxy @n) (Proxy @a)
+        sz = simdElemBytes (Proxy @a)
+        uTy = "uint" <> show (sz * 8) <> "_t"
+        JCType uspec _ = cuNamedType uTy
+        arrDec = Array [] (ArraySize False (signedIntConst lanes) noLoc) (DeclRoot noLoc) noLoc
+    arr <- cuUninit (JCType uspec arrDec)
+    cuStmt $ Exp (Just $ cuCall "memcpy" [arr, UnOp AddrOf ev noLoc, signedIntConst (lanes * sz)]) noLoc
+    acc <- emitLocalVal (cuNamedType uTy) (Index arr (cuInt 0) noLoc)
+    forM_ [1 .. lanes - 1] $ \i -> cuStmt $ Exp (Just $ Assign acc XorAssign (Index arr (signedIntConst i) noLoc) noLoc) noLoc
+    out <- cuUninit (cuNamedType (simdElemCTypeName (Proxy @a)))
+    cuStmt $ Exp (Just $ cuCall "memcpy" [UnOp AddrOf out noLoc, UnOp AddrOf acc noLoc, signedIntConst sz]) noLoc
+    pure (RVal out)
+
+-- 10. ExpSIMDDot JanusCUDA (__dp4a, __dp2a_lo, __dp2a_hi on sm_61+, __vsadu4)
+emitCUDADp4aSWord :: CUDAFeatures -> Exp -> Exp -> Exp -> JanusCM Exp
+emitCUDADp4aSWord fs ea eb ec
+  | cudaHasDP4A fs = do
+      addHeader "sm_61_intrinsics.h"
+      emitLocalVal (cuNamedType "int32_t") (cuCall "__dp4a" [cuCast "int" ea, cuCast "int" eb, cuCast "int" ec])
+  | otherwise = do
+      a <- emitLocalVal (cuNamedType "uint32_t") ea
+      b <- emitLocalVal (cuNamedType "uint32_t") eb
+      acc <- emitLocalVal (cuNamedType "uint32_t") (cuCast "uint32_t" ec)
+      let byteS u k = cuCast "int32_t" (cuCast "int8_t" (BinOp Rsh u (signedIntConst (k * 8)) noLoc))
+          term k = cuCast "uint32_t" (BinOp Mul (byteS a k) (byteS b k) noLoc)
+          s4 = foldl (\s k -> BinOp Add s (term k) noLoc) acc [0 .. 3 :: Int]
+      emitLocalVal (cuNamedType "int32_t") (cuCast "int32_t" s4)
+
+emitCUDADp4aUWord :: CUDAFeatures -> Exp -> Exp -> Exp -> JanusCM Exp
+emitCUDADp4aUWord fs ea eb ec
+  | cudaHasDP4A fs = do
+      addHeader "sm_61_intrinsics.h"
+      emitLocalVal (cuNamedType "uint32_t") (cuCall "__dp4a" [cuCast "unsigned int" ea, cuCast "unsigned int" eb, cuCast "unsigned int" ec])
+  | otherwise = do
+      a <- emitLocalVal (cuNamedType "uint32_t") ea
+      b <- emitLocalVal (cuNamedType "uint32_t") eb
+      acc <- emitLocalVal (cuNamedType "uint32_t") ec
+      let byteU u k = BinOp And (BinOp Rsh u (signedIntConst (k * 8)) noLoc) (unsignedIntConst (0xFF :: Word32)) noLoc
+          term k = BinOp Mul (byteU a k) (byteU b k) noLoc
+          s4 = foldl (\s k -> BinOp Add s (term k) noLoc) acc [0 .. 3 :: Int]
+      emitLocalVal (cuNamedType "uint32_t") s4
+
+instance ExpSIMDDot JanusCUDA where
+  vdp4aS (JanusCUDA (JanusC ma)) (JanusCUDA (JanusC mb)) (JanusCUDA (JanusC mc)) =
+    JanusCUDA $ JanusC $ do
+      fs <- askCUDAFeatures
+      RVal a <- ma
+      RVal b <- mb
+      RVal c <- mc
+      RVal <$> emitCUDADp4aSWord fs a b c
+
+  vdp4aU (JanusCUDA (JanusC ma)) (JanusCUDA (JanusC mb)) (JanusCUDA (JanusC mc)) =
+    JanusCUDA $ JanusC $ do
+      fs <- askCUDAFeatures
+      RVal a <- ma
+      RVal b <- mb
+      RVal c <- mc
+      RVal <$> emitCUDADp4aUWord fs a b c
+
+  vdp4aVecS ::
+    forall m k.
+    (SIMDDp4aShape m k) =>
+    JanusCUDA (SIMDVector JanusCUDA m Int8) ->
+    JanusCUDA (SIMDVector JanusCUDA m Int8) ->
+    JanusCUDA (SIMDVector JanusCUDA k Int32) ->
+    JanusCUDA (SIMDVector JanusCUDA k Int32)
+  vdp4aVecS (JanusCUDA (JanusC ma)) (JanusCUDA (JanusC mb)) (JanusCUDA (JanusC mc)) =
+    JanusCUDA $ JanusC $ do
+      addHeader "string.h"
+      fs <- askCUDAFeatures
+      tyA <- getJanusCType (Proxy @(SIMDVector JanusCUDA m Int8))
+      tyK <- getJanusCType (Proxy @(SIMDVector JanusCUDA k Int32))
+      RVal ea0 <- ma
+      RVal eb0 <- mb
+      RVal ec0 <- mc
+      ea <- emitLocalVal tyA ea0
+      eb <- emitLocalVal tyA eb0
+      ec <- emitLocalVal tyK ec0
+      let groups = simdLanes (Proxy @k) (Proxy @Int32)
+          JCType u32spec _ = cuNamedType "uint32_t"
+          JCType i32spec _ = cuNamedType "int32_t"
+          arrDec = Array [] (ArraySize False (signedIntConst groups) noLoc) (DeclRoot noLoc) noLoc
+      aw <- cuUninit (JCType u32spec arrDec)
+      bw <- cuUninit (JCType u32spec arrDec)
+      cw <- cuUninit (JCType i32spec arrDec)
+      rw <- cuUninit (JCType i32spec arrDec)
+      out <- cuUninit tyK
+      cuStmt $ Exp (Just $ cuCall "memcpy" [aw, UnOp AddrOf ea noLoc, signedIntConst (groups * 4)]) noLoc
+      cuStmt $ Exp (Just $ cuCall "memcpy" [bw, UnOp AddrOf eb noLoc, signedIntConst (groups * 4)]) noLoc
+      cuStmt $ Exp (Just $ cuCall "memcpy" [cw, UnOp AddrOf ec noLoc, signedIntConst (groups * 4)]) noLoc
+      forM_ [0 .. groups - 1] $ \g -> do
+        let gi = signedIntConst g
+        rg <- emitCUDADp4aSWord fs (Index aw gi noLoc) (Index bw gi noLoc) (Index cw gi noLoc)
+        cuStmt $ Exp (Just $ Assign (Index rw gi noLoc) JustAssign rg noLoc) noLoc
+      cuStmt $ Exp (Just $ cuCall "memcpy" [UnOp AddrOf out noLoc, rw, signedIntConst (groups * 4)]) noLoc
+      pure (RVal out)
+
+  vdp4aVecU ::
+    forall m k.
+    (SIMDDp4aShape m k) =>
+    JanusCUDA (SIMDVector JanusCUDA m Word8) ->
+    JanusCUDA (SIMDVector JanusCUDA m Word8) ->
+    JanusCUDA (SIMDVector JanusCUDA k Word32) ->
+    JanusCUDA (SIMDVector JanusCUDA k Word32)
+  vdp4aVecU (JanusCUDA (JanusC ma)) (JanusCUDA (JanusC mb)) (JanusCUDA (JanusC mc)) =
+    JanusCUDA $ JanusC $ do
+      addHeader "string.h"
+      fs <- askCUDAFeatures
+      tyA <- getJanusCType (Proxy @(SIMDVector JanusCUDA m Word8))
+      tyK <- getJanusCType (Proxy @(SIMDVector JanusCUDA k Word32))
+      RVal ea0 <- ma
+      RVal eb0 <- mb
+      RVal ec0 <- mc
+      ea <- emitLocalVal tyA ea0
+      eb <- emitLocalVal tyA eb0
+      ec <- emitLocalVal tyK ec0
+      let groups = simdLanes (Proxy @k) (Proxy @Word32)
+          JCType u32spec _ = cuNamedType "uint32_t"
+          arrDec = Array [] (ArraySize False (signedIntConst groups) noLoc) (DeclRoot noLoc) noLoc
+      aw <- cuUninit (JCType u32spec arrDec)
+      bw <- cuUninit (JCType u32spec arrDec)
+      cw <- cuUninit (JCType u32spec arrDec)
+      rw <- cuUninit (JCType u32spec arrDec)
+      out <- cuUninit tyK
+      cuStmt $ Exp (Just $ cuCall "memcpy" [aw, UnOp AddrOf ea noLoc, signedIntConst (groups * 4)]) noLoc
+      cuStmt $ Exp (Just $ cuCall "memcpy" [bw, UnOp AddrOf eb noLoc, signedIntConst (groups * 4)]) noLoc
+      cuStmt $ Exp (Just $ cuCall "memcpy" [cw, UnOp AddrOf ec noLoc, signedIntConst (groups * 4)]) noLoc
+      forM_ [0 .. groups - 1] $ \g -> do
+        let gi = signedIntConst g
+        rg <- emitCUDADp4aUWord fs (Index aw gi noLoc) (Index bw gi noLoc) (Index cw gi noLoc)
+        cuStmt $ Exp (Just $ Assign (Index rw gi noLoc) JustAssign rg noLoc) noLoc
+      cuStmt $ Exp (Just $ cuCall "memcpy" [UnOp AddrOf out noLoc, rw, signedIntConst (groups * 4)]) noLoc
+      pure (RVal out)
+
+  vdp2aLoS (JanusCUDA (JanusC ma)) (JanusCUDA (JanusC mb)) (JanusCUDA (JanusC mc)) =
+    JanusCUDA $ JanusC $ do
+      fs <- askCUDAFeatures
+      RVal ea <- ma
+      RVal eb <- mb
+      RVal ec <- mc
+      if cudaHasDP2A fs
+        then do
+          addHeader "sm_61_intrinsics.h"
+          RVal <$> emitLocalVal (cuNamedType "int32_t") (cuCall "__dp2a_lo" [cuCast "int" ea, cuCast "int" eb, cuCast "int" ec])
+        else do
+          a <- emitLocalVal (cuNamedType "uint32_t") ea
+          b <- emitLocalVal (cuNamedType "uint32_t") eb
+          let a0 = cuCast "int32_t" (cuCast "int16_t" a)
+              a1 = cuCast "int32_t" (cuCast "int16_t" (BinOp Rsh a (cuInt 16) noLoc))
+              b0 = cuCast "int32_t" (cuCast "int8_t" b)
+              b1 = cuCast "int32_t" (cuCast "int8_t" (BinOp Rsh b (cuInt 8) noLoc))
+              prod = cuCast "uint32_t" (BinOp Add (BinOp Mul a0 b0 noLoc) (BinOp Mul a1 b1 noLoc) noLoc)
+          RVal <$> emitLocalVal (cuNamedType "int32_t") (cuCast "int32_t" (BinOp Add (cuCast "uint32_t" ec) prod noLoc))
+
+  vdp2aHiS (JanusCUDA (JanusC ma)) (JanusCUDA (JanusC mb)) (JanusCUDA (JanusC mc)) =
+    JanusCUDA $ JanusC $ do
+      fs <- askCUDAFeatures
+      RVal ea <- ma
+      RVal eb <- mb
+      RVal ec <- mc
+      if cudaHasDP2A fs
+        then do
+          addHeader "sm_61_intrinsics.h"
+          RVal <$> emitLocalVal (cuNamedType "int32_t") (cuCall "__dp2a_hi" [cuCast "int" ea, cuCast "int" eb, cuCast "int" ec])
+        else do
+          a <- emitLocalVal (cuNamedType "uint32_t") ea
+          b <- emitLocalVal (cuNamedType "uint32_t") eb
+          let a0 = cuCast "int32_t" (cuCast "int16_t" a)
+              a1 = cuCast "int32_t" (cuCast "int16_t" (BinOp Rsh a (cuInt 16) noLoc))
+              b2 = cuCast "int32_t" (cuCast "int8_t" (BinOp Rsh b (cuInt 16) noLoc))
+              b3 = cuCast "int32_t" (cuCast "int8_t" (BinOp Rsh b (cuInt 24) noLoc))
+              prod = cuCast "uint32_t" (BinOp Add (BinOp Mul a0 b2 noLoc) (BinOp Mul a1 b3 noLoc) noLoc)
+          RVal <$> emitLocalVal (cuNamedType "int32_t") (cuCast "int32_t" (BinOp Add (cuCast "uint32_t" ec) prod noLoc))
+
+  vdp2aLoU (JanusCUDA (JanusC ma)) (JanusCUDA (JanusC mb)) (JanusCUDA (JanusC mc)) =
+    JanusCUDA $ JanusC $ do
+      fs <- askCUDAFeatures
+      RVal ea <- ma
+      RVal eb <- mb
+      RVal ec <- mc
+      if cudaHasDP2A fs
+        then do
+          addHeader "sm_61_intrinsics.h"
+          RVal <$> emitLocalVal (cuNamedType "uint32_t") (cuCall "__dp2a_lo" [cuCast "unsigned int" ea, cuCast "unsigned int" eb, cuCast "unsigned int" ec])
+        else do
+          a <- emitLocalVal (cuNamedType "uint32_t") ea
+          b <- emitLocalVal (cuNamedType "uint32_t") eb
+          let a0 = BinOp And a (unsignedIntConst (0xFFFF :: Word32)) noLoc
+              a1 = BinOp Rsh a (cuInt 16) noLoc
+              b0 = BinOp And b (unsignedIntConst (0xFF :: Word32)) noLoc
+              b1 = BinOp And (BinOp Rsh b (cuInt 8) noLoc) (unsignedIntConst (0xFF :: Word32)) noLoc
+          RVal <$> emitLocalVal (cuNamedType "uint32_t") (BinOp Add ec (BinOp Add (BinOp Mul a0 b0 noLoc) (BinOp Mul a1 b1 noLoc) noLoc) noLoc)
+
+  vdp2aHiU (JanusCUDA (JanusC ma)) (JanusCUDA (JanusC mb)) (JanusCUDA (JanusC mc)) =
+    JanusCUDA $ JanusC $ do
+      fs <- askCUDAFeatures
+      RVal ea <- ma
+      RVal eb <- mb
+      RVal ec <- mc
+      if cudaHasDP2A fs
+        then do
+          addHeader "sm_61_intrinsics.h"
+          RVal <$> emitLocalVal (cuNamedType "uint32_t") (cuCall "__dp2a_hi" [cuCast "unsigned int" ea, cuCast "unsigned int" eb, cuCast "unsigned int" ec])
+        else do
+          a <- emitLocalVal (cuNamedType "uint32_t") ea
+          b <- emitLocalVal (cuNamedType "uint32_t") eb
+          let a0 = BinOp And a (unsignedIntConst (0xFFFF :: Word32)) noLoc
+              a1 = BinOp Rsh a (cuInt 16) noLoc
+              b2 = BinOp And (BinOp Rsh b (cuInt 16) noLoc) (unsignedIntConst (0xFF :: Word32)) noLoc
+              b3 = BinOp Rsh b (cuInt 24) noLoc
+          RVal <$> emitLocalVal (cuNamedType "uint32_t") (BinOp Add ec (BinOp Add (BinOp Mul a0 b2 noLoc) (BinOp Mul a1 b3 noLoc) noLoc) noLoc)
+
+  vsad8 ::
+    forall n.
+    (SIMDShape n Word8) =>
+    JanusCUDA (SIMDVector JanusCUDA n Word8) ->
+    JanusCUDA (SIMDVector JanusCUDA n Word8) ->
+    JanusCUDA Word32
+  vsad8 (JanusCUDA (JanusC ma)) (JanusCUDA (JanusC mb)) =
+    JanusCUDA $ JanusC $ do
+      addHeader "string.h"
+      ty <- getJanusCType (Proxy @(SIMDVector JanusCUDA n Word8))
+      RVal ea0 <- ma
+      RVal eb0 <- mb
+      ea <- emitLocalVal ty ea0
+      eb <- emitLocalVal ty eb0
+      let bytes = simdBytes (Proxy @n) (Proxy @Word8)
+          words32 = bytes `div` 4
+      if words32 == 1
+        then RVal <$> emitLocalVal (cuNamedType "uint32_t") (cuCall "__vsadu4" [ea, eb])
+        else do
+          let JCType u32spec _ = cuNamedType "uint32_t"
+              arrDec = Array [] (ArraySize False (signedIntConst words32) noLoc) (DeclRoot noLoc) noLoc
+          aw <- cuUninit (JCType u32spec arrDec)
+          bw <- cuUninit (JCType u32spec arrDec)
+          cuStmt $ Exp (Just $ cuCall "memcpy" [aw, UnOp AddrOf ea noLoc, signedIntConst bytes]) noLoc
+          cuStmt $ Exp (Just $ cuCall "memcpy" [bw, UnOp AddrOf eb noLoc, signedIntConst bytes]) noLoc
+          acc <- emitLocalVal (cuNamedType "uint32_t") (unsignedIntConst (0 :: Word32))
+          forM_ [0 .. words32 - 1] $ \w -> do
+            let wi = signedIntConst w
+            cuStmt $ Exp (Just $ Assign acc AddAssign (cuCall "__vsadu4" [Index aw wi noLoc, Index bw wi noLoc]) noLoc) noLoc
+          pure (RVal acc)
+
+-- 11. ExpSIMDCast JanusCUDA
+instance ExpSIMDCast JanusCUDA where
+  vbitcast ::
+    forall n a m b.
+    (SIMDShape n a, SIMDShape m b) =>
+    JanusCUDA (SIMDVector JanusCUDA n a) ->
+    JanusCUDA (SIMDVector JanusCUDA m b)
+  vbitcast (JanusCUDA (JanusC mv)) = JanusCUDA $ JanusC $ do
+    addHeader "string.h"
+    let b1 = simdBytes (Proxy @n) (Proxy @a)
+        b2 = simdBytes (Proxy @m) (Proxy @b)
+    when (b1 /= b2) $ error "vbitcast: mismatched byte widths"
+    srcTy <- getJanusCType (Proxy @(SIMDVector JanusCUDA n a))
+    dstTy <- getJanusCType (Proxy @(SIMDVector JanusCUDA m b))
+    RVal ev0 <- mv
+    ev <- emitLocalVal srcTy ev0
+    out <- cuUninit dstTy
+    cuStmt $ Exp (Just $ cuCall "memcpy" [UnOp AddrOf out noLoc, UnOp AddrOf ev noLoc, signedIntConst b1]) noLoc
+    pure (RVal out)
+
+  vcvt ::
+    forall n a b.
+    (SIMDShape n a, SIMDShape n b, CPUSIMDElem a, CPUSIMDElem b) =>
+    JanusCUDA (SIMDVector JanusCUDA n a) ->
+    JanusCUDA (SIMDVector JanusCUDA n b)
+  vcvt (JanusCUDA (JanusC mv)) = JanusCUDA $ JanusC $ do
+    addHeader "string.h"
+    srcTy <- getJanusCType (Proxy @(SIMDVector JanusCUDA n a))
+    dstTy <- getJanusCType (Proxy @(SIMDVector JanusCUDA n b))
+    RVal ev0 <- mv
+    ev <- emitLocalVal srcTy ev0
+    let lanes = simdLanes (Proxy @n) (Proxy @a)
+        sb = simdBytes (Proxy @n) (Proxy @a)
+        db = simdBytes (Proxy @n) (Proxy @b)
+        JCType sspec _ = cuNamedType (simdElemCTypeName (Proxy @a))
+        JCType dspec _ = cuNamedType (simdElemCTypeName (Proxy @b))
+        arrDec = Array [] (ArraySize False (signedIntConst lanes) noLoc) (DeclRoot noLoc) noLoc
+    sa <- cuUninit (JCType sspec arrDec)
+    da <- cuUninit (JCType dspec arrDec)
+    out <- cuUninit dstTy
+    cuStmt $ Exp (Just $ cuCall "memcpy" [sa, UnOp AddrOf ev noLoc, signedIntConst sb]) noLoc
+    forM_ [0 .. lanes - 1] $ \i -> do
+      let idx = signedIntConst i
+      cuStmt $ Exp (Just $ Assign (Index da idx noLoc) JustAssign (cuCast (simdElemCTypeName (Proxy @b)) (Index sa idx noLoc)) noLoc) noLoc
+    cuStmt $ Exp (Just $ cuCall "memcpy" [UnOp AddrOf out noLoc, da, signedIntConst db]) noLoc
+    pure (RVal out)
+
+  vnarrowSat ::
+    forall n m a b.
+    (SIMDPackShape n m a b) =>
+    JanusCUDA (SIMDVector JanusCUDA n a) ->
+    JanusCUDA (SIMDVector JanusCUDA n a) ->
+    JanusCUDA (SIMDVector JanusCUDA m b)
+  vnarrowSat (JanusCUDA (JanusC mlo)) (JanusCUDA (JanusC mhi)) = JanusCUDA $ JanusC $ do
+    addHeader "string.h"
+    srcTy <- getJanusCType (Proxy @(SIMDVector JanusCUDA n a))
+    dstTy <- getJanusCType (Proxy @(SIMDVector JanusCUDA m b))
+    RVal elo0 <- mlo
+    RVal ehi0 <- mhi
+    elo <- emitLocalVal srcTy elo0
+    ehi <- emitLocalVal srcTy ehi0
+    let half = simdLanes (Proxy @n) (Proxy @a)
+        total = 2 * half
+        sb = simdBytes (Proxy @n) (Proxy @a)
+        db = simdBytes (Proxy @m) (Proxy @b)
+        dstBits = simdElemBytes (Proxy @b) * 8
+        dstSigned = simdElemSigned (Proxy @b)
+        dmin = if dstSigned then -(1 `shiftL` (dstBits - 1) :: Int64) else 0
+        dmax = (if dstSigned then (1 `shiftL` (dstBits - 1)) - 1 else (1 `shiftL` dstBits) - 1) :: Int64
+        JCType sspec _ = cuNamedType (simdElemCTypeName (Proxy @a))
+        JCType dspec _ = cuNamedType (simdElemCTypeName (Proxy @b))
+        sDec = Array [] (ArraySize False (signedIntConst half) noLoc) (DeclRoot noLoc) noLoc
+        dDec = Array [] (ArraySize False (signedIntConst total) noLoc) (DeclRoot noLoc) noLoc
+    alo <- cuUninit (JCType sspec sDec)
+    ahi <- cuUninit (JCType sspec sDec)
+    adst <- cuUninit (JCType dspec dDec)
+    out <- cuUninit dstTy
+    cuStmt $ Exp (Just $ cuCall "memcpy" [alo, UnOp AddrOf elo noLoc, signedIntConst sb]) noLoc
+    cuStmt $ Exp (Just $ cuCall "memcpy" [ahi, UnOp AddrOf ehi noLoc, signedIntConst sb]) noLoc
+    let clampExp v =
+          let v64 = cuCast "int64_t" v
+              loE = signedIntConst dmin
+              hiE = signedIntConst dmax
+           in cuCast (simdElemCTypeName (Proxy @b)) (Cond (BinOp Lt v64 loE noLoc) loE (Cond (BinOp Gt v64 hiE noLoc) hiE v64 noLoc) noLoc)
+    forM_ [0 .. half - 1] $ \i -> do
+      cuStmt $ Exp (Just $ Assign (Index adst (signedIntConst i) noLoc) JustAssign (clampExp (Index alo (signedIntConst i) noLoc)) noLoc) noLoc
+      cuStmt $ Exp (Just $ Assign (Index adst (signedIntConst (half + i)) noLoc) JustAssign (clampExp (Index ahi (signedIntConst i) noLoc)) noLoc) noLoc
+    cuStmt $ Exp (Just $ cuCall "memcpy" [UnOp AddrOf out noLoc, adst, signedIntConst db]) noLoc
+    pure (RVal out)
+
+-- 12. CmdSIMDMem JanusCUDAM JanusCUDA
+instance (SIMDShape n a, Typeable a, JanusCTyped a) => CmdSIMDMem JanusCUDAM JanusCUDA n a where
+  vload (JanusCUDA (JanusC mp)) = JanusCUDAM $ lift $ do
+    addHeader "string.h"
+    vty <- getJanusCType (Proxy @(SIMDVector JanusCUDA n a))
+    pty <- getJanusCType (Proxy @(Ptr a))
+    RVal ep0 <- mp
+    ep <- emitLocalVal pty ep0
+    out <- cuUninit vty
+    -- Safe element-by-element load for unaligned global/shared pointers
+    let lanes = simdLanes (Proxy @n) (Proxy @a)
+        bytes = simdBytes (Proxy @n) (Proxy @a)
+        JCType espec _ = cuNamedType (simdElemCTypeName (Proxy @a))
+        arrDec = Array [] (ArraySize False (signedIntConst lanes) noLoc) (DeclRoot noLoc) noLoc
+    arr <- cuUninit (JCType espec arrDec)
+    forM_ [0 .. lanes - 1] $ \i ->
+      cuStmt $ Exp (Just $ Assign (Index arr (signedIntConst i) noLoc) JustAssign (Index ep (signedIntConst i) noLoc) noLoc) noLoc
+    cuStmt $ Exp (Just $ cuCall "memcpy" [UnOp AddrOf out noLoc, arr, signedIntConst bytes]) noLoc
+    pure (JanusCUDA (JanusC (pure (RVal out))))
+
+  vloadAligned (JanusCUDA (JanusC mp)) = JanusCUDAM $ lift $ do
+    vty@(JCType spec dec) <- getJanusCType (Proxy @(SIMDVector JanusCUDA n a))
+    RVal ep0 <- mp
+    -- Coalesced wide load (e.g. ld.global.v4.f32 / ld.global.v4.u32)
+    let castP = Cast (Type spec (Ptr [Tconst noLoc] dec noLoc) noLoc) ep0 noLoc
+    out <- emitLocalVal vty (UnOp Deref castP noLoc)
+    pure (JanusCUDA (JanusC (pure (RVal out))))
+
+  vstore (JanusCUDA (JanusC mp)) (JanusCUDA (JanusC mv)) = JanusCUDAM $ lift $ do
+    addHeader "string.h"
+    vty <- getJanusCType (Proxy @(SIMDVector JanusCUDA n a))
+    pty <- getJanusCType (Proxy @(Ptr a))
+    RVal ep0 <- mp
+    RVal ev0 <- mv
+    ep <- emitLocalVal pty ep0
+    ev <- emitLocalVal vty ev0
+    let lanes = simdLanes (Proxy @n) (Proxy @a)
+        bytes = simdBytes (Proxy @n) (Proxy @a)
+        JCType espec _ = cuNamedType (simdElemCTypeName (Proxy @a))
+        arrDec = Array [] (ArraySize False (signedIntConst lanes) noLoc) (DeclRoot noLoc) noLoc
+    arr <- cuUninit (JCType espec arrDec)
+    cuStmt $ Exp (Just $ cuCall "memcpy" [arr, UnOp AddrOf ev noLoc, signedIntConst bytes]) noLoc
+    forM_ [0 .. lanes - 1] $ \i ->
+      cuStmt $ Exp (Just $ Assign (Index ep (signedIntConst i) noLoc) JustAssign (Index arr (signedIntConst i) noLoc) noLoc) noLoc
+
+  vstoreAligned (JanusCUDA (JanusC mp)) (JanusCUDA (JanusC mv)) = JanusCUDAM $ lift $ do
+    vty@(JCType spec dec) <- getJanusCType (Proxy @(SIMDVector JanusCUDA n a))
+    RVal ep0 <- mp
+    RVal ev0 <- mv
+    ev <- emitLocalVal vty ev0
+    let castP = Cast (Type spec (Ptr [] dec noLoc) noLoc) ep0 noLoc
+    cuStmt $ Exp (Just $ Assign (UnOp Deref castP noLoc) JustAssign ev noLoc) noLoc
+
+  vloadMasked (JanusCUDA (JanusC mm)) (JanusCUDA (JanusC mfb)) (JanusCUDA (JanusC mp)) =
+    JanusCUDAM $ lift $ do
+      addHeader "string.h"
+      mty <- getJanusCType (Proxy @(SIMDMask JanusCUDA n a))
+      vty <- getJanusCType (Proxy @(SIMDVector JanusCUDA n a))
+      pty <- getJanusCType (Proxy @(Ptr a))
+      RVal em0 <- mm
+      RVal efb0 <- mfb
+      RVal ep0 <- mp
+      em <- emitLocalVal mty em0
+      efb <- emitLocalVal vty efb0
+      ep <- emitLocalVal pty ep0
+      let lanes = simdLanes (Proxy @n) (Proxy @a)
+          sz = simdElemBytes (Proxy @a)
+          bytes = lanes * sz
+          JCType espec _ = cuNamedType (simdElemCTypeName (Proxy @a))
+          arrDec = Array [] (ArraySize False (signedIntConst lanes) noLoc) (DeclRoot noLoc) noLoc
+      arr <- cuUninit (JCType espec arrDec)
+      out <- cuUninit vty
+      cuStmt $ Exp (Just $ cuCall "memcpy" [arr, UnOp AddrOf efb noLoc, signedIntConst bytes]) noLoc
+      let maskBytes = cuConstPtrCast "uint8_t" (UnOp AddrOf em noLoc)
+      forM_ [0 .. lanes - 1] $ \i -> do
+        let active = BinOp And (Index maskBytes (signedIntConst (i * sz + (sz - 1))) noLoc) (unsignedIntConst (0x80 :: Word32)) noLoc
+            assignLoad = BlockStm $ Exp (Just $ Assign (Index arr (signedIntConst i) noLoc) JustAssign (Index ep (signedIntConst i) noLoc) noLoc) noLoc
+        cuStmt $ If active (Block [assignLoad] noLoc) Nothing noLoc
+      cuStmt $ Exp (Just $ cuCall "memcpy" [UnOp AddrOf out noLoc, arr, signedIntConst bytes]) noLoc
+      pure (JanusCUDA (JanusC (pure (RVal out))))
+
+  vstoreMasked (JanusCUDA (JanusC mm)) (JanusCUDA (JanusC mp)) (JanusCUDA (JanusC mv)) =
+    JanusCUDAM $ lift $ do
+      addHeader "string.h"
+      mty <- getJanusCType (Proxy @(SIMDMask JanusCUDA n a))
+      vty <- getJanusCType (Proxy @(SIMDVector JanusCUDA n a))
+      pty <- getJanusCType (Proxy @(Ptr a))
+      RVal em0 <- mm
+      RVal ep0 <- mp
+      RVal ev0 <- mv
+      em <- emitLocalVal mty em0
+      ep <- emitLocalVal pty ep0
+      ev <- emitLocalVal vty ev0
+      let lanes = simdLanes (Proxy @n) (Proxy @a)
+          sz = simdElemBytes (Proxy @a)
+          bytes = lanes * sz
+          JCType espec _ = cuNamedType (simdElemCTypeName (Proxy @a))
+          arrDec = Array [] (ArraySize False (signedIntConst lanes) noLoc) (DeclRoot noLoc) noLoc
+      arr <- cuUninit (JCType espec arrDec)
+      cuStmt $ Exp (Just $ cuCall "memcpy" [arr, UnOp AddrOf ev noLoc, signedIntConst bytes]) noLoc
+      let maskBytes = cuConstPtrCast "uint8_t" (UnOp AddrOf em noLoc)
+      forM_ [0 .. lanes - 1] $ \i -> do
+        let active = BinOp And (Index maskBytes (signedIntConst (i * sz + (sz - 1))) noLoc) (unsignedIntConst (0x80 :: Word32)) noLoc
+            assignStore = BlockStm $ Exp (Just $ Assign (Index ep (signedIntConst i) noLoc) JustAssign (Index arr (signedIntConst i) noLoc) noLoc) noLoc
+        cuStmt $ If active (Block [assignStore] noLoc) Nothing noLoc
+
+  vgather (JanusCUDA (JanusC mp)) (JanusCUDA (JanusC midx)) =
+    JanusCUDAM $ lift $ do
+      addHeader "string.h"
+      vty <- getJanusCType (Proxy @(SIMDVector JanusCUDA n a))
+      ity <- getJanusCType (Proxy @(SIMDVector JanusCUDA n Int32))
+      pty <- getJanusCType (Proxy @(Ptr a))
+      RVal ep0 <- mp
+      RVal eidx0 <- midx
+      ep <- emitLocalVal pty ep0
+      eidx <- emitLocalVal ity eidx0
+      let lanes = simdLanes (Proxy @n) (Proxy @a)
+          bytes = simdBytes (Proxy @n) (Proxy @a)
+          JCType espec _ = cuNamedType (simdElemCTypeName (Proxy @a))
+          JCType ispec _ = cuNamedType "int32_t"
+          arrDec = Array [] (ArraySize False (signedIntConst lanes) noLoc) (DeclRoot noLoc) noLoc
+      ia <- cuUninit (JCType ispec arrDec)
+      da <- cuUninit (JCType espec arrDec)
+      out <- cuUninit vty
+      cuStmt $ Exp (Just $ cuCall "memcpy" [ia, UnOp AddrOf eidx noLoc, signedIntConst (lanes * 4)]) noLoc
+      forM_ [0 .. lanes - 1] $ \i ->
+        cuStmt $ Exp (Just $ Assign (Index da (signedIntConst i) noLoc) JustAssign (Index ep (Index ia (signedIntConst i) noLoc) noLoc) noLoc) noLoc
+      cuStmt $ Exp (Just $ cuCall "memcpy" [UnOp AddrOf out noLoc, da, signedIntConst bytes]) noLoc
+      pure (JanusCUDA (JanusC (pure (RVal out))))
+
+  vgatherMasked (JanusCUDA (JanusC mm)) (JanusCUDA (JanusC mfb)) (JanusCUDA (JanusC mp)) (JanusCUDA (JanusC midx)) =
+    JanusCUDAM $ lift $ do
+      addHeader "string.h"
+      mty <- getJanusCType (Proxy @(SIMDMask JanusCUDA n a))
+      vty <- getJanusCType (Proxy @(SIMDVector JanusCUDA n a))
+      ity <- getJanusCType (Proxy @(SIMDVector JanusCUDA n Int32))
+      pty <- getJanusCType (Proxy @(Ptr a))
+      RVal em0 <- mm
+      RVal efb0 <- mfb
+      RVal ep0 <- mp
+      RVal eidx0 <- midx
+      em <- emitLocalVal mty em0
+      efb <- emitLocalVal vty efb0
+      ep <- emitLocalVal pty ep0
+      eidx <- emitLocalVal ity eidx0
+      let lanes = simdLanes (Proxy @n) (Proxy @a)
+          sz = simdElemBytes (Proxy @a)
+          bytes = lanes * sz
+          JCType espec _ = cuNamedType (simdElemCTypeName (Proxy @a))
+          JCType ispec _ = cuNamedType "int32_t"
+          arrDec = Array [] (ArraySize False (signedIntConst lanes) noLoc) (DeclRoot noLoc) noLoc
+      ia <- cuUninit (JCType ispec arrDec)
+      da <- cuUninit (JCType espec arrDec)
+      out <- cuUninit vty
+      cuStmt $ Exp (Just $ cuCall "memcpy" [ia, UnOp AddrOf eidx noLoc, signedIntConst (lanes * 4)]) noLoc
+      cuStmt $ Exp (Just $ cuCall "memcpy" [da, UnOp AddrOf efb noLoc, signedIntConst bytes]) noLoc
+      let maskBytes = cuConstPtrCast "uint8_t" (UnOp AddrOf em noLoc)
+      forM_ [0 .. lanes - 1] $ \i -> do
+        let active = BinOp And (Index maskBytes (signedIntConst (i * sz + (sz - 1))) noLoc) (unsignedIntConst (0x80 :: Word32)) noLoc
+            assignGather = BlockStm $ Exp (Just $ Assign (Index da (signedIntConst i) noLoc) JustAssign (Index ep (Index ia (signedIntConst i) noLoc) noLoc) noLoc) noLoc
+        cuStmt $ If active (Block [assignGather] noLoc) Nothing noLoc
+      cuStmt $ Exp (Just $ cuCall "memcpy" [UnOp AddrOf out noLoc, da, signedIntConst bytes]) noLoc
+      pure (JanusCUDA (JanusC (pure (RVal out))))
