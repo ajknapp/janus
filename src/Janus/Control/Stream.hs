@@ -1,4 +1,5 @@
 {-# LANGUAGE BangPatterns #-}
+{-# LANGUAGE BlockArguments #-}
 {-# LANGUAGE DeriveTraversable #-}
 {-# LANGUAGE DerivingVia #-}
 {-# LANGUAGE FlexibleContexts #-}
@@ -9,11 +10,13 @@
 
 module Janus.Control.Stream where
 
+import Control.Applicative
 import Control.Monad
 import Control.Monad.Codensity
 import Control.Monad.Cont
 import Control.Monad.Trans
 import Data.Functor.Identity ()
+import Data.Functor.Alt
 import Data.Int
 import Janus.Command.Cond
 import Janus.Command.Format
@@ -23,7 +26,7 @@ import Janus.Control.Step
 import Janus.Expression.Bool
 import Janus.Expression.Ord
 import Janus.Typed
-import Prelude hiding ((.), id)
+import Prelude hiding (id, (.))
 
 -- | A stream that produces elements of type @a@ in monad @m@.
 --
@@ -51,6 +54,38 @@ instance (Monad m, CmdCond m e, CmdWhile m e, JanusTyped e Bool) => Applicative 
       isFirst <- readRef first
       ifThenElseM_ isFirst (writeRef first false >> k (Yield a)) (k Stop)
   (<*>) = ap
+
+-- | 'Alt' instance that concatenates streams sequentially.
+--
+-- 'empty' produces an empty stream that immediately stops.
+-- @xs '<|>' ys@ behaves like @xs@ until it emits 'Stop', immediately
+-- switching to @ys@ on that same step (without an extra 'Skip') and
+-- running @ys@ until it emits 'Stop', which stops the combined stream.
+instance (Monad m, CmdCond m e, CmdWhile m e, JanusTyped e Bool) => Alt (Stream m) where
+  Stream s1 <!> Stream s2 = Stream $ do
+    inLeft <- lift (newRef true)
+    b1 <- s1
+    b2 <- s2
+    pure $ ContT $ \k -> do
+      isLeft <- readRef inLeft
+      whenM_ isLeft $
+        runContT b1 $ \case
+          Yield a -> k (Yield a)
+          Skip -> k Skip
+          Stop -> writeRef inLeft false
+      isLeft' <- readRef inLeft
+      unlessM_ isLeft' $
+        runContT b2 k
+
+-- | Duplicates the 'Alt' instance.
+instance (Monad m, CmdCond m e, CmdWhile m e, JanusTyped e Bool) => Alternative (Stream m) where
+  empty = Stream $ pure (pure Stop)
+  (<|>) = (<!>)
+
+-- | Duplicates the 'Alt' instance.
+instance (Monad m, CmdCond m e, CmdWhile m e, JanusTyped e Bool) => MonadPlus (Stream m) where
+  mzero = empty
+  mplus = (<|>)
 
 -- | Produce an infinite stream that yields @a@ on every iteration.
 repeatS :: (Applicative m) => a -> Stream m a
