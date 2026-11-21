@@ -122,17 +122,19 @@ module Janus.Expression.SIMD.FFI
   )
 where
 
+import Control.Monad (when)
 import Data.Int (Int16, Int32, Int8)
 import Data.Proxy (Proxy (..))
 import Data.Word (Word16, Word32, Word8)
 import Foreign.C.Types (CInt (..))
 import Foreign.Marshal.Alloc (alloca)
 import Foreign.Marshal.Array (withArray)
-import Foreign.Ptr (Ptr, castPtr)
+import Foreign.Ptr (Ptr, castPtr, ptrToWordPtr)
 import Foreign.Storable (Storable (peek, poke))
 import GHC.Exts (ByteArray#, MutableByteArray#, RealWorld, copyByteArray#)
 import GHC.Exts (Int (..))
 import GHC.IO (IO (..), unsafeDupablePerformIO)
+import Janus.Backend.C.Target (X86Feature (..), getActiveHostX86Features, hasX86Feature)
 import Janus.CBits ()
 import Janus.Expression.SIMD.Types
 
@@ -511,8 +513,19 @@ ffiLoad p = do
   let b = bytesInt @n @a
   RawSIMD <$> allocByteBuf b (\dst# -> c_load (fromIntegral b) dst# (castPtr p))
 
+checkFFIAligned :: forall n a. (SIMDShape n a) => String -> Ptr a -> IO ()
+checkFFIAligned label p = do
+  fs <- getActiveHostX86Features
+  let b = bytesInt @n @a
+      has256 = if simdElemIsFloat (Proxy @a) then hasX86Feature fs X86_AVX else hasX86Feature fs X86_AVX2
+      reqAlign = if b == 32 && has256 then 32 else min 16 b
+      addr = fromIntegral (ptrToWordPtr p) :: Int
+  when (addr `mod` reqAlign /= 0) $
+    ioError $ userError $ label <> ": pointer " <> show p <> " is not " <> show reqAlign <> "-byte aligned"
+
 ffiLoadAligned :: forall n a. (SIMDShape n a) => Ptr a -> IO (RawSIMD n a)
 ffiLoadAligned p = do
+  checkFFIAligned @n @a "ffiLoadAligned" p
   let b = bytesInt @n @a
   RawSIMD <$> allocByteBuf b (\dst# -> c_load_aligned (fromIntegral b) dst# (castPtr p))
 
@@ -521,7 +534,8 @@ ffiStore p (RawSIMD (ByteBuf s#)) =
   c_store (fromIntegral (bytesInt @n @a)) (castPtr p) s#
 
 ffiStoreAligned :: forall n a. (SIMDShape n a) => Ptr a -> RawSIMD n a -> IO ()
-ffiStoreAligned p (RawSIMD (ByteBuf s#)) =
+ffiStoreAligned p (RawSIMD (ByteBuf s#)) = do
+  checkFFIAligned @n @a "ffiStoreAligned" p
   c_store_aligned (fromIntegral (bytesInt @n @a)) (castPtr p) s#
 
 ffiLoadMasked :: forall n a. (SIMDShape n a) => RawMask n a -> RawSIMD n a -> Ptr a -> IO (RawSIMD n a)

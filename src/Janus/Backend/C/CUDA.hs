@@ -180,6 +180,8 @@ instance (ExpIntegralCast JanusC a b) => ExpIntegralCast JanusCUDA a b where
 
 deriving via JanusC instance ExpCond JanusCUDA
 
+deriving via JanusC instance ExpPtrCast JanusCUDA
+
 instance (ExpEq JanusC a) => ExpEq JanusCUDA a where
   eq = coerce (eq @JanusC @a)
   ne = coerce (ne @JanusC @a)
@@ -1043,6 +1045,7 @@ deriving newtype instance (SIMDShape n a, CPUSIMDElem a) => Num (SIMDVector CUDA
 deriving newtype instance (SIMDShape n a, CPUSIMDElem a, Fractional a) => Fractional (SIMDVector CUDAIO n a)
 deriving newtype instance (SIMDShape n a, CPUSIMDElem a, Floating a) => Floating (SIMDVector CUDAIO n a)
 deriving newtype instance (SIMDShape n a, CPUSIMDElem a, FMA a) => FMA (SIMDVector CUDAIO n a)
+deriving newtype instance (SIMDShape n a, CPUSIMDElem a, Floating a, Hypot a) => Hypot (SIMDVector CUDAIO n a)
 deriving newtype instance (SIMDShape n a) => Join (SIMDMask CUDAIO n a)
 deriving newtype instance (SIMDShape n a) => Meet (SIMDMask CUDAIO n a)
 deriving newtype instance (SIMDShape n a) => Lower (SIMDMask CUDAIO n a)
@@ -1073,6 +1076,7 @@ deriving newtype instance (SIMDShape n a, CPUSIMDElem a) => Num (SIMDVector CUDA
 deriving newtype instance (SIMDShape n a, CPUSIMDElem a, Fractional a) => Fractional (SIMDVector CUDADejaFu n a)
 deriving newtype instance (SIMDShape n a, CPUSIMDElem a, Floating a) => Floating (SIMDVector CUDADejaFu n a)
 deriving newtype instance (SIMDShape n a, CPUSIMDElem a, FMA a) => FMA (SIMDVector CUDADejaFu n a)
+deriving newtype instance (SIMDShape n a, CPUSIMDElem a, Floating a, Hypot a) => Hypot (SIMDVector CUDADejaFu n a)
 deriving newtype instance (SIMDShape n a) => Join (SIMDMask CUDADejaFu n a)
 deriving newtype instance (SIMDShape n a) => Meet (SIMDMask CUDADejaFu n a)
 deriving newtype instance (SIMDShape n a) => Lower (SIMDMask CUDADejaFu n a)
@@ -1584,6 +1588,18 @@ instance (SIMDShape n Double) => Floating (JanusCUDA (SIMDVector JanusCUDA n Dou
 
 instance {-# OVERLAPPING #-} (SIMDShape n a, CPUSIMDElem a, Floating a, FMA a, JanusLitC a) => FMA (JanusCUDA (SIMDVector JanusCUDA n a)) where
   fma = vfma
+
+instance {-# OVERLAPPING #-} (SIMDShape n Float) => Hypot (JanusCUDA (SIMDVector JanusCUDA n Float)) where
+  hypot (JanusCUDA (JanusC ma)) (JanusCUDA (JanusC mb)) = JanusCUDA $ JanusC $ do
+    RVal a <- ma
+    RVal b <- mb
+    RVal <$> emitCUDALaneBin @n @Float (\x y -> cuCall "hypotf" [x, y]) a b
+
+instance {-# OVERLAPPING #-} (SIMDShape n Double) => Hypot (JanusCUDA (SIMDVector JanusCUDA n Double)) where
+  hypot (JanusCUDA (JanusC ma)) (JanusCUDA (JanusC mb)) = JanusCUDA $ JanusC $ do
+    RVal a <- ma
+    RVal b <- mb
+    RVal <$> emitCUDALaneBin @n @Double (\x y -> cuCall "hypot" [x, y]) a b
 
 instance (SIMDShape n a) => Join (JanusCUDA (SIMDMask JanusCUDA n a)) where (\/) = mor
 instance (SIMDShape n a) => Meet (JanusCUDA (SIMDMask JanusCUDA n a)) where (/\) = mand
@@ -2898,7 +2914,7 @@ instance (SIMDShape n a, Typeable a, JanusCTyped a) => CmdSIMDMem JanusCUDAM Jan
     vty@(JCType spec dec) <- getJanusCType (Proxy @(SIMDVector JanusCUDA n a))
     RVal ep0 <- mp
     -- Coalesced wide load (e.g. ld.global.v4.f32 / ld.global.v4.u32)
-    let castP = Cast (Type spec (Ptr [Tconst noLoc] dec noLoc) noLoc) ep0 noLoc
+    let castP = Cast (Type (setTypeQualifiers [Tconst noLoc] spec) (Ptr [] dec noLoc) noLoc) ep0 noLoc
     out <- emitLocalVal vty (UnOp Deref castP noLoc)
     pure (JanusCUDA (JanusC (pure (RVal out))))
 

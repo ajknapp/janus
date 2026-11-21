@@ -61,13 +61,13 @@ class GJanusCFields f where
 
 instance {-# OVERLAPS #-} (JanusCTyped f) => GJanusCFields (K1 i (JanusC f)) where
   gjcfields _ s = do
-    JCType spec _ <- getJanusCType (Proxy @f)
-    pure [FieldGroup spec [Field (Just $ Id s noLoc) (Just $ DeclRoot noLoc) Nothing noLoc] noLoc]
+    JCType spec dec <- getJanusCType (Proxy @f)
+    pure [FieldGroup spec [Field (Just $ Id s noLoc) (Just dec) Nothing noLoc] noLoc]
 
 instance (JanusCTyped f) => GJanusCFields (K1 i f) where
   gjcfields _ s = do
-    JCType spec _ <- getJanusCType (Proxy @f)
-    pure [FieldGroup spec [Field (Just $ Id s noLoc) (Just $ DeclRoot noLoc) Nothing noLoc] noLoc]
+    JCType spec dec <- getJanusCType (Proxy @f)
+    pure [FieldGroup spec [Field (Just $ Id s noLoc) (Just dec) Nothing noLoc] noLoc]
 
 instance (GJanusCFields f, KnownSymbol name) => GJanusCFields (S1 ('MetaSel ('Just name) p s l) f) where
   gjcfields :: forall a. Proxy (S1 ('MetaSel ('Just name) p s l) f a) -> String -> JanusCM [FieldGroup]

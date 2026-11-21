@@ -530,14 +530,27 @@ instance JanusCTyped CFile where
 instance JanusCTyped (Complex Float) where
   jctype _ = pure $ JCType (DeclSpec [] [] (Tfloat_Complex noLoc) noLoc) (DeclRoot noLoc)
 
+instance JanusCTyped (Complex Double) where
+  jctype _ = pure $ JCType (DeclSpec [] [] (Tdouble_Complex noLoc) noLoc) (DeclRoot noLoc)
+
 class JanusLitC a where
   jlitc :: a -> JanusCM Exp
 
 signedIntConst :: (Show a, Integral a) => a -> Exp
-signedIntConst a = C.Const (IntConst (show a) Signed (toInteger a) noLoc) noLoc
+signedIntConst a
+  | toInteger a <= toInteger (minBound :: Int64) =
+      BinOp
+        Sub
+        (C.Const (IntConst "-9223372036854775807LL" Signed (-9223372036854775807) noLoc) noLoc)
+        (C.Const (IntConst "1LL" Signed 1 noLoc) noLoc)
+        noLoc
+  | otherwise = C.Const (IntConst (show a) Signed (toInteger a) noLoc) noLoc
 
 unsignedIntConst :: (Show a, Integral a) => a -> Exp
-unsignedIntConst a = C.Const (IntConst (show a) Unsigned (toInteger a) noLoc) noLoc
+unsignedIntConst a
+  | toInteger a > toInteger (maxBound :: Int64) =
+      C.Const (IntConst (show a <> "ULL") Unsigned (toInteger a) noLoc) noLoc
+  | otherwise = C.Const (IntConst (show a) Unsigned (toInteger a) noLoc) noLoc
 
 -- TODO make this figure out if C platform has signed char or not
 instance JanusLitC CChar where

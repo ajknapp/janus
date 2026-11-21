@@ -128,12 +128,12 @@ import Data.Semilattice.Meet (Meet (..))
 import Data.Semilattice.Upper (Upper (..))
 import Data.Word (Word16, Word32, Word64, Word8)
 import Foreign.Marshal.Alloc (alloca, allocaBytes)
-import Foreign.Ptr (Ptr, castPtr)
+import Foreign.Ptr (Ptr, castPtr, ptrToWordPtr)
 import Foreign.Storable (Storable (..))
 import GHC.Float (castDoubleToWord64, castFloatToWord32, castWord32ToFloat, castWord64ToDouble)
 import GHC.IO (unsafeDupablePerformIO)
 import GHC.TypeLits (Nat)
-import Janus.Expression.Math (FMA (..))
+import Janus.Expression.Math (FMA (..), Hypot (..))
 import Janus.Expression.SIMD.Types
 
 --------------------------------------------------------------------------------
@@ -160,13 +160,13 @@ cpuMaskFromRaw = CPUMask . rawMaskToBools
 
 instance (SIMDShape n a) => Storable (CPUSIMD n a) where
   sizeOf _ = simdBytes (Proxy @n) (Proxy @a)
-  alignment _ = min 16 (simdBytes (Proxy @n) (Proxy @a))
+  alignment _ = min 32 (simdBytes (Proxy @n) (Proxy @a))
   peek p = cpuSIMDFromRaw <$> peek (castPtr p :: Ptr (RawSIMD n a))
   poke p v = poke (castPtr p :: Ptr (RawSIMD n a)) (cpuSIMDToRaw v)
 
 instance (SIMDShape n a) => Storable (CPUMask n a) where
   sizeOf _ = simdBytes (Proxy @n) (Proxy @a)
-  alignment _ = min 16 (simdBytes (Proxy @n) (Proxy @a))
+  alignment _ = min 32 (simdBytes (Proxy @n) (Proxy @a))
   peek p = cpuMaskFromRaw <$> peek (castPtr p :: Ptr (RawMask n a))
   poke p m = poke (castPtr p :: Ptr (RawMask n a)) (cpuMaskToRaw m)
 
@@ -453,6 +453,9 @@ instance (SIMDShape n a, CPUSIMDElem a, Floating a) => Floating (CPUSIMD n a) wh
 
 instance (SIMDShape n a, CPUSIMDElem a, FMA a) => FMA (CPUSIMD n a) where
   fma (CPUSIMD as) (CPUSIMD bs) (CPUSIMD cs) = CPUSIMD (zipWith3 fma as bs cs)
+
+instance (SIMDShape n a, CPUSIMDElem a, Floating a, Hypot a) => Hypot (CPUSIMD n a) where
+  hypot (CPUSIMD as) (CPUSIMD bs) = CPUSIMD (zipWith hypot as bs)
 
 instance (SIMDShape n a) => Join (CPUMask n a) where
   (\/) = cpuMaskOr
@@ -750,12 +753,22 @@ cpuLoad, cpuLoadAligned :: forall m n a. (MonadIO m, SIMDShape n a) => Ptr a -> 
 cpuLoad p =
   let lanes = simdLanes (Proxy @n) (Proxy @a)
    in CPUSIMD <$> mapM (liftIO . peekElemOff p) [0 .. lanes - 1]
-cpuLoadAligned = cpuLoad
+cpuLoadAligned p = do
+  let reqAlign = min 16 (simdBytes (Proxy @n) (Proxy @a))
+      addr = fromIntegral (ptrToWordPtr p) :: Int
+  when (addr `mod` reqAlign /= 0) $
+    liftIO $ ioError $ userError $ "cpuLoadAligned: pointer " <> show p <> " is not " <> show reqAlign <> "-byte aligned"
+  cpuLoad p
 
 cpuStore, cpuStoreAligned :: forall m n a. (MonadIO m, SIMDShape n a) => Ptr a -> CPUSIMD n a -> m ()
 cpuStore p (CPUSIMD xs) =
   forM_ (zip [0 ..] xs) (\(i, x) -> liftIO (pokeElemOff p i x))
-cpuStoreAligned = cpuStore
+cpuStoreAligned p v = do
+  let reqAlign = min 16 (simdBytes (Proxy @n) (Proxy @a))
+      addr = fromIntegral (ptrToWordPtr p) :: Int
+  when (addr `mod` reqAlign /= 0) $
+    liftIO $ ioError $ userError $ "cpuStoreAligned: pointer " <> show p <> " is not " <> show reqAlign <> "-byte aligned"
+  cpuStore p v
 
 cpuLoadMasked :: forall m n a. (MonadIO m, SIMDShape n a) => CPUMask n a -> CPUSIMD n a -> Ptr a -> m (CPUSIMD n a)
 cpuLoadMasked (CPUMask ms) (CPUSIMD fbs) p =

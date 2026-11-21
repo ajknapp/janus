@@ -37,7 +37,7 @@ import Data.Typeable (Typeable)
 import Data.Word
 import Foreign.ForeignPtr (ForeignPtr, withForeignPtr)
 import Foreign.LibFFI (Arg, argPtr, callFFI, retVoid)
-import Foreign.Marshal.Alloc (allocaBytes)
+import Foreign.Marshal.Alloc (allocaBytesAligned)
 import Foreign.Ptr (FunPtr, Ptr, castPtrToFunPtr)
 import qualified Foreign.Storable as Storable
 import GHC.Float (expm1, log1p)
@@ -245,11 +245,12 @@ instance CmdTicToc LinuxX86_64CM LinuxX86_64C where
 -- LinuxX86_64C Compilation, Inspection, & ABI-Safe Evaluation
 --------------------------------------------------------------------------------
 
-type family LinuxX86_64CEval a where
-  LinuxX86_64CEval (LinuxX86_64C a -> r) = a -> LinuxX86_64CEval r
-  LinuxX86_64CEval (LinuxX86_64C a) = a
-  LinuxX86_64CEval (LinuxX86_64CM (LinuxX86_64C a)) = IO a
-  LinuxX86_64CEval (LinuxX86_64CM ()) = IO ()
+type family LinuxX86_64CEval a
+
+type instance LinuxX86_64CEval (LinuxX86_64C a -> r) = a -> LinuxX86_64CEval r
+type instance LinuxX86_64CEval (LinuxX86_64C a) = a
+type instance LinuxX86_64CEval (LinuxX86_64CM (LinuxX86_64C a)) = IO a
+type instance LinuxX86_64CEval (LinuxX86_64CM ()) = IO ()
 
 class (JanusCTyped a) => LinuxX86_64ABIParam a where
   x86EmitParam :: Int -> JanusCM (Param, Exp)
@@ -388,11 +389,12 @@ instance (LinuxX86_64ABIParam b, X86DeferCall r, X86DeferCont r, LinuxX86_64Eval
 class X86DeferCont r where
   x86DeferCont :: (([Arg] -> IO (LinuxX86_64BaseRet r)) -> IO (LinuxX86_64BaseRet r)) -> ForeignPtr () -> r -> LinuxX86_64CEval r
 
-type family LinuxX86_64BaseRet r where
-  LinuxX86_64BaseRet (LinuxX86_64C a) = a
-  LinuxX86_64BaseRet (LinuxX86_64CM (LinuxX86_64C a)) = a
-  LinuxX86_64BaseRet (LinuxX86_64CM ()) = ()
-  LinuxX86_64BaseRet (LinuxX86_64C _ -> r) = LinuxX86_64BaseRet r
+type family LinuxX86_64BaseRet r
+
+type instance LinuxX86_64BaseRet (LinuxX86_64C a) = a
+type instance LinuxX86_64BaseRet (LinuxX86_64CM (LinuxX86_64C a)) = a
+type instance LinuxX86_64BaseRet (LinuxX86_64CM ()) = ()
+type instance LinuxX86_64BaseRet (LinuxX86_64C _ -> r) = LinuxX86_64BaseRet r
 
 instance (LinuxX86_64ABIRet a) => X86DeferCont (LinuxX86_64C a) where
   x86DeferCont withArgs dlFPtr _ =
@@ -529,13 +531,13 @@ instance (SIMDShape n a) => LinuxX86_64ABIParam (SIMDVector LinuxX86_64C n a) wh
     pure (Param (Just aid) vspec vdec noLoc, loadExp)
   x86WithArg v k =
     let b = simdBytes (Proxy @n) (Proxy @a)
-     in allocaBytes b $ \p -> Storable.poke p v >> k (argPtr p)
+     in allocaBytesAligned b (min 32 b) $ \p -> Storable.poke p v >> k (argPtr p)
 
 instance (SIMDShape n a) => LinuxX86_64ABIRet (SIMDVector LinuxX86_64C n a) where
   x86FinishReturn = emitMemcpyRet (simdBytes (Proxy @n) (Proxy @a))
   x86CallReturn _ fp args =
     let b = simdBytes (Proxy @n) (Proxy @a)
-     in allocaBytes b $ \pOut -> do
+     in allocaBytesAligned b (min 32 b) $ \pOut -> do
           callFFI fp retVoid (reverse args <> [argPtr pOut])
           Storable.peek pOut
 
@@ -547,13 +549,13 @@ instance (SIMDShape n a) => LinuxX86_64ABIParam (SIMDMask LinuxX86_64C n a) wher
     pure (Param (Just aid) vspec vdec noLoc, loadExp)
   x86WithArg m k =
     let b = simdBytes (Proxy @n) (Proxy @a)
-     in allocaBytes b $ \p -> Storable.poke p m >> k (argPtr p)
+     in allocaBytesAligned b (min 32 b) $ \p -> Storable.poke p m >> k (argPtr p)
 
 instance (SIMDShape n a) => LinuxX86_64ABIRet (SIMDMask LinuxX86_64C n a) where
   x86FinishReturn = emitMemcpyRet (simdBytes (Proxy @n) (Proxy @a))
   x86CallReturn _ fp args =
     let b = simdBytes (Proxy @n) (Proxy @a)
-     in allocaBytes b $ \pOut -> do
+     in allocaBytesAligned b (min 32 b) $ \pOut -> do
           callFFI fp retVoid (reverse args <> [argPtr pOut])
           Storable.peek pOut
 
@@ -2741,19 +2743,25 @@ emitX86Load aligned ptrExp = do
   p <- emitLocalVal (JCType (DeclSpec [] [Tconst noLoc] (Tvoid noLoc) noLoc) (Ptr [] (DeclRoot noLoc) noLoc)) ptrExp
   let b = simdBytes (Proxy @n) (Proxy @a)
       tag = simdElemTag (Proxy @a)
+      load128 ptr128 = case tag of
+        JanusElemFloat -> cCall (if aligned then "_mm_load_ps" else "_mm_loadu_ps") [cConstPtrCast "float" ptr128]
+        JanusElemDouble -> cCall (if aligned then "_mm_load_pd" else "_mm_loadu_pd") [cConstPtrCast "double" ptr128]
+        _ -> cCall (if aligned then "_mm_load_si128" else "_mm_loadu_si128") [cConstPtrCast "__m128i" ptr128]
   case b of
-    16 ->
-      let call = case tag of
-            JanusElemFloat -> cCall (if aligned then "_mm_load_ps" else "_mm_loadu_ps") [cConstPtrCast "float" p]
-            JanusElemDouble -> cCall (if aligned then "_mm_load_pd" else "_mm_loadu_pd") [cConstPtrCast "double" p]
-            _ -> cCall (if aligned then "_mm_load_si128" else "_mm_loadu_si128") [cConstPtrCast "__m128i" p]
-       in emitLocalVal ty call
-    32 | x86Has256Reg fs (Proxy @a) ->
-      let call = case tag of
-            JanusElemFloat -> cCall (if aligned then "_mm256_load_ps" else "_mm256_loadu_ps") [cConstPtrCast "float" p]
-            JanusElemDouble -> cCall (if aligned then "_mm256_load_pd" else "_mm256_loadu_pd") [cConstPtrCast "double" p]
-            _ -> cCall (if aligned then "_mm256_load_si256" else "_mm256_loadu_si256") [cConstPtrCast "__m256i" p]
-       in emitLocalVal ty call
+    16 -> emitLocalVal ty (load128 p)
+    32
+      | x86Has256Reg fs (Proxy @a) ->
+          let call = case tag of
+                JanusElemFloat -> cCall (if aligned then "_mm256_load_ps" else "_mm256_loadu_ps") [cConstPtrCast "float" p]
+                JanusElemDouble -> cCall (if aligned then "_mm256_load_pd" else "_mm256_loadu_pd") [cConstPtrCast "double" p]
+                _ -> cCall (if aligned then "_mm256_load_si256" else "_mm256_loadu_si256") [cConstPtrCast "__m256i" p]
+           in emitLocalVal ty call
+      | otherwise -> do
+          let halfTy = namedCType (x86128RegName (Proxy @a))
+              pHi = BinOp Add (cConstPtrCast "uint8_t" p) (cInt 16) noLoc
+          lo <- emitLocalVal halfTy (load128 p)
+          hi <- emitLocalVal halfTy (load128 pHi)
+          emitPairStruct ty lo hi
     _ -> emitMemcpyLoad @(SIMDVector LinuxX86_64C n a) b p
 
 emitX86Store :: forall n a. (SIMDShape n a) => Bool -> Exp -> Exp -> JanusCM ()
@@ -2764,19 +2772,23 @@ emitX86Store aligned ptrExp valExp = do
   v <- emitLocalVal ty valExp
   let b = simdBytes (Proxy @n) (Proxy @a)
       tag = simdElemTag (Proxy @a)
+      store128 ptr128 val128 = case tag of
+        JanusElemFloat -> cCall (if aligned then "_mm_store_ps" else "_mm_storeu_ps") [cPtrCast "float" ptr128, val128]
+        JanusElemDouble -> cCall (if aligned then "_mm_store_pd" else "_mm_storeu_pd") [cPtrCast "double" ptr128, val128]
+        _ -> cCall (if aligned then "_mm_store_si128" else "_mm_storeu_si128") [cPtrCast "__m128i" ptr128, val128]
   case b of
-    16 ->
-      let call = case tag of
-            JanusElemFloat -> cCall (if aligned then "_mm_store_ps" else "_mm_storeu_ps") [cPtrCast "float" p, v]
-            JanusElemDouble -> cCall (if aligned then "_mm_store_pd" else "_mm_storeu_pd") [cPtrCast "double" p, v]
-            _ -> cCall (if aligned then "_mm_store_si128" else "_mm_storeu_si128") [cPtrCast "__m128i" p, v]
-       in emitStmt (Exp (Just call) noLoc)
-    32 | x86Has256Reg fs (Proxy @a) ->
-      let call = case tag of
-            JanusElemFloat -> cCall (if aligned then "_mm256_store_ps" else "_mm256_storeu_ps") [cPtrCast "float" p, v]
-            JanusElemDouble -> cCall (if aligned then "_mm256_store_pd" else "_mm256_storeu_pd") [cPtrCast "double" p, v]
-            _ -> cCall (if aligned then "_mm256_store_si256" else "_mm256_storeu_si256") [cPtrCast "__m256i" p, v]
-       in emitStmt (Exp (Just call) noLoc)
+    16 -> emitStmt (Exp (Just (store128 p v)) noLoc)
+    32
+      | x86Has256Reg fs (Proxy @a) ->
+          let call = case tag of
+                JanusElemFloat -> cCall (if aligned then "_mm256_store_ps" else "_mm256_storeu_ps") [cPtrCast "float" p, v]
+                JanusElemDouble -> cCall (if aligned then "_mm256_store_pd" else "_mm256_storeu_pd") [cPtrCast "double" p, v]
+                _ -> cCall (if aligned then "_mm256_store_si256" else "_mm256_storeu_si256") [cPtrCast "__m256i" p, v]
+           in emitStmt (Exp (Just call) noLoc)
+      | otherwise -> do
+          let pHi = BinOp Add (cPtrCast "uint8_t" p) (cInt 16) noLoc
+          emitStmt (Exp (Just (store128 p (cMember v "lo"))) noLoc)
+          emitStmt (Exp (Just (store128 pHi (cMember v "hi"))) noLoc)
     _ -> do
       addHeader "string.h"
       emitStmt (Exp (Just $ cCall "memcpy" [p, UnOp AddrOf v noLoc, signedIntConst b]) noLoc)

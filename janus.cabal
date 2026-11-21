@@ -77,11 +77,21 @@ library
                       Janus.FFI.Arg
                       Janus.FFI.Ret
                       Janus.Fix
+                      Janus.SPMD
                       Janus.Typed
     -- Modules included in this library but not exported.
     other-modules:    Janus.Expression.SIMD.Types
                       Janus.Expression.SIMD.FFI
                       Janus.Expression.SIMD.CPU
+                      Janus.SPMD.Cast
+                      Janus.SPMD.Command
+                      Janus.SPMD.Expression
+                      Janus.SPMD.Gang
+                      Janus.SPMD.Host
+                      Janus.SPMD.Lane
+                      Janus.SPMD.Raw
+                      Janus.SPMD.Typed
+                      Janus.SPMD.Types
 
     -- LANGUAGE extensions used by modules in this package.
     -- other-extensions:
@@ -137,6 +147,7 @@ test-suite janus-test
                       Test.Janus.Control.StreamPipe
                       Test.Janus.Expression.Let
                       Test.Janus.Expression.SIMD
+                      Test.Janus.SPMD
 
     -- LANGUAGE extensions used by modules in this package.
     -- other-extensions:

@@ -308,13 +308,13 @@ instance (SIMDShape n a) => Show (RawMask n a) where
 
 instance (SIMDShape n a) => Storable (RawSIMD n a) where
   sizeOf _ = simdBytes (Proxy @n) (Proxy @a)
-  alignment _ = min 16 (simdBytes (Proxy @n) (Proxy @a))
+  alignment _ = min 32 (simdBytes (Proxy @n) (Proxy @a))
   peek p = RawSIMD <$> peekByteBufBytes (simdBytes (Proxy @n) (Proxy @a)) p
   poke p (RawSIMD bb) = pokeByteBufBytes (simdBytes (Proxy @n) (Proxy @a)) p bb
 
 instance (SIMDShape n a) => Storable (RawMask n a) where
   sizeOf _ = simdBytes (Proxy @n) (Proxy @a)
-  alignment _ = min 16 (simdBytes (Proxy @n) (Proxy @a))
+  alignment _ = min 32 (simdBytes (Proxy @n) (Proxy @a))
   peek p = RawMask <$> peekByteBufBytes (simdBytes (Proxy @n) (Proxy @a)) p
   poke p (RawMask bb) = pokeByteBufBytes (simdBytes (Proxy @n) (Proxy @a)) p bb
 
