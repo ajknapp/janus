@@ -1,6 +1,7 @@
 {-# LANGUAGE AllowAmbiguousTypes #-}
 {-# LANGUAGE BangPatterns #-}
 {-# LANGUAGE DataKinds #-}
+{-# LANGUAGE DeriveGeneric #-}
 {-# LANGUAGE DeriveTraversable #-}
 {-# LANGUAGE DerivingStrategies #-}
 {-# LANGUAGE FlexibleContexts #-}
@@ -24,7 +25,7 @@ module Janus.Expression.SIMD.Types
 
     -- * Scalar Lane Element Metadata
     SIMDElem (..),
-    JANUS_ELEM_TAG,
+    JanusElemTag (..),
 
     -- * Validated (n, a) SIMD Shapes
     SIMDShape (..),
@@ -72,6 +73,7 @@ import GHC.Exts
     unsafeFreezeByteArray#,
     writeWord8Array#,
   )
+import GHC.Generics
 import GHC.IO (IO (..), unsafeDupablePerformIO)
 import GHC.TypeLits (KnownNat, Nat, natVal)
 import GHC.Word (Word8 (..))
@@ -144,80 +146,91 @@ instance Ord ByteBuf where
 -- Scalar Lane Element Metadata
 --------------------------------------------------------------------------------
 
-type JANUS_ELEM_TAG = Int
+data JanusElemTag
+  = JanusElemInt8
+  | JanusElemWord8
+  | JanusElemInt16
+  | JanusElemWord16
+  | JanusElemInt32
+  | JanusElemWord32
+  | JanusElemInt64
+  | JanusElemWord64
+  | JanusElemFloat
+  | JanusElemDouble
+  deriving stock (Eq, Ord, Show, Bounded, Enum, Generic)
 
 class (Storable a, Eq a, Show a, Typeable a) => SIMDElem a where
-  simdElemTag :: Proxy a -> JANUS_ELEM_TAG
+  simdElemTag :: Proxy a -> JanusElemTag
   simdElemBytes :: Proxy a -> Int
   simdElemSigned :: Proxy a -> Bool
   simdElemIsFloat :: Proxy a -> Bool
   simdElemCTypeName :: Proxy a -> String
 
 instance SIMDElem Int8 where
-  simdElemTag _ = 0
+  simdElemTag _ = JanusElemInt8
   simdElemBytes _ = 1
   simdElemSigned _ = True
   simdElemIsFloat _ = False
   simdElemCTypeName _ = "int8_t"
 
 instance SIMDElem Word8 where
-  simdElemTag _ = 1
+  simdElemTag _ = JanusElemWord8
   simdElemBytes _ = 1
   simdElemSigned _ = False
   simdElemIsFloat _ = False
   simdElemCTypeName _ = "uint8_t"
 
 instance SIMDElem Int16 where
-  simdElemTag _ = 2
+  simdElemTag _ = JanusElemInt16
   simdElemBytes _ = 2
   simdElemSigned _ = True
   simdElemIsFloat _ = False
   simdElemCTypeName _ = "int16_t"
 
 instance SIMDElem Word16 where
-  simdElemTag _ = 3
+  simdElemTag _ = JanusElemWord16
   simdElemBytes _ = 2
   simdElemSigned _ = False
   simdElemIsFloat _ = False
   simdElemCTypeName _ = "uint16_t"
 
 instance SIMDElem Int32 where
-  simdElemTag _ = 4
+  simdElemTag _ = JanusElemInt32
   simdElemBytes _ = 4
   simdElemSigned _ = True
   simdElemIsFloat _ = False
   simdElemCTypeName _ = "int32_t"
 
 instance SIMDElem Word32 where
-  simdElemTag _ = 5
+  simdElemTag _ = JanusElemWord32
   simdElemBytes _ = 4
   simdElemSigned _ = False
   simdElemIsFloat _ = False
   simdElemCTypeName _ = "uint32_t"
 
 instance SIMDElem Int64 where
-  simdElemTag _ = 6
+  simdElemTag _ = JanusElemInt64
   simdElemBytes _ = 8
   simdElemSigned _ = True
   simdElemIsFloat _ = False
   simdElemCTypeName _ = "int64_t"
 
 instance SIMDElem Word64 where
-  simdElemTag _ = 7
+  simdElemTag _ = JanusElemWord64
   simdElemBytes _ = 8
   simdElemSigned _ = False
   simdElemIsFloat _ = False
   simdElemCTypeName _ = "uint64_t"
 
 instance SIMDElem Float where
-  simdElemTag _ = 8
+  simdElemTag _ = JanusElemFloat
   simdElemBytes _ = 4
   simdElemSigned _ = True
   simdElemIsFloat _ = True
   simdElemCTypeName _ = "float"
 
 instance SIMDElem Double where
-  simdElemTag _ = 9
+  simdElemTag _ = JanusElemDouble
   simdElemBytes _ = 8
   simdElemSigned _ = True
   simdElemIsFloat _ = True

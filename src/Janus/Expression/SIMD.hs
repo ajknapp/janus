@@ -18,6 +18,7 @@ module Janus.Expression.SIMD
     module Janus.Backend.C.Target,
 
     -- * Shapes, Scalar Metadata, & Wide Unrolling
+    JanusElemTag (..),
     SIMDElem (..),
     CPUSIMDElem,
     SIMDShape (..),

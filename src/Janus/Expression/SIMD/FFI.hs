@@ -323,7 +323,7 @@ foreign import ccall unsafe "janus_simd_gather_masked"
 --------------------------------------------------------------------------------
 
 elemC :: forall a. (SIMDElem a) => CInt
-elemC = fromIntegral (simdElemTag (Proxy @a))
+elemC = fromIntegral (fromEnum (simdElemTag (Proxy @a)))
 
 lanesC :: forall n a. (SIMDShape n a) => CInt
 lanesC = fromIntegral (simdLanes (Proxy @n) (Proxy @a))

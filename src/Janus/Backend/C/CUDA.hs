@@ -1296,17 +1296,17 @@ cuNamedType nm = JCType (DeclSpec [] [] (Tnamed (Id nm noLoc) [] noLoc) noLoc) (
 
 cu16BVecName :: forall a. (SIMDElem a) => Proxy a -> String
 cu16BVecName p = case simdElemTag p of
-  8 -> "float4"
-  9 -> "double2"
-  4 -> "int4"
-  6 -> "longlong2"
-  7 -> "ulonglong2"
+  JanusElemFloat -> "float4"
+  JanusElemDouble -> "double2"
+  JanusElemInt32 -> "int4"
+  JanusElemInt64 -> "longlong2"
+  JanusElemWord64 -> "ulonglong2"
   _ -> "uint4"
 
 cu8BVecName :: forall a. (SIMDElem a) => Proxy a -> String
 cu8BVecName p = case simdElemTag p of
-  8 -> "float2"
-  4 -> "int2"
+  JanusElemFloat -> "float2"
+  JanusElemInt32 -> "int2"
   _ -> "uint2"
 
 cudaSIMDType :: forall n a. (SIMDShape n a) => JanusCM JCType
@@ -1811,32 +1811,32 @@ emitCUDACmpFallback cop ea0 eb0 = do
   cuStmt $ Exp (Just $ cuCall "memcpy" [UnOp AddrOf out noLoc, am, signedIntConst bytes]) noLoc
   pure out
 
-cudaVideoCmpName :: Int -> BinOp -> Maybe String
+cudaVideoCmpName :: JanusElemTag -> BinOp -> Maybe String
 cudaVideoCmpName tag cop = case (tag, cop) of
-  (0, Eq) -> Just "__vcmpeq4"
-  (1, Eq) -> Just "__vcmpeq4"
-  (2, Eq) -> Just "__vcmpeq2"
-  (3, Eq) -> Just "__vcmpeq2"
-  (0, Ne) -> Just "__vcmpne4"
-  (1, Ne) -> Just "__vcmpne4"
-  (2, Ne) -> Just "__vcmpne2"
-  (3, Ne) -> Just "__vcmpne2"
-  (0, Lt) -> Just "__vcmplts4"
-  (1, Lt) -> Just "__vcmpltu4"
-  (2, Lt) -> Just "__vcmplts2"
-  (3, Lt) -> Just "__vcmpltu2"
-  (0, Le) -> Just "__vcmples4"
-  (1, Le) -> Just "__vcmpleu4"
-  (2, Le) -> Just "__vcmples2"
-  (3, Le) -> Just "__vcmpleu2"
-  (0, Gt) -> Just "__vcmpgts4"
-  (1, Gt) -> Just "__vcmpgtu4"
-  (2, Gt) -> Just "__vcmpgts2"
-  (3, Gt) -> Just "__vcmpgtu2"
-  (0, Ge) -> Just "__vcmpges4"
-  (1, Ge) -> Just "__vcmpgeu4"
-  (2, Ge) -> Just "__vcmpges2"
-  (3, Ge) -> Just "__vcmpgeu2"
+  (JanusElemInt8, Eq) -> Just "__vcmpeq4"
+  (JanusElemWord8, Eq) -> Just "__vcmpeq4"
+  (JanusElemInt16, Eq) -> Just "__vcmpeq2"
+  (JanusElemWord16, Eq) -> Just "__vcmpeq2"
+  (JanusElemInt8, Ne) -> Just "__vcmpne4"
+  (JanusElemWord8, Ne) -> Just "__vcmpne4"
+  (JanusElemInt16, Ne) -> Just "__vcmpne2"
+  (JanusElemWord16, Ne) -> Just "__vcmpne2"
+  (JanusElemInt8, Lt) -> Just "__vcmplts4"
+  (JanusElemWord8, Lt) -> Just "__vcmpltu4"
+  (JanusElemInt16, Lt) -> Just "__vcmplts2"
+  (JanusElemWord16, Lt) -> Just "__vcmpltu2"
+  (JanusElemInt8, Le) -> Just "__vcmples4"
+  (JanusElemWord8, Le) -> Just "__vcmpleu4"
+  (JanusElemInt16, Le) -> Just "__vcmples2"
+  (JanusElemWord16, Le) -> Just "__vcmpleu2"
+  (JanusElemInt8, Gt) -> Just "__vcmpgts4"
+  (JanusElemWord8, Gt) -> Just "__vcmpgtu4"
+  (JanusElemInt16, Gt) -> Just "__vcmpgts2"
+  (JanusElemWord16, Gt) -> Just "__vcmpgtu2"
+  (JanusElemInt8, Ge) -> Just "__vcmpges4"
+  (JanusElemWord8, Ge) -> Just "__vcmpgeu4"
+  (JanusElemInt16, Ge) -> Just "__vcmpges2"
+  (JanusElemWord16, Ge) -> Just "__vcmpgeu2"
   _ -> Nothing
 
 emitCUDACmp ::
@@ -1869,10 +1869,10 @@ instance (SIMDShape n a, CPUSIMDElem a) => ExpSIMDArith JanusCUDA n a where
     let bytes = simdBytes (Proxy @n) (Proxy @a)
         tag = simdElemTag (Proxy @a)
     RVal <$> case tag of
-      0 -> emitCUDAPackedWordBin @(SIMDVector JanusCUDA n a) bytes (\x y -> cuCall "__vadd4" [x, y]) a b
-      1 -> emitCUDAPackedWordBin @(SIMDVector JanusCUDA n a) bytes (\x y -> cuCall "__vadd4" [x, y]) a b
-      2 -> emitCUDAPackedWordBin @(SIMDVector JanusCUDA n a) bytes (\x y -> cuCall "__vadd2" [x, y]) a b
-      3 -> emitCUDAPackedWordBin @(SIMDVector JanusCUDA n a) bytes (\x y -> cuCall "__vadd2" [x, y]) a b
+      JanusElemInt8 -> emitCUDAPackedWordBin @(SIMDVector JanusCUDA n a) bytes (\x y -> cuCall "__vadd4" [x, y]) a b
+      JanusElemWord8 -> emitCUDAPackedWordBin @(SIMDVector JanusCUDA n a) bytes (\x y -> cuCall "__vadd4" [x, y]) a b
+      JanusElemInt16 -> emitCUDAPackedWordBin @(SIMDVector JanusCUDA n a) bytes (\x y -> cuCall "__vadd2" [x, y]) a b
+      JanusElemWord16 -> emitCUDAPackedWordBin @(SIMDVector JanusCUDA n a) bytes (\x y -> cuCall "__vadd2" [x, y]) a b
       _
         | simdElemIsFloat (Proxy @a) -> emitCUDALaneBin @n @a (\x y -> BinOp Add x y noLoc) a b
         | otherwise -> do
@@ -1885,10 +1885,10 @@ instance (SIMDShape n a, CPUSIMDElem a) => ExpSIMDArith JanusCUDA n a where
     let bytes = simdBytes (Proxy @n) (Proxy @a)
         tag = simdElemTag (Proxy @a)
     RVal <$> case tag of
-      0 -> emitCUDAPackedWordBin @(SIMDVector JanusCUDA n a) bytes (\x y -> cuCall "__vsub4" [x, y]) a b
-      1 -> emitCUDAPackedWordBin @(SIMDVector JanusCUDA n a) bytes (\x y -> cuCall "__vsub4" [x, y]) a b
-      2 -> emitCUDAPackedWordBin @(SIMDVector JanusCUDA n a) bytes (\x y -> cuCall "__vsub2" [x, y]) a b
-      3 -> emitCUDAPackedWordBin @(SIMDVector JanusCUDA n a) bytes (\x y -> cuCall "__vsub2" [x, y]) a b
+      JanusElemInt8 -> emitCUDAPackedWordBin @(SIMDVector JanusCUDA n a) bytes (\x y -> cuCall "__vsub4" [x, y]) a b
+      JanusElemWord8 -> emitCUDAPackedWordBin @(SIMDVector JanusCUDA n a) bytes (\x y -> cuCall "__vsub4" [x, y]) a b
+      JanusElemInt16 -> emitCUDAPackedWordBin @(SIMDVector JanusCUDA n a) bytes (\x y -> cuCall "__vsub2" [x, y]) a b
+      JanusElemWord16 -> emitCUDAPackedWordBin @(SIMDVector JanusCUDA n a) bytes (\x y -> cuCall "__vsub2" [x, y]) a b
       _
         | simdElemIsFloat (Proxy @a) -> emitCUDALaneBin @n @a (\x y -> BinOp Sub x y noLoc) a b
         | otherwise -> do
@@ -1909,10 +1909,10 @@ instance (SIMDShape n a, CPUSIMDElem a) => ExpSIMDArith JanusCUDA n a where
     let bytes = simdBytes (Proxy @n) (Proxy @a)
         tag = simdElemTag (Proxy @a)
     RVal <$> case tag of
-      0 -> emitCUDAPackedWordUn @(SIMDVector JanusCUDA n a) bytes (\x -> cuCall "__vneg4" [x]) a
-      1 -> emitCUDAPackedWordUn @(SIMDVector JanusCUDA n a) bytes (\x -> cuCall "__vneg4" [x]) a
-      2 -> emitCUDAPackedWordUn @(SIMDVector JanusCUDA n a) bytes (\x -> cuCall "__vneg2" [x]) a
-      3 -> emitCUDAPackedWordUn @(SIMDVector JanusCUDA n a) bytes (\x -> cuCall "__vneg2" [x]) a
+      JanusElemInt8 -> emitCUDAPackedWordUn @(SIMDVector JanusCUDA n a) bytes (\x -> cuCall "__vneg4" [x]) a
+      JanusElemWord8 -> emitCUDAPackedWordUn @(SIMDVector JanusCUDA n a) bytes (\x -> cuCall "__vneg4" [x]) a
+      JanusElemInt16 -> emitCUDAPackedWordUn @(SIMDVector JanusCUDA n a) bytes (\x -> cuCall "__vneg2" [x]) a
+      JanusElemWord16 -> emitCUDAPackedWordUn @(SIMDVector JanusCUDA n a) bytes (\x -> cuCall "__vneg2" [x]) a
       _
         | simdElemIsFloat (Proxy @a) -> emitCUDALaneUn @n @a (\x -> UnOp Negate x noLoc) a
         | otherwise -> do
@@ -1926,10 +1926,10 @@ instance (SIMDShape n a, CPUSIMDElem a) => ExpSIMDArith JanusCUDA n a where
         let bytes = simdBytes (Proxy @n) (Proxy @a)
             tag = simdElemTag (Proxy @a)
         RVal <$> case tag of
-          0 -> emitCUDAPackedWordUn @(SIMDVector JanusCUDA n a) bytes (\x -> cuCall "__vabs4" [x]) a
-          2 -> emitCUDAPackedWordUn @(SIMDVector JanusCUDA n a) bytes (\x -> cuCall "__vabs2" [x]) a
-          8 -> emitCUDALaneUn @n @a (\x -> cuCall "fabsf" [x]) a
-          9 -> emitCUDALaneUn @n @a (\x -> cuCall "fabs" [x]) a
+          JanusElemInt8 -> emitCUDAPackedWordUn @(SIMDVector JanusCUDA n a) bytes (\x -> cuCall "__vabs4" [x]) a
+          JanusElemInt16 -> emitCUDAPackedWordUn @(SIMDVector JanusCUDA n a) bytes (\x -> cuCall "__vabs2" [x]) a
+          JanusElemFloat -> emitCUDALaneUn @n @a (\x -> cuCall "fabsf" [x]) a
+          JanusElemDouble -> emitCUDALaneUn @n @a (\x -> cuCall "fabs" [x]) a
           _ -> do
             let uTy = "uint" <> show (simdElemBytes (Proxy @a) * 8) <> "_t"
             emitCUDALaneUn @n @a (\x -> Cond (BinOp Lt x (cuInt 0) noLoc) (cuCast (simdElemCTypeName (Proxy @a)) (BinOp Sub (unsignedIntConst (0 :: Word64)) (cuCast uTy x) noLoc)) x noLoc) a
@@ -1940,10 +1940,10 @@ instance (SIMDShape n a, CPUSIMDElem a) => ExpSIMDArith JanusCUDA n a where
     let bytes = simdBytes (Proxy @n) (Proxy @a)
         tag = simdElemTag (Proxy @a)
     RVal <$> case tag of
-      0 -> emitCUDAPackedWordBin @(SIMDVector JanusCUDA n a) bytes (\x y -> cuCall "__vmins4" [x, y]) a b
-      1 -> emitCUDAPackedWordBin @(SIMDVector JanusCUDA n a) bytes (\x y -> cuCall "__vminu4" [x, y]) a b
-      2 -> emitCUDAPackedWordBin @(SIMDVector JanusCUDA n a) bytes (\x y -> cuCall "__vmins2" [x, y]) a b
-      3 -> emitCUDAPackedWordBin @(SIMDVector JanusCUDA n a) bytes (\x y -> cuCall "__vminu2" [x, y]) a b
+      JanusElemInt8 -> emitCUDAPackedWordBin @(SIMDVector JanusCUDA n a) bytes (\x y -> cuCall "__vmins4" [x, y]) a b
+      JanusElemWord8 -> emitCUDAPackedWordBin @(SIMDVector JanusCUDA n a) bytes (\x y -> cuCall "__vminu4" [x, y]) a b
+      JanusElemInt16 -> emitCUDAPackedWordBin @(SIMDVector JanusCUDA n a) bytes (\x y -> cuCall "__vmins2" [x, y]) a b
+      JanusElemWord16 -> emitCUDAPackedWordBin @(SIMDVector JanusCUDA n a) bytes (\x y -> cuCall "__vminu2" [x, y]) a b
       _ -> emitCUDALaneBin @n @a (\x y -> Cond (BinOp Lt x y noLoc) x y noLoc) a b
 
   vmax (JanusCUDA (JanusC ma)) (JanusCUDA (JanusC mb)) = JanusCUDA $ JanusC $ do
@@ -1952,10 +1952,10 @@ instance (SIMDShape n a, CPUSIMDElem a) => ExpSIMDArith JanusCUDA n a where
     let bytes = simdBytes (Proxy @n) (Proxy @a)
         tag = simdElemTag (Proxy @a)
     RVal <$> case tag of
-      0 -> emitCUDAPackedWordBin @(SIMDVector JanusCUDA n a) bytes (\x y -> cuCall "__vmaxs4" [x, y]) a b
-      1 -> emitCUDAPackedWordBin @(SIMDVector JanusCUDA n a) bytes (\x y -> cuCall "__vmaxu4" [x, y]) a b
-      2 -> emitCUDAPackedWordBin @(SIMDVector JanusCUDA n a) bytes (\x y -> cuCall "__vmaxs2" [x, y]) a b
-      3 -> emitCUDAPackedWordBin @(SIMDVector JanusCUDA n a) bytes (\x y -> cuCall "__vmaxu2" [x, y]) a b
+      JanusElemInt8 -> emitCUDAPackedWordBin @(SIMDVector JanusCUDA n a) bytes (\x y -> cuCall "__vmaxs4" [x, y]) a b
+      JanusElemWord8 -> emitCUDAPackedWordBin @(SIMDVector JanusCUDA n a) bytes (\x y -> cuCall "__vmaxu4" [x, y]) a b
+      JanusElemInt16 -> emitCUDAPackedWordBin @(SIMDVector JanusCUDA n a) bytes (\x y -> cuCall "__vmaxs2" [x, y]) a b
+      JanusElemWord16 -> emitCUDAPackedWordBin @(SIMDVector JanusCUDA n a) bytes (\x y -> cuCall "__vmaxu2" [x, y]) a b
       _ -> emitCUDALaneBin @n @a (\x y -> Cond (BinOp Gt x y noLoc) x y noLoc) a b
 
 -- 5. ExpSIMDSat JanusCUDA (__vaddss*, __vaddus*, __vsubss*, __vsubus*, __vabsss*, __vavgu*, __vabsdiff*)
@@ -1968,13 +1968,13 @@ instance (SIMDShape n a, CPUSIMDElem a) => ExpSIMDSat JanusCUDA n a where
         let bytes = simdBytes (Proxy @n) (Proxy @a)
             tag = simdElemTag (Proxy @a)
         RVal <$> case tag of
-          0 -> emitCUDAPackedWordBin @(SIMDVector JanusCUDA n a) bytes (\x y -> cuCall "__vaddss4" [x, y]) ea eb
-          1 -> emitCUDAPackedWordBin @(SIMDVector JanusCUDA n a) bytes (\x y -> cuCall "__vaddus4" [x, y]) ea eb
-          2 -> emitCUDAPackedWordBin @(SIMDVector JanusCUDA n a) bytes (\x y -> cuCall "__vaddss2" [x, y]) ea eb
-          3 -> emitCUDAPackedWordBin @(SIMDVector JanusCUDA n a) bytes (\x y -> cuCall "__vaddus2" [x, y]) ea eb
+          JanusElemInt8 -> emitCUDAPackedWordBin @(SIMDVector JanusCUDA n a) bytes (\x y -> cuCall "__vaddss4" [x, y]) ea eb
+          JanusElemWord8 -> emitCUDAPackedWordBin @(SIMDVector JanusCUDA n a) bytes (\x y -> cuCall "__vaddus4" [x, y]) ea eb
+          JanusElemInt16 -> emitCUDAPackedWordBin @(SIMDVector JanusCUDA n a) bytes (\x y -> cuCall "__vaddss2" [x, y]) ea eb
+          JanusElemWord16 -> emitCUDAPackedWordBin @(SIMDVector JanusCUDA n a) bytes (\x y -> cuCall "__vaddus2" [x, y]) ea eb
           _ | not (simdElemSigned (Proxy @a)) ->
             emitCUDALaneBin @n @a (\x y -> Cond (BinOp Lt (BinOp Add x y noLoc) x noLoc) (UnOp Not (cuCast (simdElemCTypeName (Proxy @a)) (unsignedIntConst (0 :: Word64))) noLoc) (BinOp Add x y noLoc) noLoc) ea eb
-          4 -> do
+          JanusElemInt32 -> do
             let s x y = BinOp Add (cuCast "int64_t" x) (cuCast "int64_t" y) noLoc
                 mx = signedIntConst (fromIntegral (maxBound :: Int32) :: Int64)
                 mn = signedIntConst (fromIntegral (minBound :: Int32) :: Int64)
@@ -1997,13 +1997,13 @@ instance (SIMDShape n a, CPUSIMDElem a) => ExpSIMDSat JanusCUDA n a where
         let bytes = simdBytes (Proxy @n) (Proxy @a)
             tag = simdElemTag (Proxy @a)
         RVal <$> case tag of
-          0 -> emitCUDAPackedWordBin @(SIMDVector JanusCUDA n a) bytes (\x y -> cuCall "__vsubss4" [x, y]) ea eb
-          1 -> emitCUDAPackedWordBin @(SIMDVector JanusCUDA n a) bytes (\x y -> cuCall "__vsubus4" [x, y]) ea eb
-          2 -> emitCUDAPackedWordBin @(SIMDVector JanusCUDA n a) bytes (\x y -> cuCall "__vsubss2" [x, y]) ea eb
-          3 -> emitCUDAPackedWordBin @(SIMDVector JanusCUDA n a) bytes (\x y -> cuCall "__vsubus2" [x, y]) ea eb
+          JanusElemInt8 -> emitCUDAPackedWordBin @(SIMDVector JanusCUDA n a) bytes (\x y -> cuCall "__vsubss4" [x, y]) ea eb
+          JanusElemWord8 -> emitCUDAPackedWordBin @(SIMDVector JanusCUDA n a) bytes (\x y -> cuCall "__vsubus4" [x, y]) ea eb
+          JanusElemInt16 -> emitCUDAPackedWordBin @(SIMDVector JanusCUDA n a) bytes (\x y -> cuCall "__vsubss2" [x, y]) ea eb
+          JanusElemWord16 -> emitCUDAPackedWordBin @(SIMDVector JanusCUDA n a) bytes (\x y -> cuCall "__vsubus2" [x, y]) ea eb
           _ | not (simdElemSigned (Proxy @a)) ->
             emitCUDALaneBin @n @a (\x y -> Cond (BinOp Ge x y noLoc) (BinOp Sub x y noLoc) (unsignedIntConst (0 :: Word64)) noLoc) ea eb
-          4 -> do
+          JanusElemInt32 -> do
             let d x y = BinOp Sub (cuCast "int64_t" x) (cuCast "int64_t" y) noLoc
                 mx = signedIntConst (fromIntegral (maxBound :: Int32) :: Int64)
                 mn = signedIntConst (fromIntegral (minBound :: Int32) :: Int64)
@@ -2024,8 +2024,8 @@ instance (SIMDShape n a, CPUSIMDElem a) => ExpSIMDSat JanusCUDA n a where
         let bytes = simdBytes (Proxy @n) (Proxy @a)
             tag = simdElemTag (Proxy @a)
         RVal <$> case tag of
-          0 -> emitCUDAPackedWordUn @(SIMDVector JanusCUDA n a) bytes (\x -> cuCall "__vabsss4" [x]) ea
-          2 -> emitCUDAPackedWordUn @(SIMDVector JanusCUDA n a) bytes (\x -> cuCall "__vabsss2" [x]) ea
+          JanusElemInt8 -> emitCUDAPackedWordUn @(SIMDVector JanusCUDA n a) bytes (\x -> cuCall "__vabsss4" [x]) ea
+          JanusElemInt16 -> emitCUDAPackedWordUn @(SIMDVector JanusCUDA n a) bytes (\x -> cuCall "__vabsss2" [x]) ea
           _ -> do
             let bits = simdElemBytes (Proxy @a) * 8
                 sminE = if bits == 64 then cuVar "INT64_MIN" else cuCast (simdElemCTypeName (Proxy @a)) (signedIntConst (-(1 `shiftL` (bits - 1)) :: Int64))
@@ -2037,7 +2037,7 @@ instance (SIMDShape n a, CPUSIMDElem a) => ExpSIMDSat JanusCUDA n a where
     | simdElemIsFloat (Proxy @a) = JanusCUDA $ JanusC $ do
         RVal ea <- ma
         RVal eb <- mb
-        let halfLit = if simdElemTag (Proxy @a) == 8 then C.Const (FloatConst "0.5f" 0.5 noLoc) noLoc else C.Const (DoubleConst "0.5" 0.5 noLoc) noLoc
+        let halfLit = if simdElemTag (Proxy @a) == JanusElemFloat then C.Const (FloatConst "0.5f" 0.5 noLoc) noLoc else C.Const (DoubleConst "0.5" 0.5 noLoc) noLoc
         RVal <$> emitCUDALaneBin @n @a (\x y -> BinOp Mul halfLit (BinOp Add x y noLoc) noLoc) ea eb
     | otherwise = JanusCUDA $ JanusC $ do
         RVal ea <- ma
@@ -2047,10 +2047,10 @@ instance (SIMDShape n a, CPUSIMDElem a) => ExpSIMDSat JanusCUDA n a where
             b8 = unsignedIntConst (0x80808080 :: Word32)
             b16 = unsignedIntConst (0x80008000 :: Word32)
         RVal <$> case tag of
-          1 -> emitCUDAPackedWordBin @(SIMDVector JanusCUDA n a) bytes (\x y -> cuCall "__vavgu4" [x, y]) ea eb
-          3 -> emitCUDAPackedWordBin @(SIMDVector JanusCUDA n a) bytes (\x y -> cuCall "__vavgu2" [x, y]) ea eb
-          0 -> emitCUDAPackedWordBin @(SIMDVector JanusCUDA n a) bytes (\x y -> BinOp Xor (cuCall "__vavgu4" [BinOp Xor x b8 noLoc, BinOp Xor y b8 noLoc]) b8 noLoc) ea eb
-          2 -> emitCUDAPackedWordBin @(SIMDVector JanusCUDA n a) bytes (\x y -> BinOp Xor (cuCall "__vavgu2" [BinOp Xor x b16 noLoc, BinOp Xor y b16 noLoc]) b16 noLoc) ea eb
+          JanusElemWord8 -> emitCUDAPackedWordBin @(SIMDVector JanusCUDA n a) bytes (\x y -> cuCall "__vavgu4" [x, y]) ea eb
+          JanusElemWord16 -> emitCUDAPackedWordBin @(SIMDVector JanusCUDA n a) bytes (\x y -> cuCall "__vavgu2" [x, y]) ea eb
+          JanusElemInt8 -> emitCUDAPackedWordBin @(SIMDVector JanusCUDA n a) bytes (\x y -> BinOp Xor (cuCall "__vavgu4" [BinOp Xor x b8 noLoc, BinOp Xor y b8 noLoc]) b8 noLoc) ea eb
+          JanusElemInt16 -> emitCUDAPackedWordBin @(SIMDVector JanusCUDA n a) bytes (\x y -> BinOp Xor (cuCall "__vavgu2" [BinOp Xor x b16 noLoc, BinOp Xor y b16 noLoc]) b16 noLoc) ea eb
           _ -> do
             -- Branchless Dietz rounding average: (x | y) - ((x ^ y) >> 1)
             emitCUDALaneBin @n @a (\x y -> BinOp Sub (BinOp Or x y noLoc) (BinOp Rsh (BinOp Xor x y noLoc) (cuInt 1) noLoc) noLoc) ea eb
@@ -2063,10 +2063,10 @@ instance (SIMDShape n a, CPUSIMDElem a) => ExpSIMDSat JanusCUDA n a where
         let bytes = simdBytes (Proxy @n) (Proxy @a)
             tag = simdElemTag (Proxy @a)
         RVal <$> case tag of
-          0 -> emitCUDAPackedWordBin @(SIMDVector JanusCUDA n a) bytes (\x y -> cuCall "__vabsdiffs4" [x, y]) ea eb
-          1 -> emitCUDAPackedWordBin @(SIMDVector JanusCUDA n a) bytes (\x y -> cuCall "__vabsdiffu4" [x, y]) ea eb
-          2 -> emitCUDAPackedWordBin @(SIMDVector JanusCUDA n a) bytes (\x y -> cuCall "__vabsdiffs2" [x, y]) ea eb
-          3 -> emitCUDAPackedWordBin @(SIMDVector JanusCUDA n a) bytes (\x y -> cuCall "__vabsdiffu2" [x, y]) ea eb
+          JanusElemInt8 -> emitCUDAPackedWordBin @(SIMDVector JanusCUDA n a) bytes (\x y -> cuCall "__vabsdiffs4" [x, y]) ea eb
+          JanusElemWord8 -> emitCUDAPackedWordBin @(SIMDVector JanusCUDA n a) bytes (\x y -> cuCall "__vabsdiffu4" [x, y]) ea eb
+          JanusElemInt16 -> emitCUDAPackedWordBin @(SIMDVector JanusCUDA n a) bytes (\x y -> cuCall "__vabsdiffs2" [x, y]) ea eb
+          JanusElemWord16 -> emitCUDAPackedWordBin @(SIMDVector JanusCUDA n a) bytes (\x y -> cuCall "__vabsdiffu2" [x, y]) ea eb
           _ -> do
             let a' = JanusCUDA (JanusC (pure (RVal ea))) :: JanusCUDA (SIMDVector JanusCUDA n a)
                 b' = JanusCUDA (JanusC (pure (RVal eb))) :: JanusCUDA (SIMDVector JanusCUDA n a)
@@ -2119,48 +2119,48 @@ instance (SIMDShape n a, CPUSIMDElem a, Floating a, FMA a) => ExpSIMDFloat Janus
 
   vsqrt (JanusCUDA (JanusC ma)) = JanusCUDA $ JanusC $ do
     RVal a <- ma
-    let fn = if simdElemTag (Proxy @a) == 8 then "sqrtf" else "sqrt"
+    let fn = if simdElemTag (Proxy @a) == JanusElemFloat then "sqrtf" else "sqrt"
     RVal <$> emitCUDALaneUn @n @a (\x -> cuCall fn [x]) a
 
   vrsqrtApprox (JanusCUDA (JanusC ma)) = JanusCUDA $ JanusC $ do
     RVal a <- ma
-    let fn = if simdElemTag (Proxy @a) == 8 then "rsqrtf" else "rsqrt"
+    let fn = if simdElemTag (Proxy @a) == JanusElemFloat then "rsqrtf" else "rsqrt"
     RVal <$> emitCUDALaneUn @n @a (\x -> cuCall fn [x]) a
 
   vrcpApprox (JanusCUDA (JanusC ma)) = JanusCUDA $ JanusC $ do
     RVal a <- ma
-    let fn x = if simdElemTag (Proxy @a) == 8 then cuCall "__frcp_rn" [x] else cuCall "__drcp_rn" [x]
+    let fn x = if simdElemTag (Proxy @a) == JanusElemFloat then cuCall "__frcp_rn" [x] else cuCall "__drcp_rn" [x]
     RVal <$> emitCUDALaneUn @n @a fn a
 
   vfma =
-    let f = if simdElemTag (Proxy @a) == 8 then "fmaf" else "fma"
+    let f = if simdElemTag (Proxy @a) == JanusElemFloat then "fmaf" else "fma"
      in emitCUDAFloatTern (\x y z -> cuCall f [x, y, z])
   vfms =
-    let f = if simdElemTag (Proxy @a) == 8 then "fmaf" else "fma"
+    let f = if simdElemTag (Proxy @a) == JanusElemFloat then "fmaf" else "fma"
      in emitCUDAFloatTern (\x y z -> cuCall f [x, y, UnOp Negate z noLoc])
   vfnma =
-    let f = if simdElemTag (Proxy @a) == 8 then "fmaf" else "fma"
+    let f = if simdElemTag (Proxy @a) == JanusElemFloat then "fmaf" else "fma"
      in emitCUDAFloatTern (\x y z -> cuCall f [UnOp Negate x noLoc, y, z])
   vfnms =
-    let f = if simdElemTag (Proxy @a) == 8 then "fmaf" else "fma"
+    let f = if simdElemTag (Proxy @a) == JanusElemFloat then "fmaf" else "fma"
      in emitCUDAFloatTern (\x y z -> cuCall f [UnOp Negate x noLoc, y, UnOp Negate z noLoc])
   vmulAdd = vfma
 
   vfloor (JanusCUDA (JanusC ma)) = JanusCUDA $ JanusC $ do
     RVal a <- ma
-    let f = if simdElemTag (Proxy @a) == 8 then "floorf" else "floor"
+    let f = if simdElemTag (Proxy @a) == JanusElemFloat then "floorf" else "floor"
     RVal <$> emitCUDALaneUn @n @a (\x -> cuCall f [x]) a
   vceil (JanusCUDA (JanusC ma)) = JanusCUDA $ JanusC $ do
     RVal a <- ma
-    let f = if simdElemTag (Proxy @a) == 8 then "ceilf" else "ceil"
+    let f = if simdElemTag (Proxy @a) == JanusElemFloat then "ceilf" else "ceil"
     RVal <$> emitCUDALaneUn @n @a (\x -> cuCall f [x]) a
   vtrunc (JanusCUDA (JanusC ma)) = JanusCUDA $ JanusC $ do
     RVal a <- ma
-    let f = if simdElemTag (Proxy @a) == 8 then "truncf" else "trunc"
+    let f = if simdElemTag (Proxy @a) == JanusElemFloat then "truncf" else "trunc"
     RVal <$> emitCUDALaneUn @n @a (\x -> cuCall f [x]) a
   vroundNearest (JanusCUDA (JanusC ma)) = JanusCUDA $ JanusC $ do
     RVal a <- ma
-    let f = if simdElemTag (Proxy @a) == 8 then "rintf" else "rint"
+    let f = if simdElemTag (Proxy @a) == JanusElemFloat then "rintf" else "rint"
     RVal <$> emitCUDALaneUn @n @a (\x -> cuCall f [x]) a
 
 -- 7. ExpSIMDBits JanusCUDA

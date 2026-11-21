@@ -19,7 +19,7 @@ import Data.Proxy (Proxy (..))
 import Data.Semilattice.Join (Join (..))
 import Data.Semilattice.Lower (Lower (..))
 import Data.Semilattice.Meet (Meet (..))
-import Data.Word (Word32, Word8)
+import Data.Word (Word16, Word32, Word64, Word8)
 import Foreign.Marshal.Alloc (alloca, allocaBytes)
 import Foreign.Marshal.Array (peekArray, pokeArray, withArray)
 import Foreign.Ptr (Ptr, castPtr, nullPtr, plusPtr)
@@ -59,6 +59,27 @@ getTestBuildConfig = do
 --------------------------------------------------------------------------------
 -- 1. Target Feature Lattices, Admission, & Explicit Cross-Target Codegen
 --------------------------------------------------------------------------------
+
+unit_janus_elem_tag :: IO ()
+unit_janus_elem_tag = do
+  let allTags = [minBound .. maxBound :: JanusElemTag]
+      instanceTags =
+        [ simdElemTag (Proxy @Int8),
+          simdElemTag (Proxy @Word8),
+          simdElemTag (Proxy @Int16),
+          simdElemTag (Proxy @Word16),
+          simdElemTag (Proxy @Int32),
+          simdElemTag (Proxy @Word32),
+          simdElemTag (Proxy @Int64),
+          simdElemTag (Proxy @Word64),
+          simdElemTag (Proxy @Float),
+          simdElemTag (Proxy @Double)
+        ]
+  allTags @?= instanceTags
+  map fromEnum allTags @?= [0 .. 9]
+  (minBound :: JanusElemTag) @?= JanusElemInt8
+  (maxBound :: JanusElemTag) @?= JanusElemDouble
+  assertBool "Show & Ord instances work" (JanusElemInt8 < JanusElemDouble && show JanusElemFloat == "JanusElemFloat")
 
 unit_x86_and_cuda_feature_lattices :: IO ()
 unit_x86_and_cuda_feature_lattices = do

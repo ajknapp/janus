@@ -562,8 +562,8 @@ namedCType nm = JCType (DeclSpec [] [] (Tnamed (Id nm noLoc) [] noLoc) noLoc) (D
 
 x86128RegName :: forall a. (SIMDElem a) => Proxy a -> String
 x86128RegName p = case simdElemTag p of
-  8 -> "__m128"
-  9 -> "__m128d"
+  JanusElemFloat -> "__m128"
+  JanusElemDouble -> "__m128d"
   _ -> "__m128i"
 
 x86Has256Reg :: forall a. (SIMDElem a) => X86Features -> Proxy a -> Bool
@@ -574,8 +574,8 @@ x86Has256Reg fs p =
 
 x86256RegName :: forall a. (SIMDElem a) => Proxy a -> String
 x86256RegName p = case simdElemTag p of
-  8 -> "__m256"
-  9 -> "__m256d"
+  JanusElemFloat -> "__m256"
+  JanusElemDouble -> "__m256d"
   _ -> "__m256i"
 
 x86SIMDType :: forall n a. (SIMDShape n a) => JanusCM JCType
@@ -670,14 +670,14 @@ toXMM128 16 e = pure e
 toXMM128 4 e = do
   let xi = cCall "_mm_cvtsi32_si128" [cCast "int32_t" e]
   case simdElemTag (Proxy @a) of
-    8 -> emitLocalVal (namedCType "__m128") (cCall "_mm_castsi128_ps" [xi])
-    9 -> emitLocalVal (namedCType "__m128d") (cCall "_mm_castsi128_pd" [xi])
+    JanusElemFloat -> emitLocalVal (namedCType "__m128") (cCall "_mm_castsi128_ps" [xi])
+    JanusElemDouble -> emitLocalVal (namedCType "__m128d") (cCall "_mm_castsi128_pd" [xi])
     _ -> emitLocalVal (namedCType "__m128i") xi
 toXMM128 8 e = do
   let xi = cCall "_mm_cvtsi64_si128" [cCast "int64_t" e]
   case simdElemTag (Proxy @a) of
-    8 -> emitLocalVal (namedCType "__m128") (cCall "_mm_castsi128_ps" [xi])
-    9 -> emitLocalVal (namedCType "__m128d") (cCall "_mm_castsi128_pd" [xi])
+    JanusElemFloat -> emitLocalVal (namedCType "__m128") (cCall "_mm_castsi128_ps" [xi])
+    JanusElemDouble -> emitLocalVal (namedCType "__m128d") (cCall "_mm_castsi128_pd" [xi])
     _ -> emitLocalVal (namedCType "__m128i") xi
 toXMM128 _ _ = error "toXMM128: invalid byte size"
 
@@ -685,40 +685,40 @@ fromXMM128 :: forall a. (SIMDElem a) => Int -> Exp -> JanusCM Exp
 fromXMM128 16 e = emitLocalVal (namedCType (x86128RegName (Proxy @a))) e
 fromXMM128 4 e = do
   let asI = case simdElemTag (Proxy @a) of
-        8 -> cCall "_mm_castps_si128" [e]
-        9 -> cCall "_mm_castpd_si128" [e]
+        JanusElemFloat -> cCall "_mm_castps_si128" [e]
+        JanusElemDouble -> cCall "_mm_castpd_si128" [e]
         _ -> e
   emitLocalVal (namedCType "uint32_t") (cCast "uint32_t" (cCall "_mm_cvtsi128_si32" [asI]))
 fromXMM128 8 e = do
   let asI = case simdElemTag (Proxy @a) of
-        8 -> cCall "_mm_castps_si128" [e]
-        9 -> cCall "_mm_castpd_si128" [e]
+        JanusElemFloat -> cCall "_mm_castps_si128" [e]
+        JanusElemDouble -> cCall "_mm_castpd_si128" [e]
         _ -> e
   emitLocalVal (namedCType "uint64_t") (cCast "uint64_t" (cCall "_mm_cvtsi128_si64" [asI]))
 fromXMM128 _ _ = error "fromXMM128: invalid byte size"
 
 asM128i :: forall a. (SIMDElem a) => Proxy a -> Exp -> Exp
 asM128i p e = case simdElemTag p of
-  8 -> cCall "_mm_castps_si128" [e]
-  9 -> cCall "_mm_castpd_si128" [e]
+  JanusElemFloat -> cCall "_mm_castps_si128" [e]
+  JanusElemDouble -> cCall "_mm_castpd_si128" [e]
   _ -> e
 
 fromM128i :: forall a. (SIMDElem a) => Proxy a -> Exp -> Exp
 fromM128i p e = case simdElemTag p of
-  8 -> cCall "_mm_castsi128_ps" [e]
-  9 -> cCall "_mm_castsi128_pd" [e]
+  JanusElemFloat -> cCall "_mm_castsi128_ps" [e]
+  JanusElemDouble -> cCall "_mm_castsi128_pd" [e]
   _ -> e
 
 asM256i :: forall a. (SIMDElem a) => Proxy a -> Exp -> Exp
 asM256i p e = case simdElemTag p of
-  8 -> cCall "_mm256_castps_si256" [e]
-  9 -> cCall "_mm256_castpd_si256" [e]
+  JanusElemFloat -> cCall "_mm256_castps_si256" [e]
+  JanusElemDouble -> cCall "_mm256_castpd_si256" [e]
   _ -> e
 
 fromM256i :: forall a. (SIMDElem a) => Proxy a -> Exp -> Exp
 fromM256i p e = case simdElemTag p of
-  8 -> cCall "_mm256_castsi256_ps" [e]
-  9 -> cCall "_mm256_castsi256_pd" [e]
+  JanusElemFloat -> cCall "_mm256_castsi256_ps" [e]
+  JanusElemDouble -> cCall "_mm256_castsi256_pd" [e]
   _ -> e
 
 -- Scalar lane fallback inside generated C using stack array round-trip
@@ -784,20 +784,20 @@ emitLaneLoopUn bodyFn va = do
 
 extractLo256 :: forall a. (SIMDElem a) => Proxy a -> Exp -> Exp
 extractLo256 p e = case simdElemTag p of
-  8 -> cCall "_mm256_castps256_ps128" [e]
-  9 -> cCall "_mm256_castpd256_pd128" [e]
+  JanusElemFloat -> cCall "_mm256_castps256_ps128" [e]
+  JanusElemDouble -> cCall "_mm256_castpd256_pd128" [e]
   _ -> cCall "_mm256_castsi256_si128" [e]
 
 extractHi256 :: forall a. (SIMDElem a) => Proxy a -> Exp -> Exp
 extractHi256 p e = case simdElemTag p of
-  8 -> cCall "_mm256_extractf128_ps" [e, cInt 1]
-  9 -> cCall "_mm256_extractf128_pd" [e, cInt 1]
+  JanusElemFloat -> cCall "_mm256_extractf128_ps" [e, cInt 1]
+  JanusElemDouble -> cCall "_mm256_extractf128_pd" [e, cInt 1]
   _ -> cCall "_mm256_extracti128_si256" [e, cInt 1]
 
 combine256 :: forall a. (SIMDElem a) => Proxy a -> Exp -> Exp -> Exp
 combine256 p lo hi = case simdElemTag p of
-  8 -> cCall "_mm256_insertf128_ps" [cCall "_mm256_castps128_ps256" [lo], hi, cInt 1]
-  9 -> cCall "_mm256_insertf128_pd" [cCall "_mm256_castpd128_pd256" [lo], hi, cInt 1]
+  JanusElemFloat -> cCall "_mm256_insertf128_ps" [cCall "_mm256_castps128_ps256" [lo], hi, cInt 1]
+  JanusElemDouble -> cCall "_mm256_insertf128_pd" [cCall "_mm256_castpd128_pd256" [lo], hi, cInt 1]
   _ -> cCall "_mm256_inserti128_si256" [cCall "_mm256_castsi128_si256" [lo], hi, cInt 1]
 
 liftX86Bin ::
@@ -878,101 +878,101 @@ liftX86Un f128 mf256 (LinuxX86_64C (JanusC ma)) =
 
 x86Set1_128 :: forall a. (SIMDElem a) => Exp -> Exp
 x86Set1_128 s = case simdElemTag (Proxy @a) of
-  0 -> cCall "_mm_set1_epi8" [cCast "char" s]
-  1 -> cCall "_mm_set1_epi8" [cCast "char" s]
-  2 -> cCall "_mm_set1_epi16" [cCast "short" s]
-  3 -> cCall "_mm_set1_epi16" [cCast "short" s]
-  4 -> cCall "_mm_set1_epi32" [cCast "int" s]
-  5 -> cCall "_mm_set1_epi32" [cCast "int" s]
-  6 -> cCall "_mm_set1_epi64x" [cCast "long long" s]
-  7 -> cCall "_mm_set1_epi64x" [cCast "long long" s]
-  8 -> cCall "_mm_set1_ps" [s]
-  _ -> cCall "_mm_set1_pd" [s]
+  JanusElemInt8 -> cCall "_mm_set1_epi8" [cCast "char" s]
+  JanusElemWord8 -> cCall "_mm_set1_epi8" [cCast "char" s]
+  JanusElemInt16 -> cCall "_mm_set1_epi16" [cCast "short" s]
+  JanusElemWord16 -> cCall "_mm_set1_epi16" [cCast "short" s]
+  JanusElemInt32 -> cCall "_mm_set1_epi32" [cCast "int" s]
+  JanusElemWord32 -> cCall "_mm_set1_epi32" [cCast "int" s]
+  JanusElemInt64 -> cCall "_mm_set1_epi64x" [cCast "long long" s]
+  JanusElemWord64 -> cCall "_mm_set1_epi64x" [cCast "long long" s]
+  JanusElemFloat -> cCall "_mm_set1_ps" [s]
+  JanusElemDouble -> cCall "_mm_set1_pd" [s]
 
 x86Set1_256 :: forall a. (SIMDElem a) => Exp -> Exp
 x86Set1_256 s = case simdElemTag (Proxy @a) of
-  0 -> cCall "_mm256_set1_epi8" [cCast "char" s]
-  1 -> cCall "_mm256_set1_epi8" [cCast "char" s]
-  2 -> cCall "_mm256_set1_epi16" [cCast "short" s]
-  3 -> cCall "_mm256_set1_epi16" [cCast "short" s]
-  4 -> cCall "_mm256_set1_epi32" [cCast "int" s]
-  5 -> cCall "_mm256_set1_epi32" [cCast "int" s]
-  6 -> cCall "_mm256_set1_epi64x" [cCast "long long" s]
-  7 -> cCall "_mm256_set1_epi64x" [cCast "long long" s]
-  8 -> cCall "_mm256_set1_ps" [s]
-  _ -> cCall "_mm256_set1_pd" [s]
+  JanusElemInt8 -> cCall "_mm256_set1_epi8" [cCast "char" s]
+  JanusElemWord8 -> cCall "_mm256_set1_epi8" [cCast "char" s]
+  JanusElemInt16 -> cCall "_mm256_set1_epi16" [cCast "short" s]
+  JanusElemWord16 -> cCall "_mm256_set1_epi16" [cCast "short" s]
+  JanusElemInt32 -> cCall "_mm256_set1_epi32" [cCast "int" s]
+  JanusElemWord32 -> cCall "_mm256_set1_epi32" [cCast "int" s]
+  JanusElemInt64 -> cCall "_mm256_set1_epi64x" [cCast "long long" s]
+  JanusElemWord64 -> cCall "_mm256_set1_epi64x" [cCast "long long" s]
+  JanusElemFloat -> cCall "_mm256_set1_ps" [s]
+  JanusElemDouble -> cCall "_mm256_set1_pd" [s]
 
 x86Zero128 :: forall a. (SIMDElem a) => Exp
 x86Zero128 = case simdElemTag (Proxy @a) of
-  8 -> cCall "_mm_setzero_ps" []
-  9 -> cCall "_mm_setzero_pd" []
+  JanusElemFloat -> cCall "_mm_setzero_ps" []
+  JanusElemDouble -> cCall "_mm_setzero_pd" []
   _ -> cCall "_mm_setzero_si128" []
 
 x86Zero256 :: forall a. (SIMDElem a) => Exp
 x86Zero256 = case simdElemTag (Proxy @a) of
-  8 -> cCall "_mm256_setzero_ps" []
-  9 -> cCall "_mm256_setzero_pd" []
+  JanusElemFloat -> cCall "_mm256_setzero_ps" []
+  JanusElemDouble -> cCall "_mm256_setzero_pd" []
   _ -> cCall "_mm256_setzero_si256" []
 
 x86Add128 :: forall a. (SIMDElem a) => X86Features -> Exp -> Exp -> JanusCM Exp
 x86Add128 _ a b = pure $ case simdElemTag (Proxy @a) of
-  0 -> cCall "_mm_add_epi8" [a, b]
-  1 -> cCall "_mm_add_epi8" [a, b]
-  2 -> cCall "_mm_add_epi16" [a, b]
-  3 -> cCall "_mm_add_epi16" [a, b]
-  4 -> cCall "_mm_add_epi32" [a, b]
-  5 -> cCall "_mm_add_epi32" [a, b]
-  6 -> cCall "_mm_add_epi64" [a, b]
-  7 -> cCall "_mm_add_epi64" [a, b]
-  8 -> cCall "_mm_add_ps" [a, b]
-  _ -> cCall "_mm_add_pd" [a, b]
+  JanusElemInt8 -> cCall "_mm_add_epi8" [a, b]
+  JanusElemWord8 -> cCall "_mm_add_epi8" [a, b]
+  JanusElemInt16 -> cCall "_mm_add_epi16" [a, b]
+  JanusElemWord16 -> cCall "_mm_add_epi16" [a, b]
+  JanusElemInt32 -> cCall "_mm_add_epi32" [a, b]
+  JanusElemWord32 -> cCall "_mm_add_epi32" [a, b]
+  JanusElemInt64 -> cCall "_mm_add_epi64" [a, b]
+  JanusElemWord64 -> cCall "_mm_add_epi64" [a, b]
+  JanusElemFloat -> cCall "_mm_add_ps" [a, b]
+  JanusElemDouble -> cCall "_mm_add_pd" [a, b]
 
 x86Add256 :: forall a. (SIMDElem a) => X86Features -> Exp -> Exp -> JanusCM Exp
 x86Add256 _ a b = pure $ case simdElemTag (Proxy @a) of
-  0 -> cCall "_mm256_add_epi8" [a, b]
-  1 -> cCall "_mm256_add_epi8" [a, b]
-  2 -> cCall "_mm256_add_epi16" [a, b]
-  3 -> cCall "_mm256_add_epi16" [a, b]
-  4 -> cCall "_mm256_add_epi32" [a, b]
-  5 -> cCall "_mm256_add_epi32" [a, b]
-  6 -> cCall "_mm256_add_epi64" [a, b]
-  7 -> cCall "_mm256_add_epi64" [a, b]
-  8 -> cCall "_mm256_add_ps" [a, b]
-  _ -> cCall "_mm256_add_pd" [a, b]
+  JanusElemInt8 -> cCall "_mm256_add_epi8" [a, b]
+  JanusElemWord8 -> cCall "_mm256_add_epi8" [a, b]
+  JanusElemInt16 -> cCall "_mm256_add_epi16" [a, b]
+  JanusElemWord16 -> cCall "_mm256_add_epi16" [a, b]
+  JanusElemInt32 -> cCall "_mm256_add_epi32" [a, b]
+  JanusElemWord32 -> cCall "_mm256_add_epi32" [a, b]
+  JanusElemInt64 -> cCall "_mm256_add_epi64" [a, b]
+  JanusElemWord64 -> cCall "_mm256_add_epi64" [a, b]
+  JanusElemFloat -> cCall "_mm256_add_ps" [a, b]
+  JanusElemDouble -> cCall "_mm256_add_pd" [a, b]
 
 x86Sub128 :: forall a. (SIMDElem a) => X86Features -> Exp -> Exp -> JanusCM Exp
 x86Sub128 _ a b = pure $ case simdElemTag (Proxy @a) of
-  0 -> cCall "_mm_sub_epi8" [a, b]
-  1 -> cCall "_mm_sub_epi8" [a, b]
-  2 -> cCall "_mm_sub_epi16" [a, b]
-  3 -> cCall "_mm_sub_epi16" [a, b]
-  4 -> cCall "_mm_sub_epi32" [a, b]
-  5 -> cCall "_mm_sub_epi32" [a, b]
-  6 -> cCall "_mm_sub_epi64" [a, b]
-  7 -> cCall "_mm_sub_epi64" [a, b]
-  8 -> cCall "_mm_sub_ps" [a, b]
-  _ -> cCall "_mm_sub_pd" [a, b]
+  JanusElemInt8 -> cCall "_mm_sub_epi8" [a, b]
+  JanusElemWord8 -> cCall "_mm_sub_epi8" [a, b]
+  JanusElemInt16 -> cCall "_mm_sub_epi16" [a, b]
+  JanusElemWord16 -> cCall "_mm_sub_epi16" [a, b]
+  JanusElemInt32 -> cCall "_mm_sub_epi32" [a, b]
+  JanusElemWord32 -> cCall "_mm_sub_epi32" [a, b]
+  JanusElemInt64 -> cCall "_mm_sub_epi64" [a, b]
+  JanusElemWord64 -> cCall "_mm_sub_epi64" [a, b]
+  JanusElemFloat -> cCall "_mm_sub_ps" [a, b]
+  JanusElemDouble -> cCall "_mm_sub_pd" [a, b]
 
 x86Sub256 :: forall a. (SIMDElem a) => X86Features -> Exp -> Exp -> JanusCM Exp
 x86Sub256 _ a b = pure $ case simdElemTag (Proxy @a) of
-  0 -> cCall "_mm256_sub_epi8" [a, b]
-  1 -> cCall "_mm256_sub_epi8" [a, b]
-  2 -> cCall "_mm256_sub_epi16" [a, b]
-  3 -> cCall "_mm256_sub_epi16" [a, b]
-  4 -> cCall "_mm256_sub_epi32" [a, b]
-  5 -> cCall "_mm256_sub_epi32" [a, b]
-  6 -> cCall "_mm256_sub_epi64" [a, b]
-  7 -> cCall "_mm256_sub_epi64" [a, b]
-  8 -> cCall "_mm256_sub_ps" [a, b]
-  _ -> cCall "_mm256_sub_pd" [a, b]
+  JanusElemInt8 -> cCall "_mm256_sub_epi8" [a, b]
+  JanusElemWord8 -> cCall "_mm256_sub_epi8" [a, b]
+  JanusElemInt16 -> cCall "_mm256_sub_epi16" [a, b]
+  JanusElemWord16 -> cCall "_mm256_sub_epi16" [a, b]
+  JanusElemInt32 -> cCall "_mm256_sub_epi32" [a, b]
+  JanusElemWord32 -> cCall "_mm256_sub_epi32" [a, b]
+  JanusElemInt64 -> cCall "_mm256_sub_epi64" [a, b]
+  JanusElemWord64 -> cCall "_mm256_sub_epi64" [a, b]
+  JanusElemFloat -> cCall "_mm256_sub_ps" [a, b]
+  JanusElemDouble -> cCall "_mm256_sub_pd" [a, b]
 
 x86Mul128 :: forall a. (SIMDElem a) => X86Features -> Exp -> Exp -> JanusCM Exp
 x86Mul128 fs a b = case simdElemTag (Proxy @a) of
-  8 -> pure $ cCall "_mm_mul_ps" [a, b]
-  9 -> pure $ cCall "_mm_mul_pd" [a, b]
-  2 -> pure $ cCall "_mm_mullo_epi16" [a, b]
-  3 -> pure $ cCall "_mm_mullo_epi16" [a, b]
-  t | t == 4 || t == 5 ->
+  JanusElemFloat -> pure $ cCall "_mm_mul_ps" [a, b]
+  JanusElemDouble -> pure $ cCall "_mm_mul_pd" [a, b]
+  JanusElemInt16 -> pure $ cCall "_mm_mullo_epi16" [a, b]
+  JanusElemWord16 -> pure $ cCall "_mm_mullo_epi16" [a, b]
+  t | t == JanusElemInt32 || t == JanusElemWord32 ->
       if hasX86Feature fs X86_SSE4_1
         then pure $ cCall "_mm_mullo_epi32" [a, b]
         else do
@@ -987,7 +987,7 @@ x86Mul128 fs a b = case simdElemTag (Proxy @a) of
               [ cCall "_mm_shuffle_epi32" [m02, cInt 8],
                 cCall "_mm_shuffle_epi32" [m13, cInt 8]
               ]
-  t | t == 0 || t == 1 -> do
+  t | t == JanusElemInt8 || t == JanusElemWord8 -> do
       ev <- emitLocalVal (namedCType "__m128i") (cCall "_mm_mullo_epi16" [a, b])
       od <-
         emitLocalVal
@@ -1014,13 +1014,13 @@ x86Mul128 fs a b = case simdElemTag (Proxy @a) of
 
 x86Mul256 :: forall a. (SIMDElem a) => X86Features -> Exp -> Exp -> JanusCM Exp
 x86Mul256 _ a b = case simdElemTag (Proxy @a) of
-  8 -> pure $ cCall "_mm256_mul_ps" [a, b]
-  9 -> pure $ cCall "_mm256_mul_pd" [a, b]
-  2 -> pure $ cCall "_mm256_mullo_epi16" [a, b]
-  3 -> pure $ cCall "_mm256_mullo_epi16" [a, b]
-  4 -> pure $ cCall "_mm256_mullo_epi32" [a, b]
-  5 -> pure $ cCall "_mm256_mullo_epi32" [a, b]
-  t | t == 0 || t == 1 -> do
+  JanusElemFloat -> pure $ cCall "_mm256_mul_ps" [a, b]
+  JanusElemDouble -> pure $ cCall "_mm256_mul_pd" [a, b]
+  JanusElemInt16 -> pure $ cCall "_mm256_mullo_epi16" [a, b]
+  JanusElemWord16 -> pure $ cCall "_mm256_mullo_epi16" [a, b]
+  JanusElemInt32 -> pure $ cCall "_mm256_mullo_epi32" [a, b]
+  JanusElemWord32 -> pure $ cCall "_mm256_mullo_epi32" [a, b]
+  t | t == JanusElemInt8 || t == JanusElemWord8 -> do
       ev <- emitLocalVal (namedCType "__m256i") (cCall "_mm256_mullo_epi16" [a, b])
       od <-
         emitLocalVal
@@ -1057,7 +1057,7 @@ instance {-# OVERLAPPING #-} (SIMDShape n a, CPUSIMDElem a, JanusLitC a) => Num 
         z = cInt 0
         one = if simdElemIsFloat (Proxy @a) then C.Const (FloatConst "1.0f" 1.0 noLoc) noLoc else cInt 1
         negOne = UnOp Negate one noLoc
-    r <- emitLaneLoopUn @n @a (\x -> if simdElemSigned (Proxy @a) then (if tag == 8 || tag == 9 then Cond (BinOp Gt x z noLoc) one (Cond (BinOp Lt x z noLoc) negOne x noLoc) noLoc else BinOp Sub (BinOp Gt x z noLoc) (BinOp Lt x z noLoc) noLoc) else Cond (BinOp Gt x z noLoc) (cInt 1) z noLoc) ev
+    r <- emitLaneLoopUn @n @a (\x -> if simdElemSigned (Proxy @a) then (if tag == JanusElemFloat || tag == JanusElemDouble then Cond (BinOp Gt x z noLoc) one (Cond (BinOp Lt x z noLoc) negOne x noLoc) noLoc else BinOp Sub (BinOp Gt x z noLoc) (BinOp Lt x z noLoc) noLoc) else Cond (BinOp Gt x z noLoc) (cInt 1) z noLoc) ev
     pure (RVal r)
   fromInteger k = vsplat (fromInteger k)
 
@@ -1085,7 +1085,7 @@ sleefUnOp ::
   LinuxX86_64C (SIMDVector LinuxX86_64C n a) ->
   LinuxX86_64C (SIMDVector LinuxX86_64C n a)
 sleefUnOp opName ulp =
-  let isF32 = simdElemTag (Proxy @a) == 8
+  let isF32 = simdElemTag (Proxy @a) == JanusElemFloat
       w128 = if isF32 then "f4_" else "d2_"
       w256 = if isF32 then "f8_" else "d4_"
       fn128 fs x = addHeader "sleef.h" >> pure (cCall ("Sleef_" <> opName <> w128 <> ulp <> sleefSuffix128 fs) [x])
@@ -1101,7 +1101,7 @@ sleefBinOp ::
   LinuxX86_64C (SIMDVector LinuxX86_64C n a) ->
   LinuxX86_64C (SIMDVector LinuxX86_64C n a)
 sleefBinOp opName ulp =
-  let isF32 = simdElemTag (Proxy @a) == 8
+  let isF32 = simdElemTag (Proxy @a) == JanusElemFloat
       w128 = if isF32 then "f4_" else "d2_"
       w256 = if isF32 then "f8_" else "d4_"
       fn128 fs x y = addHeader "sleef.h" >> pure (cCall ("Sleef_" <> opName <> w128 <> ulp <> sleefSuffix128 fs) [x, y])
@@ -1332,10 +1332,10 @@ instance (SIMDShape n a) => ExpSIMDMask LinuxX86_64C n a where
       _ -> error "mtrue: invalid size"
     pure (RVal r)
 
-  mand = maskBinX86 (\x y -> cCall "_mm_and_si128" [x, y]) (\p x y -> case simdElemTag p of 8 -> cCall "_mm256_and_ps" [x, y]; 9 -> cCall "_mm256_and_pd" [x, y]; _ -> cCall "_mm256_and_si256" [x, y])
-  mor = maskBinX86 (\x y -> cCall "_mm_or_si128" [x, y]) (\p x y -> case simdElemTag p of 8 -> cCall "_mm256_or_ps" [x, y]; 9 -> cCall "_mm256_or_pd" [x, y]; _ -> cCall "_mm256_or_si256" [x, y])
-  mxor = maskBinX86 (\x y -> cCall "_mm_xor_si128" [x, y]) (\p x y -> case simdElemTag p of 8 -> cCall "_mm256_xor_ps" [x, y]; 9 -> cCall "_mm256_xor_pd" [x, y]; _ -> cCall "_mm256_xor_si256" [x, y])
-  mandnot = maskBinX86 (\x y -> cCall "_mm_andnot_si128" [x, y]) (\p x y -> case simdElemTag p of 8 -> cCall "_mm256_andnot_ps" [x, y]; 9 -> cCall "_mm256_andnot_pd" [x, y]; _ -> cCall "_mm256_andnot_si256" [x, y])
+  mand = maskBinX86 (\x y -> cCall "_mm_and_si128" [x, y]) (\p x y -> case simdElemTag p of JanusElemFloat -> cCall "_mm256_and_ps" [x, y]; JanusElemDouble -> cCall "_mm256_and_pd" [x, y]; _ -> cCall "_mm256_and_si256" [x, y])
+  mor = maskBinX86 (\x y -> cCall "_mm_or_si128" [x, y]) (\p x y -> case simdElemTag p of JanusElemFloat -> cCall "_mm256_or_ps" [x, y]; JanusElemDouble -> cCall "_mm256_or_pd" [x, y]; _ -> cCall "_mm256_or_si256" [x, y])
+  mxor = maskBinX86 (\x y -> cCall "_mm_xor_si128" [x, y]) (\p x y -> case simdElemTag p of JanusElemFloat -> cCall "_mm256_xor_ps" [x, y]; JanusElemDouble -> cCall "_mm256_xor_pd" [x, y]; _ -> cCall "_mm256_xor_si256" [x, y])
+  mandnot = maskBinX86 (\x y -> cCall "_mm_andnot_si128" [x, y]) (\p x y -> case simdElemTag p of JanusElemFloat -> cCall "_mm256_andnot_ps" [x, y]; JanusElemDouble -> cCall "_mm256_andnot_pd" [x, y]; _ -> cCall "_mm256_andnot_si256" [x, y])
   mnot m = mxor m mtrue
 
   vselect (LinuxX86_64C (JanusC mm)) (LinuxX86_64C (JanusC mt)) (LinuxX86_64C (JanusC mf)) =
@@ -1353,8 +1353,8 @@ instance (SIMDShape n a) => ExpSIMDMask LinuxX86_64C n a where
           pa = Proxy @a
           sel128 xm xt xf
             | hasX86Feature fs X86_SSE4_1 = case simdElemTag pa of
-                8 -> cCall "_mm_blendv_ps" [xf, xt, xm]
-                9 -> cCall "_mm_blendv_pd" [xf, xt, xm]
+                JanusElemFloat -> cCall "_mm_blendv_ps" [xf, xt, xm]
+                JanusElemDouble -> cCall "_mm_blendv_pd" [xf, xt, xm]
                 _ -> cCall "_mm_blendv_epi8" [xf, xt, xm]
             | otherwise =
                 fromM128i pa $
@@ -1367,8 +1367,8 @@ instance (SIMDShape n a) => ExpSIMDMask LinuxX86_64C n a where
         32
           | x86Has256Reg fs pa -> do
               let e256 = case simdElemTag pa of
-                    8 -> cCall "_mm256_blendv_ps" [ef, et, em]
-                    9 -> cCall "_mm256_blendv_pd" [ef, et, em]
+                    JanusElemFloat -> cCall "_mm256_blendv_ps" [ef, et, em]
+                    JanusElemDouble -> cCall "_mm256_blendv_pd" [ef, et, em]
                     _ -> cCall "_mm256_blendv_epi8" [ef, et, em]
               emitLocalVal ty e256
           | otherwise -> do
@@ -1399,16 +1399,16 @@ instance (SIMDShape n a) => ExpSIMDMask LinuxX86_64C n a where
         pure . RVal $ cCast "uint32_t" (cCall "_mm256_movemask_epi8" [em])
       (4, _) | b <= 16 -> do
         xm <- toXMM128 @a b em
-        let ps = if simdElemTag (Proxy @a) == 8 then xm else cCall "_mm_castsi128_ps" [xm]
+        let ps = if simdElemTag (Proxy @a) == JanusElemFloat then xm else cCall "_mm_castsi128_ps" [xm]
         pure . RVal $ BinOp And (cCast "uint32_t" (cCall "_mm_movemask_ps" [ps])) (unsignedIntConst lmask) noLoc
       (4, 32) | x86Has256Reg fs (Proxy @a) -> do
-        let ps = if simdElemTag (Proxy @a) == 8 then em else cCall "_mm256_castsi256_ps" [em]
+        let ps = if simdElemTag (Proxy @a) == JanusElemFloat then em else cCall "_mm256_castsi256_ps" [em]
         pure . RVal $ cCast "uint32_t" (cCall "_mm256_movemask_ps" [ps])
       (8, 16) -> do
-        let pd = if simdElemTag (Proxy @a) == 9 then em else cCall "_mm_castsi128_pd" [em]
+        let pd = if simdElemTag (Proxy @a) == JanusElemDouble then em else cCall "_mm_castsi128_pd" [em]
         pure . RVal $ cCast "uint32_t" (cCall "_mm_movemask_pd" [pd])
       (8, 32) | x86Has256Reg fs (Proxy @a) -> do
-        let pd = if simdElemTag (Proxy @a) == 9 then em else cCall "_mm256_castsi256_pd" [em]
+        let pd = if simdElemTag (Proxy @a) == JanusElemDouble then em else cCall "_mm256_castsi256_pd" [em]
         pure . RVal $ cCast "uint32_t" (cCall "_mm256_movemask_pd" [pd])
       _ -> do
         acc <- emitLocalVal (namedCType "uint32_t") (unsignedIntConst (0 :: Word32))
@@ -1450,14 +1450,14 @@ instance (SIMDShape n a) => ExpSIMDMask LinuxX86_64C n a where
 -- 3. ExpSIMDCmp
 x86Cmp128 :: forall a. (SIMDElem a) => BinOp -> X86Features -> Exp -> Exp -> JanusCM Exp
 x86Cmp128 cop fs a b = case simdElemTag (Proxy @a) of
-  8 -> pure $ case cop of
+  JanusElemFloat -> pure $ case cop of
     Eq -> cCall "_mm_cmpeq_ps" [a, b]
     Ne -> cCall "_mm_cmpneq_ps" [a, b]
     Lt -> cCall "_mm_cmplt_ps" [a, b]
     Le -> cCall "_mm_cmple_ps" [a, b]
     Gt -> cCall "_mm_cmpgt_ps" [a, b]
     _ -> cCall "_mm_cmpge_ps" [a, b]
-  9 -> pure $ case cop of
+  JanusElemDouble -> pure $ case cop of
     Eq -> cCall "_mm_cmpeq_pd" [a, b]
     Ne -> cCall "_mm_cmpneq_pd" [a, b]
     Lt -> cCall "_mm_cmplt_pd" [a, b]
@@ -1468,33 +1468,33 @@ x86Cmp128 cop fs a b = case simdElemTag (Proxy @a) of
     let ones = cCall "_mm_set1_epi32" [signedIntConst (-1 :: Int32)]
         notI x = cCall "_mm_xor_si128" [x, ones]
         eqI x y = case tag of
-          0 -> cCall "_mm_cmpeq_epi8" [x, y]
-          1 -> cCall "_mm_cmpeq_epi8" [x, y]
-          2 -> cCall "_mm_cmpeq_epi16" [x, y]
-          3 -> cCall "_mm_cmpeq_epi16" [x, y]
-          4 -> cCall "_mm_cmpeq_epi32" [x, y]
-          5 -> cCall "_mm_cmpeq_epi32" [x, y]
+          JanusElemInt8 -> cCall "_mm_cmpeq_epi8" [x, y]
+          JanusElemWord8 -> cCall "_mm_cmpeq_epi8" [x, y]
+          JanusElemInt16 -> cCall "_mm_cmpeq_epi16" [x, y]
+          JanusElemWord16 -> cCall "_mm_cmpeq_epi16" [x, y]
+          JanusElemInt32 -> cCall "_mm_cmpeq_epi32" [x, y]
+          JanusElemWord32 -> cCall "_mm_cmpeq_epi32" [x, y]
           _
             | hasX86Feature fs X86_SSE4_1 -> cCall "_mm_cmpeq_epi64" [x, y]
             | otherwise ->
                 let c32 = cCall "_mm_cmpeq_epi32" [x, y]
                  in cCall "_mm_and_si128" [c32, cCall "_mm_shuffle_epi32" [c32, cInt 0xB1]]
         bias = case tag of
-          1 -> Just (cCall "_mm_set1_epi8" [cCast "char" (unsignedIntConst (0x80 :: Word32))])
-          3 -> Just (cCall "_mm_set1_epi16" [cCast "short" (unsignedIntConst (0x8000 :: Word32))])
-          5 -> Just (cCall "_mm_set1_epi32" [cCast "int" (unsignedIntConst (0x80000000 :: Word32))])
-          7 -> Just (cCall "_mm_set1_epi64x" [cCast "long long" (unsignedIntConst (0x8000000000000000 :: Word64))])
+          JanusElemWord8 -> Just (cCall "_mm_set1_epi8" [cCast "char" (unsignedIntConst (0x80 :: Word32))])
+          JanusElemWord16 -> Just (cCall "_mm_set1_epi16" [cCast "short" (unsignedIntConst (0x8000 :: Word32))])
+          JanusElemWord32 -> Just (cCall "_mm_set1_epi32" [cCast "int" (unsignedIntConst (0x80000000 :: Word32))])
+          JanusElemWord64 -> Just (cCall "_mm_set1_epi64x" [cCast "long long" (unsignedIntConst (0x8000000000000000 :: Word64))])
           _ -> Nothing
         (ax, bx) = case bias of
           Just bs -> (cCall "_mm_xor_si128" [a, bs], cCall "_mm_xor_si128" [b, bs])
           Nothing -> (a, b)
         gtSigned x y = case tag of
-          0 -> pure $ cCall "_mm_cmpgt_epi8" [x, y]
-          1 -> pure $ cCall "_mm_cmpgt_epi8" [x, y]
-          2 -> pure $ cCall "_mm_cmpgt_epi16" [x, y]
-          3 -> pure $ cCall "_mm_cmpgt_epi16" [x, y]
-          4 -> pure $ cCall "_mm_cmpgt_epi32" [x, y]
-          5 -> pure $ cCall "_mm_cmpgt_epi32" [x, y]
+          JanusElemInt8 -> pure $ cCall "_mm_cmpgt_epi8" [x, y]
+          JanusElemWord8 -> pure $ cCall "_mm_cmpgt_epi8" [x, y]
+          JanusElemInt16 -> pure $ cCall "_mm_cmpgt_epi16" [x, y]
+          JanusElemWord16 -> pure $ cCall "_mm_cmpgt_epi16" [x, y]
+          JanusElemInt32 -> pure $ cCall "_mm_cmpgt_epi32" [x, y]
+          JanusElemWord32 -> pure $ cCall "_mm_cmpgt_epi32" [x, y]
           _
             | hasX86Feature fs X86_SSE4_2 -> pure $ cCall "_mm_cmpgt_epi64" [x, y]
             | otherwise -> do
@@ -1519,7 +1519,7 @@ x86Cmp128 cop fs a b = case simdElemTag (Proxy @a) of
 
 x86Cmp256 :: forall a. (SIMDElem a) => BinOp -> X86Features -> Exp -> Exp -> JanusCM Exp
 x86Cmp256 cop _ a b = case simdElemTag (Proxy @a) of
-  8 ->
+  JanusElemFloat ->
     let imm = case cop of
           Eq -> "_CMP_EQ_OQ"
           Ne -> "_CMP_NEQ_UQ"
@@ -1528,7 +1528,7 @@ x86Cmp256 cop _ a b = case simdElemTag (Proxy @a) of
           Gt -> "_CMP_GT_OQ"
           _ -> "_CMP_GE_OQ"
      in pure $ cCall "_mm256_cmp_ps" [a, b, cVar imm]
-  9 ->
+  JanusElemDouble ->
     let imm = case cop of
           Eq -> "_CMP_EQ_OQ"
           Ne -> "_CMP_NEQ_UQ"
@@ -1541,29 +1541,29 @@ x86Cmp256 cop _ a b = case simdElemTag (Proxy @a) of
     let ones = cCall "_mm256_set1_epi32" [signedIntConst (-1 :: Int32)]
         notI x = cCall "_mm256_xor_si256" [x, ones]
         eqI x y = case tag of
-          0 -> cCall "_mm256_cmpeq_epi8" [x, y]
-          1 -> cCall "_mm256_cmpeq_epi8" [x, y]
-          2 -> cCall "_mm256_cmpeq_epi16" [x, y]
-          3 -> cCall "_mm256_cmpeq_epi16" [x, y]
-          4 -> cCall "_mm256_cmpeq_epi32" [x, y]
-          5 -> cCall "_mm256_cmpeq_epi32" [x, y]
+          JanusElemInt8 -> cCall "_mm256_cmpeq_epi8" [x, y]
+          JanusElemWord8 -> cCall "_mm256_cmpeq_epi8" [x, y]
+          JanusElemInt16 -> cCall "_mm256_cmpeq_epi16" [x, y]
+          JanusElemWord16 -> cCall "_mm256_cmpeq_epi16" [x, y]
+          JanusElemInt32 -> cCall "_mm256_cmpeq_epi32" [x, y]
+          JanusElemWord32 -> cCall "_mm256_cmpeq_epi32" [x, y]
           _ -> cCall "_mm256_cmpeq_epi64" [x, y]
         bias = case tag of
-          1 -> Just (cCall "_mm256_set1_epi8" [cCast "char" (unsignedIntConst (0x80 :: Word32))])
-          3 -> Just (cCall "_mm256_set1_epi16" [cCast "short" (unsignedIntConst (0x8000 :: Word32))])
-          5 -> Just (cCall "_mm256_set1_epi32" [cCast "int" (unsignedIntConst (0x80000000 :: Word32))])
-          7 -> Just (cCall "_mm256_set1_epi64x" [cCast "long long" (unsignedIntConst (0x8000000000000000 :: Word64))])
+          JanusElemWord8 -> Just (cCall "_mm256_set1_epi8" [cCast "char" (unsignedIntConst (0x80 :: Word32))])
+          JanusElemWord16 -> Just (cCall "_mm256_set1_epi16" [cCast "short" (unsignedIntConst (0x8000 :: Word32))])
+          JanusElemWord32 -> Just (cCall "_mm256_set1_epi32" [cCast "int" (unsignedIntConst (0x80000000 :: Word32))])
+          JanusElemWord64 -> Just (cCall "_mm256_set1_epi64x" [cCast "long long" (unsignedIntConst (0x8000000000000000 :: Word64))])
           _ -> Nothing
         (ax, bx) = case bias of
           Just bs -> (cCall "_mm256_xor_si256" [a, bs], cCall "_mm256_xor_si256" [b, bs])
           Nothing -> (a, b)
         gtSigned x y = case tag of
-          0 -> cCall "_mm256_cmpgt_epi8" [x, y]
-          1 -> cCall "_mm256_cmpgt_epi8" [x, y]
-          2 -> cCall "_mm256_cmpgt_epi16" [x, y]
-          3 -> cCall "_mm256_cmpgt_epi16" [x, y]
-          4 -> cCall "_mm256_cmpgt_epi32" [x, y]
-          5 -> cCall "_mm256_cmpgt_epi32" [x, y]
+          JanusElemInt8 -> cCall "_mm256_cmpgt_epi8" [x, y]
+          JanusElemWord8 -> cCall "_mm256_cmpgt_epi8" [x, y]
+          JanusElemInt16 -> cCall "_mm256_cmpgt_epi16" [x, y]
+          JanusElemWord16 -> cCall "_mm256_cmpgt_epi16" [x, y]
+          JanusElemInt32 -> cCall "_mm256_cmpgt_epi32" [x, y]
+          JanusElemWord32 -> cCall "_mm256_cmpgt_epi32" [x, y]
           _ -> cCall "_mm256_cmpgt_epi64" [x, y]
     pure $ case cop of
       Eq -> eqI a b
@@ -1590,12 +1590,12 @@ instance (SIMDShape n a, CPUSIMDElem a) => ExpSIMDArith LinuxX86_64C n a where
     | simdElemIsFloat (Proxy @a) =
         let signMask128 _ x =
               pure $
-                if simdElemTag (Proxy @a) == 8
+                if simdElemTag (Proxy @a) == JanusElemFloat
                   then cCall "_mm_xor_ps" [x, cCall "_mm_set1_ps" [C.Const (FloatConst "-0.0f" (-0.0) noLoc) noLoc]]
                   else cCall "_mm_xor_pd" [x, cCall "_mm_set1_pd" [C.Const (DoubleConst "-0.0" (-0.0) noLoc) noLoc]]
             signMask256 _ x =
               pure $
-                if simdElemTag (Proxy @a) == 8
+                if simdElemTag (Proxy @a) == JanusElemFloat
                   then cCall "_mm256_xor_ps" [x, cCall "_mm256_set1_ps" [C.Const (FloatConst "-0.0f" (-0.0) noLoc) noLoc]]
                   else cCall "_mm256_xor_pd" [x, cCall "_mm256_set1_pd" [C.Const (DoubleConst "-0.0" (-0.0) noLoc) noLoc]]
          in liftX86Un @n @a signMask128 (Just signMask256) v
@@ -1603,29 +1603,29 @@ instance (SIMDShape n a, CPUSIMDElem a) => ExpSIMDArith LinuxX86_64C n a where
 
   vabs v
     | not (simdElemSigned (Proxy @a)) = v
-    | simdElemTag (Proxy @a) == 8 =
+    | simdElemTag (Proxy @a) == JanusElemFloat =
         liftX86Un @n @a
           (\_ x -> pure $ cCall "_mm_and_ps" [x, cCall "_mm_castsi128_ps" [cCall "_mm_set1_epi32" [cInt 0x7FFFFFFF]]])
           (Just (\_ x -> pure $ cCall "_mm256_and_ps" [x, cCall "_mm256_castsi256_ps" [cCall "_mm256_set1_epi32" [cInt 0x7FFFFFFF]]]))
           v
-    | simdElemTag (Proxy @a) == 9 =
+    | simdElemTag (Proxy @a) == JanusElemDouble =
         liftX86Un @n @a
           (\_ x -> pure $ cCall "_mm_and_pd" [x, cCall "_mm_castsi128_pd" [cCall "_mm_set1_epi64x" [signedIntConst (0x7FFFFFFFFFFFFFFF :: Int64)]]])
           (Just (\_ x -> pure $ cCall "_mm256_and_pd" [x, cCall "_mm256_castsi256_pd" [cCall "_mm256_set1_epi64x" [signedIntConst (0x7FFFFFFFFFFFFFFF :: Int64)]]]))
           v
     | otherwise =
         let abs128 fs x
-              | hasX86Feature fs X86_SSSE3 && simdElemTag (Proxy @a) == 0 = pure $ cCall "_mm_abs_epi8" [x]
-              | hasX86Feature fs X86_SSSE3 && simdElemTag (Proxy @a) == 2 = pure $ cCall "_mm_abs_epi16" [x]
-              | hasX86Feature fs X86_SSSE3 && simdElemTag (Proxy @a) == 4 = pure $ cCall "_mm_abs_epi32" [x]
+              | hasX86Feature fs X86_SSSE3 && simdElemTag (Proxy @a) == JanusElemInt8 = pure $ cCall "_mm_abs_epi8" [x]
+              | hasX86Feature fs X86_SSSE3 && simdElemTag (Proxy @a) == JanusElemInt16 = pure $ cCall "_mm_abs_epi16" [x]
+              | hasX86Feature fs X86_SSSE3 && simdElemTag (Proxy @a) == JanusElemInt32 = pure $ cCall "_mm_abs_epi32" [x]
               | otherwise = do
                   negX <- x86Sub128 @a fs (x86Zero128 @a) x
                   m <- x86Cmp128 @a Lt fs x (x86Zero128 @a)
                   pure $ cCall "_mm_or_si128" [cCall "_mm_and_si128" [m, negX], cCall "_mm_andnot_si128" [m, x]]
             abs256 _ x = case simdElemTag (Proxy @a) of
-              0 -> pure $ cCall "_mm256_abs_epi8" [x]
-              2 -> pure $ cCall "_mm256_abs_epi16" [x]
-              4 -> pure $ cCall "_mm256_abs_epi32" [x]
+              JanusElemInt8 -> pure $ cCall "_mm256_abs_epi8" [x]
+              JanusElemInt16 -> pure $ cCall "_mm256_abs_epi16" [x]
+              JanusElemInt32 -> pure $ cCall "_mm256_abs_epi32" [x]
               _ -> do
                 lo <- emitLocalVal (namedCType "__m128i") (cCall "_mm256_castsi256_si128" [x])
                 hi <- emitLocalVal (namedCType "__m128i") (cCall "_mm256_extracti128_si256" [x, cInt 1])
@@ -1636,26 +1636,26 @@ instance (SIMDShape n a, CPUSIMDElem a) => ExpSIMDArith LinuxX86_64C n a where
 
   vmin a b =
     let min128 fs x y = case simdElemTag (Proxy @a) of
-          8 -> pure $ cCall "_mm_min_ps" [x, y]
-          9 -> pure $ cCall "_mm_min_pd" [x, y]
-          1 -> pure $ cCall "_mm_min_epu8" [x, y]
-          2 -> pure $ cCall "_mm_min_epi16" [x, y]
-          0 | hasX86Feature fs X86_SSE4_1 -> pure $ cCall "_mm_min_epi8" [x, y]
-          3 | hasX86Feature fs X86_SSE4_1 -> pure $ cCall "_mm_min_epu16" [x, y]
-          4 | hasX86Feature fs X86_SSE4_1 -> pure $ cCall "_mm_min_epi32" [x, y]
-          5 | hasX86Feature fs X86_SSE4_1 -> pure $ cCall "_mm_min_epu32" [x, y]
+          JanusElemFloat -> pure $ cCall "_mm_min_ps" [x, y]
+          JanusElemDouble -> pure $ cCall "_mm_min_pd" [x, y]
+          JanusElemWord8 -> pure $ cCall "_mm_min_epu8" [x, y]
+          JanusElemInt16 -> pure $ cCall "_mm_min_epi16" [x, y]
+          JanusElemInt8 | hasX86Feature fs X86_SSE4_1 -> pure $ cCall "_mm_min_epi8" [x, y]
+          JanusElemWord16 | hasX86Feature fs X86_SSE4_1 -> pure $ cCall "_mm_min_epu16" [x, y]
+          JanusElemInt32 | hasX86Feature fs X86_SSE4_1 -> pure $ cCall "_mm_min_epi32" [x, y]
+          JanusElemWord32 | hasX86Feature fs X86_SSE4_1 -> pure $ cCall "_mm_min_epu32" [x, y]
           _ -> do
             m <- x86Cmp128 @a Lt fs x y
             pure $ cCall "_mm_or_si128" [cCall "_mm_and_si128" [m, x], cCall "_mm_andnot_si128" [m, y]]
         min256 _ x y = case simdElemTag (Proxy @a) of
-          8 -> pure $ cCall "_mm256_min_ps" [x, y]
-          9 -> pure $ cCall "_mm256_min_pd" [x, y]
-          0 -> pure $ cCall "_mm256_min_epi8" [x, y]
-          1 -> pure $ cCall "_mm256_min_epu8" [x, y]
-          2 -> pure $ cCall "_mm256_min_epi16" [x, y]
-          3 -> pure $ cCall "_mm256_min_epu16" [x, y]
-          4 -> pure $ cCall "_mm256_min_epi32" [x, y]
-          5 -> pure $ cCall "_mm256_min_epu32" [x, y]
+          JanusElemFloat -> pure $ cCall "_mm256_min_ps" [x, y]
+          JanusElemDouble -> pure $ cCall "_mm256_min_pd" [x, y]
+          JanusElemInt8 -> pure $ cCall "_mm256_min_epi8" [x, y]
+          JanusElemWord8 -> pure $ cCall "_mm256_min_epu8" [x, y]
+          JanusElemInt16 -> pure $ cCall "_mm256_min_epi16" [x, y]
+          JanusElemWord16 -> pure $ cCall "_mm256_min_epu16" [x, y]
+          JanusElemInt32 -> pure $ cCall "_mm256_min_epi32" [x, y]
+          JanusElemWord32 -> pure $ cCall "_mm256_min_epu32" [x, y]
           _ -> do
             lo <- min128 x86AVX2 (cCall "_mm256_castsi256_si128" [x]) (cCall "_mm256_castsi256_si128" [y])
             hi <- min128 x86AVX2 (cCall "_mm256_extracti128_si256" [x, cInt 1]) (cCall "_mm256_extracti128_si256" [y, cInt 1])
@@ -1664,26 +1664,26 @@ instance (SIMDShape n a, CPUSIMDElem a) => ExpSIMDArith LinuxX86_64C n a where
 
   vmax a b =
     let max128 fs x y = case simdElemTag (Proxy @a) of
-          8 -> pure $ cCall "_mm_max_ps" [x, y]
-          9 -> pure $ cCall "_mm_max_pd" [x, y]
-          1 -> pure $ cCall "_mm_max_epu8" [x, y]
-          2 -> pure $ cCall "_mm_max_epi16" [x, y]
-          0 | hasX86Feature fs X86_SSE4_1 -> pure $ cCall "_mm_max_epi8" [x, y]
-          3 | hasX86Feature fs X86_SSE4_1 -> pure $ cCall "_mm_max_epu16" [x, y]
-          4 | hasX86Feature fs X86_SSE4_1 -> pure $ cCall "_mm_max_epi32" [x, y]
-          5 | hasX86Feature fs X86_SSE4_1 -> pure $ cCall "_mm_max_epu32" [x, y]
+          JanusElemFloat -> pure $ cCall "_mm_max_ps" [x, y]
+          JanusElemDouble -> pure $ cCall "_mm_max_pd" [x, y]
+          JanusElemWord8 -> pure $ cCall "_mm_max_epu8" [x, y]
+          JanusElemInt16 -> pure $ cCall "_mm_max_epi16" [x, y]
+          JanusElemInt8 | hasX86Feature fs X86_SSE4_1 -> pure $ cCall "_mm_max_epi8" [x, y]
+          JanusElemWord16 | hasX86Feature fs X86_SSE4_1 -> pure $ cCall "_mm_max_epu16" [x, y]
+          JanusElemInt32 | hasX86Feature fs X86_SSE4_1 -> pure $ cCall "_mm_max_epi32" [x, y]
+          JanusElemWord32 | hasX86Feature fs X86_SSE4_1 -> pure $ cCall "_mm_max_epu32" [x, y]
           _ -> do
             m <- x86Cmp128 @a Gt fs x y
             pure $ cCall "_mm_or_si128" [cCall "_mm_and_si128" [m, x], cCall "_mm_andnot_si128" [m, y]]
         max256 _ x y = case simdElemTag (Proxy @a) of
-          8 -> pure $ cCall "_mm256_max_ps" [x, y]
-          9 -> pure $ cCall "_mm256_max_pd" [x, y]
-          0 -> pure $ cCall "_mm256_max_epi8" [x, y]
-          1 -> pure $ cCall "_mm256_max_epu8" [x, y]
-          2 -> pure $ cCall "_mm256_max_epi16" [x, y]
-          3 -> pure $ cCall "_mm256_max_epu16" [x, y]
-          4 -> pure $ cCall "_mm256_max_epi32" [x, y]
-          5 -> pure $ cCall "_mm256_max_epu32" [x, y]
+          JanusElemFloat -> pure $ cCall "_mm256_max_ps" [x, y]
+          JanusElemDouble -> pure $ cCall "_mm256_max_pd" [x, y]
+          JanusElemInt8 -> pure $ cCall "_mm256_max_epi8" [x, y]
+          JanusElemWord8 -> pure $ cCall "_mm256_max_epu8" [x, y]
+          JanusElemInt16 -> pure $ cCall "_mm256_max_epi16" [x, y]
+          JanusElemWord16 -> pure $ cCall "_mm256_max_epu16" [x, y]
+          JanusElemInt32 -> pure $ cCall "_mm256_max_epi32" [x, y]
+          JanusElemWord32 -> pure $ cCall "_mm256_max_epu32" [x, y]
           _ -> do
             lo <- max128 x86AVX2 (cCall "_mm256_castsi256_si128" [x]) (cCall "_mm256_castsi256_si128" [y])
             hi <- max128 x86AVX2 (cCall "_mm256_extracti128_si256" [x, cInt 1]) (cCall "_mm256_extracti128_si256" [y, cInt 1])
@@ -1694,16 +1694,16 @@ instance (SIMDShape n a, CPUSIMDElem a) => ExpSIMDArith LinuxX86_64C n a where
 instance (SIMDShape n a, CPUSIMDElem a) => ExpSIMDSat LinuxX86_64C n a where
   vadds a b
     | simdElemIsFloat (Proxy @a) = vadd a b
-    | simdElemTag (Proxy @a) `elem` [0, 1, 2, 3] =
+    | simdElemTag (Proxy @a) `elem` [JanusElemInt8, JanusElemWord8, JanusElemInt16, JanusElemWord16] =
         let adds128 _ x y = pure $ case simdElemTag (Proxy @a) of
-              0 -> cCall "_mm_adds_epi8" [x, y]
-              1 -> cCall "_mm_adds_epu8" [x, y]
-              2 -> cCall "_mm_adds_epi16" [x, y]
+              JanusElemInt8 -> cCall "_mm_adds_epi8" [x, y]
+              JanusElemWord8 -> cCall "_mm_adds_epu8" [x, y]
+              JanusElemInt16 -> cCall "_mm_adds_epi16" [x, y]
               _ -> cCall "_mm_adds_epu16" [x, y]
             adds256 _ x y = pure $ case simdElemTag (Proxy @a) of
-              0 -> cCall "_mm256_adds_epi8" [x, y]
-              1 -> cCall "_mm256_adds_epu8" [x, y]
-              2 -> cCall "_mm256_adds_epi16" [x, y]
+              JanusElemInt8 -> cCall "_mm256_adds_epi8" [x, y]
+              JanusElemWord8 -> cCall "_mm256_adds_epu8" [x, y]
+              JanusElemInt16 -> cCall "_mm256_adds_epi16" [x, y]
               _ -> cCall "_mm256_adds_epu16" [x, y]
          in liftX86Bin @n @a adds128 (Just adds256) a b
     | not (simdElemSigned (Proxy @a)) =
@@ -1726,16 +1726,16 @@ instance (SIMDShape n a, CPUSIMDElem a) => ExpSIMDSat LinuxX86_64C n a where
 
   vsubs a b
     | simdElemIsFloat (Proxy @a) = vsub a b
-    | simdElemTag (Proxy @a) `elem` [0, 1, 2, 3] =
+    | simdElemTag (Proxy @a) `elem` [JanusElemInt8, JanusElemWord8, JanusElemInt16, JanusElemWord16] =
         let subs128 _ x y = pure $ case simdElemTag (Proxy @a) of
-              0 -> cCall "_mm_subs_epi8" [x, y]
-              1 -> cCall "_mm_subs_epu8" [x, y]
-              2 -> cCall "_mm_subs_epi16" [x, y]
+              JanusElemInt8 -> cCall "_mm_subs_epi8" [x, y]
+              JanusElemWord8 -> cCall "_mm_subs_epu8" [x, y]
+              JanusElemInt16 -> cCall "_mm_subs_epi16" [x, y]
               _ -> cCall "_mm_subs_epu16" [x, y]
             subs256 _ x y = pure $ case simdElemTag (Proxy @a) of
-              0 -> cCall "_mm256_subs_epi8" [x, y]
-              1 -> cCall "_mm256_subs_epu8" [x, y]
-              2 -> cCall "_mm256_subs_epi16" [x, y]
+              JanusElemInt8 -> cCall "_mm256_subs_epi8" [x, y]
+              JanusElemWord8 -> cCall "_mm256_subs_epu8" [x, y]
+              JanusElemInt16 -> cCall "_mm256_subs_epi16" [x, y]
               _ -> cCall "_mm256_subs_epu16" [x, y]
          in liftX86Bin @n @a subs128 (Just subs256) a b
     | not (simdElemSigned (Proxy @a)) = vsub (vmax a b) b
@@ -1763,7 +1763,7 @@ instance (SIMDShape n a, CPUSIMDElem a) => ExpSIMDSat LinuxX86_64C n a where
 
   vavg a b
     | simdElemIsFloat (Proxy @a) =
-        let isF32 = simdElemTag (Proxy @a) == 8
+        let isF32 = simdElemTag (Proxy @a) == JanusElemFloat
             halfLit = if isF32 then C.Const (FloatConst "0.5f" 0.5 noLoc) noLoc else C.Const (DoubleConst "0.5" 0.5 noLoc) noLoc
             avg128 _ x y =
               pure $
@@ -1776,11 +1776,11 @@ instance (SIMDShape n a, CPUSIMDElem a) => ExpSIMDSat LinuxX86_64C n a where
                   then cCall "_mm256_mul_ps" [cCall "_mm256_set1_ps" [halfLit], cCall "_mm256_add_ps" [x, y]]
                   else cCall "_mm256_mul_pd" [cCall "_mm256_set1_pd" [halfLit], cCall "_mm256_add_pd" [x, y]]
          in liftX86Bin @n @a avg128 (Just avg256) a b
-    | simdElemTag (Proxy @a) == 1 =
+    | simdElemTag (Proxy @a) == JanusElemWord8 =
         liftX86Bin @n @a (\_ x y -> pure $ cCall "_mm_avg_epu8" [x, y]) (Just (\_ x y -> pure $ cCall "_mm256_avg_epu8" [x, y])) a b
-    | simdElemTag (Proxy @a) == 3 =
+    | simdElemTag (Proxy @a) == JanusElemWord16 =
         liftX86Bin @n @a (\_ x y -> pure $ cCall "_mm_avg_epu16" [x, y]) (Just (\_ x y -> pure $ cCall "_mm256_avg_epu16" [x, y])) a b
-    | simdElemTag (Proxy @a) == 0 =
+    | simdElemTag (Proxy @a) == JanusElemInt8 =
         let avgI8_128 _ x y = do
               let bs = cCall "_mm_set1_epi8" [cCast "char" (unsignedIntConst (0x80 :: Word32))]
               pure $ cCall "_mm_xor_si128" [cCall "_mm_avg_epu8" [cCall "_mm_xor_si128" [x, bs], cCall "_mm_xor_si128" [y, bs]], bs]
@@ -1788,7 +1788,7 @@ instance (SIMDShape n a, CPUSIMDElem a) => ExpSIMDSat LinuxX86_64C n a where
               let bs = cCall "_mm256_set1_epi8" [cCast "char" (unsignedIntConst (0x80 :: Word32))]
               pure $ cCall "_mm256_xor_si256" [cCall "_mm256_avg_epu8" [cCall "_mm256_xor_si256" [x, bs], cCall "_mm256_xor_si256" [y, bs]], bs]
          in liftX86Bin @n @a avgI8_128 (Just avgI8_256) a b
-    | simdElemTag (Proxy @a) == 2 =
+    | simdElemTag (Proxy @a) == JanusElemInt16 =
         let avgI16_128 _ x y = do
               let bs = cCall "_mm_set1_epi16" [cCast "short" (unsignedIntConst (0x8000 :: Word32))]
               pure $ cCall "_mm_xor_si128" [cCall "_mm_avg_epu16" [cCall "_mm_xor_si128" [x, bs], cCall "_mm_xor_si128" [y, bs]], bs]
@@ -1806,8 +1806,8 @@ instance (SIMDShape n a, CPUSIMDElem a) => ExpSIMDSat LinuxX86_64C n a where
 
   vabsdiff a b
     | simdElemIsFloat (Proxy @a) = vabs (vsub a b)
-    | simdElemTag (Proxy @a) == 1 = vor (vsubs a b) (vsubs b a)
-    | simdElemTag (Proxy @a) == 3 = vor (vsubs a b) (vsubs b a)
+    | simdElemTag (Proxy @a) == JanusElemWord8 = vor (vsubs a b) (vsubs b a)
+    | simdElemTag (Proxy @a) == JanusElemWord16 = vor (vsubs a b) (vsubs b a)
     | otherwise = vsub (vmax a b) (vmin a b)
 
 -- 6. ExpSIMDFloat
@@ -1867,7 +1867,7 @@ x86FmaOp fn128 fn256 scalarFallback (LinuxX86_64C (JanusC ma)) (LinuxX86_64C (Ja
 
 instance (SIMDShape n a, CPUSIMDElem a, Floating a, FMA a) => ExpSIMDFloat LinuxX86_64C n a where
   vdiv a b =
-    let isF32 = simdElemTag (Proxy @a) == 8
+    let isF32 = simdElemTag (Proxy @a) == JanusElemFloat
         div128 _ x y
           | simdBytes (Proxy @n) (Proxy @a) < 16 = do
               -- Set unused upper lanes of divisor to 1.0f to remain safe even under FP exceptions
@@ -1880,42 +1880,42 @@ instance (SIMDShape n a, CPUSIMDElem a, Floating a, FMA a) => ExpSIMDFloat Linux
      in liftX86Bin @n @a div128 (Just div256) a b
 
   vsqrt =
-    let isF32 = simdElemTag (Proxy @a) == 8
+    let isF32 = simdElemTag (Proxy @a) == JanusElemFloat
      in liftX86Un @n @a
           (\_ x -> pure $ cCall (if isF32 then "_mm_sqrt_ps" else "_mm_sqrt_pd") [x])
           (Just (\_ x -> pure $ cCall (if isF32 then "_mm256_sqrt_ps" else "_mm256_sqrt_pd") [x]))
 
   vrsqrtApprox v
-    | simdElemTag (Proxy @a) == 8 =
+    | simdElemTag (Proxy @a) == JanusElemFloat =
         liftX86Un @n @a (\_ x -> pure $ cCall "_mm_rsqrt_ps" [x]) (Just (\_ x -> pure $ cCall "_mm256_rsqrt_ps" [x])) v
     | otherwise =
         let oneD = C.Const (DoubleConst "1.0" 1.0 noLoc) noLoc
          in liftX86Un @n @a (\_ x -> pure $ cCall "_mm_div_pd" [cCall "_mm_set1_pd" [oneD], cCall "_mm_sqrt_pd" [x]]) (Just (\_ x -> pure $ cCall "_mm256_div_pd" [cCall "_mm256_set1_pd" [oneD], cCall "_mm256_sqrt_pd" [x]])) v
 
   vrcpApprox v
-    | simdElemTag (Proxy @a) == 8 =
+    | simdElemTag (Proxy @a) == JanusElemFloat =
         liftX86Un @n @a (\_ x -> pure $ cCall "_mm_rcp_ps" [x]) (Just (\_ x -> pure $ cCall "_mm256_rcp_ps" [x])) v
     | otherwise =
         let oneD = C.Const (DoubleConst "1.0" 1.0 noLoc) noLoc
          in liftX86Un @n @a (\_ x -> pure $ cCall "_mm_div_pd" [cCall "_mm_set1_pd" [oneD], x]) (Just (\_ x -> pure $ cCall "_mm256_div_pd" [cCall "_mm256_set1_pd" [oneD], x])) v
 
   vfma =
-    let isF32 = simdElemTag (Proxy @a) == 8
+    let isF32 = simdElemTag (Proxy @a) == JanusElemFloat
         cFma = if isF32 then "fmaf" else "fma"
      in x86FmaOp @n @a (if isF32 then "_mm_fmadd_ps" else "_mm_fmadd_pd") (if isF32 then "_mm256_fmadd_ps" else "_mm256_fmadd_pd") (\x y z -> cCall cFma [x, y, z])
 
   vfms =
-    let isF32 = simdElemTag (Proxy @a) == 8
+    let isF32 = simdElemTag (Proxy @a) == JanusElemFloat
         cFma = if isF32 then "fmaf" else "fma"
      in x86FmaOp @n @a (if isF32 then "_mm_fmsub_ps" else "_mm_fmsub_pd") (if isF32 then "_mm256_fmsub_ps" else "_mm256_fmsub_pd") (\x y z -> cCall cFma [x, y, UnOp Negate z noLoc])
 
   vfnma =
-    let isF32 = simdElemTag (Proxy @a) == 8
+    let isF32 = simdElemTag (Proxy @a) == JanusElemFloat
         cFma = if isF32 then "fmaf" else "fma"
      in x86FmaOp @n @a (if isF32 then "_mm_fnmadd_ps" else "_mm_fnmadd_pd") (if isF32 then "_mm256_fnmadd_ps" else "_mm256_fnmadd_pd") (\x y z -> cCall cFma [UnOp Negate x noLoc, y, z])
 
   vfnms =
-    let isF32 = simdElemTag (Proxy @a) == 8
+    let isF32 = simdElemTag (Proxy @a) == JanusElemFloat
         cFma = if isF32 then "fmaf" else "fma"
      in x86FmaOp @n @a (if isF32 then "_mm_fnmsub_ps" else "_mm_fnmsub_pd") (if isF32 then "_mm256_fnmsub_ps" else "_mm256_fnmsub_pd") (\x y z -> cCall cFma [UnOp Negate x noLoc, y, UnOp Negate z noLoc])
 
@@ -1926,7 +1926,7 @@ instance (SIMDShape n a, CPUSIMDElem a, Floating a, FMA a) => ExpSIMDFloat Linux
 
   vfloor (LinuxX86_64C (JanusC mv)) = LinuxX86_64C $ JanusC $ do
     fs <- askX86Features
-    let isF32 = simdElemTag (Proxy @a) == 8
+    let isF32 = simdElemTag (Proxy @a) == JanusElemFloat
     if hasX86Feature fs X86_SSE4_1
       then
         getJanusC $
@@ -1939,7 +1939,7 @@ instance (SIMDShape n a, CPUSIMDElem a, Floating a, FMA a) => ExpSIMDFloat Linux
 
   vceil (LinuxX86_64C (JanusC mv)) = LinuxX86_64C $ JanusC $ do
     fs <- askX86Features
-    let isF32 = simdElemTag (Proxy @a) == 8
+    let isF32 = simdElemTag (Proxy @a) == JanusElemFloat
     if hasX86Feature fs X86_SSE4_1
       then
         getJanusC $
@@ -1952,7 +1952,7 @@ instance (SIMDShape n a, CPUSIMDElem a, Floating a, FMA a) => ExpSIMDFloat Linux
 
   vtrunc (LinuxX86_64C (JanusC mv)) = LinuxX86_64C $ JanusC $ do
     fs <- askX86Features
-    let isF32 = simdElemTag (Proxy @a) == 8
+    let isF32 = simdElemTag (Proxy @a) == JanusElemFloat
     if hasX86Feature fs X86_SSE4_1
       then
         getJanusC $
@@ -1965,7 +1965,7 @@ instance (SIMDShape n a, CPUSIMDElem a, Floating a, FMA a) => ExpSIMDFloat Linux
 
   vroundNearest (LinuxX86_64C (JanusC mv)) = LinuxX86_64C $ JanusC $ do
     fs <- askX86Features
-    let isF32 = simdElemTag (Proxy @a) == 8
+    let isF32 = simdElemTag (Proxy @a) == JanusElemFloat
     if hasX86Feature fs X86_SSE4_1
       then
         getJanusC $
@@ -1993,8 +1993,8 @@ bitBinX86 fn128 fn256ps fn256pd fn256si =
         (\_ x y -> pure $ fromM128i pa (cCall fn128 [asM128i pa x, asM128i pa y]))
         ( Just
             ( \_ x y -> pure $ case simdElemTag pa of
-                8 -> cCall fn256ps [x, y]
-                9 -> cCall fn256pd [x, y]
+                JanusElemFloat -> cCall fn256ps [x, y]
+                JanusElemDouble -> cCall fn256pd [x, y]
                 _ -> cCall fn256si [x, y]
             )
         )
@@ -2008,8 +2008,8 @@ instance (SIMDShape n a, CPUSIMDElem a) => ExpSIMDBits LinuxX86_64C n a where
     let pa = Proxy @a
         ones128 _ x = pure $ fromM128i pa (cCall "_mm_xor_si128" [asM128i pa x, cCall "_mm_set1_epi32" [signedIntConst (-1 :: Int32)]])
         ones256 _ x = pure $ case simdElemTag pa of
-          8 -> cCall "_mm256_xor_ps" [x, cCall "_mm256_castsi256_ps" [cCall "_mm256_set1_epi32" [signedIntConst (-1 :: Int32)]]]
-          9 -> cCall "_mm256_xor_pd" [x, cCall "_mm256_castsi256_pd" [cCall "_mm256_set1_epi32" [signedIntConst (-1 :: Int32)]]]
+          JanusElemFloat -> cCall "_mm256_xor_ps" [x, cCall "_mm256_castsi256_ps" [cCall "_mm256_set1_epi32" [signedIntConst (-1 :: Int32)]]]
+          JanusElemDouble -> cCall "_mm256_xor_pd" [x, cCall "_mm256_castsi256_pd" [cCall "_mm256_set1_epi32" [signedIntConst (-1 :: Int32)]]]
           _ -> cCall "_mm256_xor_si256" [x, cCall "_mm256_set1_epi32" [signedIntConst (-1 :: Int32)]]
      in liftX86Un @n @a ones128 (Just ones256) v
 
@@ -2085,10 +2085,10 @@ instance (SIMDShape n a, CPUSIMDElem a) => ExpSIMDBits LinuxX86_64C n a where
   vshlVar a b = LinuxX86_64C $ JanusC $ do
     fs <- askX86Features
     let tag = simdElemTag (Proxy @a)
-    if hasX86Feature fs X86_AVX2 && tag `elem` [4, 5, 6, 7]
+    if hasX86Feature fs X86_AVX2 && tag `elem` [JanusElemInt32, JanusElemWord32, JanusElemInt64, JanusElemWord64]
       then do
-        let sll128 = if tag `elem` [4, 5] then "_mm_sllv_epi32" else "_mm_sllv_epi64"
-            sll256 = if tag `elem` [4, 5] then "_mm256_sllv_epi32" else "_mm256_sllv_epi64"
+        let sll128 = if tag `elem` [JanusElemInt32, JanusElemWord32] then "_mm_sllv_epi32" else "_mm_sllv_epi64"
+            sll256 = if tag `elem` [JanusElemInt32, JanusElemWord32] then "_mm256_sllv_epi32" else "_mm256_sllv_epi64"
         getJanusC $ getLinuxX86_64C $ liftX86Bin @n @a (\_ x y -> pure $ cCall sll128 [x, y]) (Just (\_ x y -> pure $ cCall sll256 [x, y])) a b
       else do
         RVal ea <- getJanusC (getLinuxX86_64C a)
@@ -2104,15 +2104,15 @@ instance (SIMDShape n a, CPUSIMDElem a) => ExpSIMDBits LinuxX86_64C n a where
   vshrVar a b = LinuxX86_64C $ JanusC $ do
     fs <- askX86Features
     let tag = simdElemTag (Proxy @a)
-    if hasX86Feature fs X86_AVX2 && tag `elem` [4, 5, 7]
+    if hasX86Feature fs X86_AVX2 && tag `elem` [JanusElemInt32, JanusElemWord32, JanusElemWord64]
       then do
         let srl128 = case tag of
-              4 -> "_mm_srav_epi32"
-              5 -> "_mm_srlv_epi32"
+              JanusElemInt32 -> "_mm_srav_epi32"
+              JanusElemWord32 -> "_mm_srlv_epi32"
               _ -> "_mm_srlv_epi64"
             srl256 = case tag of
-              4 -> "_mm256_srav_epi32"
-              5 -> "_mm256_srlv_epi32"
+              JanusElemInt32 -> "_mm256_srav_epi32"
+              JanusElemWord32 -> "_mm256_srlv_epi32"
               _ -> "_mm256_srlv_epi64"
         getJanusC $ getLinuxX86_64C $ liftX86Bin @n @a (\_ x y -> pure $ cCall srl128 [x, y]) (Just (\_ x y -> pure $ cCall srl256 [x, y])) a b
       else do
@@ -2135,7 +2135,7 @@ instance (SIMDShape n a, CPUSIMDElem a) => ExpSIMDBits LinuxX86_64C n a where
   vpopcnt v = LinuxX86_64C $ JanusC $ do
     fs <- askX86Features
     let tag = simdElemTag (Proxy @a)
-    if hasX86Feature fs X86_SSSE3 && tag `elem` [0, 1]
+    if hasX86Feature fs X86_SSSE3 && tag `elem` [JanusElemInt8, JanusElemWord8]
       then do
         let pop8_128 _ x = do
               lut <- emitLocalVal (namedCType "__m128i") (cCall "_mm_setr_epi8" (map signedIntConst ([0, 1, 1, 2, 1, 2, 2, 3, 1, 2, 2, 3, 2, 3, 3, 4] :: [Int])))
@@ -2195,7 +2195,7 @@ instance (SIMDShape n a, CPUSIMDElem a) => ExpSIMDShuffle LinuxX86_64C n a where
     if hasX86Feature fs X86_AVX2 && sz == 4 && lanes == 8
       then do
         let perm =
-              if simdElemTag (Proxy @a) == 8
+              if simdElemTag (Proxy @a) == JanusElemFloat
                 then cCall "_mm256_permutevar8x32_ps" [ev, eidx]
                 else cCall "_mm256_permutevar8x32_epi32" [ev, eidx]
         RVal <$> emitLocalVal ty perm
@@ -2260,16 +2260,16 @@ instance (SIMDShape n a, CPUSIMDElem a) => ExpSIMDShuffle LinuxX86_64C n a where
     if bytes == 16
       then do
         let fn = case simdElemTag (Proxy @a) of
-              0 -> "_mm_unpacklo_epi8"
-              1 -> "_mm_unpacklo_epi8"
-              2 -> "_mm_unpacklo_epi16"
-              3 -> "_mm_unpacklo_epi16"
-              4 -> "_mm_unpacklo_epi32"
-              5 -> "_mm_unpacklo_epi32"
-              6 -> "_mm_unpacklo_epi64"
-              7 -> "_mm_unpacklo_epi64"
-              8 -> "_mm_unpacklo_ps"
-              _ -> "_mm_unpacklo_pd"
+              JanusElemInt8 -> "_mm_unpacklo_epi8"
+              JanusElemWord8 -> "_mm_unpacklo_epi8"
+              JanusElemInt16 -> "_mm_unpacklo_epi16"
+              JanusElemWord16 -> "_mm_unpacklo_epi16"
+              JanusElemInt32 -> "_mm_unpacklo_epi32"
+              JanusElemWord32 -> "_mm_unpacklo_epi32"
+              JanusElemInt64 -> "_mm_unpacklo_epi64"
+              JanusElemWord64 -> "_mm_unpacklo_epi64"
+              JanusElemFloat -> "_mm_unpacklo_ps"
+              JanusElemDouble -> "_mm_unpacklo_pd"
         RVal <$> emitLocalVal ty (cCall fn [ea, eb])
       else do
         let lanes = simdLanes (Proxy @n) (Proxy @a)
@@ -2298,16 +2298,16 @@ instance (SIMDShape n a, CPUSIMDElem a) => ExpSIMDShuffle LinuxX86_64C n a where
     if bytes == 16
       then do
         let fn = case simdElemTag (Proxy @a) of
-              0 -> "_mm_unpackhi_epi8"
-              1 -> "_mm_unpackhi_epi8"
-              2 -> "_mm_unpackhi_epi16"
-              3 -> "_mm_unpackhi_epi16"
-              4 -> "_mm_unpackhi_epi32"
-              5 -> "_mm_unpackhi_epi32"
-              6 -> "_mm_unpackhi_epi64"
-              7 -> "_mm_unpackhi_epi64"
-              8 -> "_mm_unpackhi_ps"
-              _ -> "_mm_unpackhi_pd"
+              JanusElemInt8 -> "_mm_unpackhi_epi8"
+              JanusElemWord8 -> "_mm_unpackhi_epi8"
+              JanusElemInt16 -> "_mm_unpackhi_epi16"
+              JanusElemWord16 -> "_mm_unpackhi_epi16"
+              JanusElemInt32 -> "_mm_unpackhi_epi32"
+              JanusElemWord32 -> "_mm_unpackhi_epi32"
+              JanusElemInt64 -> "_mm_unpackhi_epi64"
+              JanusElemWord64 -> "_mm_unpackhi_epi64"
+              JanusElemFloat -> "_mm_unpackhi_ps"
+              JanusElemDouble -> "_mm_unpackhi_pd"
         RVal <$> emitLocalVal ty (cCall fn [ea, eb])
       else do
         let lanes = simdLanes (Proxy @n) (Proxy @a)
@@ -2744,14 +2744,14 @@ emitX86Load aligned ptrExp = do
   case b of
     16 ->
       let call = case tag of
-            8 -> cCall (if aligned then "_mm_load_ps" else "_mm_loadu_ps") [cConstPtrCast "float" p]
-            9 -> cCall (if aligned then "_mm_load_pd" else "_mm_loadu_pd") [cConstPtrCast "double" p]
+            JanusElemFloat -> cCall (if aligned then "_mm_load_ps" else "_mm_loadu_ps") [cConstPtrCast "float" p]
+            JanusElemDouble -> cCall (if aligned then "_mm_load_pd" else "_mm_loadu_pd") [cConstPtrCast "double" p]
             _ -> cCall (if aligned then "_mm_load_si128" else "_mm_loadu_si128") [cConstPtrCast "__m128i" p]
        in emitLocalVal ty call
     32 | x86Has256Reg fs (Proxy @a) ->
       let call = case tag of
-            8 -> cCall (if aligned then "_mm256_load_ps" else "_mm256_loadu_ps") [cConstPtrCast "float" p]
-            9 -> cCall (if aligned then "_mm256_load_pd" else "_mm256_loadu_pd") [cConstPtrCast "double" p]
+            JanusElemFloat -> cCall (if aligned then "_mm256_load_ps" else "_mm256_loadu_ps") [cConstPtrCast "float" p]
+            JanusElemDouble -> cCall (if aligned then "_mm256_load_pd" else "_mm256_loadu_pd") [cConstPtrCast "double" p]
             _ -> cCall (if aligned then "_mm256_load_si256" else "_mm256_loadu_si256") [cConstPtrCast "__m256i" p]
        in emitLocalVal ty call
     _ -> emitMemcpyLoad @(SIMDVector LinuxX86_64C n a) b p
@@ -2767,14 +2767,14 @@ emitX86Store aligned ptrExp valExp = do
   case b of
     16 ->
       let call = case tag of
-            8 -> cCall (if aligned then "_mm_store_ps" else "_mm_storeu_ps") [cPtrCast "float" p, v]
-            9 -> cCall (if aligned then "_mm_store_pd" else "_mm_storeu_pd") [cPtrCast "double" p, v]
+            JanusElemFloat -> cCall (if aligned then "_mm_store_ps" else "_mm_storeu_ps") [cPtrCast "float" p, v]
+            JanusElemDouble -> cCall (if aligned then "_mm_store_pd" else "_mm_storeu_pd") [cPtrCast "double" p, v]
             _ -> cCall (if aligned then "_mm_store_si128" else "_mm_storeu_si128") [cPtrCast "__m128i" p, v]
        in emitStmt (Exp (Just call) noLoc)
     32 | x86Has256Reg fs (Proxy @a) ->
       let call = case tag of
-            8 -> cCall (if aligned then "_mm256_store_ps" else "_mm256_storeu_ps") [cPtrCast "float" p, v]
-            9 -> cCall (if aligned then "_mm256_store_pd" else "_mm256_storeu_pd") [cPtrCast "double" p, v]
+            JanusElemFloat -> cCall (if aligned then "_mm256_store_ps" else "_mm256_storeu_ps") [cPtrCast "float" p, v]
+            JanusElemDouble -> cCall (if aligned then "_mm256_store_pd" else "_mm256_storeu_pd") [cPtrCast "double" p, v]
             _ -> cCall (if aligned then "_mm256_store_si256" else "_mm256_storeu_si256") [cPtrCast "__m256i" p, v]
        in emitStmt (Exp (Just call) noLoc)
     _ -> do
@@ -2870,10 +2870,10 @@ instance (SIMDShape n a, Typeable a, JanusCTyped a) => CmdSIMDMem LinuxX86_64CM 
           sz = simdElemBytes (Proxy @a)
           tag = simdElemTag (Proxy @a)
       out <- case (hasX86Feature fs X86_AVX2, tag, lanes) of
-        (True, 8, 8) -> emitLocalVal vty (cCall "_mm256_i32gather_ps" [cConstPtrCast "float" ep, eidx, cInt 4])
-        (True, 8, 4) -> emitLocalVal vty (cCall "_mm_i32gather_ps" [cConstPtrCast "float" ep, eidx, cInt 4])
-        (True, t, 8) | t `elem` [4, 5] -> emitLocalVal vty (cCall "_mm256_i32gather_epi32" [cConstPtrCast "int" ep, eidx, cInt 4])
-        (True, t, 4) | t `elem` [4, 5] -> emitLocalVal vty (cCall "_mm_i32gather_epi32" [cConstPtrCast "int" ep, eidx, cInt 4])
+        (True, JanusElemFloat, 8) -> emitLocalVal vty (cCall "_mm256_i32gather_ps" [cConstPtrCast "float" ep, eidx, cInt 4])
+        (True, JanusElemFloat, 4) -> emitLocalVal vty (cCall "_mm_i32gather_ps" [cConstPtrCast "float" ep, eidx, cInt 4])
+        (True, t, 8) | t `elem` [JanusElemInt32, JanusElemWord32] -> emitLocalVal vty (cCall "_mm256_i32gather_epi32" [cConstPtrCast "int" ep, eidx, cInt 4])
+        (True, t, 4) | t `elem` [JanusElemInt32, JanusElemWord32] -> emitLocalVal vty (cCall "_mm_i32gather_epi32" [cConstPtrCast "int" ep, eidx, cInt 4])
         _ -> do
           let JCType espec _ = namedCType (simdElemCTypeName (Proxy @a))
               JCType ispec _ = namedCType "int32_t"
