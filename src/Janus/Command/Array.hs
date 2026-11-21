@@ -32,6 +32,7 @@ import Foreign.Ptr as Ptr
 import qualified Foreign.Storable as Storable
 import GHC.TypeLits
 import Janus.Backend.C
+import Janus.Control.Drain
 import Janus.Control.Pipe
 import Janus.Control.Step
 import Janus.Control.Stream

@@ -31,6 +31,7 @@ import Data.Coerce
 import Data.Complex
 import Data.Int
 import qualified Data.Kind as K
+import Data.List (intercalate)
 import Data.Loc
 import qualified Data.Map as Map
 import Data.Monoid
@@ -79,7 +80,7 @@ data JCTypedef = JCTypedef DeclSpec String
 data JCFunc = JCFunc
   { _jcfName :: String,
     _jcfHeaders :: Set.Set String,
-    _jcfTypedefs :: Set.Set JCTypedef,
+    _jcfTypedefs :: [JCTypedef],
     _jcfTypeCache :: Map.Map TypeRep JCType,
     _jcfProtos :: Set.Set InitGroup,
     _jcfType :: Maybe JCType,
@@ -146,8 +147,25 @@ setTypeQualifiers :: [TypeQual] -> DeclSpec -> DeclSpec
 setTypeQualifiers tqs (DeclSpec sto _ ts loc) = DeclSpec sto tqs ts loc
 setTypeQualifiers _ _ = error "setTypeQualifiers: the impossible happened"
 
+addStaticStorage :: DeclSpec -> DeclSpec
+addStaticStorage (DeclSpec sto tqs ts loc) =
+  let isStatic = \case
+        Tstatic _ -> True
+        _ -> False
+      sto' = if any isStatic sto then sto else Tstatic noLoc : sto
+   in DeclSpec sto' tqs ts loc
+addStaticStorage ds = ds
+
+dedupTypedefs :: [JCTypedef] -> [JCTypedef]
+dedupTypedefs = go Set.empty
+  where
+    go _ [] = []
+    go seen (td@(JCTypedef _ nm) : rest)
+      | Set.member nm seen = go seen rest
+      | otherwise = td : go (Set.insert nm seen) rest
+
 renderJCFunc :: JCFunc -> String
-renderJCFunc (JCFunc fname headerSet typedefSet _ funcSet (Just (JCType spec dec)) params block e _) =
+renderJCFunc (JCFunc fname headerSet typedefList _ funcSet (Just (JCType spec dec)) params block e _) =
   let headers = foldMap (\h -> "#include <" <> h <> ">\n") headerSet
       tdef (JCTypedef spec' name) =
         DecDef
@@ -159,13 +177,66 @@ renderJCFunc (JCFunc fname headerSet typedefSet _ funcSet (Just (JCType spec dec
           )
           noLoc
       protos = foldMap ((<> "\n") . pretty 120 . ppr . BlockDecl) funcSet
-      typedefs = foldMap ((<> "\n") . pretty 120 . ppr . tdef) typedefSet
+      typedefs = foldMap ((<> "\n") . pretty 120 . ppr . tdef) (dedupTypedefs typedefList)
       block' = appendBlock block [BlockStm $ Return e noLoc]
       body = pretty 120 $ ppr $ Func spec (Id fname noLoc) dec params (appEndo block' []) noLoc
       externCBegin = "#ifdef __cplusplus\nextern \"C\" {\n#endif\n\n"
       externCEnd = "\n\n#ifdef __cplusplus\n}\n#endif\n"
    in headers <> ['\n' | not (null headers)] <> externCBegin <> typedefs <> ['\n' | not (null typedefs)] <> protos <> ['\n' | not (null protos)] <> body <> externCEnd
 renderJCFunc _ = error "renderJCFunc: function has no type specified!"
+
+renderJCProgram :: String -> [JCFunc] -> String
+renderJCProgram entryName funcs =
+  let definedNames = Set.fromList (map _jcfName funcs)
+      orderedFuncs =
+        filter ((/= entryName) . _jcfName) funcs
+          <> filter ((== entryName) . _jcfName) funcs
+      headerSet = foldMap _jcfHeaders orderedFuncs
+      headers = foldMap (\h -> "#include <" <> h <> ">\n") headerSet
+      tdef (JCTypedef spec' name) =
+        DecDef
+          ( TypedefGroup
+              spec'
+              []
+              [Typedef (Id name noLoc) (DeclRoot noLoc) [] noLoc]
+              noLoc
+          )
+          noLoc
+      typedefList = dedupTypedefs (foldMap _jcfTypedefs orderedFuncs)
+      typedefs = foldMap ((<> "\n") . pretty 120 . ppr . tdef) typedefList
+      isExternalProto (InitGroup _ _ inits _) =
+        all
+          ( \case
+              Init (Id nm _) _ _ _ _ _ -> not (Set.member nm definedNames)
+              _ -> True
+          )
+          inits
+      isExternalProto _ = True
+      extProtoSet = Set.filter isExternalProto (foldMap _jcfProtos orderedFuncs)
+      mkFuncProto (JCFunc fname _ _ _ _ (Just (JCType spec dec)) params _ _ _) =
+        let spec' = if fname == entryName then spec else addStaticStorage spec
+         in InitGroup spec' [] [Init (Id fname noLoc) (Proto dec params noLoc) Nothing Nothing [] noLoc] noLoc
+      mkFuncProto _ = error "renderJCProgram: function has no type specified!"
+      extProtos = foldMap ((<> "\n") . pretty 120 . ppr . BlockDecl) extProtoSet
+      localProtos = foldMap ((<> "\n") . pretty 120 . ppr . BlockDecl . mkFuncProto) orderedFuncs
+      allProtos = extProtos <> localProtos
+      renderBody (JCFunc fname _ _ _ _ (Just (JCType spec dec)) params block e _) =
+        let spec' = if fname == entryName then spec else addStaticStorage spec
+            block' = appendBlock block [BlockStm $ Return e noLoc]
+         in pretty 120 $ ppr $ Func spec' (Id fname noLoc) dec params (appEndo block' []) noLoc
+      renderBody _ = error "renderJCProgram: function has no type specified!"
+      bodies = intercalate "\n\n" (map renderBody orderedFuncs)
+      externCBegin = "#ifdef __cplusplus\nextern \"C\" {\n#endif\n\n"
+      externCEnd = "\n\n#ifdef __cplusplus\n}\n#endif\n"
+   in headers
+        <> ['\n' | not (null headers)]
+        <> externCBegin
+        <> typedefs
+        <> ['\n' | not (null typedefs)]
+        <> allProtos
+        <> ['\n' | not (null allProtos)]
+        <> bodies
+        <> externCEnd
 
 modifyFunction :: (JCFunc -> JCFunc) -> JanusCM ()
 modifyFunction f = do
@@ -251,7 +322,7 @@ defaultJCFunc name params =
   JCFunc
     { _jcfName = name,
       _jcfHeaders = Set.empty,
-      _jcfTypedefs = Set.empty,
+      _jcfTypedefs = [],
       _jcfTypeCache = Map.empty,
       _jcfProtos = Set.empty,
       _jcfType = Nothing,
@@ -316,24 +387,34 @@ instance (JanusCTyped a, JanusCParam r, JanusCParamImpl JanusC JanusCM r) => Jan
 instance (JanusCTyped a, FFIArg a, JanusCEvaluate r) => JanusCEvaluate (JanusC a -> r) where
   jceval dlFPtr args f a = jceval dlFPtr (arg a : args) (f $ JanusC $ pure $ RVal $ Var (Id "this_is_a_bug_if_you_see_this" noLoc) noLoc)
 
+compileJanusCNamed :: forall r. (JanusCParam r, JanusCEvaluate r) => String -> JanusCBackend -> CBuildConfig -> r -> IO (JanusCEval r)
+compileJanusCNamed name backend config a = fst <$> acquireJanusCNamed name backend config a
+
 compileJanusC :: forall r. (JanusCParam r, JanusCEvaluate r) => JanusCBackend -> CBuildConfig -> r -> IO (JanusCEval r)
-compileJanusC backend config a = fst <$> acquireJanusC backend config a
+compileJanusC = compileJanusCNamed "janus_main"
+
+-- this mostly exists for use with hedgehog withResource
+acquireJanusCNamed :: forall r. (JanusCParam r, JanusCEvaluate r) => String -> JanusCBackend -> CBuildConfig -> r -> IO (JanusCEval r, ForeignPtr ())
+acquireJanusCNamed name backend config a = do
+  let dir = config ^. cBuildConfigCacheDir
+  files <- writeJanusCFiles backend dir (jcparam name 0 (pure []) backend a)
+  dlFPtr <- acquireJanusCFunPtrWithConfig config [] [] files name
+  pure (jceval dlFPtr [] a :: JanusCEval r, dlFPtr)
 
 -- this mostly exists for use with hedgehog withResource
 acquireJanusC :: forall r. (JanusCParam r, JanusCEvaluate r) => JanusCBackend -> CBuildConfig -> r -> IO (JanusCEval r, ForeignPtr ())
-acquireJanusC backend config a = do
-  let dir = config ^. cBuildConfigCacheDir
-  files <- writeJanusCFiles backend dir (jcparam "janus_main" 0 (pure []) backend a)
-  dlFPtr <- acquireJanusCFunPtr dir files "janus_main"
-  pure (jceval dlFPtr [] a :: JanusCEval r, dlFPtr)
+acquireJanusC = acquireJanusCNamed "janus_main"
 
 -- this mostly exists for use with hedgehog withResource; the DL is closed by
 -- the ForeignPtr finalizer once all closures/thunks referencing it become unreachable
 releaseJanusC :: (a, ForeignPtr ()) -> IO ()
 releaseJanusC _ = pure ()
 
+withJanusCNamed :: forall a r. (JanusCParam r, JanusCEvaluate r, FFIRet (JanusCRetType r)) => String -> CBuildConfig -> r -> (JanusCEval r -> IO a) -> IO a
+withJanusCNamed name config a k = compileJanusCNamed name JC config a >>= k
+
 withJanusC :: forall a r. (JanusCParam r, JanusCEvaluate r, FFIRet (JanusCRetType r)) => CBuildConfig -> r -> (JanusCEval r -> IO a) -> IO a
-withJanusC config a k = compileJanusC JC config a >>= k
+withJanusC = withJanusCNamed "janus_main"
 
 showJanusC :: forall a. (JanusCParam a) => String -> JanusCBackend -> a -> String
 showJanusC name backend a =
@@ -403,18 +484,18 @@ getJanusCType p = do
         else do
           -- have to get this again because jctype can insert headers
           fUpdated <- getFunction
-          -- TODO generate name by hashing typerep
-          let c = fUpdated ^. jcfVarCounter
-              tyname = "type_" <> show c
+          let specRendered = pretty 120 (ppr spec)
+              specSha = SHA256.hash (Text.encodeUtf8 (Text.pack specRendered))
+              tyname = "type_" <> take 16 (unpack (B16.encode specSha))
               tyId = Id tyname noLoc
               spec' = DeclSpec [] [] (Tnamed tyId [] noLoc) noLoc
               dec' = DeclRoot noLoc
               t' = JCType spec' dec'
+              td = JCTypedef spec tyname
               f' =
                 fUpdated
                   & jcfTypeCache %~ Map.insert tyrep t'
-                  & jcfVarCounter +~ 1
-                  & jcfTypedefs %~ Set.insert (JCTypedef spec tyname)
+                  & jcfTypedefs %~ (\tds -> if td `elem` tds then tds else tds <> [td])
           modify $ \s -> s & at fname ?~ f'
           pure t'
 
@@ -441,6 +522,11 @@ emitLocalVal (JCType spec dec) rhs = do
   pure (Var vid noLoc)
 
 instance JanusCTyped Bool where
+  jctype _ = do
+    addHeader "stdbool.h"
+    pure $ JCType (DeclSpec [] [] (Tnamed (Id "bool" noLoc) [] noLoc) noLoc) (DeclRoot noLoc)
+
+instance JanusCTyped CBool where
   jctype _ = do
     addHeader "stdbool.h"
     pure $ JCType (DeclSpec [] [] (Tnamed (Id "bool" noLoc) [] noLoc) noLoc) (DeclRoot noLoc)
@@ -513,7 +599,13 @@ instance JanusCTyped Word64 where
 instance JanusCTyped Float where
   jctype _ = pure $ JCType (DeclSpec [] [] (Tfloat noLoc) noLoc) (DeclRoot noLoc)
 
+instance JanusCTyped CFloat where
+  jctype _ = pure $ JCType (DeclSpec [] [] (Tfloat noLoc) noLoc) (DeclRoot noLoc)
+
 instance JanusCTyped Double where
+  jctype _ = pure $ JCType (DeclSpec [] [] (Tdouble noLoc) noLoc) (DeclRoot noLoc)
+
+instance JanusCTyped CDouble where
   jctype _ = pure $ JCType (DeclSpec [] [] (Tdouble noLoc) noLoc) (DeclRoot noLoc)
 
 instance (JanusCTyped a) => JanusCTyped (Ptr a) where
@@ -613,11 +705,20 @@ instance JanusLitC Word32 where
 instance JanusLitC Word64 where
   jlitc = pure . unsignedIntConst
 
+instance JanusLitC CBool where
+  jlitc = pure . unsignedIntConst
+
 instance JanusLitC Float where
   jlitc a = pure $ C.Const (FloatConst (show a) a noLoc) noLoc
 
+instance JanusLitC CFloat where
+  jlitc (CFloat a) = jlitc a
+
 instance JanusLitC Double where
   jlitc a = pure $ C.Const (DoubleConst (show a) a noLoc) noLoc
+
+instance JanusLitC CDouble where
+  jlitc (CDouble a) = jlitc a
 
 instance JanusLitC (Complex Float) where
   jlitc a = do

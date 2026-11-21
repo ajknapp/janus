@@ -38,7 +38,7 @@ import Data.Word
 import Foreign.ForeignPtr (ForeignPtr, withForeignPtr)
 import Foreign.LibFFI (Arg, argPtr, callFFI, retVoid)
 import Foreign.Marshal.Alloc (allocaBytesAligned)
-import Foreign.Ptr (FunPtr, Ptr, castPtrToFunPtr)
+import Foreign.Ptr (FunPtr, Ptr, castPtr, castPtrToFunPtr)
 import qualified Foreign.Storable as Storable
 import GHC.Float (expm1, log1p)
 import GHC.TypeLits (natVal)
@@ -255,10 +255,28 @@ type instance LinuxX86_64CEval (LinuxX86_64CM ()) = IO ()
 class (JanusCTyped a) => LinuxX86_64ABIParam a where
   x86EmitParam :: Int -> JanusCM (Param, Exp)
   x86WithArg :: a -> (Arg -> IO b) -> IO b
+  x86ParamIsIndirect :: Proxy a -> Bool
+  x86ParamIsIndirect _ = False
 
 class LinuxX86_64ABIRet a where
   x86FinishReturn :: JanusC a -> JanusCM [Param]
   x86CallReturn :: Proxy a -> FunPtr () -> [Arg] -> IO a
+  x86RetIsIndirect :: Proxy a -> Bool
+  x86RetIsIndirect _ = False
+
+{-# INLINE withX86StorableArg #-}
+withX86StorableArg :: (Storable.Storable a) => a -> (Ptr () -> IO b) -> IO b
+withX86StorableArg v k =
+  let b = Storable.sizeOf v
+      al = max 32 (Storable.alignment v)
+   in allocaBytesAligned b al $ \p -> Storable.poke p v >> k (castPtr p)
+
+{-# INLINE withX86StorableRet #-}
+withX86StorableRet :: forall a. (Storable.Storable a) => (Ptr () -> IO ()) -> IO a
+withX86StorableRet callOut =
+  let b = Storable.sizeOf (undefined :: a)
+      al = max 32 (Storable.alignment (undefined :: a))
+   in allocaBytesAligned b al $ \pOut -> callOut (castPtr pOut) >> Storable.peek pOut
 
 instance {-# OVERLAPPABLE #-} (JanusCTyped a, FFIArg a) => LinuxX86_64ABIParam a where
   x86EmitParam n = do
@@ -431,6 +449,37 @@ printLinuxX86_64CWith fs = putStrLn . showLinuxX86_64CWith fs "janus_main"
 printLinuxX86_64C :: (LinuxX86_64Param r) => r -> IO ()
 printLinuxX86_64C a = showLinuxX86_64C "janus_main" a >>= putStrLn
 
+resolveX86Features :: CBuildConfig -> IO X86Features
+resolveX86Features config =
+  case config ^. cBuildConfigX86Features of
+    Just fs -> pure fs
+    Nothing -> observeHostX86Features
+
+prepareLinuxX86_64CUnit ::
+  (LinuxX86_64Param r) =>
+  X86Features ->
+  String ->
+  r ->
+  IO (String, [String])
+prepareLinuxX86_64CUnit reqFeatures name a = do
+  let funcs = x86param reqFeatures name 0 (pure []) a
+      targetBanner = "/* janus-x86-target: " <> unwords (x86CompilerFlags reqFeatures) <> " */\n"
+      cSource = targetBanner <> renderJCProgram name funcs
+      needsSleef = any (Set.member "sleef.h" . _jcfHeaders) funcs
+  (sleefCFlags, _) <- if needsSleef then observeSleefFlags else pure ([], [])
+  pure (cSource, x86CompilerFlags reqFeatures <> sleefCFlags)
+
+compileLinuxX86_64CNamedWith ::
+  forall r.
+  (LinuxX86_64Param r, X86DeferCont r) =>
+  String ->
+  X86Features ->
+  CBuildConfig ->
+  r ->
+  IO (LinuxX86_64CEval r)
+compileLinuxX86_64CNamedWith name reqFeatures config a =
+  fst <$> acquireLinuxX86_64CNamedWith name reqFeatures config a
+
 compileLinuxX86_64CWith ::
   forall r.
   (LinuxX86_64Param r, X86DeferCont r) =>
@@ -438,16 +487,44 @@ compileLinuxX86_64CWith ::
   CBuildConfig ->
   r ->
   IO (LinuxX86_64CEval r)
-compileLinuxX86_64CWith reqFeatures config a = fst <$> acquireLinuxX86_64CWith reqFeatures config a
+compileLinuxX86_64CWith = compileLinuxX86_64CNamedWith "janus_main"
+
+compileLinuxX86_64CNamed ::
+  (LinuxX86_64Param r, X86DeferCont r) =>
+  String ->
+  CBuildConfig ->
+  r ->
+  IO (LinuxX86_64CEval r)
+compileLinuxX86_64CNamed name config a = do
+  fs <- resolveX86Features config
+  compileLinuxX86_64CNamedWith name fs config a
 
 compileLinuxX86_64C ::
   (LinuxX86_64Param r, X86DeferCont r) =>
   CBuildConfig ->
   r ->
   IO (LinuxX86_64CEval r)
-compileLinuxX86_64C config a = do
-  fs <- observeHostX86Features
-  compileLinuxX86_64CWith fs config a
+compileLinuxX86_64C = compileLinuxX86_64CNamed "janus_main"
+
+acquireLinuxX86_64CNamedWith ::
+  forall r.
+  (LinuxX86_64Param r, X86DeferCont r) =>
+  String ->
+  X86Features ->
+  CBuildConfig ->
+  r ->
+  IO (LinuxX86_64CEval r, ForeignPtr ())
+acquireLinuxX86_64CNamedWith name reqFeatures config a = do
+  observed <- observeHostX86Features
+  ensureX86Admitted observed reqFeatures
+  let dir = config ^. cBuildConfigCacheDir
+      funcs = x86param reqFeatures name 0 (pure []) a
+      needsSleef = any (Set.member "sleef.h" . _jcfHeaders) funcs
+  (sleefCFlags, sleefLDFlags) <- if needsSleef then observeSleefFlags else pure ([], [])
+  let cflags = x86CompilerFlags reqFeatures <> sleefCFlags
+  files <- writeJanusCFiles JC dir funcs
+  dlFPtr <- acquireJanusCFunPtrWithConfig config cflags sleefLDFlags files name
+  pure (x86DeferCont ($ []) dlFPtr a, dlFPtr)
 
 acquireLinuxX86_64CWith ::
   forall r.
@@ -456,29 +533,38 @@ acquireLinuxX86_64CWith ::
   CBuildConfig ->
   r ->
   IO (LinuxX86_64CEval r, ForeignPtr ())
-acquireLinuxX86_64CWith reqFeatures config a = do
-  observed <- observeHostX86Features
-  ensureX86Admitted observed reqFeatures
-  let dir = config ^. cBuildConfigCacheDir
-      funcs = x86param reqFeatures "janus_main" 0 (pure []) a
-      needsSleef = any (Set.member "sleef.h" . _jcfHeaders) funcs
-  (sleefCFlags, sleefLDFlags) <- if needsSleef then observeSleefFlags else pure ([], [])
-  let cflags = x86CompilerFlags reqFeatures <> sleefCFlags
-  files <- writeJanusCFiles JC dir funcs
-  dlFPtr <- acquireJanusCFunPtrWithFlags dir cflags sleefLDFlags files "janus_main"
-  pure (x86DeferCont ($ []) dlFPtr a, dlFPtr)
+acquireLinuxX86_64CWith = acquireLinuxX86_64CNamedWith "janus_main"
+
+acquireLinuxX86_64CNamed ::
+  (LinuxX86_64Param r, X86DeferCont r) =>
+  String ->
+  CBuildConfig ->
+  r ->
+  IO (LinuxX86_64CEval r, ForeignPtr ())
+acquireLinuxX86_64CNamed name config a = do
+  fs <- resolveX86Features config
+  acquireLinuxX86_64CNamedWith name fs config a
 
 acquireLinuxX86_64C ::
   (LinuxX86_64Param r, X86DeferCont r) =>
   CBuildConfig ->
   r ->
   IO (LinuxX86_64CEval r, ForeignPtr ())
-acquireLinuxX86_64C config a = do
-  fs <- observeHostX86Features
-  acquireLinuxX86_64CWith fs config a
+acquireLinuxX86_64C = acquireLinuxX86_64CNamed "janus_main"
 
 releaseLinuxX86_64C :: (a, ForeignPtr ()) -> IO ()
 releaseLinuxX86_64C _ = pure ()
+
+withLinuxX86_64CNamedWith ::
+  (LinuxX86_64Param r, X86DeferCont r) =>
+  String ->
+  X86Features ->
+  CBuildConfig ->
+  r ->
+  (LinuxX86_64CEval r -> IO a) ->
+  IO a
+withLinuxX86_64CNamedWith name fs config a k =
+  compileLinuxX86_64CNamedWith name fs config a >>= k
 
 withLinuxX86_64CWith ::
   (LinuxX86_64Param r, X86DeferCont r) =>
@@ -487,8 +573,18 @@ withLinuxX86_64CWith ::
   r ->
   (LinuxX86_64CEval r -> IO a) ->
   IO a
-withLinuxX86_64CWith fs config a k =
-  compileLinuxX86_64CWith fs config a >>= k
+withLinuxX86_64CWith = withLinuxX86_64CNamedWith "janus_main"
+
+withLinuxX86_64CNamed ::
+  (LinuxX86_64Param r, X86DeferCont r) =>
+  String ->
+  CBuildConfig ->
+  r ->
+  (LinuxX86_64CEval r -> IO a) ->
+  IO a
+withLinuxX86_64CNamed name config a k = do
+  fs <- resolveX86Features config
+  withLinuxX86_64CNamedWith name fs config a k
 
 withLinuxX86_64C ::
   (LinuxX86_64Param r, X86DeferCont r) =>
@@ -496,9 +592,7 @@ withLinuxX86_64C ::
   r ->
   (LinuxX86_64CEval r -> IO a) ->
   IO a
-withLinuxX86_64C config a k = do
-  fs <- observeHostX86Features
-  withLinuxX86_64CWith fs config a k
+withLinuxX86_64C = withLinuxX86_64CNamed "janus_main"
 
 --------------------------------------------------------------------------------
 -- ExpSIMD LinuxX86_64C: Associated Types, ABI, & Register Representation
@@ -532,6 +626,7 @@ instance (SIMDShape n a) => LinuxX86_64ABIParam (SIMDVector LinuxX86_64C n a) wh
   x86WithArg v k =
     let b = simdBytes (Proxy @n) (Proxy @a)
      in allocaBytesAligned b (min 32 b) $ \p -> Storable.poke p v >> k (argPtr p)
+  x86ParamIsIndirect _ = True
 
 instance (SIMDShape n a) => LinuxX86_64ABIRet (SIMDVector LinuxX86_64C n a) where
   x86FinishReturn = emitMemcpyRet (simdBytes (Proxy @n) (Proxy @a))
@@ -540,6 +635,7 @@ instance (SIMDShape n a) => LinuxX86_64ABIRet (SIMDVector LinuxX86_64C n a) wher
      in allocaBytesAligned b (min 32 b) $ \pOut -> do
           callFFI fp retVoid (reverse args <> [argPtr pOut])
           Storable.peek pOut
+  x86RetIsIndirect _ = True
 
 instance (SIMDShape n a) => LinuxX86_64ABIParam (SIMDMask LinuxX86_64C n a) where
   x86EmitParam k = do
@@ -550,6 +646,7 @@ instance (SIMDShape n a) => LinuxX86_64ABIParam (SIMDMask LinuxX86_64C n a) wher
   x86WithArg m k =
     let b = simdBytes (Proxy @n) (Proxy @a)
      in allocaBytesAligned b (min 32 b) $ \p -> Storable.poke p m >> k (argPtr p)
+  x86ParamIsIndirect _ = True
 
 instance (SIMDShape n a) => LinuxX86_64ABIRet (SIMDMask LinuxX86_64C n a) where
   x86FinishReturn = emitMemcpyRet (simdBytes (Proxy @n) (Proxy @a))
@@ -558,6 +655,7 @@ instance (SIMDShape n a) => LinuxX86_64ABIRet (SIMDMask LinuxX86_64C n a) where
      in allocaBytesAligned b (min 32 b) $ \pOut -> do
           callFFI fp retVoid (reverse args <> [argPtr pOut])
           Storable.peek pOut
+  x86RetIsIndirect _ = True
 
 namedCType :: String -> JCType
 namedCType nm = JCType (DeclSpec [] [] (Tnamed (Id nm noLoc) [] noLoc) noLoc) (DeclRoot noLoc)

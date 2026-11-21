@@ -13,15 +13,22 @@ module Janus.Fix where
 import Control.Lens
 import Control.Monad.Reader
 import Control.Monad.State
+import qualified Crypto.Hash.SHA256 as SHA256
+import qualified Data.ByteString.Base16 as B16
+import Data.ByteString.Char8 (unpack)
+import Data.Char (isAlphaNum)
 import Data.Function
 import Data.Kind as K
 import Data.Loc
 import Data.Proxy
 import qualified Data.Set as Set
+import qualified Data.Text as Text
+import qualified Data.Text.Encoding as Text
+import Data.Typeable (Typeable, typeRep)
 import Janus.Backend.C
 import Language.C.Quote
 
-class JanusCFix r where
+class (Typeable r) => JanusCFix r where
   jcfun :: String -> JanusCM [Exp] -> JanusCM [Param] -> Int -> r -> r
   jcfake :: String -> JanusCM [Exp] -> r -> r
 
@@ -89,13 +96,25 @@ instance (JanusCTyped a, JanusCFix r) => JanusCFix (JanusC a -> r) where
     args' <- args
     pure (x' : args')
 
+sanitizeLocalIdent :: String -> String
+sanitizeLocalIdent = map (\c -> if isAlphaNum c || c == '_' then c else '_')
+
 jfix ::
-  (JanusCFix r) => String -> (r -> r) -> r
-jfix name f = jcfun name (pure []) (pure []) 0 (f $ jcfake name (pure []) (jfix name f))
+  forall r.
+  (JanusCFix r) =>
+  String ->
+  (r -> r) ->
+  r
+jfix name f =
+  let tySha = SHA256.hash (Text.encodeUtf8 (Text.pack (show (typeRep (Proxy @r)))))
+      mangled =
+        "janus_local_"
+          <> sanitizeLocalIdent name
+          <> "_"
+          <> take 12 (unpack (B16.encode tySha))
+   in jcfun mangled (pure []) (pure []) 0 (f $ jcfake mangled (pure []) (jfix name f))
 
 -- TODO find a way to get rid of the Proxy argument
--- TODO hash function name based on type, so the same function can be
--- specialized multiple times in the same program
 --
 -- only use fun directly beneath a toplevel, pointfree definition like so:
 -- foo :: e a -> e b -> e c -> e d

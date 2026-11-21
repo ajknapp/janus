@@ -45,7 +45,9 @@ library
                       Janus.Backend.C.Build
                       Janus.Backend.C.CUDA
                       Janus.Backend.C.LinuxX86_64
+                      Janus.Backend.C.TH
                       Janus.Backend.C.Target
+                      Janus.Control.Drain
                       Janus.Control.Fold
                       Janus.Control.Pipe
                       Janus.Control.Step
@@ -144,6 +146,9 @@ test-suite janus-test
     -- Modules included in this executable, other than Main.
     other-modules:    Test.Janus.Fix
                       Test.Janus.Backend.C.CUDA
+                      Test.Janus.Backend.C.TH
+                      Test.Janus.Backend.C.THDefs
+                      Test.Janus.Backend.C.THOther
                       Test.Janus.Control.StreamPipe
                       Test.Janus.Expression.Let
                       Test.Janus.Expression.SIMD
@@ -164,8 +169,11 @@ test-suite janus-test
 
     -- Test dependencies.
     build-depends:    base ^>=4.20
+                    , async
                     , concurrency
                     , dejafu
+                    , directory
+                    , filepath
                     , hedgehog
                     , janus
                     , janus-cbits
@@ -176,5 +184,6 @@ test-suite janus-test
                     , tasty-dejafu
                     , tasty-hedgehog
                     , tasty-hunit
+                    , template-haskell
                     , transformers
                     , vector

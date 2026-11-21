@@ -16,6 +16,9 @@ class FFIArg a where
 instance FFIArg Bool where
   arg = argCChar . fromIntegral . fromEnum
 
+instance FFIArg CBool where
+  arg = coerce argWord8
+
 instance FFIArg CInt where
   arg = argCInt
 

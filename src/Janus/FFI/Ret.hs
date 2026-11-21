@@ -20,6 +20,9 @@ instance FFIRet () where
 instance FFIRet Bool where
   ret _ = withRetType (pure . (/= 0)) retCChar
 
+instance FFIRet CBool where
+  ret _ = coerce retWord8
+
 instance FFIRet CInt where
   ret _ = retCInt
 

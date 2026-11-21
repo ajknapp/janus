@@ -18,6 +18,7 @@ import Control.Concurrent.Async
 import Control.Concurrent.STM
 import Control.Exception
 import Control.Lens
+import Control.Monad (unless)
 import Control.Monad.Reader
 import Control.Monad.Trans.Control
 import Crypto.Hash.SHA256 as SHA256
@@ -49,21 +50,42 @@ import qualified Rock
 import System.Directory
 import System.Exit
 import System.FilePath
-import System.IO (hClose, openBinaryTempFile, openTempFile)
+import System.IO (hClose, hPutStrLn, openBinaryTempFile, openTempFile)
 import System.Posix hiding (createDirectory)
 import System.Process
 
 data JanusCC = Clang | GCC
   deriving (Eq, Ord, Show, Generic)
 
+instance Hashable JanusCC
+
 data CBuildConfig = CBuildConfig
-  { _cBuildConfigCacheDir :: FilePath
+  { _cBuildConfigCacheDir :: FilePath,
+    _cBuildConfigUseTempDir :: Bool,
+    _cBuildConfigCC :: JanusCC,
+    _cBuildConfigCFlags :: [String],
+    _cBuildConfigSharedCFlags :: [String],
+    _cBuildConfigLDFlags :: [String],
+    _cBuildConfigX86Features :: Maybe X86Features
   }
+  deriving (Eq, Ord, Show, Generic)
 
 $(makeLenses ''CBuildConfig)
 
 defaultCBuildConfig :: CBuildConfig
-defaultCBuildConfig = CBuildConfig "_cache"
+defaultCBuildConfig =
+  CBuildConfig
+    { _cBuildConfigCacheDir = "_cache",
+      _cBuildConfigUseTempDir = False,
+      _cBuildConfigCC = GCC,
+      _cBuildConfigCFlags = ["-O3", "-fPIC"],
+      _cBuildConfigSharedCFlags = ["-flto"],
+      _cBuildConfigLDFlags = ["-shared"],
+      _cBuildConfigX86Features = Nothing
+    }
+
+defaultTHBuildConfig :: CBuildConfig
+defaultTHBuildConfig = defaultCBuildConfig & cBuildConfigUseTempDir .~ True
 
 ccName :: JanusCC -> String
 ccName Clang = "clang"
@@ -71,8 +93,8 @@ ccName GCC = "gcc"
 
 data Query a where
   CacheDir :: FilePath -> Query (Maybe FilePath)
-  CObjectFile :: FilePath -> FilePath -> [String] -> Query (Maybe FilePath)
-  CSharedLibrary :: FilePath -> FilePath -> [FilePath] -> [String] -> [String] -> Query (Maybe FilePath)
+  CObjectFile :: FilePath -> JanusCC -> FilePath -> [String] -> Query (Maybe FilePath)
+  CSharedLibrary :: FilePath -> JanusCC -> FilePath -> [FilePath] -> [String] -> [String] -> Query (Maybe FilePath)
   CUPTXFile :: FilePath -> FilePath -> Int -> Int -> Query (Maybe FilePath)
   CUBinFile :: FilePath -> FilePath -> [FilePath] -> Int -> Int -> Query (Maybe FilePath)
 
@@ -86,10 +108,10 @@ instance Hashable (Query a) where
   hashWithSalt salt query =
     case query of
       CacheDir fp -> hashWithSalt salt fp
-      CObjectFile dir fp cflags ->
-        hashWithSalt salt (hashWithSalt (hashWithSalt salt (dir </> fp)) cflags + 1)
-      CSharedLibrary dir sofile fps cflags ldflags ->
-        hashWithSalt salt (hashWithSalt (hashWithSalt (hashWithSalt salt (dir : sofile : fps)) cflags) ldflags + 2)
+      CObjectFile dir cc fp cflags ->
+        hashWithSalt salt (hashWithSalt (hashWithSalt (hashWithSalt salt (dir </> fp)) cc) cflags + 1)
+      CSharedLibrary dir cc sofile fps cflags ldflags ->
+        hashWithSalt salt (hashWithSalt (hashWithSalt (hashWithSalt (hashWithSalt salt (dir : sofile : fps)) cc) cflags) ldflags + 2)
       CUPTXFile dir ptxfile major minor ->
         let h1 = hashWithSalt salt [dir, ptxfile]
             h2 = hashWithSalt salt (hashWithSalt h1 major)
@@ -115,14 +137,13 @@ janusRules key = do
       liftIO $ createDirectoryIfMissing True dir
       pure (Just dir)
 
-    CObjectFile dir cfile cflags -> do
+    CObjectFile dir cc cfile cflags -> do
       Rock.fetch (CacheDir dir) >>= \case
         Just _ -> do
           let (root, _) = splitExtension cfile
-              flagsSuffix
-                | null cflags = ""
-                | otherwise =
-                    "_" <> unpack (B16.encode (SHA256.hash (Text.encodeUtf8 (Text.pack (unwords cflags)))))
+              flagsPayload = unwords (ccName cc : cflags)
+              flagsSuffix =
+                "_" <> unpack (B16.encode (SHA256.hash (Text.encodeUtf8 (Text.pack flagsPayload))))
               ofile = root <> flagsSuffix <> ".o"
               ofilePath = dir </> ofile
           liftIO $ do
@@ -135,14 +156,14 @@ janusRules key = do
                   (\(tmpPath, hndl) -> hClose hndl >> removePathForcibly tmpPath)
                   $ \(tmpPath, hndl) -> do
                     hClose hndl
-                    p <- spawnProcess (ccName GCC) (["-O3", "-fPIC", "-flto"] <> cflags <> ["-o", tmpPath, "-c", dir </> cfile])
+                    p <- spawnProcess (ccName cc) (cflags <> ["-o", tmpPath, "-c", dir </> cfile])
                     waitForProcess p >>= \case
                       ExitSuccess -> renameFile tmpPath ofilePath >> pure (Just ofilePath)
                       _exitFailure -> removePathForcibly tmpPath >> pure Nothing
         Nothing -> pure Nothing
 
-    CSharedLibrary dir sofile cfiles cflags ldflags -> do
-      ofiles <- fetchConcurrently (fmap (\cf -> CObjectFile dir cf cflags) cfiles)
+    CSharedLibrary dir cc sofile cfiles cflags ldflags -> do
+      ofiles <- fetchConcurrently (fmap (\cf -> CObjectFile dir cc cf cflags) cfiles)
       let success = all isJust ofiles
           sofilePath = dir </> sofile
       if not success
@@ -156,7 +177,7 @@ janusRules key = do
               (\(tmpPath, hndl) -> hClose hndl >> removePathForcibly tmpPath)
               $ \(tmpPath, hndl) -> do
                 hClose hndl
-                p <- spawnProcess (ccName GCC) $ ["-O3", "-fPIC", "-shared", "-flto"] <> cflags <> ["-o", tmpPath] <> ofiles' <> ldflags
+                p <- spawnProcess (ccName cc) $ cflags <> ["-o", tmpPath] <> ofiles' <> ldflags
                 waitForProcess p >>= \case
                   ExitSuccess -> renameFile tmpPath sofilePath >> pure (Just sofilePath)
                   _exitFailure -> removePathForcibly tmpPath >> pure Nothing
@@ -228,16 +249,76 @@ fetchConcurrently queries = do
     replicateConcurrently_ (max n 8) workerThread
     for jobs (readIORef . snd)
 
-acquireJanusCDLWithFlags :: FilePath -> [String] -> [String] -> [FilePath] -> IO DL
-acquireJanusCDLWithFlags dir cflags ldflags cfiles = do
+compileJanusCSourceToObject :: JanusCC -> [String] -> FilePath -> FilePath -> IO ()
+compileJanusCSourceToObject cc cflags cPath objPath = do
+  let args = cflags <> ["-o", objPath, "-c", cPath]
+  (ec, _out, err) <- readProcessWithExitCode (ccName cc) args ""
+  case ec of
+    ExitSuccess -> pure ()
+    ExitFailure code ->
+      ioError $
+        userError $
+          "compileJanusCSourceToObject: "
+            <> ccName cc
+            <> " exited with code "
+            <> show code
+            <> " (args: "
+            <> unwords args
+            <> ")\n"
+            <> err
+
+buildCachedJanusObject :: CBuildConfig -> [String] -> String -> IO FilePath
+buildCachedJanusObject config extraCFlags cSource = do
+  let dir = config ^. cBuildConfigCacheDir
+      cc = config ^. cBuildConfigCC
+      cflags = (config ^. cBuildConfigCFlags) <> extraCFlags
+      sha = SHA256.hash (Text.encodeUtf8 (Text.pack cSource))
+      cfile = unpack (B16.encode sha) <> ".c"
+      cpath = dir </> cfile
+  _ <- Rock.runTask janusRules (Rock.fetch (CacheDir dir))
+  exist <- fileExist cpath
+  unless exist $
+    bracketOnError
+      (openTempFile dir "janus_src.c")
+      (\(tmpPath, hndl) -> hClose hndl >> removePathForcibly tmpPath)
+      $ \(tmpPath, hndl) -> do
+        hPutStrLn hndl cSource
+        hClose hndl
+        renameFile tmpPath cpath
   memoVar <- newIORef mempty
-  let hashPayload = foldMap Text.pack cfiles <> Text.pack ("|" <> unwords cflags <> "|" <> unwords ldflags)
+  result <- Rock.runTask (Rock.memoise memoVar janusRules) . Rock.fetch $ CObjectFile dir cc cfile cflags
+  case result of
+    Just ofile -> makeAbsolute ofile
+    Nothing ->
+      ioError $
+        userError $
+          "buildCachedJanusObject: failed to compile "
+            <> cpath
+            <> " with "
+            <> ccName cc
+            <> " "
+            <> unwords cflags
+
+acquireJanusCDLWithConfig :: CBuildConfig -> [String] -> [String] -> [FilePath] -> IO DL
+acquireJanusCDLWithConfig config extraCFlags extraLDFlags cfiles = do
+  memoVar <- newIORef mempty
+  let dir = config ^. cBuildConfigCacheDir
+      cc = config ^. cBuildConfigCC
+      cflags = (config ^. cBuildConfigCFlags) <> (config ^. cBuildConfigSharedCFlags) <> extraCFlags
+      ldflags = (config ^. cBuildConfigLDFlags) <> extraLDFlags
+      hashPayload =
+        foldMap Text.pack cfiles
+          <> Text.pack ("|" <> ccName cc <> "|" <> unwords cflags <> "|" <> unwords ldflags)
       filesHash = B16.encode (SHA256.hash $ Text.encodeUtf8 hashPayload)
       sofile_ = unpack filesHash <> ".so"
-  result <- Rock.runTask (Rock.memoise memoVar janusRules) . Rock.fetch $ CSharedLibrary dir sofile_ cfiles cflags ldflags
+  result <- Rock.runTask (Rock.memoise memoVar janusRules) . Rock.fetch $ CSharedLibrary dir cc sofile_ cfiles cflags ldflags
   case result of
     Just sofile -> dlopen sofile [RTLD_LAZY, RTLD_LOCAL]
     Nothing -> error "withJanusDL: compilation failed!"
+
+acquireJanusCDLWithFlags :: FilePath -> [String] -> [String] -> [FilePath] -> IO DL
+acquireJanusCDLWithFlags dir =
+  acquireJanusCDLWithConfig (defaultCBuildConfig & cBuildConfigCacheDir .~ dir)
 
 acquireJanusCDL :: FilePath -> [FilePath] -> IO DL
 acquireJanusCDL dir = acquireJanusCDLWithFlags dir [] []
@@ -245,17 +326,21 @@ acquireJanusCDL dir = acquireJanusCDLWithFlags dir [] []
 releaseJanusCDL :: DL -> IO ()
 releaseJanusCDL = dlclose
 
-acquireJanusCFunPtrWithFlags :: FilePath -> [String] -> [String] -> [FilePath] -> String -> IO (ForeignPtr ())
-acquireJanusCFunPtrWithFlags dir cflags ldflags cfiles sym =
+acquireJanusCFunPtrWithConfig :: CBuildConfig -> [String] -> [String] -> [FilePath] -> String -> IO (ForeignPtr ())
+acquireJanusCFunPtrWithConfig config extraCFlags extraLDFlags cfiles sym =
   mask $ \restore -> do
-    dl <- restore (acquireJanusCDLWithFlags dir cflags ldflags cfiles)
+    dl <- restore (acquireJanusCDLWithConfig config extraCFlags extraLDFlags cfiles)
     ( do
         fp <- dlsym dl sym
         if fp == nullFunPtr
-          then error ("acquireJanusCFunPtrWithFlags: null function pointer for " <> sym)
+          then error ("acquireJanusCFunPtrWithConfig: null function pointer for " <> sym)
           else FC.newForeignPtr (castFunPtrToPtr fp) (releaseJanusCDL dl)
       )
       `onException` releaseJanusCDL dl
+
+acquireJanusCFunPtrWithFlags :: FilePath -> [String] -> [String] -> [FilePath] -> String -> IO (ForeignPtr ())
+acquireJanusCFunPtrWithFlags dir =
+  acquireJanusCFunPtrWithConfig (defaultCBuildConfig & cBuildConfigCacheDir .~ dir)
 
 acquireJanusCFunPtr :: FilePath -> [FilePath] -> String -> IO (ForeignPtr ())
 acquireJanusCFunPtr dir = acquireJanusCFunPtrWithFlags dir [] []

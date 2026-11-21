@@ -176,6 +176,7 @@ instance (JanusCTyped a, JanusCTyped b, Storable.Storable a, Storable.Storable b
   x86WithArg v k =
     let (tot, al, _) = simdPairLayout @a @b
      in allocaBytesAligned tot (max 32 al) $ \p -> Storable.poke p v >> k (argPtr p)
+  x86ParamIsIndirect _ = True
 
 instance (JanusCTyped a, JanusCTyped b, Storable.Storable a, Storable.Storable b) => LinuxX86_64ABIRet (SIMDPair a b) where
   x86FinishReturn =
@@ -186,6 +187,7 @@ instance (JanusCTyped a, JanusCTyped b, Storable.Storable a, Storable.Storable b
      in allocaBytesAligned tot (max 32 al) $ \pOut -> do
           callFFI fp retVoid (reverse args <> [argPtr pOut])
           Storable.peek pOut
+  x86RetIsIndirect _ = True
 
 newtype VoidPtr = VoidPtr {getVoidPtr :: Ptr ()}
   deriving newtype (Eq, Ord, Show, Storable.Storable, FFIArg, FFIRet)
