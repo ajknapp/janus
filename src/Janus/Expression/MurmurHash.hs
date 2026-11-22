@@ -14,6 +14,7 @@ module Janus.Expression.MurmurHash where
 import Control.Lens (ix, (%~), (&), (+~), (.~), (^.))
 import Control.Monad.State (modify)
 import Data.Functor.Identity
+import Data.Int (Int64)
 import Data.Loc (noLoc)
 import Data.Proxy (Proxy (..))
 import qualified Data.Set as Set
@@ -22,9 +23,17 @@ import Foreign.Ptr (Ptr, ptrToWordPtr)
 import GHC.Float
 import GHC.Generics
 import Janus.Backend.C
+import Janus.Command.Cond (CmdCond, whenM_)
+import Janus.Command.Memory (CmdStorable (..))
+import Janus.Command.Ref (CmdRef (..), RefCell)
+import Janus.Command.While (CmdWhile)
+import Janus.Control.Drain (drainFoldM, runDrain)
+import Janus.Control.Stream (rangeS)
 import Janus.Expression.Bits
+import Janus.Expression.Bool (ExpBool)
 import Janus.Expression.Cast
 import Janus.Expression.Let
+import Janus.Expression.Ord (ExpOrd (..))
 import Janus.Typed
 import Language.C.Quote
   ( BlockItem (BlockDecl, BlockStm),
@@ -150,3 +159,80 @@ instance (GExpHash e f) => GExpHash e (M1 i c f) where
 
 defaultHashWithSalt :: (GExpHash e (Rep a), Generic a) => e Word64 -> a -> e Word64
 defaultHashWithSalt salt x = ghashWithSalt salt (from x)
+
+type CmdHashBytes m e =
+  ( ExpHash' e,
+    CmdRef m e,
+    RefCell m e (e Word64),
+    CmdCond m e,
+    CmdWhile m e,
+    CmdStorable m e Word8,
+    ExpBool e,
+    ExpBits e Int64,
+    ExpOrd e Int64,
+    ExpIntegralCast e Int64 Word64,
+    ExpIntegralCast e Word8 Word64,
+    Num (e Int64),
+    JanusTyped e Bool,
+    JanusTyped e Int64
+  )
+
+-- | Alignment-safe, endianness-deterministic 64-bit MurmurHash over an arbitrary
+-- @[ptr .. ptr + byteLen - 1]@ byte slice, folding 8-byte blocks + tail bytes via 'rangeS'.
+hashBytesWithSalt ::
+  forall m e.
+  (CmdHashBytes m e) =>
+  e Word64 ->
+  e (Ptr Word8) ->
+  e Int64 ->
+  m (e Word64)
+hashBytesWithSalt salt ptr byteLen = do
+  outRef <- newRef (hash64WithSalt salt 0)
+  whenM_ (byteLen `gt` 0) $ do
+    let h0 = hash64WithSalt salt (toIntegral byteLen)
+        numBlocks = byteLen `rshift` 3
+        tailStart = numBlocks `lshift` 3
+        tailRem = byteLen `iand` 7
+    hBlocks <-
+      runDrain
+        ( drainFoldM h0 $ \acc bi -> do
+            let base = bi `lshift` 3
+            b0 <- toIntegral <$> peekElemOff ptr base
+            b1 <- toIntegral <$> peekElemOff ptr (base + 1)
+            b2 <- toIntegral <$> peekElemOff ptr (base + 2)
+            b3 <- toIntegral <$> peekElemOff ptr (base + 3)
+            b4 <- toIntegral <$> peekElemOff ptr (base + 4)
+            b5 <- toIntegral <$> peekElemOff ptr (base + 5)
+            b6 <- toIntegral <$> peekElemOff ptr (base + 6)
+            b7 <- toIntegral <$> peekElemOff ptr (base + 7)
+            let w =
+                  b0
+                    `ior` (b1 `lshift` 8)
+                    `ior` (b2 `lshift` 16)
+                    `ior` (b3 `lshift` 24)
+                    `ior` (b4 `lshift` 32)
+                    `ior` (b5 `lshift` 40)
+                    `ior` (b6 `lshift` 48)
+                    `ior` (b7 `lshift` 56)
+            pure (hash64WithSalt acc w)
+        )
+        (rangeS 0 numBlocks)
+    writeRef outRef hBlocks
+    whenM_ (tailRem `gt` 0) $ do
+      tailW <-
+        runDrain
+          ( drainFoldM (0 :: e Word64) $ \tw k -> do
+              bk <- toIntegral <$> peekElemOff ptr (tailStart + k)
+              let sh = toIntegral (k `lshift` 3) :: e Word64
+              pure (tw `ior` (bk `lshift` sh))
+          )
+          (rangeS 0 tailRem)
+      writeRef outRef (hash64WithSalt hBlocks tailW)
+  readRef outRef
+
+hashBytes ::
+  (CmdHashBytes m e) =>
+  e (Ptr Word8) ->
+  e Int64 ->
+  m (e Word64)
+hashBytes = hashBytesWithSalt defaultHashSalt

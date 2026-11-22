@@ -70,17 +70,36 @@ library
                       Janus.Data.StableVec
                       Janus.Data.RingBuffer
                       Janus.Data.Deque
+                      Janus.Data.Stack
+                      Janus.Data.SmallStack
+                      Janus.Data.PriorityQueue
+                      Janus.Data.IndexedPQ
+                      Janus.Data.BitSet
+                      Janus.Data.BitTree
+                      Janus.Data.BloomFilter
+                      Janus.Data.XorFilter
                       Janus.Data.HashMap
                       Janus.Data.HashSet
+                      Janus.Data.IndexMap
+                      Janus.Data.IndexSet
+                      Janus.Data.ClockCache
+                      Janus.Data.LruCache
                       Janus.Data.FlatMap
                       Janus.Data.FlatSet
                       Janus.Data.BTreeMap
                       Janus.Data.BTreeSet
+                      Janus.Data.DisjointSet
+                      Janus.Data.CsrGraph
+                      Janus.Data.EytzingerVec
+                      Janus.Data.FlatIntervalMap
                       Janus.Data.SlotMap
                       Janus.Data.SparseSet
                       Janus.Data.SparseVec
                       Janus.Data.Pool
+                      Janus.Data.Interner
                       Janus.Data.IntrusiveList
+                      Janus.Data.IntrusiveHeap
+                      Janus.Data.TimerWheel
                       Janus.Data
                       Janus.Command.Array
                       Janus.Command.Case
@@ -186,9 +205,14 @@ test-suite janus-test
                       Test.Janus.Alloc
                       Test.Janus.Data.HKDLayout
                       Test.Janus.Data.Sequential
+                      Test.Janus.Data.StackAndHeap
+                      Test.Janus.Data.BitAndFilter
                       Test.Janus.Data.Hash
+                      Test.Janus.Data.OrderedHashAndCache
                       Test.Janus.Data.Ordered
+                      Test.Janus.Data.GraphAndSpatial
                       Test.Janus.Data.IndexedAndIntrusive
+                      Test.Janus.Data.IntrusiveSchedAndIntern
 
     -- LANGUAGE extensions used by modules in this package.
     -- other-extensions:
