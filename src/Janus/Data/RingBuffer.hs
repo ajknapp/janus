@@ -52,6 +52,11 @@ module Janus.Data.RingBuffer
     drainToRingBuffer,
     drainOverwriteRingBuffer,
     drainTryRingBuffer,
+
+    -- * Two-Span Contiguous SPMD / SIMD Gang Kernels
+    foreachSPMD,
+    traverseSPMD_,
+    foldSPMD,
   )
 where
 
@@ -72,7 +77,7 @@ import Janus.Backend.C.LinuxX86_64
 import Janus.Backend.C.TH
 import Janus.Command.Cond (ifThenElseM_, whenM_)
 import Janus.Command.Memory (CmdStorable (..), ExpSized (..))
-import Janus.Command.Ref (newRef, readRef, writeRef)
+import Janus.Command.Ref (letM, newRef, readRef, writeRef)
 import Janus.Command.While (whileM)
 import Janus.Control.Drain (Drain (..), drainFind, drainForEach, runDrain)
 import Janus.Control.Step (Step (..))
@@ -85,6 +90,7 @@ import Janus.Expression.Cast (ExpIntegralCast (..))
 import Janus.Expression.Cond (ExpCond (..))
 import Janus.Expression.Eq (ExpEq (..))
 import Janus.Expression.Ord (ExpOrd (..))
+import Janus.SPMD (SPMD, SPMDM, SPMDTyped, withSPMD)
 import Janus.Typed (JanusTyped)
 
 -- | Spine struct for 'RingBuffer'.
@@ -471,6 +477,78 @@ drainTryRingBuffer rb = Drain $ \(Stream s) -> do
         Skip -> pure ()
         Stop -> writeRef c false
   readRef cntRef
+
+--------------------------------------------------------------------------------
+-- Two-Span Contiguous SPMD / SIMD Gang Kernels Over RingBuffer
+--------------------------------------------------------------------------------
+
+-- | Two-span contiguous in-place SIMD map over @[0 .. len - 1]@ across @Scalar@ and @SoA s@
+-- (unaligned on the head-offset first span, 64B-aligned on the wrapped @[0 .. span2Len)@ span).
+foreachSPMD ::
+  forall w a m e.
+  (RingBufferCtx m e a, LayoutSliceSPMD w m e a) =>
+  Proxy w ->
+  RingBuffer e a ->
+  (SPMD w e Int64 -> Elem (SPMD w e) a -> SPMDM w m e (Elem (SPMD w e) a)) ->
+  m ()
+foreachSPMD pw (RingBuffer hdr) step = do
+  let f = projectPtrs hdr
+  rp <- peek (getPtrOf (rbsReadPos f))
+  wp <- peek (getPtrOf (rbsWritePos f))
+  curLen <- letM (toIntegral (wp - rp) :: e Int64)
+  whenM_ (curLen `gt` 0) $ do
+    mask <- peek (getPtrOf (rbsMask f))
+    cap <- peek (getPtrOf (rbsCap f))
+    b <- peekBufStruct (getPtrOf (rbsBuf f))
+    headIdx <- letM (toIntegral (rp `iand` mask) :: e Int64)
+    let remToEnd = cap - headIdx
+    span1Len <- letM (ifThenElse (curLen `lt` remToEnd) curLen remToEnd)
+    span2Len <- letM (curLen - span1Len)
+    foreachSliceBufSPMD pw False b headIdx span1Len 0 step
+    whenM_ (span2Len `gt` 0) $
+      foreachSliceBufSPMD pw True b 0 span2Len span1Len step
+
+-- | Two-span contiguous read-only SIMD scan over @[0 .. len - 1]@ across @Scalar@ and @SoA s@.
+traverseSPMD_ ::
+  forall w a m e.
+  (RingBufferCtx m e a, LayoutSliceSPMD w m e a) =>
+  Proxy w ->
+  RingBuffer e a ->
+  (SPMD w e Int64 -> Elem (SPMD w e) a -> SPMDM w m e ()) ->
+  m ()
+traverseSPMD_ pw (RingBuffer hdr) body = do
+  let f = projectPtrs hdr
+  rp <- peek (getPtrOf (rbsReadPos f))
+  wp <- peek (getPtrOf (rbsWritePos f))
+  curLen <- letM (toIntegral (wp - rp) :: e Int64)
+  whenM_ (curLen `gt` 0) $ do
+    mask <- peek (getPtrOf (rbsMask f))
+    cap <- peek (getPtrOf (rbsCap f))
+    b <- peekBufStruct (getPtrOf (rbsBuf f))
+    headIdx <- letM (toIntegral (rp `iand` mask) :: e Int64)
+    let remToEnd = cap - headIdx
+    span1Len <- letM (ifThenElse (curLen `lt` remToEnd) curLen remToEnd)
+    span2Len <- letM (curLen - span1Len)
+    traverseSliceBufSPMD_ pw False b headIdx span1Len 0 body
+    whenM_ (span2Len `gt` 0) $
+      traverseSliceBufSPMD_ pw True b 0 span2Len span1Len body
+
+-- | Two-span contiguous masked-safe SIMD fold over @[0 .. len - 1]@ across @Scalar@ and @SoA s@.
+foldSPMD ::
+  forall w a s m e.
+  (RingBufferCtx m e a, LayoutSliceSPMD w m e a, SPMDTyped w e s) =>
+  Proxy w ->
+  RingBuffer e a ->
+  SPMD w e s ->
+  (SPMD w e s -> SPMD w e Int64 -> Elem (SPMD w e) a -> SPMDM w m e (SPMD w e s)) ->
+  m (SPMD w e s)
+foldSPMD pw rb s0 step = do
+  accRef <- withSPMD pw (newRef s0)
+  traverseSPMD_ pw rb $ \logIdx val -> do
+    cur <- readRef accRef
+    nxt <- step cur logIdx val
+    writeRef accRef nxt
+  withSPMD pw (readRef accRef)
 
 --------------------------------------------------------------------------------
 -- Host <-> C FFI Marshalling Instances

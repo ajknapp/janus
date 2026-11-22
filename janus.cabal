@@ -213,6 +213,7 @@ test-suite janus-test
                       Test.Janus.Data.GraphAndSpatial
                       Test.Janus.Data.IndexedAndIntrusive
                       Test.Janus.Data.IntrusiveSchedAndIntern
+                      Test.Janus.Data.SPMD
 
     -- LANGUAGE extensions used by modules in this package.
     -- other-extensions:

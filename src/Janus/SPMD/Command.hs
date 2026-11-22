@@ -32,7 +32,7 @@ import Janus.Command.Cond (CmdCond (..), whenM_)
 import Janus.Command.Format (CmdFormat (..), CmdPutString (..), CmdString (..))
 import Janus.Command.IO (CmdIO (..))
 import Janus.Command.Range (CmdRange)
-import Janus.Command.Ref (CmdRef (..))
+import Janus.Command.Ref (Cell (..), CmdRef (..), RefCell (..))
 import Janus.Command.TicToc (CmdTicToc (..), Tic (..), Toc (..))
 import Janus.Command.While (CmdWhile (..))
 import Janus.Expression.Bits (ExpBits)
@@ -100,6 +100,20 @@ instance
       SPMDMask m -> do
         rawOld <- liftSPMD (readRef r)
         liftSPMD (writeRef r (spmdSelectRaw @n @e @a m rawNew rawOld))
+
+instance
+  ( Monad m,
+    CmdRef m e,
+    SPMDTyped n e a
+  ) =>
+  RefCell (SPMDM n m e) (SPMD n e) (SPMD n e a)
+  where
+  newCell x = do
+    r <- newRef x
+    pure (Cell (readRef r) (writeRef r))
+  newCell' = do
+    r <- newRef'
+    pure (Cell (readRef r) (writeRef r))
 
 -- CmdCond: refines mask for then/else and skips empty coherent branches via manyOf
 instance

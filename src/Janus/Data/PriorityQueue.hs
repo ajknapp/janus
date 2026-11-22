@@ -62,6 +62,13 @@ module Janus.Data.PriorityQueue
     drainToMinHeap,
     minHeapFromStream,
     drainAppendMinHeap,
+
+    -- * SPMD / SIMD Gang Kernels Over Heap Keys & Payload Values
+    foreachValuesSPMD,
+    foldValuesSPMD,
+    foldKeysSPMD,
+    foldMinHeapSPMD,
+    mapKeysAndRebuildSPMD,
   )
 where
 
@@ -99,6 +106,7 @@ import Janus.Expression.Bool (ExpBool (..))
 import Janus.Expression.Cond (ExpCond (..))
 import Janus.Expression.Eq (ExpEq (..))
 import Janus.Expression.Ord (ExpOrd (..))
+import Janus.SPMD (SPMD, SPMDM, SPMDTyped)
 import Janus.Typed (JanusTyped)
 
 --------------------------------------------------------------------------------
@@ -843,6 +851,93 @@ drainAppendMinHeap ::
   MinHeap e k ->
   Drain m (Elem e k) ()
 drainAppendMinHeap alloc mh = drainForEach (pushMinHeap alloc mh)
+
+--------------------------------------------------------------------------------
+-- SPMD / SIMD Gang Kernels Over PriorityQueue & MinHeap
+--------------------------------------------------------------------------------
+
+-- | Mutate payload values in-place across @[0 .. size - 1]@ in SIMD without disturbing 4-ary heap keys.
+foreachValuesSPMD ::
+  forall w k v m e.
+  (PriorityQueueCtx m e k v, LayoutUnitSPMD w m e v) =>
+  Proxy w ->
+  PriorityQueue e k v ->
+  (SPMD w e Int64 -> Elem (SPMD w e) v -> SPMDM w m e (Elem (SPMD w e) v)) ->
+  m ()
+foreachValuesSPMD pw (PriorityQueue hdr) step = do
+  let f = projectPtrs hdr
+  n <- peek (getPtrOf (pqsLen f))
+  vb <- peekBufStruct (getPtrOf (pqsVals f))
+  foreachBufSPMD pw True vb n step
+
+-- | Masked-safe 64B-aligned SIMD fold over payload values @[0 .. size - 1]@.
+foldValuesSPMD ::
+  forall w k v s m e.
+  (PriorityQueueCtx m e k v, LayoutUnitSPMD w m e v, SPMDTyped w e s) =>
+  Proxy w ->
+  PriorityQueue e k v ->
+  SPMD w e s ->
+  (SPMD w e s -> SPMD w e Int64 -> Elem (SPMD w e) v -> SPMDM w m e (SPMD w e s)) ->
+  m (SPMD w e s)
+foldValuesSPMD pw (PriorityQueue hdr) s0 step = do
+  let f = projectPtrs hdr
+  n <- peek (getPtrOf (pqsLen f))
+  vb <- peekBufStruct (getPtrOf (pqsVals f))
+  foldBufSPMD pw True vb n s0 step
+
+-- | Masked-safe 64B-aligned SIMD fold over priority keys @[0 .. size - 1]@.
+foldKeysSPMD ::
+  forall w k v s m e.
+  (PriorityQueueCtx m e k v, LayoutUnitSPMD w m e k, SPMDTyped w e s) =>
+  Proxy w ->
+  PriorityQueue e k v ->
+  SPMD w e s ->
+  (SPMD w e s -> SPMD w e Int64 -> Elem (SPMD w e) k -> SPMDM w m e (SPMD w e s)) ->
+  m (SPMD w e s)
+foldKeysSPMD pw (PriorityQueue hdr) s0 step = do
+  let f = projectPtrs hdr
+  n <- peek (getPtrOf (pqsLen f))
+  kb <- peekBufStruct (getPtrOf (pqsKeys f))
+  foldBufSPMD pw True kb n s0 step
+
+-- | Masked-safe 64B-aligned SIMD fold over key-only 'MinHeap' entries @[0 .. minHeapSize - 1]@.
+foldMinHeapSPMD ::
+  forall w k s m e.
+  (MinHeapCtx m e k, LayoutUnitSPMD w m e k, SPMDTyped w e s) =>
+  Proxy w ->
+  MinHeap e k ->
+  SPMD w e s ->
+  (SPMD w e s -> SPMD w e Int64 -> Elem (SPMD w e) k -> SPMDM w m e (SPMD w e s)) ->
+  m (SPMD w e s)
+foldMinHeapSPMD pw (MinHeap hdr) s0 step = do
+  let f = projectPtrs hdr
+  n <- peek (getPtrOf (mhsLen f))
+  kb <- peekBufStruct (getPtrOf (mhsKeys f))
+  foldBufSPMD pw True kb n s0 step
+
+-- | Transform all priority keys in SIMD and restore 4-ary min-heap order in O(N) via bottom-up Floyd heapify.
+mapKeysAndRebuildSPMD ::
+  forall w k v m e.
+  (PriorityQueueCtx m e k v, LayoutUnitSPMD w m e k) =>
+  Proxy w ->
+  PriorityQueue e k v ->
+  (SPMD w e Int64 -> Elem (SPMD w e) k -> SPMDM w m e (Elem (SPMD w e) k)) ->
+  m ()
+mapKeysAndRebuildSPMD pw (PriorityQueue hdr) step = do
+  let f = projectPtrs hdr
+  n <- peek (getPtrOf (pqsLen f))
+  kb <- peekBufStruct (getPtrOf (pqsKeys f))
+  foreachBufSPMD pw True kb n step
+  whenM_ (n `ge` 2) $ do
+    vb <- peekBufStruct (getPtrOf (pqsVals f))
+    let lastParentPlus1 = ((n - 2) `rshift` 2) + 1
+    runDrain
+      ( drainForEach $ \i -> do
+          ki <- readBuf kb i
+          vi <- readBuf vb i
+          siftDownKV kb vb n i ki vi
+      )
+      (reverseRangeS 0 lastParentPlus1)
 
 --------------------------------------------------------------------------------
 -- Host <-> C FFI Marshalling Instances

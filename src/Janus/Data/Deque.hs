@@ -55,6 +55,11 @@ module Janus.Data.Deque
     fromStream,
     drainAppendDequeBack,
     drainAppendDequeFront,
+
+    -- * Two-Span Contiguous SPMD / SIMD Gang Kernels
+    foreachSPMD,
+    traverseSPMD_,
+    foldSPMD,
   )
 where
 
@@ -82,6 +87,7 @@ import Janus.Expression.Bool (ExpBool (..))
 import Janus.Expression.Cond (ExpCond (..))
 import Janus.Expression.Eq (ExpEq (..))
 import Janus.Expression.Ord (ExpOrd (..))
+import Janus.SPMD (SPMD, SPMDM, SPMDTyped, withSPMD)
 import Janus.Typed (JanusTyped)
 
 -- | Spine struct for 'Deque'.
@@ -502,6 +508,72 @@ drainAppendDequeFront ::
   Deque e a ->
   Drain m (Elem e a) ()
 drainAppendDequeFront alloc dq = drainForEach (pushFront alloc dq)
+
+--------------------------------------------------------------------------------
+-- Two-Span Contiguous SPMD / SIMD Gang Kernels Over Deque
+--------------------------------------------------------------------------------
+
+-- | Two-span contiguous in-place SIMD map over @[0 .. len - 1]@ across @Scalar@ and @SoA s@
+-- (unaligned on the head-offset first span, 64B-aligned on the wrapped @[0 .. span2Len)@ span).
+foreachSPMD ::
+  forall w a m e.
+  (DequeCtx m e a, LayoutSliceSPMD w m e a) =>
+  Proxy w ->
+  Deque e a ->
+  (SPMD w e Int64 -> Elem (SPMD w e) a -> SPMDM w m e (Elem (SPMD w e) a)) ->
+  m ()
+foreachSPMD pw (Deque hdr) step = do
+  let f = projectPtrs hdr
+  curLen <- peek (getPtrOf (dqsLen f))
+  whenM_ (curLen `gt` 0) $ do
+    hd <- peek (getPtrOf (dqsHead f))
+    cap <- peek (getPtrOf (dqsCap f))
+    b <- peekBufStruct (getPtrOf (dqsBuf f))
+    let remRight = cap - hd
+    span1Len <- letM (ifThenElse (curLen `lt` remRight) curLen remRight)
+    span2Len <- letM (curLen - span1Len)
+    foreachSliceBufSPMD pw False b hd span1Len 0 step
+    whenM_ (span2Len `gt` 0) $
+      foreachSliceBufSPMD pw True b 0 span2Len span1Len step
+
+-- | Two-span contiguous read-only SIMD scan over @[0 .. len - 1]@ across @Scalar@ and @SoA s@.
+traverseSPMD_ ::
+  forall w a m e.
+  (DequeCtx m e a, LayoutSliceSPMD w m e a) =>
+  Proxy w ->
+  Deque e a ->
+  (SPMD w e Int64 -> Elem (SPMD w e) a -> SPMDM w m e ()) ->
+  m ()
+traverseSPMD_ pw (Deque hdr) body = do
+  let f = projectPtrs hdr
+  curLen <- peek (getPtrOf (dqsLen f))
+  whenM_ (curLen `gt` 0) $ do
+    hd <- peek (getPtrOf (dqsHead f))
+    cap <- peek (getPtrOf (dqsCap f))
+    b <- peekBufStruct (getPtrOf (dqsBuf f))
+    let remRight = cap - hd
+    span1Len <- letM (ifThenElse (curLen `lt` remRight) curLen remRight)
+    span2Len <- letM (curLen - span1Len)
+    traverseSliceBufSPMD_ pw False b hd span1Len 0 body
+    whenM_ (span2Len `gt` 0) $
+      traverseSliceBufSPMD_ pw True b 0 span2Len span1Len body
+
+-- | Two-span contiguous masked-safe SIMD fold over @[0 .. len - 1]@ across @Scalar@ and @SoA s@.
+foldSPMD ::
+  forall w a s m e.
+  (DequeCtx m e a, LayoutSliceSPMD w m e a, SPMDTyped w e s) =>
+  Proxy w ->
+  Deque e a ->
+  SPMD w e s ->
+  (SPMD w e s -> SPMD w e Int64 -> Elem (SPMD w e) a -> SPMDM w m e (SPMD w e s)) ->
+  m (SPMD w e s)
+foldSPMD pw dq s0 step = do
+  accRef <- withSPMD pw (newRef s0)
+  traverseSPMD_ pw dq $ \logIdx val -> do
+    cur <- readRef accRef
+    nxt <- step cur logIdx val
+    writeRef accRef nxt
+  withSPMD pw (readRef accRef)
 
 --------------------------------------------------------------------------------
 -- Host <-> C FFI Marshalling Instances

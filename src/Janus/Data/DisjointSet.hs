@@ -38,6 +38,12 @@ module Janus.Data.DisjointSet
     rootsS,
     componentMembersS,
     drainAppendUnions,
+
+    -- * First-Class SPMD / SIMD Partition Queries & Reductions
+    isRootSPMD,
+    findSPMD,
+    connectedSPMD,
+    spmdCountComponents,
   )
 where
 
@@ -62,13 +68,23 @@ import Janus.Backend.C.TH
 import Janus.Command.Cond (ifThenElseM_, whenM_)
 import Janus.Command.Memory (CmdStorable (..), ExpSized (..))
 import Janus.Command.Ref (letM, newRef, readRef, writeRef)
-import Janus.Control.Drain (Drain, drainFind, drainForEach, drain_, runDrain)
+import Janus.Control.Drain (Drain, drainFind, drainForEach, drainLast, drain_, runDrain)
 import Janus.Control.Stream (Stream, filterMapS, iterateS, rangeS, unfoldWhileM, withStreamSetup)
 import Janus.Data.HKD
+import Janus.Data.Layout (ScalarBuf (..), foldBufSPMD)
 import Janus.Expression.Bool (ExpBool (..))
 import Janus.Expression.Cond (ExpCond (..))
 import Janus.Expression.Eq (ExpEq (..))
 import Janus.Expression.Ord (ExpOrd (..))
+import Janus.SPMD
+  ( SPMD,
+    SPMDGang,
+    SPMDM,
+    gangReduceAdd,
+    liftSPMD,
+    uniform,
+    uniformAlignedPtr,
+  )
 import Janus.Typed (JanusTyped)
 
 -- | Spine struct for flat signed-parent 'DisjointSet' (Union-Find):
@@ -339,6 +355,96 @@ drainAppendUnions ::
   DisjointSet e ->
   Drain m (e Int64, e Int64) ()
 drainAppendUnions ds = drainForEach (\(u, v) -> union ds u v >> pure ())
+
+--------------------------------------------------------------------------------
+-- First-Class SPMD / SIMD Partition Queries & Reductions
+--------------------------------------------------------------------------------
+
+-- | Bounds-masked SIMD gather checking whether each lane's index @xs@ is a canonical
+-- component root (@dssData[xs] < 0@). Out-of-bounds lanes return @false@.
+isRootSPMD ::
+  forall w m e.
+  (DisjointSetCtx m e, SPMDGang w m e) =>
+  DisjointSet e ->
+  SPMD w e Int64 ->
+  SPMDM w m e (SPMD w e Bool)
+isRootSPMD (DisjointSet hdr) xs = do
+  let fields = projectPtrs hdr
+  curLen <- liftSPMD (peek (getPtrOf (dssLen fields)))
+  outRef <- newRef (false :: SPMD w e Bool)
+  let valid = (xs `ge` 0) `land` (xs `lt` uniform curLen)
+  whenM_ valid $ do
+    arr <- liftSPMD (peek (getPtrOf (dssData fields)))
+    v <- peekElemOff (uniformAlignedPtr arr) xs
+    writeRef outRef (v `lt` 0)
+  readRef outRef
+
+-- | Read-only lane-parallel root chase across @w@ SIMD lanes using two-step pointer
+-- jumping inside 'unfoldWhileM' (zero writes, so duplicate elements across lanes are
+-- completely race-free). Out-of-bounds lanes return @-1@.
+findSPMD ::
+  forall w m e.
+  (DisjointSetCtx m e, SPMDGang w m e) =>
+  DisjointSet e ->
+  SPMD w e Int64 ->
+  SPMDM w m e (SPMD w e Int64)
+findSPMD (DisjointSet hdr) xs = do
+  let fields = projectPtrs hdr
+  curLen <- liftSPMD (peek (getPtrOf (dssLen fields)))
+  rootRef <- newRef (-1 :: SPMD w e Int64)
+  let valid = (xs `ge` 0) `land` (xs `lt` uniform curLen)
+  whenM_ valid $ do
+    arr <- liftSPMD (peek (getPtrOf (dssData fields)))
+    let spArr = uniformAlignedPtr arr
+    (_, finalRoot) <-
+      runDrain (drainLast xs) $
+        unfoldWhileM
+          xs
+          (\cur -> (`ge` 0) <$> peekElemOff spArr cur)
+          ( \cur -> do
+              p <- peekElemOff spArr cur
+              gp <- peekElemOff spArr p
+              let nxt = ifThenElse (gp `ge` 0) gp p
+              pure (nxt, nxt)
+          )
+    writeRef rootRef finalRoot
+  readRef rootRef
+
+-- | Lane-parallel connectivity query returning @true@ iff both @us@ and @vs@ are valid
+-- indices in the same equivalence class.
+connectedSPMD ::
+  forall w m e.
+  (DisjointSetCtx m e, SPMDGang w m e) =>
+  DisjointSet e ->
+  SPMD w e Int64 ->
+  SPMD w e Int64 ->
+  SPMDM w m e (SPMD w e Bool)
+connectedSPMD ds us vs = do
+  ru <- findSPMD ds us
+  rv <- findSPMD ds vs
+  pure ((ru `ge` 0) `land` (ru `eq` rv))
+
+-- | Count canonical component roots (@dssData[i] < 0@) across @[0, numElements)@ using
+-- 64B-aligned SIMD strip-mining and horizontal gang reduction.
+spmdCountComponents ::
+  forall w m e.
+  (DisjointSetCtx m e, SPMDGang w m e) =>
+  Proxy w ->
+  DisjointSet e ->
+  m (e Int64)
+spmdCountComponents pw (DisjointSet hdr) = do
+  let fields = projectPtrs hdr
+  curLen <- peek (getPtrOf (dssLen fields))
+  arr <- peek (getPtrOf (dssData fields))
+  acc <-
+    foldBufSPMD
+      pw
+      True
+      (ScalarBuf arr)
+      curLen
+      (0 :: SPMD w e Int64)
+      (\s _ v -> pure (s + ifThenElse (v `lt` 0) 1 0))
+  pure (gangReduceAdd acc)
 
 --------------------------------------------------------------------------------
 -- Host <-> C FFI Marshalling Instances

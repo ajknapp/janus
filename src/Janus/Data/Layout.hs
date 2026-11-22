@@ -19,6 +19,7 @@
 {-# LANGUAGE TypeFamilyDependencies #-}
 {-# LANGUAGE TypeOperators #-}
 {-# LANGUAGE UndecidableInstances #-}
+{-# LANGUAGE UndecidableSuperClasses #-}
 
 module Janus.Data.Layout
   ( -- * Storage Layout Tags (`Scalar`, `AoS`, `SoA`, `AoSoA w`, `SOAOA w`)
@@ -63,12 +64,29 @@ module Janus.Data.Layout
     writeSoAGang,
     foreachSoASPMD,
     readAoSoATile,
+    readAoSoATileWithAlign,
     writeAoSoATile,
+    writeAoSoATileWithAlign,
     foreachAoSoASPMD,
     readSOAOATile,
+    readSOAOATileWithAlign,
     writeSOAOATile,
+    writeSOAOATileWithAlign,
     soaoaStreamPtrAt,
     foreachSOAOASPMD,
+
+    -- * Unified Layout-Polymorphic SPMD / SIMD Classes & Buffer Combinators
+    LayoutUnitSPMD (..),
+    LayoutSliceSPMD (..),
+    LayoutGatherSPMD (..),
+    foreachBufSPMD,
+    traverseBufSPMD_,
+    foldBufSPMD,
+    foreachMaskedBufSPMD,
+    foldMaskedBufSPMD,
+    foreachSliceBufSPMD,
+    traverseSliceBufSPMD_,
+    foldSliceBufSPMD,
   )
 where
 
@@ -137,6 +155,7 @@ import Janus.SPMD
     SPMDGang,
     SPMDLayout,
     SPMDM,
+    SPMDTyped,
     liftSPMD,
     spmdAlignedUnitStride,
     spmdUnitStride,
@@ -1422,6 +1441,30 @@ tileIsNaturallySIMDAligned =
       wBytesMin = fromIntegral (natVal (Proxy @w)) * 4
    in totSz `mod` min janusSIMDAlignment wBytesMin == 0
 
+readAoSoATileWithAlign ::
+  forall w m e s.
+  ( Functor m,
+    KnownNat w,
+    ExpPtr e (CStruct (TileStruct w s)),
+    ExpStructPtr e,
+    JanusStruct (TileStruct w s),
+    Generic (TileStruct w s (PtrOf e)),
+    Generic (s (TileField w (PtrOf e))),
+    Generic (s (SPMD w e)),
+    Coercible (TileStruct w s (PtrOf e)) (s (TileField w (PtrOf e))),
+    GJanusStructProject e (Rep (TileStruct w s Identity)) (Rep (TileStruct w s (PtrOf e))),
+    GTileSPMD w m e (Rep (s (TileField w (PtrOf e)))) (Rep (s (SPMD w e)))
+  ) =>
+  Bool ->
+  AoSoABuf w s e ->
+  e Int64 ->
+  SPMDM w m e (s (SPMD w e))
+readAoSoATileWithAlign baseAligned (AoSoABuf pTiles) tileIdx =
+  let ts = projectPtrs (ptrIndex pTiles tileIdx) :: TileStruct w s (PtrOf e)
+      tf = coerce ts :: s (TileField w (PtrOf e))
+      al = baseAligned && tileIsNaturallySIMDAligned @w @s
+   in to <$> gReadTileSPMD @w @m @e al (from tf)
+
 readAoSoATile ::
   forall w m e s.
   ( Functor m,
@@ -1439,11 +1482,31 @@ readAoSoATile ::
   AoSoABuf w s e ->
   e Int64 ->
   SPMDM w m e (s (SPMD w e))
-readAoSoATile (AoSoABuf pTiles) tileIdx =
+readAoSoATile = readAoSoATileWithAlign True
+
+writeAoSoATileWithAlign ::
+  forall w m e s.
+  ( KnownNat w,
+    ExpPtr e (CStruct (TileStruct w s)),
+    ExpStructPtr e,
+    JanusStruct (TileStruct w s),
+    Generic (TileStruct w s (PtrOf e)),
+    Generic (s (TileField w (PtrOf e))),
+    Generic (s (SPMD w e)),
+    Coercible (TileStruct w s (PtrOf e)) (s (TileField w (PtrOf e))),
+    GJanusStructProject e (Rep (TileStruct w s Identity)) (Rep (TileStruct w s (PtrOf e))),
+    GTileSPMD w m e (Rep (s (TileField w (PtrOf e)))) (Rep (s (SPMD w e)))
+  ) =>
+  Bool ->
+  AoSoABuf w s e ->
+  e Int64 ->
+  s (SPMD w e) ->
+  SPMDM w m e ()
+writeAoSoATileWithAlign baseAligned (AoSoABuf pTiles) tileIdx val =
   let ts = projectPtrs (ptrIndex pTiles tileIdx) :: TileStruct w s (PtrOf e)
       tf = coerce ts :: s (TileField w (PtrOf e))
-      al = tileIsNaturallySIMDAligned @w @s
-   in to <$> gReadTileSPMD @w @m @e al (from tf)
+      al = baseAligned && tileIsNaturallySIMDAligned @w @s
+   in gWriteTileSPMD @w @m @e al (from tf) (from val)
 
 writeAoSoATile ::
   forall w m e s.
@@ -1462,11 +1525,7 @@ writeAoSoATile ::
   e Int64 ->
   s (SPMD w e) ->
   SPMDM w m e ()
-writeAoSoATile (AoSoABuf pTiles) tileIdx val =
-  let ts = projectPtrs (ptrIndex pTiles tileIdx) :: TileStruct w s (PtrOf e)
-      tf = coerce ts :: s (TileField w (PtrOf e))
-      al = tileIsNaturallySIMDAligned @w @s
-   in gWriteTileSPMD @w @m @e al (from tf) (from val)
+writeAoSoATile = writeAoSoATileWithAlign True
 
 foreachAoSoASPMD ::
   forall w m e s.
@@ -1507,23 +1566,23 @@ foreachAoSoASPMD pw buf len step = do
       writeAoSoATile @w buf numFull nxt
 
 class GSOAOASPMD (w :: Nat) m e (repId :: K.Type -> K.Type) (repGang :: K.Type -> K.Type) where
-  gReadSOAOATile :: Proxy repId -> e (Ptr (Ptr Word8)) -> e Int64 -> e Int64 -> SPMDM w m e (repGang p, e Int64)
-  gWriteSOAOATile :: Proxy repId -> e (Ptr (Ptr Word8)) -> e Int64 -> e Int64 -> repGang p -> SPMDM w m e (e Int64)
+  gReadSOAOATile :: Bool -> Proxy repId -> e (Ptr (Ptr Word8)) -> e Int64 -> e Int64 -> SPMDM w m e (repGang p, e Int64)
+  gWriteSOAOATile :: Bool -> Proxy repId -> e (Ptr (Ptr Word8)) -> e Int64 -> e Int64 -> repGang p -> SPMDM w m e (e Int64)
 
 instance (Monad m, GSOAOASPMD w m e fId fGang) => GSOAOASPMD w m e (M1 i c fId) (M1 i c fGang) where
-  gReadSOAOATile _ arr g0 t = do
-    (r, g1) <- gReadSOAOATile @w @m @e (Proxy @fId) arr g0 t
+  gReadSOAOATile al _ arr g0 t = do
+    (r, g1) <- gReadSOAOATile @w @m @e al (Proxy @fId) arr g0 t
     pure (M1 r, g1)
-  gWriteSOAOATile _ arr g0 t (M1 v) = gWriteSOAOATile @w @m @e (Proxy @fId) arr g0 t v
+  gWriteSOAOATile al _ arr g0 t (M1 v) = gWriteSOAOATile @w @m @e al (Proxy @fId) arr g0 t v
 
 instance (Monad m, GSOAOASPMD w m e fId fGang, GSOAOASPMD w m e gId gGang) => GSOAOASPMD w m e (fId :*: gId) (fGang :*: gGang) where
-  gReadSOAOATile _ arr g0 t = do
-    (rf, g1) <- gReadSOAOATile @w @m @e (Proxy @fId) arr g0 t
-    (rg, g2) <- gReadSOAOATile @w @m @e (Proxy @gId) arr g1 t
+  gReadSOAOATile al _ arr g0 t = do
+    (rf, g1) <- gReadSOAOATile @w @m @e al (Proxy @fId) arr g0 t
+    (rg, g2) <- gReadSOAOATile @w @m @e al (Proxy @gId) arr g1 t
     pure (rf :*: rg, g2)
-  gWriteSOAOATile _ arr g0 t (vf :*: vg) = do
-    g1 <- gWriteSOAOATile @w @m @e (Proxy @fId) arr g0 t vf
-    gWriteSOAOATile @w @m @e (Proxy @gId) arr g1 t vg
+  gWriteSOAOATile al _ arr g0 t (vf :*: vg) = do
+    g1 <- gWriteSOAOATile @w @m @e al (Proxy @fId) arr g0 t vf
+    gWriteSOAOATile @w @m @e al (Proxy @gId) arr g1 t vg
 
 instance
   ( KnownNat w,
@@ -1545,16 +1604,31 @@ instance
   ) =>
   GSOAOASPMD w m e (K1 i (sub Identity)) (K1 i (sub (SPMD w e)))
   where
-  gReadSOAOATile _ arr gIdx tileIdx = do
+  gReadSOAOATile al _ arr gIdx tileIdx = do
     rawP <- liftSPMD (peekElemOff arr gIdx)
     let pTiles = fromVoidPtr (toVoidPtr rawP) :: e (Ptr (CStruct (TileStruct w sub)))
-    subGang <- readAoSoATile @w (AoSoABuf pTiles) tileIdx
+    subGang <- readAoSoATileWithAlign @w al (AoSoABuf pTiles) tileIdx
     pure (K1 subGang, gIdx + 1)
-  gWriteSOAOATile _ arr gIdx tileIdx (K1 subGang) = do
+  gWriteSOAOATile al _ arr gIdx tileIdx (K1 subGang) = do
     rawP <- liftSPMD (peekElemOff arr gIdx)
     let pTiles = fromVoidPtr (toVoidPtr rawP) :: e (Ptr (CStruct (TileStruct w sub)))
-    writeAoSoATile @w (AoSoABuf pTiles) tileIdx subGang
+    writeAoSoATileWithAlign @w al (AoSoABuf pTiles) tileIdx subGang
     pure (gIdx + 1)
+
+readSOAOATileWithAlign ::
+  forall w m e outer.
+  ( Generic (outer (SPMD w e)),
+    GSOAOASPMD w m e (Rep (outer Identity)) (Rep (outer (SPMD w e))),
+    Monad m,
+    Num (e Int64)
+  ) =>
+  Bool ->
+  e (Ptr (Ptr Word8)) ->
+  e Int64 ->
+  SPMDM w m e (outer (SPMD w e))
+readSOAOATileWithAlign al streamArr tileIdx = do
+  (repG, _) <- gReadSOAOATile @w @m @e al (Proxy @(Rep (outer Identity))) streamArr 0 tileIdx
+  pure (to repG)
 
 readSOAOATile ::
   forall w m e outer.
@@ -1566,9 +1640,23 @@ readSOAOATile ::
   e (Ptr (Ptr Word8)) ->
   e Int64 ->
   SPMDM w m e (outer (SPMD w e))
-readSOAOATile streamArr tileIdx = do
-  (repG, _) <- gReadSOAOATile @w @m @e (Proxy @(Rep (outer Identity))) streamArr 0 tileIdx
-  pure (to repG)
+readSOAOATile = readSOAOATileWithAlign True
+
+writeSOAOATileWithAlign ::
+  forall w m e outer.
+  ( Generic (outer (SPMD w e)),
+    GSOAOASPMD w m e (Rep (outer Identity)) (Rep (outer (SPMD w e))),
+    Monad m,
+    Num (e Int64)
+  ) =>
+  Bool ->
+  e (Ptr (Ptr Word8)) ->
+  e Int64 ->
+  outer (SPMD w e) ->
+  SPMDM w m e ()
+writeSOAOATileWithAlign al streamArr tileIdx val = do
+  _ <- gWriteSOAOATile @w @m @e al (Proxy @(Rep (outer Identity))) streamArr 0 tileIdx (from val)
+  pure ()
 
 writeSOAOATile ::
   forall w m e outer.
@@ -1581,9 +1669,7 @@ writeSOAOATile ::
   e Int64 ->
   outer (SPMD w e) ->
   SPMDM w m e ()
-writeSOAOATile streamArr tileIdx val = do
-  _ <- gWriteSOAOATile @w @m @e (Proxy @(Rep (outer Identity))) streamArr 0 tileIdx (from val)
-  pure ()
+writeSOAOATile = writeSOAOATileWithAlign True
 
 foreachSOAOASPMD ::
   forall w m e outer.
@@ -1617,3 +1703,406 @@ foreachSOAOASPMD pw (SOAOABuf streamArr) len step = do
       cur <- readSOAOATile @w @m @e @outer streamArr numFull
       nxt <- step tailIdx cur
       writeSOAOATile @w @m @e @outer streamArr numFull nxt
+
+--------------------------------------------------------------------------------
+-- Unified Layout-Polymorphic SPMD / SIMD Classes & Buffer Combinators
+--------------------------------------------------------------------------------
+
+-- | Unified unit-stride SPMD gang load/store across @Scalar@, @SoA s@,
+-- @AoSoA w s@, and @SOAOA w outer@ buffers starting at index @0@.
+class (StorageLayout a, SPMDGang w m e) => LayoutUnitSPMD (w :: Nat) m e a where
+  readAlignedGangBuf ::
+    Proxy w ->
+    Bool ->
+    Buf a e ->
+    e Int64 ->
+    SPMD w e Int64 ->
+    SPMDM w m e (Elem (SPMD w e) a)
+  writeAlignedGangBuf ::
+    Proxy w ->
+    Bool ->
+    Buf a e ->
+    e Int64 ->
+    SPMD w e Int64 ->
+    Elem (SPMD w e) a ->
+    SPMDM w m e ()
+
+-- | Unit-stride SPMD gang load/store at arbitrary contiguous slice offsets
+-- @[startOff .. startOff + spanLen)@ (for @RingBuffer@, @Deque@, @CsrGraph@, @EytzingerVec@).
+class (StorageLayout a, SPMDGang w m e) => LayoutSliceSPMD (w :: Nat) m e a where
+  readUnitGangBuf ::
+    Proxy w ->
+    Bool ->
+    Buf a e ->
+    SPMD w e Int64 ->
+    SPMDM w m e (Elem (SPMD w e) a)
+  writeUnitGangBuf ::
+    Proxy w ->
+    Bool ->
+    Buf a e ->
+    SPMD w e Int64 ->
+    Elem (SPMD w e) a ->
+    SPMDM w m e ()
+
+-- | Arbitrary-index SIMD gather & scatter (@idx :: SPMD w e Int64@) across @Scalar@ and @SoA s@.
+class (StorageLayout a, SPMDGang w m e) => LayoutGatherSPMD (w :: Nat) m e a where
+  gatherBufSPMD ::
+    Buf a e ->
+    SPMD w e Int64 ->
+    SPMDM w m e (Elem (SPMD w e) a)
+  scatterBufSPMD ::
+    Buf a e ->
+    SPMD w e Int64 ->
+    Elem (SPMD w e) a ->
+    SPMDM w m e ()
+
+#define INST_SPMD_SCALAR(TY) \
+instance (SPMDGang w m e) => LayoutUnitSPMD w m e (TY) where { \
+  readAlignedGangBuf _ al (ScalarBuf p) _ idx = \
+    peekElemOff (if al then uniformAlignedPtr p else uniformPtr p) idx; \
+  writeAlignedGangBuf _ al (ScalarBuf p) _ idx v = \
+    pokeElemOff (if al then uniformAlignedPtr p else uniformPtr p) v idx \
+}; \
+instance (SPMDGang w m e) => LayoutSliceSPMD w m e (TY) where { \
+  readUnitGangBuf _ al (ScalarBuf p) idx = \
+    peekElemOff (if al then uniformAlignedPtr p else uniformPtr p) idx; \
+  writeUnitGangBuf _ al (ScalarBuf p) idx v = \
+    pokeElemOff (if al then uniformAlignedPtr p else uniformPtr p) v idx \
+}; \
+instance (SPMDGang w m e) => LayoutGatherSPMD w m e (TY) where { \
+  gatherBufSPMD (ScalarBuf p) idx = peekElemOff (uniformAlignedPtr p) idx; \
+  scatterBufSPMD (ScalarBuf p) idx v = pokeElemOff (uniformAlignedPtr p) v idx \
+}
+
+INST_SPMD_SCALAR(Int8)
+INST_SPMD_SCALAR(Word8)
+INST_SPMD_SCALAR(Int16)
+INST_SPMD_SCALAR(Word16)
+INST_SPMD_SCALAR(Int32)
+INST_SPMD_SCALAR(Word32)
+INST_SPMD_SCALAR(Int64)
+INST_SPMD_SCALAR(Word64)
+INST_SPMD_SCALAR(Float)
+INST_SPMD_SCALAR(Double)
+
+instance
+  ( SPMDGang w m e,
+    StorageLayout (SoA s),
+    Generic (s (PtrOf e)),
+    Generic (s (SPMD w e)),
+    GSoASPMD w m e (Rep (s (PtrOf e))) (Rep (s (SPMD w e)))
+  ) =>
+  LayoutUnitSPMD w m e (SoA s)
+  where
+  readAlignedGangBuf _ al buf _ idx = readSoAGang @w al buf idx
+  writeAlignedGangBuf _ al buf _ idx v = writeSoAGang @w al buf idx v
+
+instance
+  ( SPMDGang w m e,
+    StorageLayout (SoA s),
+    Generic (s (PtrOf e)),
+    Generic (s (SPMD w e)),
+    GSoASPMD w m e (Rep (s (PtrOf e))) (Rep (s (SPMD w e)))
+  ) =>
+  LayoutSliceSPMD w m e (SoA s)
+  where
+  readUnitGangBuf _ al buf idx = readSoAGang @w al buf idx
+  writeUnitGangBuf _ al buf idx v = writeSoAGang @w al buf idx v
+
+instance
+  ( SPMDGang w m e,
+    StorageLayout (SoA s),
+    Generic (s (PtrOf e)),
+    Generic (s (SPMD w e)),
+    GSoASPMD w m e (Rep (s (PtrOf e))) (Rep (s (SPMD w e)))
+  ) =>
+  LayoutGatherSPMD w m e (SoA s)
+  where
+  gatherBufSPMD buf idx = readSoAGang @w False buf idx
+  scatterBufSPMD buf idx v = writeSoAGang @w False buf idx v
+
+instance
+  ( SPMDGang w m e,
+    StorageLayout (AoSoA w s),
+    ExpPtr e (CStruct (TileStruct w s)),
+    ExpStructPtr e,
+    JanusStruct (TileStruct w s),
+    Generic (TileStruct w s (PtrOf e)),
+    Generic (s (TileField w (PtrOf e))),
+    Generic (s (SPMD w e)),
+    Coercible (TileStruct w s (PtrOf e)) (s (TileField w (PtrOf e))),
+    GJanusStructProject e (Rep (TileStruct w s Identity)) (Rep (TileStruct w s (PtrOf e))),
+    GTileSPMD w m e (Rep (s (TileField w (PtrOf e)))) (Rep (s (SPMD w e)))
+  ) =>
+  LayoutUnitSPMD w m e (AoSoA w s)
+  where
+  readAlignedGangBuf _ al buf tileIdx _ = readAoSoATileWithAlign @w al buf tileIdx
+  writeAlignedGangBuf _ al buf tileIdx _ v = writeAoSoATileWithAlign @w al buf tileIdx v
+
+instance
+  ( SPMDGang w m e,
+    StorageLayout (SOAOA w outer),
+    Generic (outer (SPMD w e)),
+    GSOAOASPMD w m e (Rep (outer Identity)) (Rep (outer (SPMD w e)))
+  ) =>
+  LayoutUnitSPMD w m e (SOAOA w outer)
+  where
+  readAlignedGangBuf _ al (SOAOABuf streamArr) tileIdx _ =
+    readSOAOATileWithAlign @w @m @e @outer al streamArr tileIdx
+  writeAlignedGangBuf _ al (SOAOABuf streamArr) tileIdx _ v =
+    writeSOAOATileWithAlign @w @m @e @outer al streamArr tileIdx v
+
+-- | Strip-mine @[0, len)@ in-place across @Scalar@, @SoA s@, @AoSoA w s@, or @SOAOA w outer@.
+foreachBufSPMD ::
+  forall w a m e.
+  (LayoutUnitSPMD w m e a, CmdAlloc m e) =>
+  Proxy w ->
+  Bool ->
+  Buf a e ->
+  e Int64 ->
+  (SPMD w e Int64 -> Elem (SPMD w e) a -> SPMDM w m e (Elem (SPMD w e) a)) ->
+  m ()
+foreachBufSPMD pw al buf len step = do
+  let wE = fromIntegral (natVal pw) :: e Int64
+      mkIdx base = if al then spmdAlignedUnitStride base else spmdUnitStride base
+  numFull <- letM (ifThenElse (len `gt` 0) (len `quotient` wE) 0)
+  alignedEnd <- letM (numFull * wE)
+  runDrain
+    ( drainForEach $ \g -> do
+        base <- letM (g * wE)
+        let idx = mkIdx base
+        withSPMD pw $ do
+          cur <- readAlignedGangBuf @w @m @e @a pw al buf g idx
+          nxt <- step idx cur
+          writeAlignedGangBuf @w @m @e @a pw al buf g idx nxt
+    )
+    (rangeS 0 numFull)
+  whenM_ (alignedEnd `lt` len) $ do
+    let tailIdx = mkIdx alignedEnd
+    withSPMDMasked (tailIdx `lt` uniform len) $ do
+      cur <- readAlignedGangBuf @w @m @e @a pw al buf numFull tailIdx
+      nxt <- step tailIdx cur
+      writeAlignedGangBuf @w @m @e @a pw al buf numFull tailIdx nxt
+
+-- | Read-only strip-mined SIMD scan over @[0, len)@ across @Scalar@, @SoA s@, @AoSoA w s@, or @SOAOA w outer@.
+traverseBufSPMD_ ::
+  forall w a m e.
+  (LayoutUnitSPMD w m e a, CmdAlloc m e) =>
+  Proxy w ->
+  Bool ->
+  Buf a e ->
+  e Int64 ->
+  (SPMD w e Int64 -> Elem (SPMD w e) a -> SPMDM w m e ()) ->
+  m ()
+traverseBufSPMD_ pw al buf len body = do
+  let wE = fromIntegral (natVal pw) :: e Int64
+      mkIdx base = if al then spmdAlignedUnitStride base else spmdUnitStride base
+  numFull <- letM (ifThenElse (len `gt` 0) (len `quotient` wE) 0)
+  alignedEnd <- letM (numFull * wE)
+  runDrain
+    ( drainForEach $ \g -> do
+        base <- letM (g * wE)
+        let idx = mkIdx base
+        withSPMD pw $ do
+          cur <- readAlignedGangBuf @w @m @e @a pw al buf g idx
+          body idx cur
+    )
+    (rangeS 0 numFull)
+  whenM_ (alignedEnd `lt` len) $ do
+    let tailIdx = mkIdx alignedEnd
+    withSPMDMasked (tailIdx `lt` uniform len) $ do
+      cur <- readAlignedGangBuf @w @m @e @a pw al buf numFull tailIdx
+      body tailIdx cur
+
+-- | Masked-safe SIMD fold over @[0, len)@ across @Scalar@, @SoA s@, @AoSoA w s@, or @SOAOA w outer@.
+foldBufSPMD ::
+  forall w a s m e.
+  (LayoutUnitSPMD w m e a, CmdAlloc m e, SPMDTyped w e s) =>
+  Proxy w ->
+  Bool ->
+  Buf a e ->
+  e Int64 ->
+  SPMD w e s ->
+  (SPMD w e s -> SPMD w e Int64 -> Elem (SPMD w e) a -> SPMDM w m e (SPMD w e s)) ->
+  m (SPMD w e s)
+foldBufSPMD pw al buf len s0 step = do
+  accRef <- withSPMD pw (newRef s0)
+  traverseBufSPMD_ pw al buf len $ \idx val -> do
+    cur <- readRef accRef
+    nxt <- step cur idx val
+    writeRef accRef nxt
+  withSPMD pw (readRef accRef)
+
+-- | Strip-mined in-place SIMD map over @[0, len)@ gated by a per-lane occupancy predicate
+-- (skipping completely empty gangs in O(1) via @mmovemask == 0@!).
+foreachMaskedBufSPMD ::
+  forall w a m e.
+  (LayoutUnitSPMD w m e a, CmdAlloc m e) =>
+  Proxy w ->
+  Bool ->
+  Buf a e ->
+  e Int64 ->
+  (SPMD w e Int64 -> SPMDM w m e (SPMD w e Bool)) ->
+  (SPMD w e Int64 -> Elem (SPMD w e) a -> SPMDM w m e (Elem (SPMD w e) a)) ->
+  m ()
+foreachMaskedBufSPMD pw al buf len isOccupiedM step = do
+  let wE = fromIntegral (natVal pw) :: e Int64
+      mkIdx base = if al then spmdAlignedUnitStride base else spmdUnitStride base
+  numFull <- letM (ifThenElse (len `gt` 0) (len `quotient` wE) 0)
+  alignedEnd <- letM (numFull * wE)
+  runDrain
+    ( drainForEach $ \g -> do
+        base <- letM (g * wE)
+        let idx = mkIdx base
+        withSPMD pw $ do
+          occ <- isOccupiedM idx
+          whenM_ occ $ do
+            cur <- readAlignedGangBuf @w @m @e @a pw al buf g idx
+            nxt <- step idx cur
+            writeAlignedGangBuf @w @m @e @a pw al buf g idx nxt
+    )
+    (rangeS 0 numFull)
+  whenM_ (alignedEnd `lt` len) $ do
+    let tailIdx = mkIdx alignedEnd
+    withSPMDMasked (tailIdx `lt` uniform len) $ do
+      occ <- isOccupiedM tailIdx
+      whenM_ occ $ do
+        cur <- readAlignedGangBuf @w @m @e @a pw al buf numFull tailIdx
+        nxt <- step tailIdx cur
+        writeAlignedGangBuf @w @m @e @a pw al buf numFull tailIdx nxt
+
+-- | Masked-safe SIMD fold over occupied lanes in @[0, len)@.
+foldMaskedBufSPMD ::
+  forall w a s m e.
+  (LayoutUnitSPMD w m e a, CmdAlloc m e, SPMDTyped w e s) =>
+  Proxy w ->
+  Bool ->
+  Buf a e ->
+  e Int64 ->
+  (SPMD w e Int64 -> SPMDM w m e (SPMD w e Bool)) ->
+  SPMD w e s ->
+  (SPMD w e s -> SPMD w e Int64 -> Elem (SPMD w e) a -> SPMDM w m e (SPMD w e s)) ->
+  m (SPMD w e s)
+foldMaskedBufSPMD pw al buf len isOccupiedM s0 step = do
+  let wE = fromIntegral (natVal pw) :: e Int64
+      mkIdx base = if al then spmdAlignedUnitStride base else spmdUnitStride base
+  accRef <- withSPMD pw (newRef s0)
+  numFull <- letM (ifThenElse (len `gt` 0) (len `quotient` wE) 0)
+  alignedEnd <- letM (numFull * wE)
+  runDrain
+    ( drainForEach $ \g -> do
+        base <- letM (g * wE)
+        let idx = mkIdx base
+        withSPMD pw $ do
+          occ <- isOccupiedM idx
+          whenM_ occ $ do
+            val <- readAlignedGangBuf @w @m @e @a pw al buf g idx
+            cur <- readRef accRef
+            nxt <- step cur idx val
+            writeRef accRef nxt
+    )
+    (rangeS 0 numFull)
+  whenM_ (alignedEnd `lt` len) $ do
+    let tailIdx = mkIdx alignedEnd
+    withSPMDMasked (tailIdx `lt` uniform len) $ do
+      occ <- isOccupiedM tailIdx
+      whenM_ occ $ do
+        val <- readAlignedGangBuf @w @m @e @a pw al buf numFull tailIdx
+        cur <- readRef accRef
+        nxt <- step cur tailIdx val
+        writeRef accRef nxt
+  withSPMD pw (readRef accRef)
+
+-- | Strip-mine a contiguous slice @[startOff .. startOff + spanLen)@ in @buf@,
+-- passing @(logicalBase + k)@ as the logical index to @step@.
+foreachSliceBufSPMD ::
+  forall w a m e.
+  (LayoutSliceSPMD w m e a, CmdAlloc m e) =>
+  Proxy w ->
+  Bool ->
+  Buf a e ->
+  e Int64 ->
+  e Int64 ->
+  e Int64 ->
+  (SPMD w e Int64 -> Elem (SPMD w e) a -> SPMDM w m e (Elem (SPMD w e) a)) ->
+  m ()
+foreachSliceBufSPMD pw al buf startOff spanLen logicalBase step =
+  whenM_ (spanLen `gt` 0) $ do
+    let wE = fromIntegral (natVal pw) :: e Int64
+        mkPhys base = if al then spmdAlignedUnitStride base else spmdUnitStride base
+    numFull <- letM (spanLen `quotient` wE)
+    alignedLocalEnd <- letM (numFull * wE)
+    runDrain
+      ( drainForEach $ \g -> do
+          localBase <- letM (g * wE)
+          let physIdx = mkPhys (startOff + localBase)
+              logIdx = spmdUnitStride (logicalBase + localBase)
+          withSPMD pw $ do
+            cur <- readUnitGangBuf @w @m @e @a pw al buf physIdx
+            nxt <- step logIdx cur
+            writeUnitGangBuf @w @m @e @a pw al buf physIdx nxt
+      )
+      (rangeS 0 numFull)
+    whenM_ (alignedLocalEnd `lt` spanLen) $ do
+      let tailLocal = spmdAlignedUnitStride alignedLocalEnd
+          physTail = mkPhys (startOff + alignedLocalEnd)
+          logTail = spmdUnitStride (logicalBase + alignedLocalEnd)
+      withSPMDMasked (tailLocal `lt` uniform spanLen) $ do
+        cur <- readUnitGangBuf @w @m @e @a pw al buf physTail
+        nxt <- step logTail cur
+        writeUnitGangBuf @w @m @e @a pw al buf physTail nxt
+
+traverseSliceBufSPMD_ ::
+  forall w a m e.
+  (LayoutSliceSPMD w m e a, CmdAlloc m e) =>
+  Proxy w ->
+  Bool ->
+  Buf a e ->
+  e Int64 ->
+  e Int64 ->
+  e Int64 ->
+  (SPMD w e Int64 -> Elem (SPMD w e) a -> SPMDM w m e ()) ->
+  m ()
+traverseSliceBufSPMD_ pw al buf startOff spanLen logicalBase body =
+  whenM_ (spanLen `gt` 0) $ do
+    let wE = fromIntegral (natVal pw) :: e Int64
+        mkPhys base = if al then spmdAlignedUnitStride base else spmdUnitStride base
+    numFull <- letM (spanLen `quotient` wE)
+    alignedLocalEnd <- letM (numFull * wE)
+    runDrain
+      ( drainForEach $ \g -> do
+          localBase <- letM (g * wE)
+          let physIdx = mkPhys (startOff + localBase)
+              logIdx = spmdUnitStride (logicalBase + localBase)
+          withSPMD pw $ do
+            cur <- readUnitGangBuf @w @m @e @a pw al buf physIdx
+            body logIdx cur
+      )
+      (rangeS 0 numFull)
+    whenM_ (alignedLocalEnd `lt` spanLen) $ do
+      let tailLocal = spmdAlignedUnitStride alignedLocalEnd
+          physTail = mkPhys (startOff + alignedLocalEnd)
+          logTail = spmdUnitStride (logicalBase + alignedLocalEnd)
+      withSPMDMasked (tailLocal `lt` uniform spanLen) $ do
+        cur <- readUnitGangBuf @w @m @e @a pw al buf physTail
+        body logTail cur
+
+foldSliceBufSPMD ::
+  forall w a s m e.
+  (LayoutSliceSPMD w m e a, CmdAlloc m e, SPMDTyped w e s) =>
+  Proxy w ->
+  Bool ->
+  Buf a e ->
+  e Int64 ->
+  e Int64 ->
+  e Int64 ->
+  SPMD w e s ->
+  (SPMD w e s -> SPMD w e Int64 -> Elem (SPMD w e) a -> SPMDM w m e (SPMD w e s)) ->
+  m (SPMD w e s)
+foldSliceBufSPMD pw al buf startOff spanLen logicalBase s0 step = do
+  accRef <- withSPMD pw (newRef s0)
+  traverseSliceBufSPMD_ pw al buf startOff spanLen logicalBase $ \logIdx val -> do
+    cur <- readRef accRef
+    nxt <- step cur logIdx val
+    writeRef accRef nxt
+  withSPMD pw (readRef accRef)

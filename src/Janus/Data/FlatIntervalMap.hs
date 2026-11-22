@@ -36,6 +36,12 @@ module Janus.Data.FlatIntervalMap
     countOverlapping,
     anyOverlapping,
     toStream,
+
+    -- * First-Class SPMD / SIMD Value Kernels & Overlap Counting
+    foreachValuesSPMD,
+    foldValuesSPMD,
+    spmdCountOverlapping,
+    spmdCountStabbed,
   )
 where
 
@@ -48,6 +54,7 @@ import Data.Typeable (Typeable)
 import Data.Word (Word64)
 import Foreign.Ptr (Ptr)
 import GHC.Generics (Generic)
+import GHC.TypeNats (natVal)
 import Janus.Alloc.Policy
   ( Alloc,
     allocStruct,
@@ -90,7 +97,18 @@ import Janus.Expression.Bool (ExpBool (..))
 import Janus.Expression.Cast (ExpIntegralCast (..))
 import Janus.Expression.Cond (ExpCond (..))
 import Janus.Expression.Eq (ExpEq (..))
+import Janus.Expression.Integral (ExpIntegral (..))
 import Janus.Expression.Ord (ExpOrd (..))
+import Janus.SPMD
+  ( SPMD,
+    SPMDM,
+    SPMDTyped,
+    gangReduceAdd,
+    spmdAlignedUnitStride,
+    uniform,
+    withSPMD,
+    withSPMDMasked,
+  )
 import Janus.Typed (JanusTyped)
 
 -- | Spine struct for pointer-free implicit augmented interval map ('FlatIntervalMap').
@@ -510,6 +528,106 @@ toStream (FlatIntervalMap hdr) =
               (rangeS 0 n)
               (\i -> (,,) <$> readBuf loBuf i <*> readBuf hiBuf i <*> readBuf valsBuf i)
         )
+
+--------------------------------------------------------------------------------
+-- First-Class SPMD / SIMD Value Kernels & Overlap Counting
+--------------------------------------------------------------------------------
+
+-- | Strip-mine all @size@ stored interval values in-place in sorted @(lo, hi)@ order
+-- at SIMD gang width @w@.
+foreachValuesSPMD ::
+  forall w k v m e.
+  (FlatIntervalMapCtx m e k v, LayoutUnitSPMD w m e v) =>
+  Proxy w ->
+  FlatIntervalMap e k v ->
+  (SPMD w e Int64 -> Elem (SPMD w e) v -> SPMDM w m e (Elem (SPMD w e) v)) ->
+  m ()
+foreachValuesSPMD pw (FlatIntervalMap hdr) step = do
+  let fields = projectPtrs hdr
+  n <- peek (getPtrOf (fimsLen fields))
+  valsBuf <- peekBufStruct (getPtrOf (fimsVals fields))
+  foreachBufSPMD pw True valsBuf n step
+
+-- | Masked-safe SIMD fold over all @size@ stored interval values in sorted @(lo, hi)@ order.
+foldValuesSPMD ::
+  forall w k v s m e.
+  (FlatIntervalMapCtx m e k v, LayoutUnitSPMD w m e v, SPMDTyped w e s) =>
+  Proxy w ->
+  FlatIntervalMap e k v ->
+  SPMD w e s ->
+  (SPMD w e s -> SPMD w e Int64 -> Elem (SPMD w e) v -> SPMDM w m e (SPMD w e s)) ->
+  m (SPMD w e s)
+foldValuesSPMD pw (FlatIntervalMap hdr) s0 step = do
+  let fields = projectPtrs hdr
+  n <- peek (getPtrOf (fimsLen fields))
+  valsBuf <- peekBufStruct (getPtrOf (fimsVals fields))
+  foldBufSPMD pw True valsBuf n s0 step
+
+-- | Branch-free 64B-aligned SIMD strip-mined overlap count over @[0, size)@ for a broadcast
+-- query interval @[qLoGang, qHiGang]@ (e.g. @uniform qLo@ and @uniform qHi@ for scalars).
+spmdCountOverlapping ::
+  forall w k v m e.
+  ( FlatIntervalMapCtx m e k v,
+    LayoutUnitSPMD w m e k,
+    OrdKey (SPMD w e) k
+  ) =>
+  Proxy w ->
+  FlatIntervalMap e k v ->
+  Elem (SPMD w e) k ->
+  Elem (SPMD w e) k ->
+  m (e Int64)
+spmdCountOverlapping pw (FlatIntervalMap hdr) qLoGang qHiGang = do
+  let fields = projectPtrs hdr
+      wE = fromIntegral (natVal pw) :: e Int64
+      validQuery = lnot (ltKey @(SPMD w e) @k qHiGang qLoGang)
+  n <- peek (getPtrOf (fimsLen fields))
+  loBuf <- peekBufStruct (getPtrOf (fimsLo fields))
+  hiBuf <- peekBufStruct (getPtrOf (fimsHi fields))
+  accRef <- withSPMD pw (newRef (0 :: SPMD w e Int64))
+  numFull <- letM (ifThenElse (n `gt` 0) (n `quotient` wE) 0)
+  alignedEnd <- letM (numFull * wE)
+  runDrain
+    ( drainForEach $ \g -> do
+        base <- letM (g * wE)
+        let idx = spmdAlignedUnitStride base
+        withSPMD pw $ do
+          sGang <- readAlignedGangBuf @w @m @e @k pw True loBuf g idx
+          eGang <- readAlignedGangBuf @w @m @e @k pw True hiBuf g idx
+          let hit =
+                validQuery
+                  `land` lnot (ltKey @(SPMD w e) @k eGang qLoGang)
+                  `land` lnot (ltKey @(SPMD w e) @k qHiGang sGang)
+          cur <- readRef accRef
+          writeRef accRef (cur + ifThenElse hit 1 0)
+    )
+    (rangeS 0 numFull)
+  whenM_ (alignedEnd `lt` n) $ do
+    let tailIdx = spmdAlignedUnitStride alignedEnd
+    withSPMDMasked (tailIdx `lt` uniform n) $ do
+      sGang <- readAlignedGangBuf @w @m @e @k pw True loBuf numFull tailIdx
+      eGang <- readAlignedGangBuf @w @m @e @k pw True hiBuf numFull tailIdx
+      let hit =
+            validQuery
+              `land` lnot (ltKey @(SPMD w e) @k eGang qLoGang)
+              `land` lnot (ltKey @(SPMD w e) @k qHiGang sGang)
+      cur <- readRef accRef
+      writeRef accRef (cur + ifThenElse hit 1 0)
+  acc <- withSPMD pw (readRef accRef)
+  pure (gangReduceAdd acc)
+
+-- | Branch-free 64B-aligned SIMD strip-mined point-stabbing count (@lo <= pt <= hi@)
+-- across @[0, size)@.
+spmdCountStabbed ::
+  forall w k v m e.
+  ( FlatIntervalMapCtx m e k v,
+    LayoutUnitSPMD w m e k,
+    OrdKey (SPMD w e) k
+  ) =>
+  Proxy w ->
+  FlatIntervalMap e k v ->
+  Elem (SPMD w e) k ->
+  m (e Int64)
+spmdCountStabbed pw fim ptGang = spmdCountOverlapping pw fim ptGang ptGang
 
 --------------------------------------------------------------------------------
 -- Host <-> C FFI Marshalling Instances

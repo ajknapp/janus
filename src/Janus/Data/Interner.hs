@@ -49,6 +49,11 @@ module Janus.Data.Interner
     symbolsS,
     entriesS,
     drainAppendInterner,
+
+    -- * First-Class SPMD / SIMD Symbol Metadata Gathers & Folds
+    symbolLengthsSPMD,
+    symbolHashesSPMD,
+    foldSymbolLengthsSPMD,
   )
 where
 
@@ -98,6 +103,7 @@ import Janus.Control.Stream
   )
 import Janus.Data.HKD
 import Janus.Data.HashMap (probeGroupsS, swarBitsS)
+import Janus.Data.Layout (ScalarBuf (..), foldBufSPMD)
 import Janus.Expression.Bits (ExpBits (..))
 import Janus.Expression.Bool (ExpBool (..))
 import Janus.Expression.Cast (ExpIntegralCast (..), ExpPtrCast (..))
@@ -105,6 +111,16 @@ import Janus.Expression.Cond (ExpCond (..))
 import Janus.Expression.Eq (ExpEq (..))
 import Janus.Expression.MurmurHash (CmdHashBytes, defaultHashSalt, hashBytesWithSalt)
 import Janus.Expression.Ord (ExpOrd (..))
+import Janus.SPMD
+  ( SPMD,
+    SPMDGang,
+    SPMDM,
+    SPMDTyped,
+    liftSPMD,
+    uniform,
+    uniformAlignedPtr,
+    withSPMD,
+  )
 import Janus.Typed (JanusTyped)
 
 --------------------------------------------------------------------------------
@@ -784,6 +800,65 @@ drainAppendInterner ::
   Drain m (e (Ptr Word8), e Int64) ()
 drainAppendInterner alloc intr =
   drainForEach (\(p, l) -> internBytes alloc intr p l >> pure ())
+
+--------------------------------------------------------------------------------
+-- First-Class SPMD / SIMD Symbol Metadata Gathers & Folds
+--------------------------------------------------------------------------------
+
+-- | Bounds-masked O(1) SIMD gather of interned byte lengths for @w@ 'Symbol' IDs
+-- (returning @0@ for out-of-bounds symbol indices).
+symbolLengthsSPMD ::
+  forall w m e.
+  (InternerCtx m e, SPMDGang w m e) =>
+  Interner e ->
+  SPMD w e Word32 ->
+  SPMDM w m e (SPMD w e Int64)
+symbolLengthsSPMD (Interner hdr) syms = do
+  let f = projectPtrs hdr
+      idx64 = toIntegral syms :: SPMD w e Int64
+  cnt <- liftSPMD (peek (getPtrOf (insCount f)))
+  outRef <- newRef (0 :: SPMD w e Int64)
+  whenM_ ((idx64 `ge` 0) `land` (idx64 `lt` uniform cnt)) $ do
+    lens <- liftSPMD (peek (getPtrOf (insLens f)))
+    peekElemOff (uniformAlignedPtr lens) idx64 >>= writeRef outRef
+  readRef outRef
+
+-- | Bounds-masked O(1) SIMD gather of precomputed 64-bit hashes for @w@ 'Symbol' IDs
+-- (returning @0@ for out-of-bounds symbol indices).
+symbolHashesSPMD ::
+  forall w m e.
+  (InternerCtx m e, SPMDGang w m e) =>
+  Interner e ->
+  SPMD w e Word32 ->
+  SPMDM w m e (SPMD w e Word64)
+symbolHashesSPMD (Interner hdr) syms = do
+  let f = projectPtrs hdr
+      idx64 = toIntegral syms :: SPMD w e Int64
+  cnt <- liftSPMD (peek (getPtrOf (insCount f)))
+  outRef <- newRef (0 :: SPMD w e Word64)
+  whenM_ ((idx64 `ge` 0) `land` (idx64 `lt` uniform cnt)) $ do
+    hashes <- liftSPMD (peek (getPtrOf (insHashes f)))
+    peekElemOff (uniformAlignedPtr hashes) idx64 >>= writeRef outRef
+  readRef outRef
+
+-- | Masked-safe 64B-aligned SIMD fold over all @count@ interned symbol byte lengths.
+foldSymbolLengthsSPMD ::
+  forall w s m e.
+  (InternerCtx m e, SPMDGang w m e, SPMDTyped w e s) =>
+  Proxy w ->
+  Interner e ->
+  SPMD w e s ->
+  (SPMD w e s -> SPMD w e Int64 -> SPMD w e Int64 -> SPMDM w m e (SPMD w e s)) ->
+  m (SPMD w e s)
+foldSymbolLengthsSPMD pw (Interner hdr) s0 step = do
+  let f = projectPtrs hdr
+  cnt <- peek (getPtrOf (insCount f))
+  accRef <- withSPMD pw (newRef s0)
+  whenM_ (cnt `gt` 0) $ do
+    lens <- peek (getPtrOf (insLens f))
+    res <- foldBufSPMD pw True (ScalarBuf lens) cnt s0 step
+    withSPMD pw (writeRef accRef res)
+  withSPMD pw (readRef accRef)
 
 --------------------------------------------------------------------------------
 -- Host <-> C FFI Marshalling Instances

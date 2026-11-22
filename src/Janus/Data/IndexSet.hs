@@ -46,9 +46,12 @@ module Janus.Data.IndexSet
     -- * In-Place Zero-Allocation Sorting
     sort,
 
-    -- * Unit-Stride Dense Streams, Set-Algebra Operations, & Drains
+    -- * Unit-Stride Dense Streams, SPMD Kernels, Set-Algebra Operations, & Drains
     stream,
     reverseStream,
+    traverseSPMD_,
+    foldSPMD,
+    memberBatchSPMD,
     intersectionS,
     differenceS,
     unionInto,
@@ -88,7 +91,7 @@ import Janus.Command.Memory
     janusSIMDAlignment,
   )
 import Janus.Command.Ref (letM, newRef, readRef, writeRef)
-import Janus.Control.Drain (Drain (..), drainAll, drainFind, drainFirst, drainForEach, runDrain)
+import Janus.Control.Drain (Drain (..), drainAll, drainFind, drainFirst, drainForEach, drain_, runDrain)
 import Janus.Control.Stream
   ( Stream,
     filterMapS,
@@ -96,6 +99,7 @@ import Janus.Control.Stream
     rangeS,
     reverseRangeS,
     streamM,
+    unfoldWhileM,
     withStreamSetup,
   )
 import Janus.Data.FlatMap (OrdKey (..))
@@ -110,6 +114,15 @@ import Janus.Expression.Cond (ExpCond (..))
 import Janus.Expression.Eq (ExpEq (..))
 import Janus.Expression.MurmurHash (defaultHashSalt)
 import Janus.Expression.Ord (ExpOrd (..))
+import Janus.SPMD
+  ( SPMD,
+    SPMDGang,
+    SPMDM,
+    SPMDTyped,
+    liftSPMD,
+    uniform,
+    uniformAlignedPtr,
+  )
 import Janus.Typed (JanusTyped)
 
 --------------------------------------------------------------------------------
@@ -711,6 +724,83 @@ reverseStream (IndexSet hdr) =
    in withStreamSetup
         ((,) <$> peek (getPtrOf (issDenseLen f)) <*> peekBufStruct (getPtrOf (issKeys f)))
         (\(n, kb) -> streamM (reverseRangeS 0 n) (readBuf kb))
+
+-- | Layout-polymorphic read-only unit-stride SIMD traversal over contiguous insertion-ordered keys @[0, size)@.
+traverseSPMD_ ::
+  forall w k m e.
+  (IndexSetCtx m e k, LayoutUnitSPMD w m e k) =>
+  Proxy w ->
+  IndexSet e k ->
+  (SPMD w e Int64 -> Elem (SPMD w e) k -> SPMDM w m e ()) ->
+  m ()
+traverseSPMD_ pw (IndexSet hdr) body = do
+  let f = projectPtrs hdr
+  n <- peek (getPtrOf (issDenseLen f))
+  kb <- peekBufStruct (getPtrOf (issKeys f))
+  traverseBufSPMD_ pw True kb n body
+
+-- | Layout-polymorphic masked-safe unit-stride SIMD fold over contiguous insertion-ordered keys @[0, size)@.
+foldSPMD ::
+  forall w k s m e.
+  (IndexSetCtx m e k, LayoutUnitSPMD w m e k, SPMDTyped w e s) =>
+  Proxy w ->
+  IndexSet e k ->
+  SPMD w e s ->
+  (SPMD w e s -> SPMD w e Int64 -> Elem (SPMD w e) k -> SPMDM w m e (SPMD w e s)) ->
+  m (SPMD w e s)
+foldSPMD pw (IndexSet hdr) s0 step = do
+  let f = projectPtrs hdr
+  n <- peek (getPtrOf (issDenseLen f))
+  kb <- peekBufStruct (getPtrOf (issKeys f))
+  foldBufSPMD pw True kb n s0 step
+
+-- | Lane-parallel SIMD batch membership query probing @w@ keys simultaneously.
+memberBatchSPMD ::
+  forall w k m e.
+  (IndexSetCtx m e k, SPMDGang w m e, HashKey (SPMD w e) k, LayoutGatherSPMD w m e k) =>
+  Proxy w ->
+  IndexSet e k ->
+  Elem (SPMD w e) k ->
+  SPMDM w m e (SPMD w e Bool)
+memberBatchSPMD _ (IndexSet hdr) qKeys = do
+  let f = projectPtrs hdr
+  sCap <- liftSPMD (peek (getPtrOf (issSparseCap f)))
+  foundRef <- newRef false
+  whenM_ (uniform sCap `gt` 0) $ do
+    ctrl <- liftSPMD (peek (getPtrOf (issCtrl f)))
+    sparse <- liftSPMD (peek (getPtrOf (issSparse f)))
+    kb <- liftSPMD (peekBufStruct (getPtrOf (issKeys f)))
+    seed <- liftSPMD (peek (getPtrOf (issSeed f)))
+    let ctrlWords = fromVoidPtr (toVoidPtr ctrl) :: e (Ptr Word64)
+        groupMask = (sCap `rshift` 3) - 1
+    h <- letM (hashElemWithSalt @(SPMD w e) @k (uniform seed) qKeys)
+    let h2w64 = (h `rshift` 57) `iand` 0x7F
+        splat = h2w64 * 0x0101010101010101
+        g0 = (toIntegral (h `iand` 0x7FFFFFFFFFFFFFFF) :: SPMD w e Int64) `iand` uniform groupMask
+    runDrain drain_ $
+      unfoldWhileM (g0, 0 :: SPMD w e Int64, true) (\(_, _, act) -> pure act) $ \(g, st, _) -> do
+        cw <- peekElemOff (uniformAlignedPtr ctrlWords) g
+        let x = cw `ieor` splat
+            low7 = x `iand` 0x7F7F7F7F7F7F7F7F
+            hasZeroLow7 = inot (low7 + 0x7F7F7F7F7F7F7F7F)
+            matchMask0 = hasZeroLow7 `iand` inot x `iand` 0x8080808080808080
+            empMask = cw `iand` inot (cw `lshift` 6) `iand` 0x8080808080808080
+        runDrain drain_ $
+          unfoldWhileM matchMask0 (\curM -> pure (curM `ne` 0)) $ \curM -> do
+            let lsb = (curM `iand` (0 - curM)) `rshift` 7
+                byteIdx = toIntegral (((lsb * 0x0001020304050607) `rshift` 56) `iand` 0x7) :: SPMD w e Int64
+                sl = (g `lshift` 3) + byteIdx
+            dIdx <- peekElemOff (uniformAlignedPtr sparse) sl
+            ck <- gatherBufSPMD kb dIdx
+            let hit = eqElem @(SPMD w e) @k ck qKeys
+            whenM_ hit (writeRef foundRef true)
+            pure (ifThenElse hit 0 (curM `iand` (curM - 1)), ())
+        fnd <- readRef foundRef
+        let actNext = lnot fnd `land` (empMask `eq` 0)
+            stNext = st + 1
+            gNext = (g + stNext) `iand` uniform groupMask
+        pure ((gNext, stNext, actNext), ())
+  readRef foundRef
 
 isSubsetOf ::
   (IndexSetCtx m e k) =>

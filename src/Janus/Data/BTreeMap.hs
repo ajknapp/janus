@@ -50,11 +50,13 @@ module Janus.Data.BTreeMap
     member,
     delete,
 
-    -- * Zero-Stack Doubly-Linked Leaf Streams & Drains
+    -- * Zero-Stack Doubly-Linked Leaf Streams, SPMD Kernels, & Drains
     toStream,
     reverseStream,
     keysS,
     valuesS,
+    foreachValuesSPMD,
+    foldValuesSPMD,
     rangeStream,
     unionWithS,
     intersectWithS,
@@ -110,6 +112,13 @@ import Janus.Expression.Cast (ExpPtrCast (..))
 import Janus.Expression.Cond (ExpCond (..))
 import Janus.Expression.Eq (ExpEq (..))
 import Janus.Expression.Ord (ExpOrd (..))
+import Janus.SPMD
+  ( SPMD,
+    SPMDM,
+    SPMDTyped,
+    uniform,
+    withSPMD,
+  )
 import Janus.Typed (JanusTyped)
 import Prelude hiding (lookup)
 
@@ -1405,6 +1414,56 @@ keysS bm = fst <$> toStream bm
 
 valuesS :: (BTreeMapCtx m e k v) => BTreeMap e k v -> Stream m (Elem e v)
 valuesS bm = snd <$> toStream bm
+
+-- | Leaf-by-leaf unit-stride in-place SIMD map over sorted values across the doubly-linked leaf chain,
+-- passing the running 0-based global sorted index @(globalOffset + localIdx)@ to @step@.
+foreachValuesSPMD ::
+  forall w k v m e.
+  (BTreeMapCtx m e k v, LayoutUnitSPMD w m e v) =>
+  Proxy w ->
+  BTreeMap e k v ->
+  (SPMD w e Int64 -> Elem (SPMD w e) v -> SPMDM w m e (Elem (SPMD w e) v)) ->
+  m ()
+foreachValuesSPMD pw (BTreeMap hdr) step = do
+  firstRaw <- peek (getPtrOf (btmsFirstLeaf (projectPtrs hdr)))
+  runDrain drain_ $
+    unfoldWhileM (firstRaw, 0 :: e Int64) (\(curL, _) -> pure (ptrToWord64Expr curL `ne` 0)) $
+      \(curL, globalOff) -> do
+        let pLeaf = asLeaf @k @v curL
+            lf = projectPtrs pLeaf
+        leafLen <- peek (getPtrOf (btlNumKeys lf))
+        nxtL <- peek (getPtrOf (btlNextLeaf lf))
+        vb <- inlineAsBuf (Proxy @BTreeMaxKeys) (getPtrOf (btlVals lf))
+        foreachBufSPMD pw False vb leafLen (\localIdx val -> step (uniform globalOff + localIdx) val)
+        pure ((nxtL, globalOff + leafLen), ())
+
+-- | Leaf-by-leaf masked-safe unit-stride SIMD fold over sorted values across the doubly-linked leaf chain,
+-- passing the running 0-based global sorted index @(globalOffset + localIdx)@ to @step@.
+foldValuesSPMD ::
+  forall w k v s m e.
+  (BTreeMapCtx m e k v, LayoutUnitSPMD w m e v, SPMDTyped w e s) =>
+  Proxy w ->
+  BTreeMap e k v ->
+  SPMD w e s ->
+  (SPMD w e s -> SPMD w e Int64 -> Elem (SPMD w e) v -> SPMDM w m e (SPMD w e s)) ->
+  m (SPMD w e s)
+foldValuesSPMD pw (BTreeMap hdr) s0 step = do
+  firstRaw <- peek (getPtrOf (btmsFirstLeaf (projectPtrs hdr)))
+  accRef <- withSPMD pw (newRef s0)
+  runDrain drain_ $
+    unfoldWhileM (firstRaw, 0 :: e Int64) (\(curL, _) -> pure (ptrToWord64Expr curL `ne` 0)) $
+      \(curL, globalOff) -> do
+        let pLeaf = asLeaf @k @v curL
+            lf = projectPtrs pLeaf
+        leafLen <- peek (getPtrOf (btlNumKeys lf))
+        nxtL <- peek (getPtrOf (btlNextLeaf lf))
+        vb <- inlineAsBuf (Proxy @BTreeMaxKeys) (getPtrOf (btlVals lf))
+        traverseBufSPMD_ pw False vb leafLen $ \localIdx val -> do
+          curAcc <- readRef accRef
+          nxtAcc <- step curAcc (uniform globalOff + localIdx) val
+          writeRef accRef nxtAcc
+        pure ((nxtL, globalOff + leafLen), ())
+  withSPMD pw (readRef accRef)
 
 -- | O(log N + K) range 'Stream' over @[lo, hi]@ (inclusive): descends once to the @lo@ leaf,
 -- then walks @nextLeaf@ links sequentially until @key > hi@!

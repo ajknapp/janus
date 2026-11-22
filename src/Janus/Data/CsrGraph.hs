@@ -36,6 +36,13 @@ module Janus.Data.CsrGraph
     -- * Graph Algorithms & Sparse Linear Algebra
     bfsDistances,
     csrSpMV,
+
+    -- * First-Class SPMD / SIMD Edge Kernels, Queries, & SpMV
+    foreachEdgeValuesSPMD,
+    foldEdgeValuesSPMD,
+    outDegreeSPMD,
+    spmdCsrSpMV,
+    spmdCsrSpMVVec,
   )
 where
 
@@ -71,6 +78,18 @@ import Janus.Expression.Bool (ExpBool (..))
 import Janus.Expression.Cast (ExpPtrCast (..))
 import Janus.Expression.Cond (ExpCond (..))
 import Janus.Expression.Ord (ExpOrd (..))
+import Janus.SPMD
+  ( SPMD,
+    SPMDGang,
+    SPMDLayout,
+    SPMDM,
+    SPMDReduceByLayout,
+    SPMDTyped,
+    gangReduceAdd,
+    liftSPMD,
+    uniform,
+    uniformAlignedPtr,
+  )
 import Janus.Typed (JanusTyped)
 
 -- | Spine struct for pointer-free Compressed Sparse Row ('CsrGraph') directed weighted graph:
@@ -409,6 +428,165 @@ csrSpMV (CsrGraph hdr) xPtr yPtr = do
                 pure (w * xv)
             )
         pokeElemOff yPtr acc u
+    )
+    (rangeS 0 nv)
+
+--------------------------------------------------------------------------------
+-- First-Class SPMD / SIMD Edge Kernels, Queries, & SpMV
+--------------------------------------------------------------------------------
+
+-- | Strip-mine all @numEdges@ contiguous edge weights in-place at SIMD gang width @w@.
+foreachEdgeValuesSPMD ::
+  forall w v m e.
+  (CsrGraphCtx m e v, LayoutUnitSPMD w m e v) =>
+  Proxy w ->
+  CsrGraph e v ->
+  (SPMD w e Int64 -> Elem (SPMD w e) v -> SPMDM w m e (Elem (SPMD w e) v)) ->
+  m ()
+foreachEdgeValuesSPMD pw (CsrGraph hdr) step = do
+  let fields = projectPtrs hdr
+  ne <- peek (getPtrOf (cgsNumEdges fields))
+  wb <- peekBufStruct (getPtrOf (cgsWeights fields))
+  foreachBufSPMD pw True wb ne step
+
+-- | Masked-safe SIMD fold over all @numEdges@ contiguous edge weights at gang width @w@.
+foldEdgeValuesSPMD ::
+  forall w v s m e.
+  (CsrGraphCtx m e v, LayoutUnitSPMD w m e v, SPMDTyped w e s) =>
+  Proxy w ->
+  CsrGraph e v ->
+  SPMD w e s ->
+  (SPMD w e s -> SPMD w e Int64 -> Elem (SPMD w e) v -> SPMDM w m e (SPMD w e s)) ->
+  m (SPMD w e s)
+foldEdgeValuesSPMD pw (CsrGraph hdr) s0 step = do
+  let fields = projectPtrs hdr
+  ne <- peek (getPtrOf (cgsNumEdges fields))
+  wb <- peekBufStruct (getPtrOf (cgsWeights fields))
+  foldBufSPMD pw True wb ne s0 step
+
+-- | Bounds-masked O(1) SIMD gather of vertex out-degrees @rowOffsets[u + 1] - rowOffsets[u]@
+-- across @w@ lanes (returning @0@ for out-of-bounds vertex indices).
+outDegreeSPMD ::
+  forall w v m e.
+  (CsrGraphCtx m e v, SPMDGang w m e) =>
+  CsrGraph e v ->
+  SPMD w e Int64 ->
+  SPMDM w m e (SPMD w e Int64)
+outDegreeSPMD (CsrGraph hdr) u = do
+  let fields = projectPtrs hdr
+  nv <- liftSPMD (peek (getPtrOf (cgsNumVerts fields)))
+  degRef <- newRef (0 :: SPMD w e Int64)
+  let valid = (u `ge` 0) `land` (u `lt` uniform nv)
+  whenM_ valid $ do
+    ro <- liftSPMD (peek (getPtrOf (cgsRowOffsets fields)))
+    let spRo = uniformAlignedPtr ro
+    sOff <- peekElemOff spRo u
+    eOff <- peekElemOff spRo (u + 1)
+    writeRef degRef (eOff - sOff)
+  readRef degRef
+
+-- | SIMD strip-mined sparse matrix-vector product @y[u] = sum_{(u, v, w)} w * x[v]@
+-- over @[0, numVertices)@, matching 'csrSpMV''s pointer interface.
+spmdCsrSpMV ::
+  forall w s m e.
+  ( CsrGraphCtx m e s,
+    Buf s ~ ScalarBuf s,
+    LayoutSliceSPMD w m e s,
+    LayoutGatherSPMD w m e s,
+    Elem e s ~ e s,
+    Elem (SPMD w e) s ~ SPMD w e s,
+    JanusTyped e s,
+    SPMDTyped w e s,
+    SPMDReduceByLayout (SPMDLayout w s) w e s,
+    Num (e s),
+    Num (SPMD w e s)
+  ) =>
+  Proxy w ->
+  CsrGraph e s ->
+  e (Ptr s) ->
+  e (Ptr s) ->
+  m ()
+spmdCsrSpMV pw (CsrGraph hdr) xPtr yPtr = do
+  let fields = projectPtrs hdr
+      xBuf = ScalarBuf xPtr :: Buf s e
+      yBuf = ScalarBuf yPtr :: Buf s e
+  nv <- peek (getPtrOf (cgsNumVerts fields))
+  ro <- peek (getPtrOf (cgsRowOffsets fields))
+  ct <- peek (getPtrOf (cgsColTargets fields))
+  wb <- peekBufStruct (getPtrOf (cgsWeights fields))
+  let spColIdx = uniformAlignedPtr ct
+  runDrain
+    ( drainForEach $ \u -> do
+        rowStart <- peekElemOff ro u
+        rowEnd <- peekElemOff ro (u + 1)
+        let rowLen = rowEnd - rowStart
+        rowAcc <-
+          foldSliceBufSPMD
+            pw
+            False
+            wb
+            rowStart
+            rowLen
+            rowStart
+            (0 :: SPMD w e s)
+            ( \acc edgeIdx wVal -> do
+                col <- peekElemOff spColIdx edgeIdx
+                xv <- gatherBufSPMD xBuf col
+                pure (acc + wVal * xv)
+            )
+        writeBuf yBuf u (gangReduceAdd rowAcc)
+    )
+    (rangeS 0 nv)
+
+-- | 'DynVec'-backed variant of 'spmdCsrSpMV' writing @y[u] = sum_{(u, v, w)} w * x[v]@
+-- over @[0, numVertices)@.
+spmdCsrSpMVVec ::
+  forall w s m e.
+  ( CsrGraphCtx m e s,
+    LayoutSliceSPMD w m e s,
+    LayoutGatherSPMD w m e s,
+    Elem e s ~ e s,
+    Elem (SPMD w e) s ~ SPMD w e s,
+    JanusTyped e s,
+    SPMDTyped w e s,
+    SPMDReduceByLayout (SPMDLayout w s) w e s,
+    Num (e s),
+    Num (SPMD w e s)
+  ) =>
+  Proxy w ->
+  CsrGraph e s ->
+  DynVec e s ->
+  DynVec e s ->
+  m ()
+spmdCsrSpMVVec pw (CsrGraph hdr) xVec yVec = do
+  let fields = projectPtrs hdr
+  nv <- peek (getPtrOf (cgsNumVerts fields))
+  ro <- peek (getPtrOf (cgsRowOffsets fields))
+  ct <- peek (getPtrOf (cgsColTargets fields))
+  wb <- peekBufStruct (getPtrOf (cgsWeights fields))
+  xBuf <- DV.buf xVec
+  yBuf <- DV.buf yVec
+  let spColIdx = uniformAlignedPtr ct
+  runDrain
+    ( drainForEach $ \u -> do
+        rowStart <- peekElemOff ro u
+        rowEnd <- peekElemOff ro (u + 1)
+        let rowLen = rowEnd - rowStart
+        rowAcc <-
+          foldSliceBufSPMD
+            pw
+            False
+            wb
+            rowStart
+            rowLen
+            rowStart
+            (0 :: SPMD w e s)
+            ( \acc edgeIdx wVal -> do
+                col <- peekElemOff spColIdx edgeIdx
+                xv <- gatherBufSPMD xBuf col
+                pure (acc + wVal * xv)
+            )
+        writeBuf yBuf u (gangReduceAdd rowAcc)
     )
     (rangeS 0 nv)
 

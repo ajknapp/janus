@@ -46,6 +46,11 @@ module Janus.Data.SparseSet
     drainToSparseSet,
     fromStream,
     drainAppendSparseSet,
+
+    -- * First-Class SPMD / SIMD Dense Scans & Briggs-Torczon Gather Membership
+    traverseDenseSPMD_,
+    foldDenseSPMD,
+    memberSPMD,
   )
 where
 
@@ -72,10 +77,20 @@ import Janus.Command.Ref (newRef, readRef, writeRef)
 import Janus.Control.Drain (Drain (..), drainFind, drainForEach, runDrain)
 import Janus.Control.Stream (Stream, filterMapS, iterateS, rangeS, reverseRangeS, streamM, withStreamSetup)
 import Janus.Data.HKD
+import Janus.Data.Layout (ScalarBuf (..), foldBufSPMD, traverseBufSPMD_)
 import Janus.Expression.Bool (ExpBool (..))
 import Janus.Expression.Cond (ExpCond (..))
 import Janus.Expression.Eq (ExpEq (..))
 import Janus.Expression.Ord (ExpOrd (..))
+import Janus.SPMD
+  ( SPMD,
+    SPMDGang,
+    SPMDM,
+    SPMDTyped,
+    liftSPMD,
+    uniform,
+    uniformAlignedPtr,
+  )
 import Janus.Typed (JanusTyped)
 
 -- | Spine struct for Briggs-Torczon 'SparseSet'.
@@ -359,6 +374,61 @@ drainAppendSparseSet ::
   SparseSet e ->
   Drain m (e Int64) ()
 drainAppendSparseSet alloc ss = drainForEach (\x -> insert alloc ss x >> pure ())
+
+--------------------------------------------------------------------------------
+-- First-Class SPMD / SIMD Dense Scans & Briggs-Torczon Gather Membership
+--------------------------------------------------------------------------------
+
+-- | Read-only 64B-aligned SIMD scan over @spsDense[0 .. size - 1]@ at gang width @w@.
+traverseDenseSPMD_ ::
+  forall w m e.
+  (SparseSetCtx m e, SPMDGang w m e) =>
+  Proxy w ->
+  SparseSet e ->
+  (SPMD w e Int64 -> SPMD w e Int64 -> SPMDM w m e ()) ->
+  m ()
+traverseDenseSPMD_ pw (SparseSet hdr) body = do
+  let f = projectPtrs hdr
+  curLen <- peek (getPtrOf (spsLen f))
+  dn <- peek (getPtrOf (spsDense f))
+  traverseBufSPMD_ pw True (ScalarBuf dn) curLen body
+
+-- | Masked-safe 64B-aligned SIMD fold over @spsDense[0 .. size - 1]@ at gang width @w@.
+foldDenseSPMD ::
+  forall w s m e.
+  (SparseSetCtx m e, SPMDGang w m e, SPMDTyped w e s) =>
+  Proxy w ->
+  SparseSet e ->
+  SPMD w e s ->
+  (SPMD w e s -> SPMD w e Int64 -> SPMD w e Int64 -> SPMDM w m e (SPMD w e s)) ->
+  m (SPMD w e s)
+foldDenseSPMD pw (SparseSet hdr) s0 step = do
+  let f = projectPtrs hdr
+  curLen <- peek (getPtrOf (spsLen f))
+  dn <- peek (getPtrOf (spsDense f))
+  foldBufSPMD pw True (ScalarBuf dn) curLen s0 step
+
+-- | Lane-parallel Briggs-Torczon O(1) membership test across @w@ SIMD lanes
+-- (uninitialized-memory-safe and bounds-masked).
+memberSPMD ::
+  forall w m e.
+  (SparseSetCtx m e, SPMDGang w m e) =>
+  SparseSet e ->
+  SPMD w e Int64 ->
+  SPMDM w m e (SPMD w e Bool)
+memberSPMD (SparseSet hdr) xs = do
+  let f = projectPtrs hdr
+  uCap <- liftSPMD (peek (getPtrOf (spsUniverseCap f)))
+  okRef <- newRef (false :: SPMD w e Bool)
+  whenM_ ((xs `ge` 0) `land` (xs `lt` uniform uCap)) $ do
+    curLen <- liftSPMD (peek (getPtrOf (spsLen f)))
+    sp <- liftSPMD (peek (getPtrOf (spsSparse f)))
+    d <- peekElemOff (uniformAlignedPtr sp) xs
+    whenM_ ((d `ge` 0) `land` (d `lt` uniform curLen)) $ do
+      dn <- liftSPMD (peek (getPtrOf (spsDense f)))
+      dk <- peekElemOff (uniformAlignedPtr dn) d
+      writeRef okRef (dk `eq` xs)
+  readRef okRef
 
 --------------------------------------------------------------------------------
 -- Host <-> C FFI Marshalling Instances

@@ -54,6 +54,10 @@ module Janus.Data.Pool
     drainToPool,
     fromStream,
     drainAppendPool,
+
+    -- * First-Class Occupancy-Masked SPMD / SIMD Kernels
+    foreachOccupiedSPMD,
+    foldOccupiedSPMD,
   )
 where
 
@@ -93,6 +97,13 @@ import Janus.Expression.Cast (ExpIntegralCast (..))
 import Janus.Expression.Cond (ExpCond (..))
 import Janus.Expression.Eq (ExpEq (..))
 import Janus.Expression.Ord (ExpOrd (..))
+import Janus.SPMD
+  ( SPMD,
+    SPMDM,
+    SPMDTyped,
+    uniform,
+    withSPMD,
+  )
 import Janus.Typed (JanusTyped)
 
 type PoolSegSlots = 64
@@ -578,6 +589,82 @@ drainAppendPool alloc p = Drain $ \s -> do
     )
     s
   pure hv
+
+--------------------------------------------------------------------------------
+-- First-Class Occupancy-Masked SPMD / SIMD Kernels
+--------------------------------------------------------------------------------
+
+-- | Strip-mine all occupied slots across all 64-slot segments in-place at SIMD gang width @w@,
+-- skipping completely empty 64-slot segments in O(1) and empty @w@-lane gangs via @mmovemask == 0@.
+-- Passes the global slot index @(segIdx << 6) + localIdx@ to @step@.
+foreachOccupiedSPMD ::
+  forall w a m e.
+  (PoolCtx m e a, LayoutUnitSPMD w m e a) =>
+  Proxy w ->
+  Pool e a ->
+  (SPMD w e Int64 -> Elem (SPMD w e) a -> SPMDM w m e (Elem (SPMD w e) a)) ->
+  m ()
+foreachOccupiedSPMD pw (Pool hdr) step = do
+  let f = projectPtrs hdr
+  numS <- peek (getPtrOf (plsNumSegs f))
+  segs <- peek (getPtrOf (plsSegs f))
+  runDrain
+    ( drainForEach $ \segIdx -> do
+        let sf = projectPtrs (ptrIndex segs segIdx)
+        occMask <- peek (getPtrOf (psOcc sf))
+        whenM_ (occMask `ne` 0) $ do
+          segBuf <- peekBufStruct (getPtrOf (psBuf sf))
+          let isOcc localIdx =
+                pure (((uniform occMask `rshift` toIntegral (localIdx `iand` 63)) `iand` 1) `ne` 0)
+              baseIdx = uniform (segIdx `lshift` 6)
+          foreachMaskedBufSPMD
+            pw
+            True
+            segBuf
+            (fromIntegral segSlots)
+            isOcc
+            (\localIdx val -> step (baseIdx + localIdx) val)
+    )
+    (rangeS 0 numS)
+
+-- | Masked-safe SIMD fold over all occupied slots across all 64-slot segments at gang width @w@,
+-- passing the global slot index @(segIdx << 6) + localIdx@ to @step@.
+foldOccupiedSPMD ::
+  forall w a s m e.
+  (PoolCtx m e a, LayoutUnitSPMD w m e a, SPMDTyped w e s) =>
+  Proxy w ->
+  Pool e a ->
+  SPMD w e s ->
+  (SPMD w e s -> SPMD w e Int64 -> Elem (SPMD w e) a -> SPMDM w m e (SPMD w e s)) ->
+  m (SPMD w e s)
+foldOccupiedSPMD pw (Pool hdr) s0 step = do
+  let f = projectPtrs hdr
+  numS <- peek (getPtrOf (plsNumSegs f))
+  segs <- peek (getPtrOf (plsSegs f))
+  accRef <- withSPMD pw (newRef s0)
+  runDrain
+    ( drainForEach $ \segIdx -> do
+        let sf = projectPtrs (ptrIndex segs segIdx)
+        occMask <- peek (getPtrOf (psOcc sf))
+        whenM_ (occMask `ne` 0) $ do
+          segBuf <- peekBufStruct (getPtrOf (psBuf sf))
+          curAcc <- withSPMD pw (readRef accRef)
+          let isOcc localIdx =
+                pure (((uniform occMask `rshift` toIntegral (localIdx `iand` 63)) `iand` 1) `ne` 0)
+              baseIdx = uniform (segIdx `lshift` 6)
+          nxtAcc <-
+            foldMaskedBufSPMD
+              pw
+              True
+              segBuf
+              (fromIntegral segSlots)
+              isOcc
+              curAcc
+              (\acc localIdx val -> step acc (baseIdx + localIdx) val)
+          withSPMD pw (writeRef accRef nxtAcc)
+    )
+    (rangeS 0 numS)
+  withSPMD pw (readRef accRef)
 
 --------------------------------------------------------------------------------
 -- Host <-> C FFI Marshalling Instances

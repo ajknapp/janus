@@ -1,3 +1,4 @@
+{-# LANGUAGE AllowAmbiguousTypes #-}
 {-# LANGUAGE ConstraintKinds #-}
 {-# LANGUAGE DataKinds #-}
 {-# LANGUAGE DeriveGeneric #-}
@@ -24,14 +25,17 @@ module Janus.Data.BitTree
     new,
     free,
 
-    -- * Queries & Clear
+    -- * Queries, Leaf Word Buffer Access, & Clear
     clear,
     size,
     universe,
     isEmpty,
+    leafWordsPtr,
+    leafWordCount,
 
-    -- * Guaranteed @O(1)@ Loop-Free Membership, Insertion, & Deletion
+    -- * Guaranteed @O(1)@ Loop-Free Membership, Batch SPMD Probe, Insertion, & Deletion
     member,
+    memberSPMD,
     insert,
     delete,
 
@@ -81,6 +85,14 @@ import Janus.Expression.Bool (ExpBool (..))
 import Janus.Expression.Cast (ExpIntegralCast (..), ExpPtrCast (..))
 import Janus.Expression.Eq (ExpEq (..))
 import Janus.Expression.Ord (ExpOrd (..), max', min')
+import Janus.SPMD
+  ( SPMD,
+    SPMDGang,
+    SPMDM,
+    liftSPMD,
+    uniform,
+    uniformAlignedPtr,
+  )
 import Janus.Typed (JanusTyped)
 
 -- | Maximum universe size @64^3 = 262,144@ covered by the 3-level 64-ary bitmask pyramid.
@@ -195,6 +207,12 @@ universe (BitTree hdr) = peek (getPtrOf (btsUniverse (projectPtrs hdr)))
 isEmpty :: (BitTreeCtx m e) => BitTree e -> m (e Bool)
 isEmpty (BitTree hdr) = (`eq` 0) <$> peek (getPtrOf (btsL0 (projectPtrs hdr)))
 
+leafWordsPtr :: (BitTreeCtx m e) => BitTree e -> m (e (Ptr Word64))
+leafWordsPtr (BitTree hdr) = peek (getPtrOf (btsL2 (projectPtrs hdr)))
+
+leafWordCount :: (BitTreeCtx m e) => BitTree e -> m (e Int64)
+leafWordCount bt = (\u -> (u + 63) `rshift` 6) <$> universe bt
+
 --------------------------------------------------------------------------------
 -- Guaranteed O(1) Loop-Free Membership, Insertion, & Deletion
 --------------------------------------------------------------------------------
@@ -214,6 +232,25 @@ member (BitTree hdr) x = do
     w2 <- peekElemOff l2 (x `rshift` 6)
     let m2 = (1 :: e Word64) `lshift` toIntegral (x `iand` 63)
     writeRef resRef ((w2 `iand` m2) `ne` 0)
+  readRef resRef
+
+-- | Bounds-masked SIMD / SPMD batch membership gather probe across @w@ keys simultaneously.
+memberSPMD ::
+  forall w m e.
+  (BitTreeCtx m e, SPMDGang w m e) =>
+  BitTree e ->
+  SPMD w e Int64 ->
+  SPMDM w m e (SPMD w e Bool)
+memberSPMD bt xs = do
+  uBound <- liftSPMD (universe bt)
+  lvl2 <- liftSPMD (leafWordsPtr bt)
+  let inBounds = (xs `ge` 0) `land` (xs `lt` uniform uBound)
+      lvl2Sp = uniformAlignedPtr lvl2
+  resRef <- newRef false
+  whenM_ inBounds $ do
+    w <- peekElemOff lvl2Sp (xs `rshift` 6)
+    let mask = (1 :: SPMD w e Word64) `lshift` toIntegral (xs `iand` 63)
+    writeRef resRef ((w `iand` mask) `ne` 0)
   readRef resRef
 
 -- | Guaranteed @O(1)@ loop-free insert of @x@ (@0 <= x < universe@).

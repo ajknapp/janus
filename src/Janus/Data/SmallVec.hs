@@ -58,6 +58,11 @@ module Janus.Data.SmallVec
     drainToSmallVec,
     fromStream,
     drainAppendSmallVec,
+
+    -- * SPMD / SIMD Gang Kernels Over Inline & Spilled Storage
+    foreachSPMD,
+    traverseSPMD_,
+    foldSPMD,
   )
 where
 
@@ -85,6 +90,7 @@ import Janus.Expression.Bool (ExpBool (..))
 import Janus.Expression.Cond (ExpCond (..))
 import Janus.Expression.Eq (ExpEq (..))
 import Janus.Expression.Ord (ExpOrd (..))
+import Janus.SPMD (SPMD, SPMDM, SPMDTyped, withSPMD)
 import Janus.Typed (JanusTyped)
 
 -- | Spine struct embedding @n@ inline elements directly inside the struct.
@@ -478,6 +484,64 @@ drainAppendSmallVec ::
   SmallVec n e a ->
   Drain m (Elem e a) ()
 drainAppendSmallVec alloc sv = drainForEach (push alloc sv)
+
+--------------------------------------------------------------------------------
+-- SPMD / SIMD Gang Kernels Over SmallVec
+--------------------------------------------------------------------------------
+
+-- | Layout-polymorphic in-place SIMD map over @[0 .. len - 1]@, dispatching
+-- 64B-aligned loads/stores when spilled to the heap and unaligned loads/stores when inline.
+foreachSPMD ::
+  forall w n a m e.
+  (SmallVecCtx n m e a, LayoutUnitSPMD w m e a) =>
+  Proxy w ->
+  SmallVec n e a ->
+  (SPMD w e Int64 -> Elem (SPMD w e) a -> SPMDM w m e (Elem (SPMD w e) a)) ->
+  m ()
+foreachSPMD pw (SmallVec hdr) step = do
+  let f = projectPtrs hdr
+  curLen <- peek (getPtrOf (svsLen f))
+  b <- peekBufStruct (getPtrOf (svsBuf f))
+  isHeap <- peek (getPtrOf (svsIsHeap f))
+  ifThenElseM_
+    (isHeap `ne` 0)
+    (foreachBufSPMD pw True b curLen step)
+    (foreachBufSPMD pw False b curLen step)
+
+-- | Layout-polymorphic read-only SIMD scan over @[0 .. len - 1]@.
+traverseSPMD_ ::
+  forall w n a m e.
+  (SmallVecCtx n m e a, LayoutUnitSPMD w m e a) =>
+  Proxy w ->
+  SmallVec n e a ->
+  (SPMD w e Int64 -> Elem (SPMD w e) a -> SPMDM w m e ()) ->
+  m ()
+traverseSPMD_ pw (SmallVec hdr) body = do
+  let f = projectPtrs hdr
+  curLen <- peek (getPtrOf (svsLen f))
+  b <- peekBufStruct (getPtrOf (svsBuf f))
+  isHeap <- peek (getPtrOf (svsIsHeap f))
+  ifThenElseM_
+    (isHeap `ne` 0)
+    (traverseBufSPMD_ pw True b curLen body)
+    (traverseBufSPMD_ pw False b curLen body)
+
+-- | Layout-polymorphic masked-safe SIMD fold over @[0 .. len - 1]@.
+foldSPMD ::
+  forall w n a s m e.
+  (SmallVecCtx n m e a, LayoutUnitSPMD w m e a, SPMDTyped w e s) =>
+  Proxy w ->
+  SmallVec n e a ->
+  SPMD w e s ->
+  (SPMD w e s -> SPMD w e Int64 -> Elem (SPMD w e) a -> SPMDM w m e (SPMD w e s)) ->
+  m (SPMD w e s)
+foldSPMD pw sv s0 step = do
+  accRef <- withSPMD pw (newRef s0)
+  traverseSPMD_ pw sv $ \idx val -> do
+    cur <- readRef accRef
+    nxt <- step cur idx val
+    writeRef accRef nxt
+  withSPMD pw (readRef accRef)
 
 --------------------------------------------------------------------------------
 -- Host <-> C FFI Marshalling Instances

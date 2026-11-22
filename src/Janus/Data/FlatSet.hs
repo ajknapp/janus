@@ -44,9 +44,13 @@ module Janus.Data.FlatSet
     maxKey,
     keyAt,
 
-    -- * Sorted Streams, Range Slices, Linear Merge Set-Algebra, & Bulk Drains
+    -- * Sorted Streams, SPMD Kernels, Range Slices, Linear Merge Set-Algebra, & Bulk Drains
     stream,
     reverseStream,
+    traverseSPMD_,
+    foldSPMD,
+    lowerBoundBatchSPMD,
+    memberBatchSPMD,
     rangeStream,
     unionS,
     intersectionS,
@@ -71,7 +75,7 @@ import Janus.Backend.C.TH
 import Janus.Command.Cond (ifThenElseM_, whenM_)
 import Janus.Command.Memory (CmdStorable (..), ExpSized (..))
 import Janus.Command.Ref (RefCell, letM, newRef, readRef, writeRef)
-import Janus.Control.Drain (Drain (..), drainFind, drainFoldM, drainForEach, runDrain)
+import Janus.Control.Drain (Drain (..), drainFind, drainFoldM, drainForEach, drain_, runDrain)
 import Janus.Control.Stream
   ( Stream,
     differenceSortedByS,
@@ -80,6 +84,7 @@ import Janus.Control.Stream
     rangeS,
     reverseRangeS,
     streamM,
+    unfoldWhileM,
     unionSortedByS,
     withStreamSetup,
   )
@@ -87,10 +92,19 @@ import Janus.Data.FlatMap (OrdKey (..))
 import Janus.Data.HKD
 import Janus.Data.Layout
 import Janus.Data.Sort (lowerBoundBuf, sortBufBy, upperBoundBuf)
+import Janus.Expression.Bits (ExpBits (..))
 import Janus.Expression.Bool (ExpBool (..))
 import Janus.Expression.Cond (ExpCond (..))
 import Janus.Expression.Eq (ExpEq (..))
 import Janus.Expression.Ord (ExpOrd (..))
+import Janus.SPMD
+  ( SPMD,
+    SPMDGang,
+    SPMDM,
+    SPMDTyped,
+    liftSPMD,
+    uniform,
+  )
 import Janus.Typed (JanusTyped)
 
 data FlatSetSpine k f = FlatSetSpine
@@ -378,6 +392,83 @@ reverseStream (FlatSet hdr) =
    in withStreamSetup
         ((,) <$> peek (getPtrOf (fssLen f)) <*> peekBufStruct (getPtrOf (fssKeys f)))
         (\(n, kb) -> streamM (reverseRangeS 0 n) (readBuf kb))
+
+-- | Layout-polymorphic read-only unit-stride SIMD traversal over sorted keys @[0, size)@.
+traverseSPMD_ ::
+  forall w k m e.
+  (FlatSetCtx m e k, LayoutUnitSPMD w m e k) =>
+  Proxy w ->
+  FlatSet e k ->
+  (SPMD w e Int64 -> Elem (SPMD w e) k -> SPMDM w m e ()) ->
+  m ()
+traverseSPMD_ pw (FlatSet hdr) body = do
+  let f = projectPtrs hdr
+  n <- peek (getPtrOf (fssLen f))
+  kb <- peekBufStruct (getPtrOf (fssKeys f))
+  traverseBufSPMD_ pw True kb n body
+
+-- | Layout-polymorphic masked-safe unit-stride SIMD fold over sorted keys @[0, size)@.
+foldSPMD ::
+  forall w k s m e.
+  (FlatSetCtx m e k, LayoutUnitSPMD w m e k, SPMDTyped w e s) =>
+  Proxy w ->
+  FlatSet e k ->
+  SPMD w e s ->
+  (SPMD w e s -> SPMD w e Int64 -> Elem (SPMD w e) k -> SPMDM w m e (SPMD w e s)) ->
+  m (SPMD w e s)
+foldSPMD pw (FlatSet hdr) s0 step = do
+  let f = projectPtrs hdr
+  n <- peek (getPtrOf (fssLen f))
+  kb <- peekBufStruct (getPtrOf (fssKeys f))
+  foldBufSPMD pw True kb n s0 step
+
+-- | Branchless lane-parallel monobound SIMD binary search returning the lower-bound index
+-- in @[0, size]@ for each of @w@ query keys in lockstep.
+lowerBoundBatchSPMD ::
+  forall w k m e.
+  (FlatSetCtx m e k, SPMDGang w m e, OrdKey (SPMD w e) k, LayoutGatherSPMD w m e k) =>
+  Proxy w ->
+  FlatSet e k ->
+  Elem (SPMD w e) k ->
+  SPMDM w m e (SPMD w e Int64)
+lowerBoundBatchSPMD _ (FlatSet hdr) qKeys = do
+  let f = projectPtrs hdr
+  n <- liftSPMD (peek (getPtrOf (fssLen f)))
+  resRef <- newRef (0 :: SPMD w e Int64)
+  whenM_ (uniform n `gt` 0) $ do
+    kb <- liftSPMD (peekBufStruct (getPtrOf (fssKeys f)))
+    baseRef <- newRef (0 :: SPMD w e Int64)
+    runDrain drain_ $
+      unfoldWhileM (uniform n) (\remL -> pure (remL `gt` 1)) $ \remL -> do
+        base <- readRef baseRef
+        let half = remL `rshift` 1
+            mid = base + half
+        mk <- gatherBufSPMD kb mid
+        writeRef baseRef (ifThenElse (ltKey @(SPMD w e) @k mk qKeys) mid base)
+        pure (remL - half, ())
+    finalBase <- readRef baseRef
+    vk <- gatherBufSPMD kb finalBase
+    writeRef resRef (ifThenElse (ltKey @(SPMD w e) @k vk qKeys) (finalBase + 1) finalBase)
+  readRef resRef
+
+-- | Lane-parallel SIMD batch membership query via branchless binary search over @w@ keys.
+memberBatchSPMD ::
+  forall w k m e.
+  (FlatSetCtx m e k, SPMDGang w m e, OrdKey (SPMD w e) k, LayoutGatherSPMD w m e k) =>
+  Proxy w ->
+  FlatSet e k ->
+  Elem (SPMD w e) k ->
+  SPMDM w m e (SPMD w e Bool)
+memberBatchSPMD pw fs@(FlatSet hdr) qKeys = do
+  let f = projectPtrs hdr
+  n <- liftSPMD (peek (getPtrOf (fssLen f)))
+  pos <- lowerBoundBatchSPMD pw fs qKeys
+  foundRef <- newRef false
+  whenM_ (pos `lt` uniform n) $ do
+    kb <- liftSPMD (peekBufStruct (getPtrOf (fssKeys f)))
+    ck <- gatherBufSPMD kb pos
+    writeRef foundRef (eqKey @(SPMD w e) @k ck qKeys)
+  readRef foundRef
 
 rangeStream ::
   forall k m e.

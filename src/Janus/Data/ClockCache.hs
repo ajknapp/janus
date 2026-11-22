@@ -39,10 +39,12 @@ module Janus.Data.ClockCache
     insert,
     delete,
 
-    -- * Streams & Drains
+    -- * Streams, SPMD Kernels, & Drains
     toStream,
     keysS,
     valuesS,
+    foreachValuesSPMD,
+    foldValuesSPMD,
     drainToClockCache,
     fromStream,
     drainAppendClockCache,
@@ -98,6 +100,13 @@ import Janus.Expression.Cond (ExpCond (..))
 import Janus.Expression.Eq (ExpEq (..))
 import Janus.Expression.MurmurHash (defaultHashSalt)
 import Janus.Expression.Ord (ExpOrd (..))
+import Janus.SPMD
+  ( SPMD,
+    SPMDM,
+    SPMDTyped,
+    uniformAlignedPtr,
+    withSPMD,
+  )
 import Janus.Typed (JanusTyped)
 import Prelude hiding (lookup)
 
@@ -732,6 +741,64 @@ valuesS ::
   ClockCache e k v ->
   Stream m (Elem e v)
 valuesS cc = snd <$> toStream cc
+
+-- | Strip-mined in-place SIMD map over all occupied value slots without modifying CLOCK reference bits.
+foreachValuesSPMD ::
+  forall w k v m e.
+  (ClockCacheCtx m e k v, LayoutUnitSPMD w m e v) =>
+  Proxy w ->
+  ClockCache e k v ->
+  (SPMD w e Int64 -> Elem (SPMD w e) v -> SPMDM w m e (Elem (SPMD w e) v)) ->
+  m ()
+foreachValuesSPMD pw (ClockCache hdr) step = do
+  let f = projectPtrs hdr
+  curLen <- peek (getPtrOf (ccsLen f))
+  whenM_ (curLen `gt` 0) $ do
+    dCap <- peek (getPtrOf (ccsCap f))
+    occ <- peek (getPtrOf (ccsOccupied f))
+    vb <- peekBufStruct (getPtrOf (ccsVals f))
+    foreachMaskedBufSPMD
+      pw
+      True
+      vb
+      dCap
+      ( \idx -> do
+          o <- peekElemOff (uniformAlignedPtr occ) idx
+          pure (o `ne` 0)
+      )
+      step
+
+-- | Masked-safe SIMD fold over all occupied value slots without modifying CLOCK reference bits.
+foldValuesSPMD ::
+  forall w k v s m e.
+  (ClockCacheCtx m e k v, LayoutUnitSPMD w m e v, SPMDTyped w e s) =>
+  Proxy w ->
+  ClockCache e k v ->
+  SPMD w e s ->
+  (SPMD w e s -> SPMD w e Int64 -> Elem (SPMD w e) v -> SPMDM w m e (SPMD w e s)) ->
+  m (SPMD w e s)
+foldValuesSPMD pw (ClockCache hdr) s0 step = do
+  let f = projectPtrs hdr
+  curLen <- peek (getPtrOf (ccsLen f))
+  accRef <- withSPMD pw (newRef s0)
+  whenM_ (curLen `gt` 0) $ do
+    dCap <- peek (getPtrOf (ccsCap f))
+    occ <- peek (getPtrOf (ccsOccupied f))
+    vb <- peekBufStruct (getPtrOf (ccsVals f))
+    res <-
+      foldMaskedBufSPMD
+        pw
+        True
+        vb
+        dCap
+        ( \idx -> do
+            o <- peekElemOff (uniformAlignedPtr occ) idx
+            pure (o `ne` 0)
+        )
+        s0
+        step
+    withSPMD pw (writeRef accRef res)
+  withSPMD pw (readRef accRef)
 
 drainToClockCache ::
   forall k v m e.

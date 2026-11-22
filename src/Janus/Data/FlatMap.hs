@@ -52,11 +52,17 @@ module Janus.Data.FlatMap
     delete,
     entryAt,
 
-    -- * Contiguous Sorted Streams, Range Queries, Set-Algebra Merges, & Bulk Drains
+    -- * Contiguous Sorted Streams, SPMD Kernels, Range Queries, Set-Algebra Merges, & Bulk Drains
     toStream,
     reverseStream,
     keysS,
     valuesS,
+    foreachValuesSPMD,
+    traverseValuesSPMD_,
+    foldValuesSPMD,
+    lowerBoundBatchSPMD,
+    containsKeyBatchSPMD,
+    lookupScalarBatchSPMD,
     rangeStream,
     unionWithS,
     intersectWithS,
@@ -83,7 +89,7 @@ import Janus.Backend.C.TH
 import Janus.Command.Cond (ifThenElseM_, whenM_)
 import Janus.Command.Memory (CmdStorable (..), ExpSized (..))
 import Janus.Command.Ref (RefCell, letM, newRef, readRef, writeRef)
-import Janus.Control.Drain (Drain (..), drainFind, drainFoldM, drainForEach, runDrain)
+import Janus.Control.Drain (Drain (..), drainFind, drainFoldM, drainForEach, drain_, runDrain)
 import Janus.Control.Stream
   ( Stream,
     differenceSortedByS,
@@ -92,16 +98,26 @@ import Janus.Control.Stream
     rangeS,
     reverseRangeS,
     streamM,
+    unfoldWhileM,
     unionSortedByS,
     withStreamSetup,
   )
 import Janus.Data.HKD
 import Janus.Data.Layout
 import Janus.Data.Sort (lowerBoundBuf, stableSortKeyValBufsBy, upperBoundBuf)
+import Janus.Expression.Bits (ExpBits (..))
 import Janus.Expression.Bool (ExpBool (..))
 import Janus.Expression.Cond (ExpCond (..))
 import Janus.Expression.Eq (ExpEq (..))
 import Janus.Expression.Ord (ExpOrd (..))
+import Janus.SPMD
+  ( SPMD,
+    SPMDGang,
+    SPMDM,
+    SPMDTyped,
+    liftSPMD,
+    uniform,
+  )
 import Janus.Typed (JanusTyped)
 import Prelude hiding (lookup)
 
@@ -583,6 +599,130 @@ valuesS (FlatMap hdr) =
    in withStreamSetup
         ((,) <$> peek (getPtrOf (fmsLen f)) <*> peekBufStruct (getPtrOf (fmsVals f)))
         (\(n, vb) -> streamM (rangeS 0 n) (readBuf vb))
+
+-- | Layout-polymorphic unit-stride in-place SIMD map over sorted values @[0, size)@.
+foreachValuesSPMD ::
+  forall w k v m e.
+  (FlatMapCtx m e k v, LayoutUnitSPMD w m e v) =>
+  Proxy w ->
+  FlatMap e k v ->
+  (SPMD w e Int64 -> Elem (SPMD w e) v -> SPMDM w m e (Elem (SPMD w e) v)) ->
+  m ()
+foreachValuesSPMD pw (FlatMap hdr) step = do
+  let f = projectPtrs hdr
+  n <- peek (getPtrOf (fmsLen f))
+  vb <- peekBufStruct (getPtrOf (fmsVals f))
+  foreachBufSPMD pw True vb n step
+
+-- | Layout-polymorphic read-only unit-stride SIMD traversal over sorted values @[0, size)@.
+traverseValuesSPMD_ ::
+  forall w k v m e.
+  (FlatMapCtx m e k v, LayoutUnitSPMD w m e v) =>
+  Proxy w ->
+  FlatMap e k v ->
+  (SPMD w e Int64 -> Elem (SPMD w e) v -> SPMDM w m e ()) ->
+  m ()
+traverseValuesSPMD_ pw (FlatMap hdr) body = do
+  let f = projectPtrs hdr
+  n <- peek (getPtrOf (fmsLen f))
+  vb <- peekBufStruct (getPtrOf (fmsVals f))
+  traverseBufSPMD_ pw True vb n body
+
+-- | Layout-polymorphic masked-safe unit-stride SIMD fold over sorted values @[0, size)@.
+foldValuesSPMD ::
+  forall w k v s m e.
+  (FlatMapCtx m e k v, LayoutUnitSPMD w m e v, SPMDTyped w e s) =>
+  Proxy w ->
+  FlatMap e k v ->
+  SPMD w e s ->
+  (SPMD w e s -> SPMD w e Int64 -> Elem (SPMD w e) v -> SPMDM w m e (SPMD w e s)) ->
+  m (SPMD w e s)
+foldValuesSPMD pw (FlatMap hdr) s0 step = do
+  let f = projectPtrs hdr
+  n <- peek (getPtrOf (fmsLen f))
+  vb <- peekBufStruct (getPtrOf (fmsVals f))
+  foldBufSPMD pw True vb n s0 step
+
+-- | Branchless lane-parallel monobound SIMD binary search returning the lower-bound index
+-- in @[0, size]@ for each of @w@ query keys in lockstep.
+lowerBoundBatchSPMD ::
+  forall w k v m e.
+  (FlatMapCtx m e k v, SPMDGang w m e, OrdKey (SPMD w e) k, LayoutGatherSPMD w m e k) =>
+  Proxy w ->
+  FlatMap e k v ->
+  Elem (SPMD w e) k ->
+  SPMDM w m e (SPMD w e Int64)
+lowerBoundBatchSPMD _ (FlatMap hdr) qKeys = do
+  let f = projectPtrs hdr
+  n <- liftSPMD (peek (getPtrOf (fmsLen f)))
+  resRef <- newRef (0 :: SPMD w e Int64)
+  whenM_ (uniform n `gt` 0) $ do
+    kb <- liftSPMD (peekBufStruct (getPtrOf (fmsKeys f)))
+    baseRef <- newRef (0 :: SPMD w e Int64)
+    runDrain drain_ $
+      unfoldWhileM (uniform n) (\remL -> pure (remL `gt` 1)) $ \remL -> do
+        base <- readRef baseRef
+        let half = remL `rshift` 1
+            mid = base + half
+        mk <- gatherBufSPMD kb mid
+        writeRef baseRef (ifThenElse (ltKey @(SPMD w e) @k mk qKeys) mid base)
+        pure (remL - half, ())
+    finalBase <- readRef baseRef
+    vk <- gatherBufSPMD kb finalBase
+    writeRef resRef (ifThenElse (ltKey @(SPMD w e) @k vk qKeys) (finalBase + 1) finalBase)
+  readRef resRef
+
+-- | Lane-parallel SIMD batch membership query via branchless binary search over @w@ keys.
+containsKeyBatchSPMD ::
+  forall w k v m e.
+  (FlatMapCtx m e k v, SPMDGang w m e, OrdKey (SPMD w e) k, LayoutGatherSPMD w m e k) =>
+  Proxy w ->
+  FlatMap e k v ->
+  Elem (SPMD w e) k ->
+  SPMDM w m e (SPMD w e Bool)
+containsKeyBatchSPMD pw fm@(FlatMap hdr) qKeys = do
+  let f = projectPtrs hdr
+  n <- liftSPMD (peek (getPtrOf (fmsLen f)))
+  pos <- lowerBoundBatchSPMD pw fm qKeys
+  foundRef <- newRef false
+  whenM_ (pos `lt` uniform n) $ do
+    kb <- liftSPMD (peekBufStruct (getPtrOf (fmsKeys f)))
+    ck <- gatherBufSPMD kb pos
+    writeRef foundRef (eqKey @(SPMD w e) @k ck qKeys)
+  readRef foundRef
+
+-- | Lane-parallel SIMD batch scalar value lookup via branchless binary search over @w@ keys.
+lookupScalarBatchSPMD ::
+  forall w k v s m e.
+  ( FlatMapCtx m e k v,
+    SPMDGang w m e,
+    OrdKey (SPMD w e) k,
+    LayoutGatherSPMD w m e k,
+    LayoutGatherSPMD w m e v,
+    Elem (SPMD w e) v ~ SPMD w e s,
+    SPMDTyped w e s
+  ) =>
+  Proxy w ->
+  SPMD w e s ->
+  FlatMap e k v ->
+  Elem (SPMD w e) k ->
+  SPMDM w m e (SPMD w e Bool, SPMD w e s)
+lookupScalarBatchSPMD pw defVal fm@(FlatMap hdr) qKeys = do
+  let f = projectPtrs hdr
+  n <- liftSPMD (peek (getPtrOf (fmsLen f)))
+  pos <- lowerBoundBatchSPMD pw fm qKeys
+  foundRef <- newRef false
+  valRef <- newRef defVal
+  whenM_ (pos `lt` uniform n) $ do
+    kb <- liftSPMD (peekBufStruct (getPtrOf (fmsKeys f)))
+    vb <- liftSPMD (peekBufStruct (getPtrOf (fmsVals f)))
+    ck <- gatherBufSPMD kb pos
+    let hit = eqKey @(SPMD w e) @k ck qKeys
+    writeRef foundRef hit
+    whenM_ hit $ do
+      gv <- gatherBufSPMD vb pos
+      writeRef valRef gv
+  (,) <$> readRef foundRef <*> readRef valRef
 
 -- | Contiguous range slice over @[lo, hi]@ (inclusive) using two O(log N) branchless searches.
 rangeStream ::

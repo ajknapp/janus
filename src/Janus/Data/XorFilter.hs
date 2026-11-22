@@ -25,8 +25,9 @@ module Janus.Data.XorFilter
     fromStream,
     free,
 
-    -- * 3-Load Zero-False-Negative Probe & Queries
+    -- * 3-Load Zero-False-Negative Probe, Batch SPMD Probe, & Queries
     mightContain,
+    mightContainBatchSPMD,
     keyCount,
     byteSize,
   )
@@ -56,7 +57,7 @@ import Janus.Backend.C.LinuxX86_64
 import Janus.Backend.C.TH
 import Janus.Command.Cond (ifThenElseM_, whenM_)
 import Janus.Command.Memory (CmdMemCopy (..), CmdStorable (..), ExpPtr (..), ExpSized (..), janusSIMDAlignment)
-import Janus.Command.Ref (letM, newRef, readRef, writeRef)
+import Janus.Command.Ref (CmdRef, letM, newRef, readRef, writeRef)
 import Janus.Control.Drain (Drain (..), drainFoldM, drainForEach, drain_, runDrain)
 import Janus.Control.Stream (Stream, rangeS, reverseRangeS, unfoldWhileM)
 import Janus.Data.HKD
@@ -69,8 +70,16 @@ import Janus.Expression.Cast (ExpIntegralCast (..), ExpPtrCast (..))
 import Janus.Expression.Cond (ExpCond (..))
 import Janus.Expression.Eq (ExpEq (..))
 import Janus.Expression.Integral (ExpIntegral (..))
-import Janus.Expression.MurmurHash (defaultHashSalt, hash64, hash64WithSalt)
+import Janus.Expression.MurmurHash (ExpHash', defaultHashSalt, hash64, hash64WithSalt)
 import Janus.Expression.Ord (ExpOrd (..), max')
+import Janus.SPMD
+  ( SPMD,
+    SPMDGang,
+    SPMDM,
+    liftSPMD,
+    uniform,
+    uniformAlignedPtr,
+  )
 import Janus.Typed (JanusTyped)
 
 --------------------------------------------------------------------------------
@@ -118,13 +127,20 @@ type XorFilterCtx m e k =
 -- 3-Partite Lemire FastRange Indexing + 8-Bit Fingerprint Extraction
 --------------------------------------------------------------------------------
 
-xorPositionsAndFp ::
+xorPositionsAndFpI64 ::
   forall m e.
-  (CmdAlloc m e) =>
+  ( Monad m,
+    CmdRef m e,
+    ExpHash' e,
+    ExpIntegralCast e Int64 Word64,
+    ExpIntegralCast e Word64 Int64,
+    Num (e Int64),
+    JanusTyped e Int64
+  ) =>
   e Word64 ->
   e Int64 ->
-  m (e Int64, e Int64, e Int64, e Word8)
-xorPositionsAndFp h segLen = do
+  m (e Int64, e Int64, e Int64, e Int64)
+xorPositionsAndFpI64 h segLen = do
   segW <- letM (toIntegral segLen :: e Word64)
   hMix <- letM (hash64 (h `ieor` 0xD6E8FEB86659FD93))
   let u0 = h `iand` 0xFFFFFFFF
@@ -133,7 +149,18 @@ xorPositionsAndFp h segLen = do
   i0 <- letM (toIntegral ((u0 * segW) `rshift` 32) :: e Int64)
   i1 <- letM (segLen + (toIntegral ((u1 * segW) `rshift` 32) :: e Int64))
   i2 <- letM ((segLen * 2) + (toIntegral ((u2 * segW) `rshift` 32) :: e Int64))
-  fp <- letM (toIntegral ((hMix `rshift` 56) `iand` 0xFF) :: e Word8)
+  fpI64 <- letM (toIntegral ((hMix `rshift` 56) `iand` 0xFF) :: e Int64)
+  pure (i0, i1, i2, fpI64)
+
+xorPositionsAndFp ::
+  forall m e.
+  (CmdAlloc m e) =>
+  e Word64 ->
+  e Int64 ->
+  m (e Int64, e Int64, e Int64, e Word8)
+xorPositionsAndFp h segLen = do
+  (i0, i1, i2, fpI64) <- xorPositionsAndFpI64 h segLen
+  fp <- letM (toIntegral (toIntegral fpI64 :: e Word64) :: e Word8)
   pure (i0, i1, i2, fp)
 
 --------------------------------------------------------------------------------
@@ -379,6 +406,33 @@ mightContain (XorFilter hdr) key = do
     b1 <- peekElemOff fps i1
     b2 <- peekElemOff fps i2
     writeRef resRef (((b0 `ieor` b1) `ieor` b2) `eq` fp)
+  readRef resRef
+
+-- | SIMD / SPMD batch 3-load membership probe across @w@ keys simultaneously.
+-- Guaranteed 0 false negatives (~0.39% false positive rate).
+mightContainBatchSPMD ::
+  forall w k m e.
+  (XorFilterCtx m e k, SPMDGang w m e, HashKey (SPMD w e) k) =>
+  Proxy w ->
+  XorFilter e k ->
+  Elem (SPMD w e) k ->
+  SPMDM w m e (SPMD w e Bool)
+mightContainBatchSPMD _ (XorFilter hdr) keys = do
+  let f = projectPtrs hdr
+  blockLen <- liftSPMD (peek (getPtrOf (xfsBlockLength f)))
+  resRef <- newRef false
+  whenM_ (uniform blockLen `gt` 0) $ do
+    fps <- liftSPMD (peek (getPtrOf (xfsFingerprints f)))
+    seed <- liftSPMD (peek (getPtrOf (xfsSeed f)))
+    rawH <- letM (hashElemWithSalt @(SPMD w e) @k defaultHashSalt keys)
+    h <- letM (hash64WithSalt (uniform seed) rawH)
+    (i0, i1, i2, fpI64) <- xorPositionsAndFpI64 h (uniform blockLen)
+    let fpsSp = uniformAlignedPtr fps
+        expectedFp = toIntegral fpI64 :: SPMD w e Word8
+    fp0 <- peekElemOff fpsSp i0
+    fp1 <- peekElemOff fpsSp i1
+    fp2 <- peekElemOff fpsSp i2
+    writeRef resRef (((fp0 `ieor` fp1) `ieor` fp2) `eq` expectedFp)
   readRef resRef
 
 keyCount :: (XorFilterCtx m e k) => XorFilter e k -> m (e Int64)

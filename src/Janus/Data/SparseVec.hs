@@ -48,6 +48,10 @@ module Janus.Data.SparseVec
     toStream,
     indicesS,
     valuesS,
+    lookupScalarSPMD,
+    spmdDenseAxpyInto,
+    foreachValuesSPMD,
+    foldValuesSPMD,
     foreachScalarValuesSPMD,
     foreachSoAValuesSPMD,
     drainToSparseVec,
@@ -91,8 +95,11 @@ import Janus.SPMD
   ( Layout (..),
     SPMD,
     SPMDGang,
+    SPMDLanesByLayout,
     SPMDLayout,
     SPMDM,
+    SPMDTyped,
+    liftSPMD,
     spmdAlignedUnitStride,
     uniform,
     uniformAlignedPtr,
@@ -487,6 +494,116 @@ foreachSoAValuesSPMD pw (SparseVec hdr) step = do
   n <- peek (getPtrOf (svsLen f))
   b <- peekBufStruct (getPtrOf (svsDenseVals f))
   foreachSoASPMD pw b n step
+
+-- | Unified layout-polymorphic SPMD strip-mined loop over the packed non-zero @denseVals@
+-- across @Scalar@, @SoA@, @AoSoA w@, and @SOAOA w@.
+foreachValuesSPMD ::
+  forall w a m e.
+  (SparseVecCtx m e a, LayoutUnitSPMD w m e a) =>
+  Proxy w ->
+  SparseVec e a ->
+  (SPMD w e Int64 -> Elem (SPMD w e) a -> SPMDM w m e (Elem (SPMD w e) a)) ->
+  m ()
+foreachValuesSPMD pw (SparseVec hdr) step = do
+  let f = projectPtrs hdr
+  n <- peek (getPtrOf (svsLen f))
+  dv <- peekBufStruct (getPtrOf (svsDenseVals f))
+  foreachBufSPMD pw True dv n step
+
+-- | Masked-safe layout-polymorphic SIMD fold over the packed non-zero @denseVals@.
+foldValuesSPMD ::
+  forall w a s m e.
+  (SparseVecCtx m e a, LayoutUnitSPMD w m e a, SPMDTyped w e s) =>
+  Proxy w ->
+  SparseVec e a ->
+  SPMD w e s ->
+  (SPMD w e s -> SPMD w e Int64 -> Elem (SPMD w e) a -> SPMDM w m e (SPMD w e s)) ->
+  m (SPMD w e s)
+foldValuesSPMD pw (SparseVec hdr) s0 step = do
+  let f = projectPtrs hdr
+  n <- peek (getPtrOf (svsLen f))
+  dv <- peekBufStruct (getPtrOf (svsDenseVals f))
+  foldBufSPMD pw True dv n s0 step
+
+-- | Lane-parallel Briggs-Torczon O(1) scalar lookup across @w@ SIMD lanes, returning
+-- @(found, valOrDef)@ without zero-initialization of @svsSparse@.
+lookupScalarSPMD ::
+  forall w a s m e.
+  ( SparseVecCtx m e a,
+    LayoutGatherSPMD w m e a,
+    Elem (SPMD w e) a ~ SPMD w e s,
+    SPMDTyped w e s
+  ) =>
+  SPMD w e s ->
+  SparseVec e a ->
+  SPMD w e Int64 ->
+  SPMDM w m e (SPMD w e Bool, SPMD w e s)
+lookupScalarSPMD defVal (SparseVec hdr) idxs = do
+  let f = projectPtrs hdr
+  uCap <- liftSPMD (peek (getPtrOf (svsUniverseCap f)))
+  okRef <- newRef (false :: SPMD w e Bool)
+  valRef <- newRef defVal
+  whenM_ ((idxs `ge` 0) `land` (idxs `lt` uniform uCap)) $ do
+    curLen <- liftSPMD (peek (getPtrOf (svsLen f)))
+    sp <- liftSPMD (peek (getPtrOf (svsSparse f)))
+    d <- peekElemOff (uniformAlignedPtr sp) idxs
+    whenM_ ((d `ge` 0) `land` (d `lt` uniform curLen)) $ do
+      di <- liftSPMD (peek (getPtrOf (svsDenseIdx f)))
+      backIdx <- peekElemOff (uniformAlignedPtr di) d
+      whenM_ (backIdx `eq` idxs) $ do
+        dv <- liftSPMD (peekBufStruct (getPtrOf (svsDenseVals f)))
+        v <- gatherBufSPMD dv d
+        writeRef okRef true
+        writeRef valRef v
+  (,) <$> readRef okRef <*> readRef valRef
+
+-- | SIMD sparse-into-dense AXPY (@dst[i] += alpha * x[i]@ for every non-zero entry of @x@).
+-- Race-free across SIMD lanes because all @svsDenseIdx@ entries in a 'SparseVec' are distinct.
+spmdDenseAxpyInto ::
+  forall w s m e.
+  ( SparseVecCtx m e s,
+    Buf s ~ ScalarBuf s,
+    LayoutUnitSPMD w m e s,
+    LayoutGatherSPMD w m e s,
+    Elem e s ~ e s,
+    Elem (SPMD w e) s ~ SPMD w e s,
+    SPMDLanesByLayout (SPMDLayout w s) w e s,
+    Num (SPMD w e s)
+  ) =>
+  Proxy w ->
+  e s ->
+  SparseVec e s ->
+  e (Ptr s) ->
+  m ()
+spmdDenseAxpyInto pw alpha (SparseVec hdr) dstPtr = do
+  let f = projectPtrs hdr
+      wE = fromIntegral (natVal pw) :: e Int64
+      dstBuf = ScalarBuf dstPtr :: Buf s e
+      alphaGang = uniform alpha :: SPMD w e s
+  curLen <- peek (getPtrOf (svsLen f))
+  denseIdx <- peek (getPtrOf (svsDenseIdx f))
+  denseVals <- peekBufStruct (getPtrOf (svsDenseVals f))
+  let spDenseIdx = uniformAlignedPtr denseIdx
+  numFull <- letM (ifThenElse (curLen `gt` 0) (curLen `quotient` wE) 0)
+  alignedEnd <- letM (numFull * wE)
+  runDrain
+    ( drainForEach $ \g -> do
+        base <- letM (g * wE)
+        let idx = spmdAlignedUnitStride base
+        withSPMD pw $ do
+          idxGang <- peekElemOff spDenseIdx idx
+          valGang <- readAlignedGangBuf @w @m @e @s pw True denseVals g idx
+          yOld <- gatherBufSPMD dstBuf idxGang
+          scatterBufSPMD dstBuf idxGang (yOld + alphaGang * valGang)
+    )
+    (rangeS 0 numFull)
+  whenM_ (alignedEnd `lt` curLen) $ do
+    let tailIdx = spmdAlignedUnitStride alignedEnd
+    withSPMDMasked (tailIdx `lt` uniform curLen) $ do
+      idxGang <- peekElemOff spDenseIdx tailIdx
+      valGang <- readAlignedGangBuf @w @m @e @s pw True denseVals numFull tailIdx
+      yOld <- gatherBufSPMD dstBuf idxGang
+      scatterBufSPMD dstBuf idxGang (yOld + alphaGang * valGang)
 
 drainToSparseVec ::
   forall a m e.

@@ -26,16 +26,24 @@ module Janus.Data.BloomFilter
     newForCapacity,
     free,
 
-    -- * Queries & Clear
+    -- * Queries, Raw Pointer Access, & Clear
     clear,
     numBlocks,
     bitCount,
+    wordsPtr,
 
     -- * Single-Cache-Line Insertion, Membership Probe, Union, & Cardinality Estimate
     insert,
     mightContain,
     unionInto,
     estimatedPopcount,
+
+    -- * SPMD / SIMD Cache-Line & Batch Operations
+    spmdInsert,
+    spmdMightContain,
+    mightContainBatchSPMD,
+    spmdUnionInto,
+    spmdEstimatedPopcount,
 
     -- * Stream Consumers & Drains
     drainToBloomFilter,
@@ -71,7 +79,7 @@ import Janus.Control.Stream (Stream, iterateS, rangeS, streamM, unfoldWhileM)
 import Janus.Data.BitSet (popcountWord64)
 import Janus.Data.HKD
 import Janus.Data.HashMap (HashKey (..))
-import Janus.Data.Layout (Elem, StorageLayout)
+import Janus.Data.Layout (Elem, ScalarBuf (..), StorageLayout, foldBufSPMD, foreachBufSPMD)
 import Janus.Expression.Bits (ExpBits (..))
 import Janus.Expression.Bool (ExpBool (..))
 import Janus.Expression.Cast (ExpFloatingCast (..), ExpIntegralCast (..), ExpPtrCast (..))
@@ -79,6 +87,19 @@ import Janus.Expression.Cond (ExpCond (..))
 import Janus.Expression.Eq (ExpEq (..))
 import Janus.Expression.MurmurHash (defaultHashSalt)
 import Janus.Expression.Ord (ExpOrd (..), max')
+import Janus.SPMD
+  ( SPMD,
+    SPMDGang,
+    SPMDM,
+    gangAll,
+    gangReduceAdd,
+    liftSPMD,
+    spmdAlignedUnitStride,
+    spmdFromLanes,
+    uniform,
+    uniformAlignedPtr,
+    withSPMD,
+  )
 import Janus.Typed (JanusTyped)
 
 --------------------------------------------------------------------------------
@@ -220,6 +241,9 @@ numBlocks (BloomFilter hdr) = peek (getPtrOf (bfsNumBlocks (projectPtrs hdr)))
 bitCount :: (BloomFilterCtx m e k) => BloomFilter e k -> m (e Int64)
 bitCount bf = (`lshift` 9) <$> numBlocks bf
 
+wordsPtr :: (BloomFilterCtx m e k) => BloomFilter e k -> m (e (Ptr Word64))
+wordsPtr (BloomFilter hdr) = peek (getPtrOf (bfsWords (projectPtrs hdr)))
+
 --------------------------------------------------------------------------------
 -- Single-Cache-Line Insert, MightContain, UnionInto, & EstimatedPopcount
 --------------------------------------------------------------------------------
@@ -330,6 +354,20 @@ estimatedPopcount (BloomFilter hdr) = do
     runDrain drainSum $
       streamM (rangeS 0 totalWords) $ \i ->
         popcountWord64 <$> peekElemOff ws i
+  estimateFromSetBits nb setBits
+
+estimateFromSetBits ::
+  forall m e.
+  ( CmdAlloc m e,
+    Floating (e Double),
+    ExpOrd e Double,
+    ExpFloatingCast e Int64 Double,
+    JanusTyped e Double
+  ) =>
+  e Int64 ->
+  e Int64 ->
+  m (e Int64)
+estimateFromSetBits nb setBits = do
   totalBits <- letM (nb `lshift` 9)
   outRef <- newRef (0 :: e Int64)
   whenM_ (setBits `gt` 0) $ do
@@ -357,6 +395,150 @@ estimatedPopcount (BloomFilter hdr) = do
         )
     writeRef outRef rounded
   readRef outRef
+
+--------------------------------------------------------------------------------
+-- SPMD / SIMD Cache-Line & Batch Operations
+--------------------------------------------------------------------------------
+
+blockLaneMasks8 ::
+  forall m e.
+  (Num (e Word64), SPMDGang 8 m e) =>
+  Proxy m ->
+  e Word64 ->
+  SPMD 8 e Word64
+blockLaneMasks8 _ h =
+  let salts =
+        spmdFromLanes @8
+          [ fromIntegral saltLane0,
+            fromIntegral saltLane1,
+            fromIntegral saltLane2,
+            fromIntegral saltLane3,
+            fromIntegral saltLane4,
+            fromIntegral saltLane5,
+            fromIntegral saltLane6,
+            fromIntegral saltLane7
+          ] ::
+          SPMD 8 e Word64
+   in (1 :: SPMD 8 e Word64) `lshift` ((uniform h * salts) `rshift` 58)
+
+-- | Insert @key@ using a single 8-lane (512-bit cache-line) SPMD gang load-OR-store.
+spmdInsert ::
+  forall k m e.
+  (BloomFilterCtx m e k, SPMDGang 8 m e) =>
+  BloomFilter e k ->
+  Elem e k ->
+  m ()
+spmdInsert (BloomFilter hdr) key = do
+  let f = projectPtrs hdr
+  ws <- peek (getPtrOf (bfsWords f))
+  nb <- peek (getPtrOf (bfsNumBlocks f))
+  seed <- peek (getPtrOf (bfsSeed f))
+  h <- letM (hashElemWithSalt @e @k seed key)
+  blk <- letM ((toIntegral (h `rshift` 32) :: e Int64) `iand` (nb - 1))
+  base <- letM (blk `lshift` 3)
+  let wsSp = uniformAlignedPtr ws
+      idx = spmdAlignedUnitStride base
+      masks = blockLaneMasks8 (Proxy @m) h
+  withSPMD (Proxy @8) $ do
+    cur <- peekElemOff wsSp idx
+    pokeElemOff wsSp (cur `ior` masks) idx
+
+-- | Probe @key@ using a single 8-lane (512-bit cache-line) SPMD gang load and 'gangAll'.
+spmdMightContain ::
+  forall k m e.
+  (BloomFilterCtx m e k, SPMDGang 8 m e) =>
+  BloomFilter e k ->
+  Elem e k ->
+  m (e Bool)
+spmdMightContain (BloomFilter hdr) key = do
+  let f = projectPtrs hdr
+  ws <- peek (getPtrOf (bfsWords f))
+  nb <- peek (getPtrOf (bfsNumBlocks f))
+  seed <- peek (getPtrOf (bfsSeed f))
+  h <- letM (hashElemWithSalt @e @k seed key)
+  blk <- letM ((toIntegral (h `rshift` 32) :: e Int64) `iand` (nb - 1))
+  base <- letM (blk `lshift` 3)
+  let wsSp = uniformAlignedPtr ws
+      idx = spmdAlignedUnitStride base
+      masks = blockLaneMasks8 (Proxy @m) h
+  withSPMD (Proxy @8) $ do
+    cur <- peekElemOff wsSp idx
+    pure (gangAll ((cur `iand` masks) `ne` 0))
+
+-- | Batch SIMD / SPMD probe testing @w@ keys in parallel across their respective blocks.
+mightContainBatchSPMD ::
+  forall w k m e.
+  (BloomFilterCtx m e k, SPMDGang w m e, HashKey (SPMD w e) k) =>
+  Proxy w ->
+  BloomFilter e k ->
+  Elem (SPMD w e) k ->
+  SPMDM w m e (SPMD w e Bool)
+mightContainBatchSPMD _ (BloomFilter hdr) keys = do
+  let f = projectPtrs hdr
+  ws <- liftSPMD (peek (getPtrOf (bfsWords f)))
+  nb <- liftSPMD (peek (getPtrOf (bfsNumBlocks f)))
+  seed <- liftSPMD (peek (getPtrOf (bfsSeed f)))
+  h <- letM (hashElemWithSalt @(SPMD w e) @k (uniform seed) keys)
+  base <- letM (((toIntegral (h `rshift` 32) :: SPMD w e Int64) `iand` uniform (nb - 1)) `lshift` 3)
+  let wsSp = uniformAlignedPtr ws
+  w0 <- peekElemOff wsSp base
+  w1 <- peekElemOff wsSp (base + 1)
+  w2 <- peekElemOff wsSp (base + 2)
+  w3 <- peekElemOff wsSp (base + 3)
+  w4 <- peekElemOff wsSp (base + 4)
+  w5 <- peekElemOff wsSp (base + 5)
+  w6 <- peekElemOff wsSp (base + 6)
+  w7 <- peekElemOff wsSp (base + 7)
+  pure $
+    ((w0 `iand` laneBitMask @(SPMD w e) h saltLane0) `ne` 0)
+      `land` ((w1 `iand` laneBitMask @(SPMD w e) h saltLane1) `ne` 0)
+      `land` ((w2 `iand` laneBitMask @(SPMD w e) h saltLane2) `ne` 0)
+      `land` ((w3 `iand` laneBitMask @(SPMD w e) h saltLane3) `ne` 0)
+      `land` ((w4 `iand` laneBitMask @(SPMD w e) h saltLane4) `ne` 0)
+      `land` ((w5 `iand` laneBitMask @(SPMD w e) h saltLane5) `ne` 0)
+      `land` ((w6 `iand` laneBitMask @(SPMD w e) h saltLane6) `ne` 0)
+      `land` ((w7 `iand` laneBitMask @(SPMD w e) h saltLane7) `ne` 0)
+
+-- | Strip-mined 64B-aligned SPMD gang union @dst |= src@ when block count and seed match.
+spmdUnionInto ::
+  forall w k m e.
+  (BloomFilterCtx m e k, SPMDGang w m e) =>
+  Proxy w ->
+  BloomFilter e k ->
+  BloomFilter e k ->
+  m ()
+spmdUnionInto pw (BloomFilter hdrDst) (BloomFilter hdrSrc) = do
+  let fDst = projectPtrs hdrDst
+      fSrc = projectPtrs hdrSrc
+  nbDst <- peek (getPtrOf (bfsNumBlocks fDst))
+  nbSrc <- peek (getPtrOf (bfsNumBlocks fSrc))
+  seedDst <- peek (getPtrOf (bfsSeed fDst))
+  seedSrc <- peek (getPtrOf (bfsSeed fSrc))
+  whenM_ ((nbDst `eq` nbSrc) `land` (seedDst `eq` seedSrc)) $ do
+    dstWs <- peek (getPtrOf (bfsWords fDst))
+    srcWs <- peek (getPtrOf (bfsWords fSrc))
+    totalWords <- letM (nbDst `lshift` 3)
+    let srcSp = uniformAlignedPtr srcWs
+    foreachBufSPMD @w @Word64 pw True (ScalarBuf dstWs) totalWords $ \idx dw -> do
+      sw <- peekElemOff srcSp idx
+      pure (dw `ior` sw)
+
+-- | Strip-mined SIMD SWAR population count + Swamidass-Baldi cardinality estimate.
+spmdEstimatedPopcount ::
+  forall w k m e.
+  (BloomFilterCtx m e k, SPMDGang w m e) =>
+  Proxy w ->
+  BloomFilter e k ->
+  m (e Int64)
+spmdEstimatedPopcount pw (BloomFilter hdr) = do
+  let f = projectPtrs hdr
+  nb <- peek (getPtrOf (bfsNumBlocks f))
+  ws <- peek (getPtrOf (bfsWords f))
+  totalWords <- letM (nb `lshift` 3)
+  setBits <-
+    gangReduceAdd
+      <$> foldBufSPMD @w @Word64 @Int64 pw True (ScalarBuf ws) totalWords (0 :: SPMD w e Int64) (\acc _ w -> pure (acc + popcountWord64 w))
+  estimateFromSetBits nb setBits
 
 --------------------------------------------------------------------------------
 -- Drains & Bulk Stream Construction

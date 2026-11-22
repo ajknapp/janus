@@ -50,6 +50,11 @@ module Janus.Data.StableVec
     drainToStableVec,
     fromStream,
     drainAppendStableVec,
+
+    -- * Chunk-Sequential SPMD / SIMD Gang Kernels
+    foreachSPMD,
+    traverseSPMD_,
+    foldSPMD,
   )
 where
 
@@ -83,7 +88,8 @@ import Janus.Expression.Bits (ExpBits (..))
 import Janus.Expression.Bool (ExpBool (..))
 import Janus.Expression.Cond (ExpCond (..))
 import Janus.Expression.Eq (ExpEq (..))
-import Janus.Expression.Ord (ExpOrd (..))
+import Janus.Expression.Ord (ExpOrd (..), min')
+import Janus.SPMD (SPMD, SPMDM, SPMDTyped, uniform, withSPMD)
 import Janus.Typed (JanusTyped)
 
 -- | Spine struct for 'StableVec'.
@@ -426,6 +432,83 @@ drainAppendStableVec ::
   StableVec k e a ->
   Drain m (Elem e a) ()
 drainAppendStableVec alloc sv = drainForEach (push alloc sv)
+
+--------------------------------------------------------------------------------
+-- Chunk-Sequential SPMD / SIMD Gang Kernels Over StableVec
+--------------------------------------------------------------------------------
+
+-- | Layout-polymorphic 64B-aligned in-place SIMD map across all live @2^k@ chunks.
+foreachSPMD ::
+  forall w k a m e.
+  (StableVecCtx k m e a, LayoutUnitSPMD w m e a) =>
+  Proxy w ->
+  StableVec k e a ->
+  (SPMD w e Int64 -> Elem (SPMD w e) a -> SPMDM w m e (Elem (SPMD w e) a)) ->
+  m ()
+foreachSPMD pw (StableVec hdr) step = do
+  let f = projectPtrs hdr
+      (shI, chunkSzI, maskI) = chunkParams (Proxy @k)
+      sh = fromIntegral shI :: e Int64
+      chunkSz = fromIntegral chunkSzI :: e Int64
+      cMask = fromIntegral maskI :: e Int64
+  curLen <- peek (getPtrOf (stvsLen f))
+  whenM_ (curLen `gt` 0) $ do
+    dir <- peek (getPtrOf (stvsChunks f))
+    usedChunks <- letM ((curLen + cMask) `rshift` sh)
+    runDrain
+      ( drainForEach $ \cIdx -> do
+          chunkBuf <- peekBufStruct (ptrIndex dir cIdx)
+          chunkBase <- letM (cIdx `lshift` sh)
+          chunkItems <- letM (min' chunkSz (curLen - chunkBase))
+          foreachBufSPMD pw True chunkBuf chunkItems $ \localIdx val ->
+            step (uniform chunkBase + localIdx) val
+      )
+      (rangeS 0 usedChunks)
+
+-- | Layout-polymorphic 64B-aligned read-only SIMD scan across all live @2^k@ chunks.
+traverseSPMD_ ::
+  forall w k a m e.
+  (StableVecCtx k m e a, LayoutUnitSPMD w m e a) =>
+  Proxy w ->
+  StableVec k e a ->
+  (SPMD w e Int64 -> Elem (SPMD w e) a -> SPMDM w m e ()) ->
+  m ()
+traverseSPMD_ pw (StableVec hdr) body = do
+  let f = projectPtrs hdr
+      (shI, chunkSzI, maskI) = chunkParams (Proxy @k)
+      sh = fromIntegral shI :: e Int64
+      chunkSz = fromIntegral chunkSzI :: e Int64
+      cMask = fromIntegral maskI :: e Int64
+  curLen <- peek (getPtrOf (stvsLen f))
+  whenM_ (curLen `gt` 0) $ do
+    dir <- peek (getPtrOf (stvsChunks f))
+    usedChunks <- letM ((curLen + cMask) `rshift` sh)
+    runDrain
+      ( drainForEach $ \cIdx -> do
+          chunkBuf <- peekBufStruct (ptrIndex dir cIdx)
+          chunkBase <- letM (cIdx `lshift` sh)
+          chunkItems <- letM (min' chunkSz (curLen - chunkBase))
+          traverseBufSPMD_ pw True chunkBuf chunkItems $ \localIdx val ->
+            body (uniform chunkBase + localIdx) val
+      )
+      (rangeS 0 usedChunks)
+
+-- | Layout-polymorphic 64B-aligned masked-safe SIMD fold across all live @2^k@ chunks.
+foldSPMD ::
+  forall w k a s m e.
+  (StableVecCtx k m e a, LayoutUnitSPMD w m e a, SPMDTyped w e s) =>
+  Proxy w ->
+  StableVec k e a ->
+  SPMD w e s ->
+  (SPMD w e s -> SPMD w e Int64 -> Elem (SPMD w e) a -> SPMDM w m e (SPMD w e s)) ->
+  m (SPMD w e s)
+foldSPMD pw sv s0 step = do
+  accRef <- withSPMD pw (newRef s0)
+  traverseSPMD_ pw sv $ \idx val -> do
+    cur <- readRef accRef
+    nxt <- step cur idx val
+    writeRef accRef nxt
+  withSPMD pw (readRef accRef)
 
 --------------------------------------------------------------------------------
 -- Host <-> C FFI Marshalling Instances

@@ -39,11 +39,13 @@ module Janus.Data.LruCache
     insert,
     delete,
 
-    -- * Recency-Ordered Streams & Drains
+    -- * Recency-Ordered Streams, SPMD Kernels, & Drains
     mruStream,
     lruStream,
     mruKeysS,
     mruValuesS,
+    foreachValuesSPMD,
+    foldValuesSPMD,
     drainToLruCache,
     fromStream,
     drainAppendLruCache,
@@ -100,6 +102,14 @@ import Janus.Expression.Cond (ExpCond (..))
 import Janus.Expression.Eq (ExpEq (..))
 import Janus.Expression.MurmurHash (defaultHashSalt)
 import Janus.Expression.Ord (ExpOrd (..))
+import Janus.SPMD
+  ( SPMD,
+    SPMDM,
+    SPMDTyped,
+    uniform,
+    uniformAlignedPtr,
+    withSPMD,
+  )
 import Janus.Typed (JanusTyped)
 import Prelude hiding (lookup)
 
@@ -782,6 +792,68 @@ mruValuesS ::
   LruCache e k v ->
   Stream m (Elem e v)
 mruValuesS lru = snd <$> mruStream lru
+
+-- | Strip-mined in-place SIMD map over all occupied value slots without modifying LRU recency links.
+foreachValuesSPMD ::
+  forall w k v m e.
+  (LruCacheCtx m e k v, LayoutUnitSPMD w m e v) =>
+  Proxy w ->
+  LruCache e k v ->
+  (SPMD w e Int64 -> Elem (SPMD w e) v -> SPMDM w m e (Elem (SPMD w e) v)) ->
+  m ()
+foreachValuesSPMD pw (LruCache hdr) step = do
+  let f = projectPtrs hdr
+  curLen <- peek (getPtrOf (lcsLen f))
+  whenM_ (curLen `gt` 0) $ do
+    dCap <- peek (getPtrOf (lcsCap f))
+    prevArr <- peek (getPtrOf (lcsPrev f))
+    mru32 <- peek (getPtrOf (lcsMru f))
+    vb <- peekBufStruct (getPtrOf (lcsVals f))
+    let mru64 = toIntegral mru32 :: e Int64
+    foreachMaskedBufSPMD
+      pw
+      True
+      vb
+      dCap
+      ( \idx -> do
+          prv <- peekElemOff (uniformAlignedPtr prevArr) idx
+          pure ((prv `ge` 0) `lor` (idx `eq` uniform mru64))
+      )
+      step
+
+-- | Masked-safe SIMD fold over all occupied value slots without modifying LRU recency links.
+foldValuesSPMD ::
+  forall w k v s m e.
+  (LruCacheCtx m e k v, LayoutUnitSPMD w m e v, SPMDTyped w e s) =>
+  Proxy w ->
+  LruCache e k v ->
+  SPMD w e s ->
+  (SPMD w e s -> SPMD w e Int64 -> Elem (SPMD w e) v -> SPMDM w m e (SPMD w e s)) ->
+  m (SPMD w e s)
+foldValuesSPMD pw (LruCache hdr) s0 step = do
+  let f = projectPtrs hdr
+  curLen <- peek (getPtrOf (lcsLen f))
+  accRef <- withSPMD pw (newRef s0)
+  whenM_ (curLen `gt` 0) $ do
+    dCap <- peek (getPtrOf (lcsCap f))
+    prevArr <- peek (getPtrOf (lcsPrev f))
+    mru32 <- peek (getPtrOf (lcsMru f))
+    vb <- peekBufStruct (getPtrOf (lcsVals f))
+    let mru64 = toIntegral mru32 :: e Int64
+    res <-
+      foldMaskedBufSPMD
+        pw
+        True
+        vb
+        dCap
+        ( \idx -> do
+            prv <- peekElemOff (uniformAlignedPtr prevArr) idx
+            pure ((prv `ge` 0) `lor` (idx `eq` uniform mru64))
+        )
+        s0
+        step
+    withSPMD pw (writeRef accRef res)
+  withSPMD pw (readRef accRef)
 
 drainToLruCache ::
   forall k v m e.

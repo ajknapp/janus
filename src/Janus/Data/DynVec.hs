@@ -67,6 +67,12 @@ module Janus.Data.DynVec
     appendStream,
 
     -- * SPMD / SIMD Gang Kernels Over Vector Storage
+    foreachSPMD,
+    traverseSPMD_,
+    foldSPMD,
+    gatherUnsafeSPMD,
+    gatherScalarSPMD,
+    scatterSPMD,
     foreachScalarSPMD,
     foreachSoAVecSPMD,
     foreachAoSoAVecSPMD,
@@ -106,6 +112,8 @@ import Janus.SPMD
     SPMDGang,
     SPMDLayout,
     SPMDM,
+    SPMDTyped,
+    liftSPMD,
     spmdAlignedUnitStride,
     uniform,
     uniformAlignedPtr,
@@ -558,6 +566,93 @@ appendStream alloc v = runDrain (drainAppendDynVec alloc v)
 --------------------------------------------------------------------------------
 -- SPMD / SIMD Gang Kernels Over DynVec
 --------------------------------------------------------------------------------
+
+-- | Unified layout-polymorphic 64B-aligned in-place SIMD map over @[0 .. len - 1]@
+-- across @Scalar@, @SoA s@, @AoSoA w s@, and @SOAOA w outer@.
+foreachSPMD ::
+  forall w a m e.
+  (DynVecCtx m e a, LayoutUnitSPMD w m e a) =>
+  Proxy w ->
+  DynVec e a ->
+  (SPMD w e Int64 -> Elem (SPMD w e) a -> SPMDM w m e (Elem (SPMD w e) a)) ->
+  m ()
+foreachSPMD pw v step = do
+  n <- len v
+  b <- buf v
+  foreachBufSPMD pw True b n step
+
+-- | Unified layout-polymorphic read-only 64B-aligned SIMD scan over @[0 .. len - 1]@.
+traverseSPMD_ ::
+  forall w a m e.
+  (DynVecCtx m e a, LayoutUnitSPMD w m e a) =>
+  Proxy w ->
+  DynVec e a ->
+  (SPMD w e Int64 -> Elem (SPMD w e) a -> SPMDM w m e ()) ->
+  m ()
+traverseSPMD_ pw v body = do
+  n <- len v
+  b <- buf v
+  traverseBufSPMD_ pw True b n body
+
+-- | Unified layout-polymorphic masked-safe 64B-aligned SIMD fold over @[0 .. len - 1]@.
+foldSPMD ::
+  forall w a s m e.
+  (DynVecCtx m e a, LayoutUnitSPMD w m e a, SPMDTyped w e s) =>
+  Proxy w ->
+  DynVec e a ->
+  SPMD w e s ->
+  (SPMD w e s -> SPMD w e Int64 -> Elem (SPMD w e) a -> SPMDM w m e (SPMD w e s)) ->
+  m (SPMD w e s)
+foldSPMD pw v s0 step = do
+  n <- len v
+  b <- buf v
+  foldBufSPMD pw True b n s0 step
+
+-- | Unchecked varying-index SIMD gather across @Scalar@ and @SoA s@ (@0 <= idx < len@).
+gatherUnsafeSPMD ::
+  forall w a m e.
+  (DynVecCtx m e a, LayoutGatherSPMD w m e a) =>
+  DynVec e a ->
+  SPMD w e Int64 ->
+  SPMDM w m e (Elem (SPMD w e) a)
+gatherUnsafeSPMD v idx = do
+  b <- liftSPMD (buf v)
+  gatherBufSPMD b idx
+
+-- | Bounds-masked varying-index scalar SIMD gather returning @defVal@ on out-of-bounds lanes.
+gatherScalarSPMD ::
+  forall w a s m e.
+  ( DynVecCtx m e a,
+    LayoutGatherSPMD w m e a,
+    Elem (SPMD w e) a ~ SPMD w e s,
+    SPMDTyped w e s
+  ) =>
+  SPMD w e s ->
+  DynVec e a ->
+  SPMD w e Int64 ->
+  SPMDM w m e (SPMD w e s)
+gatherScalarSPMD defVal v idx = do
+  n <- liftSPMD (len v)
+  resRef <- newRef defVal
+  whenM_ ((idx `ge` 0) `land` (idx `lt` uniform n)) $ do
+    b <- liftSPMD (buf v)
+    gathered <- gatherBufSPMD b idx
+    writeRef resRef gathered
+  readRef resRef
+
+-- | Bounds-masked varying-index SIMD scatter across @Scalar@ and @SoA s@ (lanes outside @[0, len)@ are ignored).
+scatterSPMD ::
+  forall w a m e.
+  (DynVecCtx m e a, LayoutGatherSPMD w m e a) =>
+  DynVec e a ->
+  SPMD w e Int64 ->
+  Elem (SPMD w e) a ->
+  SPMDM w m e ()
+scatterSPMD v idx val = do
+  n <- liftSPMD (len v)
+  whenM_ ((idx `ge` 0) `land` (idx `lt` uniform n)) $ do
+    b <- liftSPMD (buf v)
+    scatterBufSPMD b idx val
 
 -- | Strip-mined 64B-aligned SPMD loop over a scalar 'DynVec'.
 foreachScalarSPMD ::

@@ -50,6 +50,11 @@ module Janus.Data.Stack
     drainToStack,
     fromStream,
     drainAppendStack,
+
+    -- * SPMD / SIMD Gang Kernels Over Stack Storage
+    foreachSPMD,
+    traverseSPMD_,
+    foldSPMD,
   )
 where
 
@@ -77,6 +82,7 @@ import Janus.Expression.Bool (ExpBool (..))
 import Janus.Expression.Cond (ExpCond (..))
 import Janus.Expression.Eq (ExpEq (..))
 import Janus.Expression.Ord (ExpOrd (..))
+import Janus.SPMD (SPMD, SPMDM, SPMDTyped)
 import Janus.Typed (JanusTyped)
 
 -- | C-ABI control spine for a contiguous LIFO 'Stack'.
@@ -371,6 +377,50 @@ drainAppendStack ::
   Stack e a ->
   Drain m (Elem e a) ()
 drainAppendStack alloc st = drainForEach (push alloc st)
+
+--------------------------------------------------------------------------------
+-- SPMD / SIMD Gang Kernels Over Stack
+--------------------------------------------------------------------------------
+
+-- | Layout-polymorphic 64B-aligned in-place SIMD map over bottom-to-top @[0 .. len - 1]@.
+foreachSPMD ::
+  forall w a m e.
+  (StackCtx m e a, LayoutUnitSPMD w m e a) =>
+  Proxy w ->
+  Stack e a ->
+  (SPMD w e Int64 -> Elem (SPMD w e) a -> SPMDM w m e (Elem (SPMD w e) a)) ->
+  m ()
+foreachSPMD pw st step = do
+  n <- len st
+  b <- buf st
+  foreachBufSPMD pw True b n step
+
+-- | Layout-polymorphic 64B-aligned read-only SIMD scan over bottom-to-top @[0 .. len - 1]@.
+traverseSPMD_ ::
+  forall w a m e.
+  (StackCtx m e a, LayoutUnitSPMD w m e a) =>
+  Proxy w ->
+  Stack e a ->
+  (SPMD w e Int64 -> Elem (SPMD w e) a -> SPMDM w m e ()) ->
+  m ()
+traverseSPMD_ pw st body = do
+  n <- len st
+  b <- buf st
+  traverseBufSPMD_ pw True b n body
+
+-- | Layout-polymorphic 64B-aligned masked-safe SIMD fold over bottom-to-top @[0 .. len - 1]@.
+foldSPMD ::
+  forall w a s m e.
+  (StackCtx m e a, LayoutUnitSPMD w m e a, SPMDTyped w e s) =>
+  Proxy w ->
+  Stack e a ->
+  SPMD w e s ->
+  (SPMD w e s -> SPMD w e Int64 -> Elem (SPMD w e) a -> SPMDM w m e (SPMD w e s)) ->
+  m (SPMD w e s)
+foldSPMD pw st s0 step = do
+  n <- len st
+  b <- buf st
+  foldBufSPMD pw True b n s0 step
 
 --------------------------------------------------------------------------------
 -- Host <-> C FFI Marshalling Instances

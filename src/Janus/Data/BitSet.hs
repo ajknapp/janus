@@ -30,38 +30,48 @@ module Janus.Data.BitSet
     withBitCapacity,
     free,
 
-    -- * Capacity Management & Clear
+    -- * Capacity Management, Raw Pointers, & Clear
     clear,
     ensureBit,
     wordCapacity,
     bitCapacity,
+    wordsPtr,
+    wordsAlignedSPMD,
 
-    -- * Single-Bit & Range Operations
+    -- * Single-Bit, Batch SPMD Probe, & Range Operations
     testBit,
+    testBitsSPMD,
     setBit,
     clearBit,
     toggleBit,
     setRange,
 
-    -- * Cardinality, Predicates, & Set Relations
+    -- * Cardinality, Predicates, & Set Relations (Scalar & SPMD)
     popcount,
+    spmdPopcount,
     isEmpty,
     equals,
     isSubsetOf,
+    spmdIsSubsetOf,
     isDisjointFrom,
+    spmdIsDisjointFrom,
 
     -- * SWAR Bit-Scanning Queries
     findFirstSet,
     findLastSet,
     findNextSetGe,
 
-    -- * In-Place Word-Level & SPMD Gang-Accelerated Set Algebra
+    -- * In-Place Word-Level & SPMD Gang-Accelerated Set Algebra & Traversals
+    foreachWordsSPMD,
+    foldWordsSPMD,
     unionInto,
     intersectInto,
     differenceInto,
     xorInto,
     spmdUnionInto,
     spmdIntersectInto,
+    spmdDifferenceInto,
+    spmdXorInto,
 
     -- * Word-Skipping Streams, Set-Algebra Streams, & Drains
     stream,
@@ -102,6 +112,7 @@ import Janus.Control.Drain (Drain (..), drainAll, drainFind, drainFirst, drainFo
 import Janus.Control.Step (Step (..))
 import Janus.Control.Stream (Stream, filterMapS, iterateS, rangeS, reverseRangeS, statefulS, streamM)
 import Janus.Data.HKD
+import Janus.Data.Layout (ScalarBuf (..), foldBufSPMD, foldSliceBufSPMD, foreachBufSPMD)
 import Janus.Expression.Bits (ExpBits (..))
 import Janus.Expression.Bool (ExpBool (..))
 import Janus.Expression.Cast (ExpIntegralCast (..), ExpPtrCast (..))
@@ -111,7 +122,13 @@ import Janus.Expression.Integral (ExpIntegral (..))
 import Janus.Expression.Let (ExpLet (..))
 import Janus.Expression.Ord (ExpOrd (..), max', min')
 import Janus.SPMD
-  ( SPMDGang,
+  ( SPMD,
+    SPMDGang,
+    SPMDM,
+    SPMDTyped,
+    gangAll,
+    gangReduceAdd,
+    liftSPMD,
     spmdAlignedUnitStride,
     uniform,
     uniformAlignedPtr,
@@ -275,6 +292,12 @@ wordCapacity (BitSet hdr) = peek (getPtrOf (bssWordCap (projectPtrs hdr)))
 bitCapacity :: (BitSetCtx m e) => BitSet e -> m (e Int64)
 bitCapacity bs = (`lshift` 6) <$> wordCapacity bs
 
+wordsPtr :: (BitSetCtx m e) => BitSet e -> m (e (Ptr Word64))
+wordsPtr (BitSet hdr) = peek (getPtrOf (bssWords (projectPtrs hdr)))
+
+wordsAlignedSPMD :: (BitSetCtx m e) => BitSet e -> m (SPMD w e (Ptr Word64))
+wordsAlignedSPMD bs = uniformAlignedPtr <$> wordsPtr bs
+
 ensureWordCap ::
   (BitSetCtx m e) =>
   Alloc e ->
@@ -323,6 +346,25 @@ testBit (BitSet hdr) bitIdx = do
     ws <- peek (getPtrOf (bssWords f))
     w <- peekElemOff ws wIdx
     let mask = (1 :: e Word64) `lshift` toIntegral (bitIdx `iand` 63)
+    writeRef resRef ((w `iand` mask) `ne` 0)
+  readRef resRef
+
+-- | Bounds-masked SIMD / SPMD batch bit-membership probe across @w@ indices simultaneously.
+testBitsSPMD ::
+  forall w m e.
+  (BitSetCtx m e, SPMDGang w m e) =>
+  BitSet e ->
+  SPMD w e Int64 ->
+  SPMDM w m e (SPMD w e Bool)
+testBitsSPMD bs bitIdxs = do
+  wCap <- liftSPMD (wordCapacity bs)
+  wsSp <- liftSPMD (wordsAlignedSPMD bs)
+  wIdx <- letM (bitIdxs `rshift` 6)
+  let inBounds = (bitIdxs `ge` 0) `land` (wIdx `lt` uniform wCap)
+  resRef <- newRef false
+  whenM_ inBounds $ do
+    w <- peekElemOff wsSp wIdx
+    let mask = (1 :: SPMD w e Word64) `lshift` toIntegral (bitIdxs `iand` 63)
     writeRef resRef ((w `iand` mask) `ne` 0)
   readRef resRef
 
@@ -442,6 +484,16 @@ popcount (BitSet hdr) = do
     streamM (rangeS 0 wCap) $ \i ->
       popcountWord64 <$> peekElemOff ws i
 
+-- | Strip-mined 64B-aligned SIMD / SPMD SWAR population count across all allocated words.
+spmdPopcount ::
+  forall w m e.
+  (BitSetCtx m e, SPMDGang w m e) =>
+  Proxy w ->
+  BitSet e ->
+  m (e Int64)
+spmdPopcount pw bs =
+  gangReduceAdd <$> foldWordsSPMD pw bs (0 :: SPMD w e Int64) (\acc _ w -> pure (acc + popcountWord64 w))
+
 isEmpty ::
   (BitSetCtx m e) =>
   BitSet e ->
@@ -504,6 +556,29 @@ isSubsetOf (BitSet hdrSub) (BitSet hdrSup) = do
     writeRef resRef okTail
   readRef resRef
 
+-- | Strip-mined branch-free SIMD / SPMD subset test @sub \subseteq sup@.
+spmdIsSubsetOf ::
+  forall w m e.
+  (BitSetCtx m e, SPMDGang w m e) =>
+  Proxy w ->
+  BitSet e ->
+  BitSet e ->
+  m (e Bool)
+spmdIsSubsetOf pw sub sup = do
+  capSub <- wordCapacity sub
+  capSup <- wordCapacity sup
+  common <- letM (min' capSub capSup)
+  wsSubRaw <- wordsPtr sub
+  wsSupSp <- wordsAlignedSPMD sup
+  badCommon <-
+    foldBufSPMD @w @Word64 @Word64 pw True (ScalarBuf wsSubRaw) common (0 :: SPMD w e Word64) $ \acc idx wSub -> do
+      wSup <- peekElemOff wsSupSp idx
+      pure (acc `ior` (wSub `iand` inot wSup))
+  bad <-
+    foldSliceBufSPMD @w @Word64 @Word64 pw False (ScalarBuf wsSubRaw) common (capSub - common) common badCommon $ \acc _ wSub ->
+      pure (acc `ior` wSub)
+  pure (gangAll (bad `eq` 0))
+
 isDisjointFrom ::
   (BitSetCtx m e) =>
   BitSet e ->
@@ -522,6 +597,26 @@ isDisjointFrom (BitSet hdrA) (BitSet hdrB) = do
       wa <- peekElemOff wsA i
       wb <- peekElemOff wsB i
       pure ((wa `iand` wb) `eq` 0)
+
+-- | Strip-mined branch-free SIMD / SPMD disjointness test @a \cap b = \emptyset@.
+spmdIsDisjointFrom ::
+  forall w m e.
+  (BitSetCtx m e, SPMDGang w m e) =>
+  Proxy w ->
+  BitSet e ->
+  BitSet e ->
+  m (e Bool)
+spmdIsDisjointFrom pw a b = do
+  capA <- wordCapacity a
+  capB <- wordCapacity b
+  common <- letM (min' capA capB)
+  wsARaw <- wordsPtr a
+  wsBSp <- wordsAlignedSPMD b
+  overlap <-
+    foldBufSPMD @w @Word64 @Word64 pw True (ScalarBuf wsARaw) common (0 :: SPMD w e Word64) $ \acc idx wa -> do
+      wb <- peekElemOff wsBSp idx
+      pure (acc `ior` (wa `iand` wb))
+  pure (gangAll (overlap `eq` 0))
 
 --------------------------------------------------------------------------------
 -- SWAR Bit-Scanning Queries
@@ -598,8 +693,36 @@ findNextSetGe (BitSet hdr) startBit = do
   (,) <$> readRef okRef <*> readRef valRef
 
 --------------------------------------------------------------------------------
--- In-Place Word-Level & SPMD Gang-Accelerated Set Algebra
+-- In-Place Word-Level & SPMD Gang-Accelerated Set Algebra & Traversals
 --------------------------------------------------------------------------------
+
+-- | Strip-mine @[0, wordCapacity bs)@ in-place across 64B-aligned @Word64@ gangs.
+foreachWordsSPMD ::
+  forall w m e.
+  (BitSetCtx m e, SPMDGang w m e) =>
+  Proxy w ->
+  BitSet e ->
+  (SPMD w e Int64 -> SPMD w e Word64 -> SPMDM w m e (SPMD w e Word64)) ->
+  m ()
+foreachWordsSPMD pw bs step = do
+  wCap <- wordCapacity bs
+  whenM_ (wCap `gt` 0) $ do
+    wsRaw <- wordsPtr bs
+    foreachBufSPMD @w @Word64 pw True (ScalarBuf wsRaw) wCap step
+
+-- | Masked-safe 64B-aligned SIMD fold over @[0, wordCapacity bs)@.
+foldWordsSPMD ::
+  forall w s m e.
+  (BitSetCtx m e, SPMDGang w m e, SPMDTyped w e s) =>
+  Proxy w ->
+  BitSet e ->
+  SPMD w e s ->
+  (SPMD w e s -> SPMD w e Int64 -> SPMD w e Word64 -> SPMDM w m e (SPMD w e s)) ->
+  m (SPMD w e s)
+foldWordsSPMD pw bs s0 step = do
+  wCap <- wordCapacity bs
+  wsRaw <- wordsPtr bs
+  foldBufSPMD @w @Word64 @s pw True (ScalarBuf wsRaw) wCap s0 step
 
 unionInto ::
   (BitSetCtx m e) =>
@@ -763,6 +886,44 @@ spmdIntersectInto pw _alloc (BitSet hdrDst) (BitSet hdrSrc) = do
         pokeElemOff dstSp (dw `iand` sw) tailIdx
   whenM_ (dstCap `gt` common) $
     cmdMemset (toVoidPtr (ptrIndex dstRaw common)) 0 ((dstCap - common) `lshift` 3)
+
+-- | Strip-mined 64B-aligned SPMD gang difference @dst &= ~src@ over @SPMD w e Word64@.
+spmdDifferenceInto ::
+  forall w m e.
+  (BitSetCtx m e, SPMDGang w m e) =>
+  Proxy w ->
+  BitSet e ->
+  BitSet e ->
+  m ()
+spmdDifferenceInto pw dst src = do
+  dstCap <- wordCapacity dst
+  srcCap <- wordCapacity src
+  common <- letM (min' dstCap srcCap)
+  whenM_ (common `gt` 0) $ do
+    dstRaw <- wordsPtr dst
+    srcSp <- wordsAlignedSPMD src
+    foreachBufSPMD @w @Word64 pw True (ScalarBuf dstRaw) common $ \idx dw -> do
+      sw <- peekElemOff srcSp idx
+      pure (dw `iand` inot sw)
+
+-- | Strip-mined 64B-aligned SPMD gang symmetric difference @dst ^= src@ over @SPMD w e Word64@.
+spmdXorInto ::
+  forall w m e.
+  (BitSetCtx m e, SPMDGang w m e) =>
+  Proxy w ->
+  Alloc e ->
+  BitSet e ->
+  BitSet e ->
+  m ()
+spmdXorInto pw alloc dst src = do
+  srcCap <- wordCapacity src
+  whenM_ (srcCap `gt` 0) $ do
+    ensureWordCap alloc dst srcCap
+    dstRaw <- wordsPtr dst
+    srcSp <- wordsAlignedSPMD src
+    foreachBufSPMD @w @Word64 pw True (ScalarBuf dstRaw) srcCap $ \idx dw -> do
+      sw <- peekElemOff srcSp idx
+      pure (dw `ieor` sw)
 
 --------------------------------------------------------------------------------
 -- Word-Skipping Streams, Set-Algebra Streams, & Drains

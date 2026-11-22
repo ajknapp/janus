@@ -38,8 +38,10 @@ module Janus.Data.HashSet
     delete,
     isSubsetOf,
 
-    -- * Fused Set-Algebra Streams & Drains
+    -- * Fused Set-Algebra Streams, SPMD Kernels, & Drains
     stream,
+    foldOccupiedSPMD,
+    memberBatchSPMD,
     unionInto,
     intersectionS,
     differenceS,
@@ -70,8 +72,8 @@ import Janus.Backend.C.TH
 import Janus.Command.Cond (ifThenElseM_, whenM_)
 import Janus.Command.Memory (CmdMemCopy (..), CmdStorable (..), ExpPtr (..), ExpSized (..), janusSIMDAlignment)
 import Janus.Command.Ref (letM, newRef, readRef, writeRef)
-import Janus.Control.Drain (Drain (..), drainAll, drainFind, drainFirst, drainForEach, drainLength, runDrain)
-import Janus.Control.Stream (Stream (..), filterMapS, iterateS, streamM, withStreamSetup)
+import Janus.Control.Drain (Drain (..), drainAll, drainFind, drainFirst, drainForEach, drainLength, drain_, runDrain)
+import Janus.Control.Stream (Stream (..), filterMapS, iterateS, streamM, unfoldWhileM, withStreamSetup)
 import Janus.Data.HKD
 import Janus.Data.HashMap (HashKey (..), probeGroupsS, swarBitsS, swarOccupiedSlotsS)
 import Janus.Data.Layout
@@ -82,6 +84,16 @@ import Janus.Expression.Cond (ExpCond (..))
 import Janus.Expression.Eq (ExpEq (..))
 import Janus.Expression.MurmurHash (defaultHashSalt)
 import Janus.Expression.Ord (ExpOrd (..))
+import Janus.SPMD
+  ( SPMD,
+    SPMDGang,
+    SPMDM,
+    SPMDTyped,
+    liftSPMD,
+    uniform,
+    uniformAlignedPtr,
+    withSPMD,
+  )
 import Janus.Typed (JanusTyped)
 
 ctrlEmptyByte :: Word8
@@ -423,6 +435,83 @@ stream (HashSet hdr) =
         $ \(cap, ctrl, kb) ->
           let ctrlWords = fromVoidPtr (toVoidPtr ctrl) :: e (Ptr Word64)
            in streamM (swarOccupiedSlotsS ctrlWords (cap `rshift` 3)) (readBuf kb)
+
+-- | Masked-safe SIMD fold over all occupied keys in @[0, cap)@.
+foldOccupiedSPMD ::
+  forall w k s m e.
+  (HashSetCtx m e k, LayoutUnitSPMD w m e k, SPMDTyped w e s) =>
+  Proxy w ->
+  HashSet e k ->
+  SPMD w e s ->
+  (SPMD w e s -> SPMD w e Int64 -> Elem (SPMD w e) k -> SPMDM w m e (SPMD w e s)) ->
+  m (SPMD w e s)
+foldOccupiedSPMD pw (HashSet hdr) s0 step = do
+  let f = projectPtrs hdr
+  cap <- peek (getPtrOf (hssCap f))
+  accRef <- withSPMD pw (newRef s0)
+  whenM_ (cap `gt` 0) $ do
+    ctrl <- peek (getPtrOf (hssCtrl f))
+    kb <- peekBufStruct (getPtrOf (hssKeys f))
+    res <-
+      foldMaskedBufSPMD
+        pw
+        True
+        kb
+        cap
+        ( \idx -> do
+            c <- peekElemOff (uniformAlignedPtr ctrl) idx
+            pure ((c `iand` 0x80) `eq` 0)
+        )
+        s0
+        step
+    withSPMD pw (writeRef accRef res)
+  withSPMD pw (readRef accRef)
+
+-- | Lane-parallel SIMD batch membership query probing @w@ keys simultaneously.
+memberBatchSPMD ::
+  forall w k m e.
+  (HashSetCtx m e k, SPMDGang w m e, HashKey (SPMD w e) k, LayoutGatherSPMD w m e k) =>
+  Proxy w ->
+  HashSet e k ->
+  Elem (SPMD w e) k ->
+  SPMDM w m e (SPMD w e Bool)
+memberBatchSPMD _ (HashSet hdr) qKeys = do
+  let f = projectPtrs hdr
+  cap <- liftSPMD (peek (getPtrOf (hssCap f)))
+  foundRef <- newRef false
+  whenM_ (uniform cap `gt` 0) $ do
+    ctrl <- liftSPMD (peek (getPtrOf (hssCtrl f)))
+    kb <- liftSPMD (peekBufStruct (getPtrOf (hssKeys f)))
+    seed <- liftSPMD (peek (getPtrOf (hssSeed f)))
+    let ctrlWords = fromVoidPtr (toVoidPtr ctrl) :: e (Ptr Word64)
+        groupMask = (cap `rshift` 3) - 1
+    h <- letM (hashElemWithSalt @(SPMD w e) @k (uniform seed) qKeys)
+    let h2w64 = (h `rshift` 57) `iand` 0x7F
+        splat = h2w64 * 0x0101010101010101
+        g0 = (toIntegral (h `iand` 0x7FFFFFFFFFFFFFFF) :: SPMD w e Int64) `iand` uniform groupMask
+    runDrain drain_ $
+      unfoldWhileM (g0, 0 :: SPMD w e Int64, true) (\(_, _, act) -> pure act) $ \(g, st, _) -> do
+        cw <- peekElemOff (uniformAlignedPtr ctrlWords) g
+        let x = cw `ieor` splat
+            low7 = x `iand` 0x7F7F7F7F7F7F7F7F
+            hasZeroLow7 = inot (low7 + 0x7F7F7F7F7F7F7F7F)
+            matchMask0 = hasZeroLow7 `iand` inot x `iand` 0x8080808080808080
+            empMask = cw `iand` inot (cw `lshift` 6) `iand` 0x8080808080808080
+        runDrain drain_ $
+          unfoldWhileM matchMask0 (\curM -> pure (curM `ne` 0)) $ \curM -> do
+            let lsb = (curM `iand` (0 - curM)) `rshift` 7
+                byteIdx = toIntegral (((lsb * 0x0001020304050607) `rshift` 56) `iand` 0x7) :: SPMD w e Int64
+                sl = (g `lshift` 3) + byteIdx
+            ck <- gatherBufSPMD kb sl
+            let hit = eqElem @(SPMD w e) @k ck qKeys
+            whenM_ hit (writeRef foundRef true)
+            pure (ifThenElse hit 0 (curM `iand` (curM - 1)), ())
+        fnd <- readRef foundRef
+        let actNext = lnot fnd `land` (empMask `eq` 0)
+            stNext = st + 1
+            gNext = (g + stNext) `iand` uniform groupMask
+        pure ((gNext, stNext, actNext), ())
+  readRef foundRef
 
 isSubsetOf ::
   (HashSetCtx m e k) =>

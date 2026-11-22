@@ -48,6 +48,9 @@ module Janus.Data.SlotMap
     valuesS,
     keysS,
     toStream,
+    containsKeysSPMD,
+    foreachValuesSPMD,
+    foldValuesSPMD,
     foreachScalarSPMD,
     foreachSoASlotMapSPMD,
     drainToSlotMap,
@@ -86,7 +89,7 @@ import Janus.Data.HKD
 import Janus.Data.Layout
 import Janus.Expression.Bits (ExpBits (..))
 import Janus.Expression.Bool (ExpBool (..))
-import Janus.Expression.Cast (ExpIntegralCast (..))
+import Janus.Expression.Cast (ExpIntegralCast (..), ExpPtrCast (..))
 import Janus.Expression.Cond (ExpCond (..))
 import Janus.Expression.Eq (ExpEq (..))
 import Janus.Expression.Integral (ExpIntegral (..))
@@ -97,6 +100,8 @@ import Janus.SPMD
     SPMDGang,
     SPMDLayout,
     SPMDM,
+    SPMDTyped,
+    liftSPMD,
     spmdAlignedUnitStride,
     uniform,
     uniformAlignedPtr,
@@ -595,6 +600,59 @@ foreachSoASlotMapSPMD pw (SlotMap hdr) step = do
   n <- peek (getPtrOf (smsDenseLen f))
   b <- peekBufStruct (getPtrOf (smsDenseVals f))
   foreachSoASPMD pw b n step
+
+-- | Lane-parallel generational key validity check across @w@ SIMD lanes via a single
+-- bounds-masked @Word32@ gather into the 8-byte @SlotEntry@ array.
+containsKeysSPMD ::
+  forall w a m e.
+  (SlotMapCtx m e a, SPMDGang w m e) =>
+  SlotMap e a ->
+  SPMD w e Word32 ->
+  SPMD w e Word32 ->
+  SPMDM w m e (SPMD w e Bool)
+containsKeysSPMD (SlotMap hdr) sIdxW32 kGen = do
+  let f = projectPtrs hdr
+      sIdx64 = toIntegral sIdxW32 :: SPMD w e Int64
+      genWordOff = fromIntegral (fieldByteOffset @SlotEntry seGen `div` 4) :: SPMD w e Int64
+  sBumped <- liftSPMD (peek (getPtrOf (smsSlotBumped f)))
+  okRef <- newRef (false :: SPMD w e Bool)
+  let valid = ((kGen `iand` 1) `eq` 1) `land` (sIdx64 `ge` 0) `land` (sIdx64 `lt` uniform sBumped)
+  whenM_ valid $ do
+    slots <- liftSPMD (peek (getPtrOf (smsSlots f)))
+    let slotsW32 = fromVoidPtr (toVoidPtr slots) :: e (Ptr Word32)
+    curGen <- peekElemOff (uniformAlignedPtr slotsW32) ((sIdx64 `lshift` 1) + genWordOff)
+    writeRef okRef (curGen `eq` kGen)
+  readRef okRef
+
+-- | Unified layout-polymorphic SPMD strip-mined loop over the packed @denseVals@ buffer
+-- across @Scalar@, @SoA@, @AoSoA w@, and @SOAOA w@.
+foreachValuesSPMD ::
+  forall w a m e.
+  (SlotMapCtx m e a, LayoutUnitSPMD w m e a) =>
+  Proxy w ->
+  SlotMap e a ->
+  (SPMD w e Int64 -> Elem (SPMD w e) a -> SPMDM w m e (Elem (SPMD w e) a)) ->
+  m ()
+foreachValuesSPMD pw (SlotMap hdr) step = do
+  let f = projectPtrs hdr
+  n <- peek (getPtrOf (smsDenseLen f))
+  dv <- peekBufStruct (getPtrOf (smsDenseVals f))
+  foreachBufSPMD pw True dv n step
+
+-- | Masked-safe layout-polymorphic SIMD fold over the packed @denseVals@ buffer.
+foldValuesSPMD ::
+  forall w a s m e.
+  (SlotMapCtx m e a, LayoutUnitSPMD w m e a, SPMDTyped w e s) =>
+  Proxy w ->
+  SlotMap e a ->
+  SPMD w e s ->
+  (SPMD w e s -> SPMD w e Int64 -> Elem (SPMD w e) a -> SPMDM w m e (SPMD w e s)) ->
+  m (SPMD w e s)
+foldValuesSPMD pw (SlotMap hdr) s0 step = do
+  let f = projectPtrs hdr
+  n <- peek (getPtrOf (smsDenseLen f))
+  dv <- peekBufStruct (getPtrOf (smsDenseVals f))
+  foldBufSPMD pw True dv n s0 step
 
 drainToSlotMap ::
   forall a m e.

@@ -43,9 +43,11 @@ module Janus.Data.BTreeSet
     minKey,
     maxKey,
 
-    -- * Zero-Stack Doubly-Linked Leaf Streams, Set-Algebra Merges, & Drains
+    -- * Zero-Stack Doubly-Linked Leaf Streams, SPMD Kernels, Set-Algebra Merges, & Drains
     stream,
     reverseStream,
+    traverseSPMD_,
+    foldSPMD,
     rangeStream,
     unionS,
     intersectionS,
@@ -100,6 +102,13 @@ import Janus.Expression.Cast (ExpPtrCast (..))
 import Janus.Expression.Cond (ExpCond (..))
 import Janus.Expression.Eq (ExpEq (..))
 import Janus.Expression.Ord (ExpOrd (..))
+import Janus.SPMD
+  ( SPMD,
+    SPMDM,
+    SPMDTyped,
+    uniform,
+    withSPMD,
+  )
 import Janus.Typed (JanusTyped)
 
 btMinKeys :: Int64
@@ -1122,6 +1131,46 @@ reverseStream (BTreeSet hdr) = Stream $ Codensity $ \kOuter -> do
                 )
             )
       )
+
+-- | Leaf-by-leaf read-only unit-stride SIMD traversal over sorted keys across the doubly-linked leaf chain,
+-- passing the running 0-based global sorted index @(globalOffset + localIdx)@ to @body@.
+traverseSPMD_ ::
+  forall w k m e.
+  (BTreeSetCtx m e k, LayoutUnitSPMD w m e k) =>
+  Proxy w ->
+  BTreeSet e k ->
+  (SPMD w e Int64 -> Elem (SPMD w e) k -> SPMDM w m e ()) ->
+  m ()
+traverseSPMD_ pw (BTreeSet hdr) body = do
+  firstRaw <- peek (getPtrOf (btssFirstLeaf (projectPtrs hdr)))
+  runDrain drain_ $
+    unfoldWhileM (firstRaw, 0 :: e Int64) (\(curL, _) -> pure (ptrToWord64Expr curL `ne` 0)) $
+      \(curL, globalOff) -> do
+        let pLeaf = asSetLeaf @k curL
+            lf = projectPtrs pLeaf
+        leafLen <- peek (getPtrOf (btslNumKeys lf))
+        nxtL <- peek (getPtrOf (btslNextLeaf lf))
+        kb <- setLeafKeysBuf pLeaf
+        traverseBufSPMD_ pw False kb leafLen (\localIdx key -> body (uniform globalOff + localIdx) key)
+        pure ((nxtL, globalOff + leafLen), ())
+
+-- | Leaf-by-leaf masked-safe unit-stride SIMD fold over sorted keys across the doubly-linked leaf chain,
+-- passing the running 0-based global sorted index @(globalOffset + localIdx)@ to @step@.
+foldSPMD ::
+  forall w k s m e.
+  (BTreeSetCtx m e k, LayoutUnitSPMD w m e k, SPMDTyped w e s) =>
+  Proxy w ->
+  BTreeSet e k ->
+  SPMD w e s ->
+  (SPMD w e s -> SPMD w e Int64 -> Elem (SPMD w e) k -> SPMDM w m e (SPMD w e s)) ->
+  m (SPMD w e s)
+foldSPMD pw bs s0 step = do
+  accRef <- withSPMD pw (newRef s0)
+  traverseSPMD_ pw bs $ \globalIdx key -> do
+    curAcc <- readRef accRef
+    nxtAcc <- step curAcc globalIdx key
+    writeRef accRef nxtAcc
+  withSPMD pw (readRef accRef)
 
 rangeStream ::
   forall k m e.

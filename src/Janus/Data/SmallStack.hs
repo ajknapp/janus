@@ -51,6 +51,11 @@ module Janus.Data.SmallStack
     drainToSmallStack,
     fromStream,
     drainAppendSmallStack,
+
+    -- * SPMD / SIMD Gang Kernels Over Inline & Spilled Storage
+    foreachSPMD,
+    traverseSPMD_,
+    foldSPMD,
   )
 where
 
@@ -79,6 +84,7 @@ import Janus.Expression.Bool (ExpBool (..))
 import Janus.Expression.Cond (ExpCond (..))
 import Janus.Expression.Eq (ExpEq (..))
 import Janus.Expression.Ord (ExpOrd (..))
+import Janus.SPMD (SPMD, SPMDM, SPMDTyped, withSPMD)
 import Janus.Typed (JanusTyped)
 
 -- | Spine struct embedding @n@ inline elements directly inside the struct.
@@ -409,6 +415,64 @@ drainAppendSmallStack ::
   SmallStack n e a ->
   Drain m (Elem e a) ()
 drainAppendSmallStack alloc st = drainForEach (push alloc st)
+
+--------------------------------------------------------------------------------
+-- SPMD / SIMD Gang Kernels Over SmallStack
+--------------------------------------------------------------------------------
+
+-- | Layout-polymorphic in-place SIMD map over bottom-to-top @[0 .. len - 1]@,
+-- dispatching 64B-aligned loads/stores when spilled to the heap and unaligned loads/stores when inline.
+foreachSPMD ::
+  forall w n a m e.
+  (SmallStackCtx n m e a, LayoutUnitSPMD w m e a) =>
+  Proxy w ->
+  SmallStack n e a ->
+  (SPMD w e Int64 -> Elem (SPMD w e) a -> SPMDM w m e (Elem (SPMD w e) a)) ->
+  m ()
+foreachSPMD pw (SmallStack hdr) step = do
+  let f = projectPtrs hdr
+  curLen <- peek (getPtrOf (sstsLen f))
+  b <- peekBufStruct (getPtrOf (sstsBuf f))
+  isHeap <- peek (getPtrOf (sstsIsHeap f))
+  ifThenElseM_
+    (isHeap `ne` 0)
+    (foreachBufSPMD pw True b curLen step)
+    (foreachBufSPMD pw False b curLen step)
+
+-- | Layout-polymorphic read-only SIMD scan over bottom-to-top @[0 .. len - 1]@.
+traverseSPMD_ ::
+  forall w n a m e.
+  (SmallStackCtx n m e a, LayoutUnitSPMD w m e a) =>
+  Proxy w ->
+  SmallStack n e a ->
+  (SPMD w e Int64 -> Elem (SPMD w e) a -> SPMDM w m e ()) ->
+  m ()
+traverseSPMD_ pw (SmallStack hdr) body = do
+  let f = projectPtrs hdr
+  curLen <- peek (getPtrOf (sstsLen f))
+  b <- peekBufStruct (getPtrOf (sstsBuf f))
+  isHeap <- peek (getPtrOf (sstsIsHeap f))
+  ifThenElseM_
+    (isHeap `ne` 0)
+    (traverseBufSPMD_ pw True b curLen body)
+    (traverseBufSPMD_ pw False b curLen body)
+
+-- | Layout-polymorphic masked-safe SIMD fold over bottom-to-top @[0 .. len - 1]@.
+foldSPMD ::
+  forall w n a s m e.
+  (SmallStackCtx n m e a, LayoutUnitSPMD w m e a, SPMDTyped w e s) =>
+  Proxy w ->
+  SmallStack n e a ->
+  SPMD w e s ->
+  (SPMD w e s -> SPMD w e Int64 -> Elem (SPMD w e) a -> SPMDM w m e (SPMD w e s)) ->
+  m (SPMD w e s)
+foldSPMD pw st s0 step = do
+  accRef <- withSPMD pw (newRef s0)
+  traverseSPMD_ pw st $ \idx val -> do
+    cur <- readRef accRef
+    nxt <- step cur idx val
+    writeRef accRef nxt
+  withSPMD pw (readRef accRef)
 
 --------------------------------------------------------------------------------
 -- Host <-> C FFI Marshalling Instances

@@ -52,6 +52,11 @@ module Janus.Data.IndexedPQ
     drainToIndexedPQ,
     fromStream,
     drainAppendIndexedPQ,
+
+    -- * SPMD / SIMD Gang Kernels & Batch Handle Membership
+    foreachValuesSPMD,
+    foldPrioritiesSPMD,
+    containsIdsSPMD,
   )
 where
 
@@ -87,6 +92,7 @@ import Janus.Expression.Bool (ExpBool (..))
 import Janus.Expression.Cond (ExpCond (..))
 import Janus.Expression.Eq (ExpEq (..))
 import Janus.Expression.Ord (ExpOrd (..))
+import Janus.SPMD (SPMD, SPMDGang, SPMDM, SPMDTyped, liftSPMD, uniform, uniformAlignedPtr)
 import Janus.Typed (JanusTyped)
 import Prelude hiding (lookup)
 
@@ -678,6 +684,60 @@ drainAppendIndexedPQ ::
   Drain m (e Int64, Elem e p, Elem e v) ()
 drainAppendIndexedPQ alloc pq =
   drainForEach (\(i, p, v) -> insertOrUpdate alloc pq i p v)
+
+--------------------------------------------------------------------------------
+-- SPMD / SIMD Gang Kernels & Batch Handle Membership Over IndexedPQ
+--------------------------------------------------------------------------------
+
+-- | Mutate payload values in-place across @[0 .. size - 1]@ in SIMD without disturbing heap priorities or handle indices.
+foreachValuesSPMD ::
+  forall w p v m e.
+  (IndexedPQCtx m e p v, LayoutUnitSPMD w m e v) =>
+  Proxy w ->
+  IndexedPQ e p v ->
+  (SPMD w e Int64 -> Elem (SPMD w e) v -> SPMDM w m e (Elem (SPMD w e) v)) ->
+  m ()
+foreachValuesSPMD pw (IndexedPQ hdr) step = do
+  let f = projectPtrs hdr
+  n <- peek (getPtrOf (ipqsLen f))
+  vb <- peekBufStruct (getPtrOf (ipqsVals f))
+  foreachBufSPMD pw True vb n step
+
+-- | Masked-safe 64B-aligned SIMD fold over packed heap priorities @[0 .. size - 1]@.
+foldPrioritiesSPMD ::
+  forall w p v s m e.
+  (IndexedPQCtx m e p v, LayoutUnitSPMD w m e p, SPMDTyped w e s) =>
+  Proxy w ->
+  IndexedPQ e p v ->
+  SPMD w e s ->
+  (SPMD w e s -> SPMD w e Int64 -> Elem (SPMD w e) p -> SPMDM w m e (SPMD w e s)) ->
+  m (SPMD w e s)
+foldPrioritiesSPMD pw (IndexedPQ hdr) s0 step = do
+  let f = projectPtrs hdr
+  n <- peek (getPtrOf (ipqsLen f))
+  pb <- peekBufStruct (getPtrOf (ipqsPrios f))
+  foldBufSPMD pw True pb n s0 step
+
+-- | Bounds-masked Briggs-Torczon SIMD handle membership query across a gang of @ids@.
+containsIdsSPMD ::
+  forall w p v m e.
+  (IndexedPQCtx m e p v, SPMDGang w m e) =>
+  IndexedPQ e p v ->
+  SPMD w e Int64 ->
+  SPMDM w m e (SPMD w e Bool)
+containsIdsSPMD (IndexedPQ hdr) ids = do
+  let f = projectPtrs hdr
+  uCap <- liftSPMD (peek (getPtrOf (ipqsUniverseCap f)))
+  curLen <- liftSPMD (peek (getPtrOf (ipqsLen f)))
+  okRef <- newRef false
+  whenM_ ((uniform curLen `gt` 0) `land` (ids `ge` 0) `land` (ids `lt` uniform uCap)) $ do
+    sp <- liftSPMD (peek (getPtrOf (ipqsSparsePos f)))
+    pos <- peekElemOff (uniformAlignedPtr sp) ids
+    whenM_ ((pos `ge` 0) `land` (pos `lt` uniform curLen)) $ do
+      hi <- liftSPMD (peek (getPtrOf (ipqsHeapIds f)))
+      backId <- peekElemOff (uniformAlignedPtr hi) pos
+      writeRef okRef (backId `eq` ids)
+  readRef okRef
 
 --------------------------------------------------------------------------------
 -- Host <-> C FFI Marshalling Instances

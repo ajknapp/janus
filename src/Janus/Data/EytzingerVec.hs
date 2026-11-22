@@ -35,6 +35,12 @@ module Janus.Data.EytzingerVec
     -- * Zero-Allocation Stackless Sorted & Raw BFS Streams
     inOrderStream,
     rawBfsStream,
+
+    -- * First-Class SPMD / SIMD Eytzinger Search & Fold
+    lookupGESPMD,
+    lookupScalarGESPMD,
+    memberSPMD,
+    foldSPMD,
   )
 where
 
@@ -54,7 +60,7 @@ import Janus.Backend.C.TH
 import Janus.Command.Cond (ifThenElseM_, whenM_)
 import Janus.Command.Memory (CmdStorable (..), ExpSized (..))
 import Janus.Command.Ref (newRef, readRef, writeRef)
-import Janus.Control.Drain (Drain (..), drainIndexed, drain_, runDrain)
+import Janus.Control.Drain (Drain (..), drainIndexed, drainLast, drain_, runDrain)
 import Janus.Control.Step (Step (..))
 import Janus.Control.Stream (Stream, rangeS, statefulS, streamM, unfoldWhileM, withStreamSetup)
 import qualified Janus.Data.DynVec as DV
@@ -63,10 +69,18 @@ import Janus.Data.HKD
 import Janus.Data.Layout
 import Janus.Expression.Bits (ExpBits (..))
 import Janus.Expression.Bool (ExpBool (..))
-import Janus.Expression.Cast (ExpIntegralCast (..))
+import Janus.Expression.Cast (ExpBoolCast (..), ExpIntegralCast (..))
 import Janus.Expression.Cond (ExpCond (..))
 import Janus.Expression.Eq (ExpEq (..))
 import Janus.Expression.Ord (ExpOrd (..))
+import Janus.SPMD
+  ( SPMD,
+    SPMDGang,
+    SPMDM,
+    SPMDTyped,
+    liftSPMD,
+    uniform,
+  )
 import Janus.Typed (JanusTyped)
 
 -- | Spine struct for 1-indexed Eytzinger (BFS-layout) static search array.
@@ -346,6 +360,102 @@ rawBfsStream (EytzingerVec hdr) =
    in withStreamSetup
         ((,) <$> peek (getPtrOf (evsLen fields)) <*> peekBufStruct (getPtrOf (evsBuf fields)))
         (\(n, b) -> streamM (rangeS 1 (n + 1)) (readBuf b))
+
+--------------------------------------------------------------------------------
+-- First-Class SPMD / SIMD Eytzinger Search & Fold
+--------------------------------------------------------------------------------
+
+-- | Lane-parallel O(log N) branchless Khuong-Morin Eytzinger lower-bound index search
+-- across @w@ SIMD lanes, returning @(found, eytzIdx1Based)@ (with @eytzIdx1Based == 0@ on miss).
+lookupGESPMD ::
+  forall w k m e.
+  ( EytzingerVecCtx m e k,
+    SPMDGang w m e,
+    OrdKey (SPMD w e) k,
+    LayoutGatherSPMD w m e k
+  ) =>
+  Proxy w ->
+  EytzingerVec e k ->
+  Elem (SPMD w e) k ->
+  SPMDM w m e (SPMD w e Bool, SPMD w e Int64)
+lookupGESPMD _ (EytzingerVec hdr) qKeys = do
+  let fields = projectPtrs hdr
+  n <- liftSPMD (peek (getPtrOf (evsLen fields)))
+  kb <- liftSPMD (peekBufStruct (getPtrOf (evsBuf fields)))
+  (_, curEnd) <-
+    runDrain (drainLast (1 :: SPMD w e Int64)) $
+      unfoldWhileM
+        (1 :: SPMD w e Int64)
+        (\cur -> pure (cur `le` uniform n))
+        ( \cur -> do
+            val <- gatherBufSPMD kb cur
+            let stepRight = fromBool (ltKey @(SPMD w e) @k val qKeys) :: SPMD w e Int64
+                nxt = (cur `lshift` 1) + stepRight
+            pure (nxt, nxt)
+        )
+  let cand = ascendRightSpines @(SPMD w e) curEnd
+  pure (cand `ge` 1, cand)
+
+-- | Lane-parallel O(log N) scalar lower-bound lookup returning @(found, firstValGEOrDefault)@.
+lookupScalarGESPMD ::
+  forall w k s m e.
+  ( EytzingerVecCtx m e k,
+    SPMDGang w m e,
+    OrdKey (SPMD w e) k,
+    LayoutGatherSPMD w m e k,
+    Elem (SPMD w e) k ~ SPMD w e s,
+    SPMDTyped w e s
+  ) =>
+  Proxy w ->
+  SPMD w e s ->
+  EytzingerVec e k ->
+  SPMD w e s ->
+  SPMDM w m e (SPMD w e Bool, SPMD w e s)
+lookupScalarGESPMD pw defVal ev@(EytzingerVec hdr) qKeys = do
+  (found, eytzIdx) <- lookupGESPMD pw ev qKeys
+  outRef <- newRef defVal
+  whenM_ found $ do
+    kb <- liftSPMD (peekBufStruct (getPtrOf (evsBuf (projectPtrs hdr))))
+    matched <- gatherBufSPMD kb eytzIdx
+    writeRef outRef matched
+  matchedOrDef <- readRef outRef
+  pure (found, matchedOrDef)
+
+-- | Lane-parallel O(log N) Eytzinger membership test across @w@ SIMD lanes.
+memberSPMD ::
+  forall w k m e.
+  ( EytzingerVecCtx m e k,
+    SPMDGang w m e,
+    OrdKey (SPMD w e) k,
+    LayoutGatherSPMD w m e k
+  ) =>
+  Proxy w ->
+  EytzingerVec e k ->
+  Elem (SPMD w e) k ->
+  SPMDM w m e (SPMD w e Bool)
+memberSPMD pw ev@(EytzingerVec hdr) qKeys = do
+  (found, eytzIdx) <- lookupGESPMD pw ev qKeys
+  okRef <- newRef (false :: SPMD w e Bool)
+  whenM_ found $ do
+    kb <- liftSPMD (peekBufStruct (getPtrOf (evsBuf (projectPtrs hdr))))
+    matched <- gatherBufSPMD kb eytzIdx
+    writeRef okRef (eqKey @(SPMD w e) @k matched qKeys)
+  readRef okRef
+
+-- | Masked-safe SIMD fold over the contiguous 1-indexed Eytzinger array @[1 .. size]@.
+foldSPMD ::
+  forall w k s m e.
+  (EytzingerVecCtx m e k, LayoutSliceSPMD w m e k, SPMDTyped w e s) =>
+  Proxy w ->
+  EytzingerVec e k ->
+  SPMD w e s ->
+  (SPMD w e s -> SPMD w e Int64 -> Elem (SPMD w e) k -> SPMDM w m e (SPMD w e s)) ->
+  m (SPMD w e s)
+foldSPMD pw (EytzingerVec hdr) s0 step = do
+  let fields = projectPtrs hdr
+  n <- peek (getPtrOf (evsLen fields))
+  kb <- peekBufStruct (getPtrOf (evsBuf fields))
+  foldSliceBufSPMD pw False kb 1 n 0 s0 step
 
 --------------------------------------------------------------------------------
 -- Host <-> C FFI Marshalling Instances
