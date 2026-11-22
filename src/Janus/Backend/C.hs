@@ -335,17 +335,19 @@ defaultJCFunc name params =
 mkArgId :: Int -> Id
 mkArgId m = Id ("arg_" <> show m) noLoc
 
-type family JanusCEval a where
-  JanusCEval (JanusC a -> r) = a -> JanusCEval r
-  JanusCEval (JanusC a) = a
-  JanusCEval (JanusCM (JanusC a)) = IO a
-  JanusCEval (JanusCM ()) = IO ()
+type family JanusCEval a
 
-type family JanusCRetType a where
-  JanusCRetType (JanusCM ()) = ()
-  JanusCRetType (JanusC a) = a
-  JanusCRetType (JanusCM (JanusC a)) = a
-  JanusCRetType (JanusC a -> r) = JanusCRetType r
+type instance JanusCEval (JanusC a -> r) = a -> JanusCEval r
+type instance JanusCEval (JanusC a) = a
+type instance JanusCEval (JanusCM (JanusC a)) = IO a
+type instance JanusCEval (JanusCM ()) = IO ()
+
+type family JanusCRetType a
+
+type instance JanusCRetType (JanusCM ()) = ()
+type instance JanusCRetType (JanusC a) = a
+type instance JanusCRetType (JanusCM (JanusC a)) = a
+type instance JanusCRetType (JanusC a -> r) = JanusCRetType r
 
 class JanusCParam r where
   jcparam :: String -> Int -> JanusCM [Param] -> JanusCBackend -> r -> [JCFunc]
@@ -471,7 +473,7 @@ getJanusCType p = do
   case Map.lookup tyrep (f ^. jcfTypeCache) of
     Just t -> pure t
     Nothing -> do
-      t@(JCType spec _) <- jctype p
+      t@(JCType spec dec) <- jctype p
       let isntStruct (DeclSpec _ _ (Tstruct {}) _) = False
           isntStruct _ = True
       if isntStruct spec
@@ -489,8 +491,7 @@ getJanusCType p = do
               tyname = "type_" <> take 16 (unpack (B16.encode specSha))
               tyId = Id tyname noLoc
               spec' = DeclSpec [] [] (Tnamed tyId [] noLoc) noLoc
-              dec' = DeclRoot noLoc
-              t' = JCType spec' dec'
+              t' = JCType spec' dec
               td = JCTypedef spec tyname
               f' =
                 fUpdated
@@ -610,7 +611,7 @@ instance JanusCTyped CDouble where
 
 instance (JanusCTyped a) => JanusCTyped (Ptr a) where
   jctype _ =
-    jctype (Proxy @a) >>= \case
+    getJanusCType (Proxy @a) >>= \case
       JCType spec dec -> pure $ JCType spec (Ptr [] dec noLoc)
 
 voidPtrType :: JCType
@@ -644,6 +645,24 @@ unsignedIntConst a
       C.Const (IntConst (show a <> "ULL") Unsigned (toInteger a) noLoc) noLoc
   | otherwise = C.Const (IntConst (show a) Unsigned (toInteger a) noLoc) noLoc
 
+signedIntConst64 :: (Show a, Integral a) => a -> Exp
+signedIntConst64 a
+  | toInteger a <= toInteger (minBound :: Int64) =
+      BinOp
+        Sub
+        (C.Const (IntConst "-9223372036854775807LL" Signed (-9223372036854775807) noLoc) noLoc)
+        (C.Const (IntConst "1LL" Signed 1 noLoc) noLoc)
+        noLoc
+  | otherwise = C.Const (IntConst (show a <> "LL") Signed (toInteger a) noLoc) noLoc
+
+unsignedIntConst32 :: (Show a, Integral a) => a -> Exp
+unsignedIntConst32 a =
+  C.Const (IntConst (show a <> "U") Unsigned (toInteger a) noLoc) noLoc
+
+unsignedIntConst64 :: (Show a, Integral a) => a -> Exp
+unsignedIntConst64 a =
+  C.Const (IntConst (show a <> "ULL") Unsigned (toInteger a) noLoc) noLoc
+
 -- TODO make this figure out if C platform has signed char or not
 instance JanusLitC CChar where
   jlitc = pure . signedIntConst
@@ -658,13 +677,13 @@ instance JanusLitC CInt where
   jlitc = pure . signedIntConst
 
 instance JanusLitC CLong where
-  jlitc = pure . signedIntConst
+  jlitc = pure . signedIntConst64
 
 instance JanusLitC CLLong where
-  jlitc = pure . signedIntConst
+  jlitc = pure . signedIntConst64
 
 instance JanusLitC CSize where
-  jlitc = pure . signedIntConst
+  jlitc = pure . unsignedIntConst64
 
 instance JanusLitC Int8 where
   jlitc = pure . signedIntConst
@@ -676,7 +695,7 @@ instance JanusLitC Int32 where
   jlitc = pure . signedIntConst
 
 instance JanusLitC Int64 where
-  jlitc = pure . signedIntConst
+  jlitc = pure . signedIntConst64
 
 instance JanusLitC CUChar where
   jlitc = pure . unsignedIntConst
@@ -685,13 +704,13 @@ instance JanusLitC CUShort where
   jlitc = pure . unsignedIntConst
 
 instance JanusLitC CUInt where
-  jlitc = pure . unsignedIntConst
+  jlitc = pure . unsignedIntConst32
 
 instance JanusLitC CULong where
-  jlitc = pure . unsignedIntConst
+  jlitc = pure . unsignedIntConst64
 
 instance JanusLitC CULLong where
-  jlitc = pure . unsignedIntConst
+  jlitc = pure . unsignedIntConst64
 
 instance JanusLitC Word8 where
   jlitc = pure . unsignedIntConst
@@ -700,10 +719,10 @@ instance JanusLitC Word16 where
   jlitc = pure . unsignedIntConst
 
 instance JanusLitC Word32 where
-  jlitc = pure . unsignedIntConst
+  jlitc = pure . unsignedIntConst32
 
 instance JanusLitC Word64 where
-  jlitc = pure . unsignedIntConst
+  jlitc = pure . unsignedIntConst64
 
 instance JanusLitC CBool where
   jlitc = pure . unsignedIntConst

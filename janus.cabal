@@ -41,6 +41,15 @@ library
     import:           warnings
     c-sources:        cbits/janus.c
     exposed-modules:  Janus
+                      Janus.Alloc
+                      Janus.Alloc.Arena
+                      Janus.Alloc.Dynamic
+                      Janus.Alloc.Fixed
+                      Janus.Alloc.Monotonic
+                      Janus.Alloc.Policy
+                      Janus.Alloc.Pool
+                      Janus.Alloc.Recycling
+                      Janus.Alloc.Stats
                       Janus.Backend.C
                       Janus.Backend.C.Build
                       Janus.Backend.C.CUDA
@@ -53,11 +62,32 @@ library
                       Janus.Control.Step
                       Janus.Control.Stream
                       Janus.Control.Unfold
+                      Janus.Data.HKD
+                      Janus.Data.Layout
+                      Janus.Data.Sort
+                      Janus.Data.DynVec
+                      Janus.Data.SmallVec
+                      Janus.Data.StableVec
+                      Janus.Data.RingBuffer
+                      Janus.Data.Deque
+                      Janus.Data.HashMap
+                      Janus.Data.HashSet
+                      Janus.Data.FlatMap
+                      Janus.Data.FlatSet
+                      Janus.Data.BTreeMap
+                      Janus.Data.BTreeSet
+                      Janus.Data.SlotMap
+                      Janus.Data.SparseSet
+                      Janus.Data.SparseVec
+                      Janus.Data.Pool
+                      Janus.Data.IntrusiveList
+                      Janus.Data
                       Janus.Command.Array
                       Janus.Command.Case
                       Janus.Command.Cond
                       Janus.Command.Format
                       Janus.Command.IO
+                      Janus.Command.Memory
                       Janus.Command.Range
                       Janus.Command.Ref
                       Janus.Command.TicToc
@@ -153,6 +183,12 @@ test-suite janus-test
                       Test.Janus.Expression.Let
                       Test.Janus.Expression.SIMD
                       Test.Janus.SPMD
+                      Test.Janus.Alloc
+                      Test.Janus.Data.HKDLayout
+                      Test.Janus.Data.Sequential
+                      Test.Janus.Data.Hash
+                      Test.Janus.Data.Ordered
+                      Test.Janus.Data.IndexedAndIntrusive
 
     -- LANGUAGE extensions used by modules in this package.
     -- other-extensions:
@@ -171,6 +207,7 @@ test-suite janus-test
     build-depends:    base ^>=4.20
                     , async
                     , concurrency
+                    , containers
                     , dejafu
                     , directory
                     , filepath

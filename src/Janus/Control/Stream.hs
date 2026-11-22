@@ -5,6 +5,7 @@
 {-# LANGUAGE FlexibleContexts #-}
 {-# LANGUAGE LambdaCase #-}
 {-# LANGUAGE RankNTypes #-}
+{-# LANGUAGE ScopedTypeVariables #-}
 {-# LANGUAGE TypeApplications #-}
 {-# LANGUAGE UndecidableInstances #-}
 
@@ -15,9 +16,10 @@ import Control.Monad
 import Control.Monad.Codensity
 import Control.Monad.Cont
 import Control.Monad.Trans
-import Data.Functor.Identity ()
 import Data.Functor.Alt
+import Data.Functor.Identity ()
 import Data.Int
+import Janus.Command.Case (CmdCase (..))
 import Janus.Command.Cond
 import Janus.Command.Format
 import Janus.Command.Ref
@@ -112,6 +114,80 @@ instance (Monad m, CmdCond m e, CmdWhile m e, JanusTyped e Bool) => Monad (Strea
         Skip -> k Skip
         Stop -> k Stop
 
+-- | Execute a monadic setup action @m s@ once during stream initialization
+-- (in the outer 'Codensity' layer) without introducing a nested '(>>=)' loop,
+-- preserving single-step pull semantics for 'zipS', 'unionSortedByS', and
+-- short-circuiting 'Drain's.
+withStreamSetup :: (Monad m) => m s -> (s -> Stream m a) -> Stream m a
+withStreamSetup setup mkStream = Stream $ do
+  s <- lift setup
+  getStream (mkStream s)
+
+-- | Construct a stream with setup state @m s@ and a per-iteration step.
+statefulS :: (Monad m) => m s -> (s -> ContT () m (Step a)) -> Stream m a
+statefulS mkState stepFn = Stream $ do
+  st <- lift mkState
+  pure (stepFn st)
+
+-- | Stateful stream unfold backed by a 'RefCell' state @s@.
+-- Each step returns @(hasValue, nextState, value)@; when @hasValue@ is false,
+-- the stream terminates with 'Stop'.
+unfoldSM ::
+  ( Monad m,
+    RefCell m e s,
+    CmdCond m e
+  ) =>
+  s ->
+  (s -> m (e Bool, s, a)) ->
+  Stream m a
+unfoldSM s0 stepFn = Stream $ do
+  stCell <- lift (newCell s0)
+  pure $ ContT $ \k -> do
+    cur <- readCell stCell
+    (keepGoing, nxt, val) <- stepFn cur
+    ifThenElseM_ keepGoing (writeCell stCell nxt >> k (Yield val)) (k Stop)
+
+-- | Stateful stream unfold that checks @cond cur@ BEFORE running @stepFn cur@,
+-- making pointer-chain walks null-safe and mutation/free-safe (since @stepFn@
+-- can prefetch @next@ before yielding @cur@).
+unfoldWhileM ::
+  ( Monad m,
+    RefCell m e s,
+    CmdCond m e
+  ) =>
+  s ->
+  (s -> m (e Bool)) ->
+  (s -> m (s, a)) ->
+  Stream m a
+unfoldWhileM s0 cond stepFn = Stream $ do
+  stCell <- lift (newCell s0)
+  pure $ ContT $ \k -> do
+    cur <- readCell stCell
+    ok <- cond cur
+    ifThenElseM_
+      ok
+      ( do
+          (nxt, val) <- stepFn cur
+          writeCell stCell nxt
+          k (Yield val)
+      )
+      (k Stop)
+
+-- | Infinite stream @x0, step x0, step (step x0), ...@ backed by a mutable cell.
+iterateS ::
+  ( Monad m,
+    RefCell m e s
+  ) =>
+  s ->
+  (s -> s) ->
+  Stream m s
+iterateS s0 step = Stream $ do
+  stCell <- lift (newCell s0)
+  pure $ ContT $ \k -> do
+    cur <- readCell stCell
+    writeCell stCell (step cur)
+    k (Yield cur)
+
 -- | Produce a stream from a range @[l, u)@.
 rangeS ::
   ( CmdRef m e,
@@ -130,6 +206,52 @@ rangeS l u = Stream $ do
     r' <- readRef r
     ifThenElseM_ (r' `lt` u) (writeRef r (r' + 1) >> k (Yield r')) (k Stop)
 
+-- | Produce a stream from a range @[l, u)@ in reverse order: @u - 1, u - 2, ..., l@.
+reverseRangeS ::
+  ( CmdRef m e,
+    CmdCond m e,
+    JanusTyped e a,
+    JanusTyped e Bool,
+    ExpOrd e a,
+    Num (e a)
+  ) =>
+  e a ->
+  e a ->
+  Stream m (e a)
+reverseRangeS l u = Stream $ do
+  r <- lift $ newRef u
+  pure $ ContT $ \k -> do
+    r' <- readRef r
+    ifThenElseM_
+      (r' `gt` l)
+      ( do
+          prev <- letM (r' - 1)
+          writeRef r prev
+          k (Yield prev)
+      )
+      (k Stop)
+
+-- | Pair each yielded element with its 0-based index @0, 1, 2, ...@.
+indexedS ::
+  ( CmdRef m e,
+    JanusTyped e Int64,
+    Num (e Int64)
+  ) =>
+  Stream m a ->
+  Stream m (e Int64, a)
+indexedS (Stream s) = Stream $ do
+  idxRef <- lift (newRef 0)
+  body <- s
+  pure $ do
+    step <- body
+    ContT $ \k -> case step of
+      Yield a -> do
+        i <- readRef idxRef
+        writeRef idxRef (i + 1)
+        k (Yield (i, a))
+      Skip -> k Skip
+      Stop -> k Stop
+
 -- | Filter elements of a stream, turning rejected elements into 'Skip'.
 filterS :: (CmdCond m e) => (a -> e Bool) -> Stream m a -> Stream m a
 filterS f (Stream s) = Stream $ do
@@ -138,6 +260,73 @@ filterS f (Stream s) = Stream $ do
     s' <- body
     ContT $ \k -> case s' of
       Yield a -> ifThenElseM_ (f a) (k (Yield a)) (k Skip)
+      Skip -> k Skip
+      Stop -> k Stop
+
+-- | Map an effectful predicate+value producer over a stream, emitting 'Yield'
+-- when the returned boolean is true and 'Skip' when false.
+filterMapS :: (Monad m, CmdCond m e) => (a -> m (e Bool, b)) -> Stream m a -> Stream m b
+filterMapS f (Stream s) = Stream $ do
+  body <- s
+  pure $ do
+    step <- body
+    ContT $ \k -> case step of
+      Yield a -> do
+        (keep, b) <- f a
+        ifThenElseM_ keep (k (Yield b)) (k Skip)
+      Skip -> k Skip
+      Stop -> k Stop
+
+-- | Yield elements while predicate holds, stopping immediately on the first failure.
+takeWhileS ::
+  ( CmdCond m e,
+    CmdRef m e,
+    ExpBool e,
+    JanusTyped e Bool
+  ) =>
+  (a -> e Bool) ->
+  Stream m a ->
+  Stream m a
+takeWhileS p (Stream s) = Stream $ do
+  doneRef <- lift (newRef false)
+  body <- s
+  pure $ ContT $ \k -> do
+    done <- readRef doneRef
+    ifThenElseM_
+      done
+      (k Stop)
+      ( runContT body $ \case
+          Yield a ->
+            ifThenElseM_
+              (p a)
+              (k (Yield a))
+              (writeRef doneRef true >> k Stop)
+          Skip -> k Skip
+          Stop -> writeRef doneRef true >> k Stop
+      )
+
+-- | Drop leading elements while predicate holds, yielding that failing element and all subsequent elements.
+dropWhileS ::
+  ( CmdCond m e,
+    CmdRef m e,
+    ExpBool e,
+    JanusTyped e Bool
+  ) =>
+  (a -> e Bool) ->
+  Stream m a ->
+  Stream m a
+dropWhileS p (Stream s) = Stream $ do
+  droppingRef <- lift (newRef true)
+  body <- s
+  pure $ do
+    step <- body
+    ContT $ \k -> case step of
+      Yield a -> do
+        dropping <- readRef droppingRef
+        ifThenElseM_
+          dropping
+          (ifThenElseM_ (p a) (k Skip) (writeRef droppingRef false >> k (Yield a)))
+          (k (Yield a))
       Skip -> k Skip
       Stop -> k Stop
 
@@ -316,3 +505,209 @@ formatS (Stream s) = Stream $ do
       Yield a -> format a >> k (Yield ())
       Skip -> k Skip
       Stop -> k Stop
+
+--------------------------------------------------------------------------------
+-- Sorted Stream Relational Combinators (Union, Intersection, Difference)
+--------------------------------------------------------------------------------
+
+-- | Merge-union two strictly ascending sorted streams in O(N + M), combining
+-- equal elements via @combineEq@.
+--
+-- State encoding for each input side: @0@ = need pull, @1@ = buffered item ready, @2@ = exhausted.
+unionSortedByS ::
+  forall m e a.
+  ( Monad m,
+    CmdRef m e,
+    CmdCond m e,
+    CmdCase m e,
+    RefCell m e a,
+    JanusTyped e Int64,
+    Num (e Int64)
+  ) =>
+  (a -> a -> e Bool) ->
+  (a -> a -> e Bool) ->
+  (a -> a -> a) ->
+  Stream m a ->
+  Stream m a ->
+  Stream m a
+unionSortedByS isLt isEq combineEq (Stream sA) (Stream sB) = Stream $ do
+  stA <- lift (newRef (0 :: e Int64))
+  stB <- lift (newRef (0 :: e Int64))
+  bufA <- lift newCell'
+  bufB <- lift newCell'
+  bodyA <- sA
+  bodyB <- sB
+  pure $ ContT $ \k -> do
+    aState <- readRef stA
+    bState <- readRef stB
+    switchCase_
+      aState
+      [ ( 0,
+          runContT bodyA $ \case
+            Yield a -> writeCell bufA a >> writeRef stA 1 >> k Skip
+            Skip -> k Skip
+            Stop -> writeRef stA 2 >> k Skip
+        )
+      ]
+      $ switchCase_
+        bState
+        [ ( 0,
+            runContT bodyB $ \case
+              Yield b -> writeCell bufB b >> writeRef stB 1 >> k Skip
+              Skip -> k Skip
+              Stop -> writeRef stB 2 >> k Skip
+          )
+        ]
+        $ switchCase_
+          (aState * 3 + bState)
+          [ ( 4, -- aState=1, bState=1
+              do
+                a <- readCell bufA
+                b <- readCell bufB
+                ifThenElseM_
+                  (isLt a b)
+                  (writeRef stA 0 >> k (Yield a))
+                  ( ifThenElseM_
+                      (isEq a b)
+                      (writeRef stA 0 >> writeRef stB 0 >> k (Yield (combineEq a b)))
+                      (writeRef stB 0 >> k (Yield b))
+                  )
+            ),
+            ( 5, -- aState=1, bState=2
+              do
+                a <- readCell bufA
+                writeRef stA 0
+                k (Yield a)
+            ),
+            ( 7, -- aState=2, bState=1
+              do
+                b <- readCell bufB
+                writeRef stB 0
+                k (Yield b)
+            )
+          ]
+          (k Stop)
+
+-- | Merge-intersect two strictly ascending sorted streams in O(N + M).
+intersectSortedByS ::
+  forall m e a b c.
+  ( Monad m,
+    CmdRef m e,
+    CmdCond m e,
+    CmdCase m e,
+    RefCell m e a,
+    RefCell m e b,
+    JanusTyped e Int64,
+    Num (e Int64)
+  ) =>
+  (a -> b -> e Bool) ->
+  (a -> b -> e Bool) ->
+  (a -> b -> c) ->
+  Stream m a ->
+  Stream m b ->
+  Stream m c
+intersectSortedByS isLt isEq combineEq (Stream sA) (Stream sB) = Stream $ do
+  stA <- lift (newRef (0 :: e Int64))
+  stB <- lift (newRef (0 :: e Int64))
+  bufA <- lift newCell'
+  bufB <- lift newCell'
+  bodyA <- sA
+  bodyB <- sB
+  pure $ ContT $ \k -> do
+    aState <- readRef stA
+    bState <- readRef stB
+    switchCase_
+      aState
+      [ (2, k Stop),
+        ( 0,
+          runContT bodyA $ \case
+            Yield a -> writeCell bufA a >> writeRef stA 1 >> k Skip
+            Skip -> k Skip
+            Stop -> writeRef stA 2 >> k Stop
+        )
+      ]
+      $ switchCase_
+        bState
+        [ (2, k Stop),
+          ( 0,
+            runContT bodyB $ \case
+              Yield b -> writeCell bufB b >> writeRef stB 1 >> k Skip
+              Skip -> k Skip
+              Stop -> writeRef stB 2 >> k Stop
+          )
+        ]
+        $ do
+          a <- readCell bufA
+          b <- readCell bufB
+          ifThenElseM_
+            (isLt a b)
+            (writeRef stA 0 >> k Skip)
+            ( ifThenElseM_
+                (isEq a b)
+                (writeRef stA 0 >> writeRef stB 0 >> k (Yield (combineEq a b)))
+                (writeRef stB 0 >> k Skip)
+            )
+
+-- | Sorted set/map difference @A \ B@ over strictly ascending sorted streams in O(N + M).
+differenceSortedByS ::
+  forall m e a b.
+  ( Monad m,
+    CmdRef m e,
+    CmdCond m e,
+    CmdCase m e,
+    RefCell m e a,
+    RefCell m e b,
+    JanusTyped e Int64,
+    Num (e Int64)
+  ) =>
+  (a -> b -> e Bool) ->
+  (a -> b -> e Bool) ->
+  Stream m a ->
+  Stream m b ->
+  Stream m a
+differenceSortedByS isLt isEq (Stream sA) (Stream sB) = Stream $ do
+  stA <- lift (newRef (0 :: e Int64))
+  stB <- lift (newRef (0 :: e Int64))
+  bufA <- lift newCell'
+  bufB <- lift newCell'
+  bodyA <- sA
+  bodyB <- sB
+  pure $ ContT $ \k -> do
+    aState <- readRef stA
+    bState <- readRef stB
+    switchCase_
+      aState
+      [ (2, k Stop),
+        ( 0,
+          runContT bodyA $ \case
+            Yield a -> writeCell bufA a >> writeRef stA 1 >> k Skip
+            Skip -> k Skip
+            Stop -> writeRef stA 2 >> k Stop
+        )
+      ]
+      $ switchCase_
+        bState
+        [ ( 2,
+            do
+              a <- readCell bufA
+              writeRef stA 0
+              k (Yield a)
+          ),
+          ( 0,
+            runContT bodyB $ \case
+              Yield b -> writeCell bufB b >> writeRef stB 1 >> k Skip
+              Skip -> k Skip
+              Stop -> writeRef stB 2 >> k Skip
+          )
+        ]
+        $ do
+          a <- readCell bufA
+          b <- readCell bufB
+          ifThenElseM_
+            (isLt a b)
+            (writeRef stA 0 >> k (Yield a))
+            ( ifThenElseM_
+                (isEq a b)
+                (writeRef stA 0 >> writeRef stB 0 >> k Skip)
+                (writeRef stB 0 >> k Skip)
+            )

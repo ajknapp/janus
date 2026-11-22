@@ -17,6 +17,14 @@ void* janus_aligned_malloc(size_t size)
   return aligned_alloc(JANUS_SIMD_ALIGNMENT, rounded);
 }
 
+void* janus_aligned_alloc(size_t alignment, size_t size)
+{
+  size_t eff_al = alignment < JANUS_SIMD_ALIGNMENT ? JANUS_SIMD_ALIGNMENT : alignment;
+  size_t rounded = size == 0 ? eff_al
+                             : ((size + (eff_al - 1u)) & ~(eff_al - 1u));
+  return aligned_alloc(eff_al, rounded);
+}
+
 void* janus_aligned_calloc(size_t nmemb, size_t size)
 {
   size_t total = nmemb * size;

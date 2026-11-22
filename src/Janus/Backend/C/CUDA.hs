@@ -202,8 +202,8 @@ deriving via JanusC a instance (FMA (JanusC a), JanusLitC a, Num a) => FMA (Janu
 
 deriving via JanusC a instance (Hypot (JanusC a), JanusLitC a, Floating (JanusCUDA a)) => Hypot (JanusCUDA a)
 
-instance (ExpMurmurHash JanusC a) => ExpMurmurHash JanusCUDA a where
-  murmurHashWithSalt = coerce (murmurHashWithSalt @JanusC @a)
+instance (ExpMurmurHash JanusC (JanusC a)) => ExpMurmurHash JanusCUDA (JanusCUDA a) where
+  murmurHashWithSalt = coerce (murmurHashWithSalt @JanusC @(JanusC a))
 
 instance (ExpOrd JanusC a) => ExpOrd JanusCUDA a where
   lt = coerce (lt @JanusC @a)

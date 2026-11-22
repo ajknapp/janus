@@ -32,7 +32,12 @@ module Janus.Backend.C.TH
     spliceJanusC,
     spliceJanusCWithConfig,
 
-    -- * Low-Level Declaration Builder & Validation
+    -- * Low-Level Declaration Builder, Spec Helpers & Validation
+    scalarParamSpec,
+    scalarRetSpec,
+    x86THParamSpec,
+    x86THRetSpec,
+    typeRepToTHType,
     buildForeignAndWrapperDecls,
     checkCSymbolName,
     checkHsVarName,

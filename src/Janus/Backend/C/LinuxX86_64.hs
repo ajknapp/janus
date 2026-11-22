@@ -89,6 +89,8 @@ instance JanusCBackendTypes LinuxX86_64C LinuxX86_64CM where
 
 deriving via JanusC a instance (JanusLitC a, Num a) => Num (LinuxX86_64C a)
 
+deriving via JanusC a instance (Bounded (JanusC a)) => Bounded (LinuxX86_64C a)
+
 deriving via JanusC a instance (JanusLitC a, Fractional a) => Fractional (LinuxX86_64C a)
 
 deriving via JanusC Float instance Floating (LinuxX86_64C Float)
@@ -143,8 +145,8 @@ deriving via JanusC a instance (FMA (JanusC a), JanusLitC a, Num a) => FMA (Linu
 
 deriving via JanusC a instance (Hypot (JanusC a), JanusLitC a, Floating (LinuxX86_64C a)) => Hypot (LinuxX86_64C a)
 
-instance (ExpMurmurHash JanusC a) => ExpMurmurHash LinuxX86_64C a where
-  murmurHashWithSalt = coerce (murmurHashWithSalt @JanusC @a)
+instance (ExpMurmurHash JanusC (JanusC a)) => ExpMurmurHash LinuxX86_64C (LinuxX86_64C a) where
+  murmurHashWithSalt = coerce (murmurHashWithSalt @JanusC @(JanusC a))
 
 instance (ExpOrd JanusC a) => ExpOrd LinuxX86_64C a where
   lt = coerce (lt @JanusC @a)
@@ -166,6 +168,14 @@ instance CmdMem LinuxX86_64CM LinuxX86_64C where
   calloc = coerce (calloc @JanusCM @JanusC)
   realloc = coerce (realloc @JanusCM @JanusC)
   free = coerce (free @JanusCM @JanusC)
+
+instance CmdDynamicAligned LinuxX86_64CM LinuxX86_64C where
+  alignedMalloc = coerce (alignedMalloc @JanusCM @JanusC)
+
+instance CmdMemCopy LinuxX86_64CM LinuxX86_64C where
+  cmdMemcpy = coerce (cmdMemcpy @JanusCM @JanusC)
+  cmdMemmove = coerce (cmdMemmove @JanusCM @JanusC)
+  cmdMemset = coerce (cmdMemset @JanusCM @JanusC)
 
 instance (ExpSized LinuxX86_64C a, JanusCTyped a) => CmdStorable LinuxX86_64CM LinuxX86_64C a where
   peek = coerce (peek @JanusCM @JanusC @a)
@@ -207,6 +217,14 @@ instance CmdRef LinuxX86_64CM LinuxX86_64C where
   newRef' = LinuxX86_64CM (LinuxX86_64CRef <$> newRef')
   readRef (LinuxX86_64CRef r) = LinuxX86_64CM (LinuxX86_64C <$> readRef r)
   writeRef (LinuxX86_64CRef r) (LinuxX86_64C a) = LinuxX86_64CM (writeRef r a)
+
+instance (JanusCTyped a) => RefCell LinuxX86_64CM LinuxX86_64C (LinuxX86_64C a) where
+  newCell x = do
+    r <- newRef x
+    pure (Cell (readRef r) (writeRef r))
+  newCell' = do
+    r <- newRef'
+    pure (Cell (readRef r) (writeRef r))
 
 instance CmdRange LinuxX86_64CM LinuxX86_64C where
   rangeM = coerce (rangeM @JanusCM @JanusC)
