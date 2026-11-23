@@ -20,7 +20,7 @@ instance IdConstraint a where
 
 type instance JanusTyped Identity = IdConstraint
 
-type instance JanusTyped JanusC = JanusCTyped
+type instance JanusTyped (JanusCT t) = JanusCTyped
 
 janusBoolTypes :: Set.Set Name
 janusBoolTypes = Set.fromList [''CBool, ''Bool]

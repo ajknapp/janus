@@ -3,6 +3,7 @@
 {-# LANGUAGE DataKinds #-}
 {-# LANGUAGE DeriveGeneric #-}
 {-# LANGUAGE DerivingStrategies #-}
+{-# LANGUAGE DerivingVia #-}
 {-# LANGUAGE FlexibleContexts #-}
 {-# LANGUAGE FlexibleInstances #-}
 {-# LANGUAGE KindSignatures #-}
@@ -70,8 +71,6 @@ import GHC.Generics (Generic)
 import GHC.TypeNats (KnownNat, Nat, natVal)
 import Janus.Alloc.Policy (Alloc, allocStruct, freeStruct)
 import Janus.Backend.C
-import Janus.Backend.C.LinuxX86_64
-import Janus.Backend.C.TH
 import Janus.Command.Cond (ifThenElseM_, whenM_)
 import Janus.Command.Memory (CmdStorable (..), ExpSized (..), allocaAligned)
 import Janus.Command.Ref (letM, newRef, readRef, writeRef)
@@ -486,69 +485,14 @@ type SmallStackABI n a =
     JanusStruct (InlineBuf n a)
   )
 
-type instance JanusCEval (SmallStack n JanusC a -> r) = SmallStack n Identity a -> JanusCEval r
+type instance JanusCHost (SmallStack n (JanusCT _) a) = SmallStack n Identity a
 
-type instance JanusCRetType (SmallStack n JanusC a -> r) = JanusCRetType r
+deriving via
+  ViaPtrHandle t (CStruct (SmallStackSpine n a)) (SmallStack n Identity a)
+  instance
+    (SmallStackABI n a) => JanusCArg t (SmallStack n (JanusCT t) a)
 
-instance (SmallStackABI n a, JanusCParam r) => JanusCParam (SmallStack n JanusC a -> r) where
-  jcparam = mkPtrHandleJCParam SmallStack
-
-instance (SmallStackABI n a, JanusCEvaluate r) => JanusCEvaluate (SmallStack n JanusC a -> r) where
-  jceval = mkPtrHandleJCEval unSmallStack SmallStack
-
-type instance JanusCEval (JanusCM (SmallStack n JanusC a)) = IO (SmallStack n Identity a)
-
-type instance JanusCRetType (JanusCM (SmallStack n JanusC a)) = SmallStack n Identity a
-
-instance (SmallStackABI n a) => JanusCParam (JanusCM (SmallStack n JanusC a)) where
-  jcparam = mkPtrHandleJCRetParam unSmallStack
-
-instance (SmallStackABI n a) => JanusCEvaluate (JanusCM (SmallStack n JanusC a)) where
-  jceval = mkPtrHandleJCRetEval SmallStack
-
-type instance LinuxX86_64CEval (SmallStack n LinuxX86_64C a -> r) = SmallStack n Identity a -> LinuxX86_64CEval r
-
-type instance LinuxX86_64BaseRet (SmallStack n LinuxX86_64C a -> r) = LinuxX86_64BaseRet r
-
-instance (SmallStackABI n a, LinuxX86_64Param r) => LinuxX86_64Param (SmallStack n LinuxX86_64C a -> r) where
-  x86param = mkPtrHandleX86Param SmallStack
-
-instance (SmallStackABI n a, X86DeferCont r, LinuxX86_64Evaluate r) => LinuxX86_64Evaluate (SmallStack n LinuxX86_64C a -> r) where
-  x86eval = mkPtrHandleX86EvalParam unSmallStack SmallStack
-
-instance (SmallStackABI n a, X86DeferCont r) => X86DeferCall (SmallStack n LinuxX86_64C a -> r) where
-  x86DeferArg = mkPtrHandleX86DeferArg unSmallStack SmallStack
-
-instance (SmallStackABI n a, X86DeferCont r) => X86DeferCont (SmallStack n LinuxX86_64C a -> r) where
-  x86DeferCont = mkPtrHandleX86DeferCont unSmallStack SmallStack
-
-type instance LinuxX86_64CEval (LinuxX86_64CM (SmallStack n LinuxX86_64C a)) = IO (SmallStack n Identity a)
-
-type instance LinuxX86_64BaseRet (LinuxX86_64CM (SmallStack n LinuxX86_64C a)) = SmallStack n Identity a
-
-instance (SmallStackABI n a) => LinuxX86_64Param (LinuxX86_64CM (SmallStack n LinuxX86_64C a)) where
-  x86param = mkPtrHandleX86RetParam unSmallStack
-
-instance (SmallStackABI n a) => LinuxX86_64Evaluate (LinuxX86_64CM (SmallStack n LinuxX86_64C a)) where
-  x86eval = mkPtrHandleX86RetEval SmallStack
-
-instance (SmallStackABI n a) => X86DeferCall (LinuxX86_64CM (SmallStack n LinuxX86_64C a)) where
-  x86DeferArg = mkPtrHandleX86RetDeferArg SmallStack
-
-instance (SmallStackABI n a) => X86DeferCont (LinuxX86_64CM (SmallStack n LinuxX86_64C a)) where
-  x86DeferCont = mkPtrHandleX86RetDeferCont SmallStack
-
-instance (SmallStackABI n a, LinuxX86_64Param r, JanusCTH r) => JanusCTH (SmallStack n LinuxX86_64C a -> r) where
-  type JanusCTHEval (SmallStack n LinuxX86_64C a -> r) = SmallStack n Identity a -> JanusCTHEval r
-  janusCTHBackend _ = THBackendLinuxX86_64
-  janusCTHCodegen = x86param
-  janusCTHSpec _ =
-    let (ps, retSpec) = janusCTHSpec (Proxy @r)
-     in (mkPtrHandleTHParamSpec (Proxy @(SmallStack n Identity a)) : ps, retSpec)
-
-instance (SmallStackABI n a) => JanusCTH (LinuxX86_64CM (SmallStack n LinuxX86_64C a)) where
-  type JanusCTHEval (LinuxX86_64CM (SmallStack n LinuxX86_64C a)) = IO (SmallStack n Identity a)
-  janusCTHBackend _ = THBackendLinuxX86_64
-  janusCTHCodegen = x86param
-  janusCTHSpec _ =
-    ([], mkPtrHandleTHRetSpec THRetIO (Proxy @(SmallStack n Identity a)) (Proxy @(CStruct (SmallStackSpine n a))))
+deriving via
+  ViaPtrHandle t (CStruct (SmallStackSpine n a)) (SmallStack n Identity a)
+  instance
+    (SmallStackABI n a) => JanusCValRet t (SmallStack n (JanusCT t) a)

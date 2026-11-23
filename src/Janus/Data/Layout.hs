@@ -129,7 +129,7 @@ import Janus.Alloc.Policy
     freeTypedArray,
     reallocTypedArray,
   )
-import Janus.Backend.C (JanusC)
+import Janus.Backend.C (JanusCTyped)
 import Janus.Command.Memory
   ( CmdMemCopy (..),
     CmdStorable (..),
@@ -212,7 +212,7 @@ deriving stock instance Eq (ScalarBuf a Identity)
 
 deriving stock instance Show (ScalarBuf a Identity)
 
-instance (Typeable a, Storable.Storable (Ptr a), JanusTyped JanusC a) => JanusStruct (ScalarBuf a)
+instance (Typeable a, Storable.Storable (Ptr a), JanusCTyped a) => JanusStruct (ScalarBuf a)
 
 newtype InlineScalar (n :: Nat) a f = InlineScalar
   { unInlineScalar :: f (FixedArray (Max1 n) a)
@@ -229,7 +229,7 @@ instance
     Typeable (Max1 n),
     Typeable a,
     Storable.Storable a,
-    JanusTyped JanusC a
+    JanusCTyped a
   ) =>
   JanusStruct (InlineScalar n a)
 
@@ -422,7 +422,7 @@ type ScalarElemCtx m e a =
     CmdStorable m e (Ptr a),
     Typeable a,
     Storable.Storable (Ptr a),
-    JanusTyped JanusC a
+    JanusCTyped a
   )
 
 type ScalarInlineCtx n e a =
@@ -430,7 +430,7 @@ type ScalarInlineCtx n e a =
     Typeable n,
     Typeable (Max1 n),
     Storable.Storable a,
-    JanusTyped JanusC a,
+    JanusCTyped a,
     JanusTyped e (FixedArray (Max1 n) a)
   )
 
@@ -498,7 +498,7 @@ scalarInlineAsBuf ::
     Typeable (Max1 n),
     Typeable a,
     Storable.Storable a,
-    JanusTyped JanusC a,
+    JanusCTyped a,
     JanusTyped e a,
     JanusTyped e (FixedArray (Max1 n) a)
   ) =>

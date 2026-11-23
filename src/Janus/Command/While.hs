@@ -1,3 +1,4 @@
+{-# LANGUAGE FlexibleInstances #-}
 {-# LANGUAGE FunctionalDependencies #-}
 
 module Janus.Command.While where
@@ -23,9 +24,10 @@ instance CmdWhile IO Identity where
           when (runIdentity r') $ body r >> go
     go
 
-instance CmdWhile JanusCM JanusC where
+instance CmdWhile (JanusCMT t) (JanusCT t) where
   whileM c body = do
-    ref@(JanusCRef (LVal r)) <- newRef c
+    ref <- newRef c
+    let LVal r = getJanusCRef ref
     fn <- getFunction
     fname <- askFuncName
     let block = fn ^. jcfBlock

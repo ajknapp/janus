@@ -2,6 +2,7 @@
 {-# LANGUAGE DataKinds #-}
 {-# LANGUAGE DeriveGeneric #-}
 {-# LANGUAGE DerivingStrategies #-}
+{-# LANGUAGE DerivingVia #-}
 {-# LANGUAGE FlexibleContexts #-}
 {-# LANGUAGE FlexibleInstances #-}
 {-# LANGUAGE KindSignatures #-}
@@ -79,8 +80,6 @@ import Janus.Alloc.Policy
     reallocTypedArray,
   )
 import Janus.Backend.C
-import Janus.Backend.C.LinuxX86_64
-import Janus.Backend.C.TH
 import Janus.Command.Cond (ifThenElseM_, whenM_)
 import Janus.Command.Memory
   ( CmdMemCopy (..),
@@ -864,69 +863,14 @@ foldSymbolLengthsSPMD pw (Interner hdr) s0 step = do
 -- Host <-> C FFI Marshalling Instances
 --------------------------------------------------------------------------------
 
-type instance JanusCEval (Interner JanusC -> r) = Interner Identity -> JanusCEval r
+type instance JanusCHost (Interner (JanusCT _)) = Interner Identity
 
-type instance JanusCRetType (Interner JanusC -> r) = JanusCRetType r
+deriving via
+  ViaPtrHandle t (CStruct InternerSpine) (Interner Identity)
+  instance
+    JanusCArg t (Interner (JanusCT t))
 
-instance (JanusCParam r) => JanusCParam (Interner JanusC -> r) where
-  jcparam = mkPtrHandleJCParam Interner
-
-instance (JanusCEvaluate r) => JanusCEvaluate (Interner JanusC -> r) where
-  jceval = mkPtrHandleJCEval unInterner Interner
-
-type instance JanusCEval (JanusCM (Interner JanusC)) = IO (Interner Identity)
-
-type instance JanusCRetType (JanusCM (Interner JanusC)) = Interner Identity
-
-instance JanusCParam (JanusCM (Interner JanusC)) where
-  jcparam = mkPtrHandleJCRetParam unInterner
-
-instance JanusCEvaluate (JanusCM (Interner JanusC)) where
-  jceval = mkPtrHandleJCRetEval Interner
-
-type instance LinuxX86_64CEval (Interner LinuxX86_64C -> r) = Interner Identity -> LinuxX86_64CEval r
-
-type instance LinuxX86_64BaseRet (Interner LinuxX86_64C -> r) = LinuxX86_64BaseRet r
-
-instance (LinuxX86_64Param r) => LinuxX86_64Param (Interner LinuxX86_64C -> r) where
-  x86param = mkPtrHandleX86Param Interner
-
-instance (X86DeferCont r, LinuxX86_64Evaluate r) => LinuxX86_64Evaluate (Interner LinuxX86_64C -> r) where
-  x86eval = mkPtrHandleX86EvalParam unInterner Interner
-
-instance (X86DeferCont r) => X86DeferCall (Interner LinuxX86_64C -> r) where
-  x86DeferArg = mkPtrHandleX86DeferArg unInterner Interner
-
-instance (X86DeferCont r) => X86DeferCont (Interner LinuxX86_64C -> r) where
-  x86DeferCont = mkPtrHandleX86DeferCont unInterner Interner
-
-type instance LinuxX86_64CEval (LinuxX86_64CM (Interner LinuxX86_64C)) = IO (Interner Identity)
-
-type instance LinuxX86_64BaseRet (LinuxX86_64CM (Interner LinuxX86_64C)) = Interner Identity
-
-instance LinuxX86_64Param (LinuxX86_64CM (Interner LinuxX86_64C)) where
-  x86param = mkPtrHandleX86RetParam unInterner
-
-instance LinuxX86_64Evaluate (LinuxX86_64CM (Interner LinuxX86_64C)) where
-  x86eval = mkPtrHandleX86RetEval Interner
-
-instance X86DeferCall (LinuxX86_64CM (Interner LinuxX86_64C)) where
-  x86DeferArg = mkPtrHandleX86RetDeferArg Interner
-
-instance X86DeferCont (LinuxX86_64CM (Interner LinuxX86_64C)) where
-  x86DeferCont = mkPtrHandleX86RetDeferCont Interner
-
-instance (LinuxX86_64Param r, JanusCTH r) => JanusCTH (Interner LinuxX86_64C -> r) where
-  type JanusCTHEval (Interner LinuxX86_64C -> r) = Interner Identity -> JanusCTHEval r
-  janusCTHBackend _ = THBackendLinuxX86_64
-  janusCTHCodegen = x86param
-  janusCTHSpec _ =
-    let (ps, retSpec) = janusCTHSpec (Proxy @r)
-     in (mkPtrHandleTHParamSpec (Proxy @(Interner Identity)) : ps, retSpec)
-
-instance JanusCTH (LinuxX86_64CM (Interner LinuxX86_64C)) where
-  type JanusCTHEval (LinuxX86_64CM (Interner LinuxX86_64C)) = IO (Interner Identity)
-  janusCTHBackend _ = THBackendLinuxX86_64
-  janusCTHCodegen = x86param
-  janusCTHSpec _ =
-    ([], mkPtrHandleTHRetSpec THRetIO (Proxy @(Interner Identity)) (Proxy @(CStruct InternerSpine)))
+deriving via
+  ViaPtrHandle t (CStruct InternerSpine) (Interner Identity)
+  instance
+    JanusCValRet t (Interner (JanusCT t))

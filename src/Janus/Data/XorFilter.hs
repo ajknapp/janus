@@ -3,6 +3,7 @@
 {-# LANGUAGE DataKinds #-}
 {-# LANGUAGE DeriveGeneric #-}
 {-# LANGUAGE DerivingStrategies #-}
+{-# LANGUAGE DerivingVia #-}
 {-# LANGUAGE FlexibleContexts #-}
 {-# LANGUAGE FlexibleInstances #-}
 {-# LANGUAGE KindSignatures #-}
@@ -53,8 +54,6 @@ import Janus.Alloc.Policy
     reallocTypedArray,
   )
 import Janus.Backend.C
-import Janus.Backend.C.LinuxX86_64
-import Janus.Backend.C.TH
 import Janus.Command.Cond (ifThenElseM_, whenM_)
 import Janus.Command.Memory (CmdMemCopy (..), CmdStorable (..), ExpPtr (..), ExpSized (..), janusSIMDAlignment)
 import Janus.Command.Ref (CmdRef, letM, newRef, readRef, writeRef)
@@ -447,69 +446,14 @@ byteSize (XorFilter hdr) = (* 3) <$> peek (getPtrOf (xfsBlockLength (projectPtrs
 
 type XorFilterABI k = Typeable k
 
-type instance JanusCEval (XorFilter JanusC k -> r) = XorFilter Identity k -> JanusCEval r
+type instance JanusCHost (XorFilter (JanusCT _) k) = XorFilter Identity k
 
-type instance JanusCRetType (XorFilter JanusC k -> r) = JanusCRetType r
+deriving via
+  ViaPtrHandle t (CStruct (XorFilterSpine k)) (XorFilter Identity k)
+  instance
+    (XorFilterABI k) => JanusCArg t (XorFilter (JanusCT t) k)
 
-instance (XorFilterABI k, JanusCParam r) => JanusCParam (XorFilter JanusC k -> r) where
-  jcparam = mkPtrHandleJCParam XorFilter
-
-instance (XorFilterABI k, JanusCEvaluate r) => JanusCEvaluate (XorFilter JanusC k -> r) where
-  jceval = mkPtrHandleJCEval unXorFilter XorFilter
-
-type instance JanusCEval (JanusCM (XorFilter JanusC k)) = IO (XorFilter Identity k)
-
-type instance JanusCRetType (JanusCM (XorFilter JanusC k)) = XorFilter Identity k
-
-instance (XorFilterABI k) => JanusCParam (JanusCM (XorFilter JanusC k)) where
-  jcparam = mkPtrHandleJCRetParam unXorFilter
-
-instance (XorFilterABI k) => JanusCEvaluate (JanusCM (XorFilter JanusC k)) where
-  jceval = mkPtrHandleJCRetEval XorFilter
-
-type instance LinuxX86_64CEval (XorFilter LinuxX86_64C k -> r) = XorFilter Identity k -> LinuxX86_64CEval r
-
-type instance LinuxX86_64BaseRet (XorFilter LinuxX86_64C k -> r) = LinuxX86_64BaseRet r
-
-instance (XorFilterABI k, LinuxX86_64Param r) => LinuxX86_64Param (XorFilter LinuxX86_64C k -> r) where
-  x86param = mkPtrHandleX86Param XorFilter
-
-instance (XorFilterABI k, X86DeferCont r, LinuxX86_64Evaluate r) => LinuxX86_64Evaluate (XorFilter LinuxX86_64C k -> r) where
-  x86eval = mkPtrHandleX86EvalParam unXorFilter XorFilter
-
-instance (XorFilterABI k, X86DeferCont r) => X86DeferCall (XorFilter LinuxX86_64C k -> r) where
-  x86DeferArg = mkPtrHandleX86DeferArg unXorFilter XorFilter
-
-instance (XorFilterABI k, X86DeferCont r) => X86DeferCont (XorFilter LinuxX86_64C k -> r) where
-  x86DeferCont = mkPtrHandleX86DeferCont unXorFilter XorFilter
-
-type instance LinuxX86_64CEval (LinuxX86_64CM (XorFilter LinuxX86_64C k)) = IO (XorFilter Identity k)
-
-type instance LinuxX86_64BaseRet (LinuxX86_64CM (XorFilter LinuxX86_64C k)) = XorFilter Identity k
-
-instance (XorFilterABI k) => LinuxX86_64Param (LinuxX86_64CM (XorFilter LinuxX86_64C k)) where
-  x86param = mkPtrHandleX86RetParam unXorFilter
-
-instance (XorFilterABI k) => LinuxX86_64Evaluate (LinuxX86_64CM (XorFilter LinuxX86_64C k)) where
-  x86eval = mkPtrHandleX86RetEval XorFilter
-
-instance (XorFilterABI k) => X86DeferCall (LinuxX86_64CM (XorFilter LinuxX86_64C k)) where
-  x86DeferArg = mkPtrHandleX86RetDeferArg XorFilter
-
-instance (XorFilterABI k) => X86DeferCont (LinuxX86_64CM (XorFilter LinuxX86_64C k)) where
-  x86DeferCont = mkPtrHandleX86RetDeferCont XorFilter
-
-instance (XorFilterABI k, LinuxX86_64Param r, JanusCTH r) => JanusCTH (XorFilter LinuxX86_64C k -> r) where
-  type JanusCTHEval (XorFilter LinuxX86_64C k -> r) = XorFilter Identity k -> JanusCTHEval r
-  janusCTHBackend _ = THBackendLinuxX86_64
-  janusCTHCodegen = x86param
-  janusCTHSpec _ =
-    let (ps, retSpec) = janusCTHSpec (Proxy @r)
-     in (mkPtrHandleTHParamSpec (Proxy @(XorFilter Identity k)) : ps, retSpec)
-
-instance (XorFilterABI k) => JanusCTH (LinuxX86_64CM (XorFilter LinuxX86_64C k)) where
-  type JanusCTHEval (LinuxX86_64CM (XorFilter LinuxX86_64C k)) = IO (XorFilter Identity k)
-  janusCTHBackend _ = THBackendLinuxX86_64
-  janusCTHCodegen = x86param
-  janusCTHSpec _ =
-    ([], mkPtrHandleTHRetSpec THRetIO (Proxy @(XorFilter Identity k)) (Proxy @(CStruct (XorFilterSpine k))))
+deriving via
+  ViaPtrHandle t (CStruct (XorFilterSpine k)) (XorFilter Identity k)
+  instance
+    (XorFilterABI k) => JanusCValRet t (XorFilter (JanusCT t) k)

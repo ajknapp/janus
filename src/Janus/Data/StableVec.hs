@@ -3,6 +3,7 @@
 {-# LANGUAGE DataKinds #-}
 {-# LANGUAGE DeriveGeneric #-}
 {-# LANGUAGE DerivingStrategies #-}
+{-# LANGUAGE DerivingVia #-}
 {-# LANGUAGE FlexibleContexts #-}
 {-# LANGUAGE FlexibleInstances #-}
 {-# LANGUAGE KindSignatures #-}
@@ -75,8 +76,6 @@ import Janus.Alloc.Policy
     reallocTypedArray,
   )
 import Janus.Backend.C
-import Janus.Backend.C.LinuxX86_64
-import Janus.Backend.C.TH
 import Janus.Command.Cond (ifThenElseM_, whenM_)
 import Janus.Command.Memory (CmdStorable (..), ExpPtr (..), ExpSized (..))
 import Janus.Command.Ref (letM, newRef, readRef, writeRef)
@@ -516,69 +515,14 @@ foldSPMD pw sv s0 step = do
 
 type StableVecABI k a = (KnownNat k, Typeable k, Typeable a, JanusStruct (Buf a))
 
-type instance JanusCEval (StableVec k JanusC a -> r) = StableVec k Identity a -> JanusCEval r
+type instance JanusCHost (StableVec k (JanusCT _) a) = StableVec k Identity a
 
-type instance JanusCRetType (StableVec k JanusC a -> r) = JanusCRetType r
+deriving via
+  ViaPtrHandle t (CStruct (StableVecSpine k a)) (StableVec k Identity a)
+  instance
+    (StableVecABI k a) => JanusCArg t (StableVec k (JanusCT t) a)
 
-instance (StableVecABI k a, JanusCParam r) => JanusCParam (StableVec k JanusC a -> r) where
-  jcparam = mkPtrHandleJCParam StableVec
-
-instance (StableVecABI k a, JanusCEvaluate r) => JanusCEvaluate (StableVec k JanusC a -> r) where
-  jceval = mkPtrHandleJCEval unStableVec StableVec
-
-type instance JanusCEval (JanusCM (StableVec k JanusC a)) = IO (StableVec k Identity a)
-
-type instance JanusCRetType (JanusCM (StableVec k JanusC a)) = StableVec k Identity a
-
-instance (StableVecABI k a) => JanusCParam (JanusCM (StableVec k JanusC a)) where
-  jcparam = mkPtrHandleJCRetParam unStableVec
-
-instance (StableVecABI k a) => JanusCEvaluate (JanusCM (StableVec k JanusC a)) where
-  jceval = mkPtrHandleJCRetEval StableVec
-
-type instance LinuxX86_64CEval (StableVec k LinuxX86_64C a -> r) = StableVec k Identity a -> LinuxX86_64CEval r
-
-type instance LinuxX86_64BaseRet (StableVec k LinuxX86_64C a -> r) = LinuxX86_64BaseRet r
-
-instance (StableVecABI k a, LinuxX86_64Param r) => LinuxX86_64Param (StableVec k LinuxX86_64C a -> r) where
-  x86param = mkPtrHandleX86Param StableVec
-
-instance (StableVecABI k a, X86DeferCont r, LinuxX86_64Evaluate r) => LinuxX86_64Evaluate (StableVec k LinuxX86_64C a -> r) where
-  x86eval = mkPtrHandleX86EvalParam unStableVec StableVec
-
-instance (StableVecABI k a, X86DeferCont r) => X86DeferCall (StableVec k LinuxX86_64C a -> r) where
-  x86DeferArg = mkPtrHandleX86DeferArg unStableVec StableVec
-
-instance (StableVecABI k a, X86DeferCont r) => X86DeferCont (StableVec k LinuxX86_64C a -> r) where
-  x86DeferCont = mkPtrHandleX86DeferCont unStableVec StableVec
-
-type instance LinuxX86_64CEval (LinuxX86_64CM (StableVec k LinuxX86_64C a)) = IO (StableVec k Identity a)
-
-type instance LinuxX86_64BaseRet (LinuxX86_64CM (StableVec k LinuxX86_64C a)) = StableVec k Identity a
-
-instance (StableVecABI k a) => LinuxX86_64Param (LinuxX86_64CM (StableVec k LinuxX86_64C a)) where
-  x86param = mkPtrHandleX86RetParam unStableVec
-
-instance (StableVecABI k a) => LinuxX86_64Evaluate (LinuxX86_64CM (StableVec k LinuxX86_64C a)) where
-  x86eval = mkPtrHandleX86RetEval StableVec
-
-instance (StableVecABI k a) => X86DeferCall (LinuxX86_64CM (StableVec k LinuxX86_64C a)) where
-  x86DeferArg = mkPtrHandleX86RetDeferArg StableVec
-
-instance (StableVecABI k a) => X86DeferCont (LinuxX86_64CM (StableVec k LinuxX86_64C a)) where
-  x86DeferCont = mkPtrHandleX86RetDeferCont StableVec
-
-instance (StableVecABI k a, LinuxX86_64Param r, JanusCTH r) => JanusCTH (StableVec k LinuxX86_64C a -> r) where
-  type JanusCTHEval (StableVec k LinuxX86_64C a -> r) = StableVec k Identity a -> JanusCTHEval r
-  janusCTHBackend _ = THBackendLinuxX86_64
-  janusCTHCodegen = x86param
-  janusCTHSpec _ =
-    let (ps, retSpec) = janusCTHSpec (Proxy @r)
-     in (mkPtrHandleTHParamSpec (Proxy @(StableVec k Identity a)) : ps, retSpec)
-
-instance (StableVecABI k a) => JanusCTH (LinuxX86_64CM (StableVec k LinuxX86_64C a)) where
-  type JanusCTHEval (LinuxX86_64CM (StableVec k LinuxX86_64C a)) = IO (StableVec k Identity a)
-  janusCTHBackend _ = THBackendLinuxX86_64
-  janusCTHCodegen = x86param
-  janusCTHSpec _ =
-    ([], mkPtrHandleTHRetSpec THRetIO (Proxy @(StableVec k Identity a)) (Proxy @(CStruct (StableVecSpine k a))))
+deriving via
+  ViaPtrHandle t (CStruct (StableVecSpine k a)) (StableVec k Identity a)
+  instance
+    (StableVecABI k a) => JanusCValRet t (StableVec k (JanusCT t) a)

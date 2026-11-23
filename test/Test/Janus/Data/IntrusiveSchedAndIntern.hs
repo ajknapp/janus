@@ -24,8 +24,9 @@ import Hedgehog (Gen, Property, assert, forAll, property, (===))
 import qualified Hedgehog.Gen as Gen
 import qualified Hedgehog.Range as Range
 import Janus.Alloc
+import Janus.Backend.C (acquireJanusC, releaseJanusC)
 import Janus.Backend.C.Build (CBuildConfig, cBuildConfigCacheDir, defaultCBuildConfig)
-import Janus.Backend.C.LinuxX86_64 (LinuxX86_64C, LinuxX86_64CM, acquireLinuxX86_64C, releaseLinuxX86_64C)
+import Janus.Backend.C.LinuxX86_64 (LinuxX86_64C, LinuxX86_64CM)
 import Janus.Command.Memory (CmdStorable (..))
 import Janus.Control.Drain (drainForEach, drainSum, runDrain)
 import Janus.Control.Stream (Stream)
@@ -454,8 +455,8 @@ check_intrusive_sched_and_intern_c_ffi getCFn = property $ do
 
 test_intrusive_sched_and_intern :: TestTree
 test_intrusive_sched_and_intern =
-  let acq = getIntrusiveSchedTestConfig >>= flip acquireLinuxX86_64C cSchedAndInternKernel
-   in withResource acq releaseLinuxX86_64C $ \rFn ->
+  let acq = getIntrusiveSchedTestConfig >>= flip acquireJanusC cSchedAndInternKernel
+   in withResource acq releaseJanusC $ \rFn ->
         testGroup
           "Zero-Alloc Intrusive Schedulers (IntrusiveHeap, TimerWheel) & Byte Interner"
           [ testProperty "IntrusiveHeap pairing heap O(1) push/merge/decreaseKey & O(log N) remove/popMin with 0 churn allocs" check_intrusive_heap_zero_alloc_churn,

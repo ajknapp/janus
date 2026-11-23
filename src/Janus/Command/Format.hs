@@ -76,7 +76,7 @@ instance (KnownSymbol c, GFormatString f) => GFormatString (C1 ('MetaCons c p n)
 instance (FormatString c) => GFormatString (K1 i c) where
   gformatString _ = formatString (Proxy @c)
 
-instance {-# OVERLAPS #-} (FormatString c) => GFormatString (K1 i (JanusC c)) where
+instance {-# OVERLAPS #-} (FormatString c) => GFormatString (K1 i (JanusCT t c)) where
   gformatString _ = formatString (Proxy @c)
 
 instance (KnownSymbol c, GFormatString f) => GFormatString (S1 ('MetaSel ('Just c) u s l) f) where
@@ -91,26 +91,26 @@ class (CmdIO m e) => CmdFormat m e a | m -> e, e -> m where
 instance (Show a) => CmdFormat IO Identity a where
   hformat (Identity h) (Identity a) term = withCString (show a <> term) $ \ptr -> void $ c_fputs ptr h
 
-primFormatJanusC :: forall a. (FormatString a) => JanusC (Ptr CFile) -> JanusC a -> String -> JanusCM ()
+primFormatJanusC :: forall t a. (FormatString a) => JanusCT t (Ptr CFile) -> JanusCT t a -> String -> JanusCMT t ()
 primFormatJanusC h a term = withString (formatString (Proxy @a) <> term) $ \s -> do
   janusCFFICall (Just "stdio.h") "fprintf" h s a
 
-instance CmdFormat JanusCM JanusC Int32 where
+instance CmdFormat (JanusCMT t) (JanusCT t) Int32 where
   hformat = primFormatJanusC
 
-instance CmdFormat JanusCM JanusC Word32 where
+instance CmdFormat (JanusCMT t) (JanusCT t) Word32 where
   hformat = primFormatJanusC
 
-instance CmdFormat JanusCM JanusC Int64 where
+instance CmdFormat (JanusCMT t) (JanusCT t) Int64 where
   hformat = primFormatJanusC
 
-instance CmdFormat JanusCM JanusC Word64 where
+instance CmdFormat (JanusCMT t) (JanusCT t) Word64 where
   hformat = primFormatJanusC
 
-instance CmdFormat JanusCM JanusC Float where
-  hformat h a = primFormatJanusC h (toFloating a :: JanusC Double)
+instance CmdFormat (JanusCMT t) (JanusCT t) Float where
+  hformat h a = primFormatJanusC h (toFloating a :: JanusCT t Double)
 
-instance CmdFormat JanusCM JanusC Double where
+instance CmdFormat (JanusCMT t) (JanusCT t) Double where
   hformat = primFormatJanusC
 
 class GJanusCFormatFields f where
@@ -119,7 +119,7 @@ class GJanusCFormatFields f where
 instance (Generic f, GJanusCFormatFields (Rep f)) => GJanusCFormatFields (K1 i f) where
   gjcFormatFields (K1 f) = gjcFormatFields (GHC.Generics.from f)
 
-instance {-# OVERLAPS #-} GJanusCFormatFields (K1 i (JanusC a)) where
+instance {-# OVERLAPS #-} GJanusCFormatFields (K1 i (JanusCT t a)) where
   gjcFormatFields (K1 f) _ = do
     RVal f' <- getJanusC f
     pure [f']
@@ -137,16 +137,16 @@ instance (GJanusCFormatFields f) => GJanusCFormatFields (D1 i f) where
   gjcFormatFields (M1 f) = gjcFormatFields f
 
 defaultJanusCHFormat ::
-  forall a.
-  (Generic a, FormatString a, GJanusCFormatFields (Rep a), ExpExtract JanusC a) =>
-  JanusC (Ptr CFile) ->
-  JanusC a ->
+  forall t a.
+  (Generic a, FormatString a, GJanusCFormatFields (Rep a), ExpExtract (JanusCT t) a) =>
+  JanusCT t (Ptr CFile) ->
+  JanusCT t a ->
   String ->
-  JanusCM ()
+  JanusCMT t ()
 defaultJanusCHFormat (JanusC h) e term = withString (formatString (Proxy @a) <> term) $ \s -> do
-  fields <- gjcFormatFields (GHC.Generics.from $ extract e) ""
-  RVal h' <- h
-  RVal s' <- getJanusC s
+  fields <- liftJanusCM $ gjcFormatFields (GHC.Generics.from $ extract e) ""
+  RVal h' <- liftJanusCM h
+  RVal s' <- liftJanusCM (getJanusC s)
   modifyFunction $ \fn ->
     let block = fn ^. jcfBlock
         x = FnCall (Var (Id "fprintf" noLoc) noLoc) (h' : s' : fields) noLoc
@@ -163,7 +163,7 @@ foreign import ccall "fputs" c_fputs :: CString -> Ptr CFile -> IO CInt
 instance CmdPutString IO Identity where
   hputString (Identity h) (Identity s) = void $ c_fputs s h
 
-instance CmdPutString JanusCM JanusC where
+instance CmdPutString (JanusCMT t) (JanusCT t) where
   hputString f s = janusCFFICall (Just "stdio.h") "fputs" s f
 
 class CmdString m e | m -> e, e -> m where
@@ -172,7 +172,7 @@ class CmdString m e | m -> e, e -> m where
 instance CmdString IO Identity where
   withString s f = withCString s (f . Identity)
 
-instance CmdString JanusCM JanusC where
+instance CmdString (JanusCMT t) (JanusCT t) where
   withString s f = f $ JanusC $ do
     JCType spec dec <- getJanusCType (Proxy @(Ptr CChar))
     case spec of

@@ -22,13 +22,13 @@ instance (Eq a) => ExpEq Identity a where
   eq a b = (==) <$> a <*> b
   ne a b = (/=) <$> a <*> b
 
-instance ExpEq JanusC Bool where
+instance ExpEq (JanusCT t) Bool where
   eq = janusCBoolBinOp Eq
   ne = janusCBoolBinOp Ne
 
 $( let inst t =
          [d|
-           instance ExpEq JanusC $t where
+           instance ExpEq (JanusCT target) $t where
              eq = janusCBoolBinOp Eq
              ne = janusCBoolBinOp Ne
            |]

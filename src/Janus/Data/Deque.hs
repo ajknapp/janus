@@ -3,6 +3,7 @@
 {-# LANGUAGE DataKinds #-}
 {-# LANGUAGE DeriveGeneric #-}
 {-# LANGUAGE DerivingStrategies #-}
+{-# LANGUAGE DerivingVia #-}
 {-# LANGUAGE FlexibleContexts #-}
 {-# LANGUAGE FlexibleInstances #-}
 {-# LANGUAGE KindSignatures #-}
@@ -73,8 +74,6 @@ import Foreign.Ptr (Ptr)
 import GHC.Generics (Generic)
 import Janus.Alloc.Policy (Alloc, allocStruct, freeStruct)
 import Janus.Backend.C
-import Janus.Backend.C.LinuxX86_64
-import Janus.Backend.C.TH
 import Janus.Command.Cond (ifThenElseM_, whenM_)
 import Janus.Command.Memory (CmdStorable (..), ExpSized (..))
 import Janus.Command.Ref (letM, newRef, readRef, writeRef)
@@ -579,69 +578,14 @@ foldSPMD pw dq s0 step = do
 -- Host <-> C FFI Marshalling Instances
 --------------------------------------------------------------------------------
 
-type instance JanusCEval (Deque JanusC a -> r) = Deque Identity a -> JanusCEval r
+type instance JanusCHost (Deque (JanusCT _) a) = Deque Identity a
 
-type instance JanusCRetType (Deque JanusC a -> r) = JanusCRetType r
+deriving via
+  ViaPtrHandle t (CStruct (DequeSpine a)) (Deque Identity a)
+  instance
+    (Typeable a, JanusStruct (Buf a)) => JanusCArg t (Deque (JanusCT t) a)
 
-instance (Typeable a, JanusStruct (Buf a), JanusCParam r) => JanusCParam (Deque JanusC a -> r) where
-  jcparam = mkPtrHandleJCParam Deque
-
-instance (Typeable a, JanusStruct (Buf a), JanusCEvaluate r) => JanusCEvaluate (Deque JanusC a -> r) where
-  jceval = mkPtrHandleJCEval unDeque Deque
-
-type instance JanusCEval (JanusCM (Deque JanusC a)) = IO (Deque Identity a)
-
-type instance JanusCRetType (JanusCM (Deque JanusC a)) = Deque Identity a
-
-instance (Typeable a, JanusStruct (Buf a)) => JanusCParam (JanusCM (Deque JanusC a)) where
-  jcparam = mkPtrHandleJCRetParam unDeque
-
-instance (Typeable a, JanusStruct (Buf a)) => JanusCEvaluate (JanusCM (Deque JanusC a)) where
-  jceval = mkPtrHandleJCRetEval Deque
-
-type instance LinuxX86_64CEval (Deque LinuxX86_64C a -> r) = Deque Identity a -> LinuxX86_64CEval r
-
-type instance LinuxX86_64BaseRet (Deque LinuxX86_64C a -> r) = LinuxX86_64BaseRet r
-
-instance (Typeable a, JanusStruct (Buf a), LinuxX86_64Param r) => LinuxX86_64Param (Deque LinuxX86_64C a -> r) where
-  x86param = mkPtrHandleX86Param Deque
-
-instance (Typeable a, JanusStruct (Buf a), X86DeferCont r, LinuxX86_64Evaluate r) => LinuxX86_64Evaluate (Deque LinuxX86_64C a -> r) where
-  x86eval = mkPtrHandleX86EvalParam unDeque Deque
-
-instance (Typeable a, JanusStruct (Buf a), X86DeferCont r) => X86DeferCall (Deque LinuxX86_64C a -> r) where
-  x86DeferArg = mkPtrHandleX86DeferArg unDeque Deque
-
-instance (Typeable a, JanusStruct (Buf a), X86DeferCont r) => X86DeferCont (Deque LinuxX86_64C a -> r) where
-  x86DeferCont = mkPtrHandleX86DeferCont unDeque Deque
-
-type instance LinuxX86_64CEval (LinuxX86_64CM (Deque LinuxX86_64C a)) = IO (Deque Identity a)
-
-type instance LinuxX86_64BaseRet (LinuxX86_64CM (Deque LinuxX86_64C a)) = Deque Identity a
-
-instance (Typeable a, JanusStruct (Buf a)) => LinuxX86_64Param (LinuxX86_64CM (Deque LinuxX86_64C a)) where
-  x86param = mkPtrHandleX86RetParam unDeque
-
-instance (Typeable a, JanusStruct (Buf a)) => LinuxX86_64Evaluate (LinuxX86_64CM (Deque LinuxX86_64C a)) where
-  x86eval = mkPtrHandleX86RetEval Deque
-
-instance (Typeable a, JanusStruct (Buf a)) => X86DeferCall (LinuxX86_64CM (Deque LinuxX86_64C a)) where
-  x86DeferArg = mkPtrHandleX86RetDeferArg Deque
-
-instance (Typeable a, JanusStruct (Buf a)) => X86DeferCont (LinuxX86_64CM (Deque LinuxX86_64C a)) where
-  x86DeferCont = mkPtrHandleX86RetDeferCont Deque
-
-instance (Typeable a, JanusStruct (Buf a), LinuxX86_64Param r, JanusCTH r) => JanusCTH (Deque LinuxX86_64C a -> r) where
-  type JanusCTHEval (Deque LinuxX86_64C a -> r) = Deque Identity a -> JanusCTHEval r
-  janusCTHBackend _ = THBackendLinuxX86_64
-  janusCTHCodegen = x86param
-  janusCTHSpec _ =
-    let (ps, retSpec) = janusCTHSpec (Proxy @r)
-     in (mkPtrHandleTHParamSpec (Proxy @(Deque Identity a)) : ps, retSpec)
-
-instance (Typeable a, JanusStruct (Buf a)) => JanusCTH (LinuxX86_64CM (Deque LinuxX86_64C a)) where
-  type JanusCTHEval (LinuxX86_64CM (Deque LinuxX86_64C a)) = IO (Deque Identity a)
-  janusCTHBackend _ = THBackendLinuxX86_64
-  janusCTHCodegen = x86param
-  janusCTHSpec _ =
-    ([], mkPtrHandleTHRetSpec THRetIO (Proxy @(Deque Identity a)) (Proxy @(CStruct (DequeSpine a))))
+deriving via
+  ViaPtrHandle t (CStruct (DequeSpine a)) (Deque Identity a)
+  instance
+    (Typeable a, JanusStruct (Buf a)) => JanusCValRet t (Deque (JanusCT t) a)

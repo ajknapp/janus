@@ -1,5 +1,6 @@
 {-# LANGUAGE DeriveGeneric #-}
 {-# LANGUAGE DerivingStrategies #-}
+{-# LANGUAGE DerivingVia #-}
 {-# LANGUAGE FlexibleContexts #-}
 {-# LANGUAGE FlexibleInstances #-}
 {-# LANGUAGE MultiParamTypeClasses #-}
@@ -24,14 +25,11 @@ where
 
 import Data.Functor.Identity (Identity (..))
 import Data.Int (Int64)
-import Data.Proxy (Proxy (..))
 import Data.Word (Word64, Word8)
 import Foreign.Ptr (Ptr)
 import GHC.Generics (Generic)
 import Janus.Alloc.Dynamic (CmdAllocBase, alignUpWord64, isNullVoidPtr, sameVoidPtr)
 import Janus.Backend.C
-import Janus.Backend.C.LinuxX86_64
-import Janus.Backend.C.TH
 import Janus.Command.Array (CmdMemCopy (..), CmdStorable (..), ExpPtr (..), janusSIMDAlignment)
 import Janus.Command.Cond (ifThenElseM_, whenM_)
 import Janus.Command.Ref (letM, newRef, readRef, writeRef)
@@ -321,36 +319,15 @@ monotonicDestroyImpl parentFree spineSz (Monotonic hdr) = do
   parentFree (toVoidPtr hdr) spineSz
 
 -- Host <-> C FFI Marshalling Instances
-type instance JanusCEval (Monotonic JanusC -> r) = Monotonic Identity -> JanusCEval r
 
-type instance JanusCRetType (Monotonic JanusC -> r) = JanusCRetType r
+type instance JanusCHost (Monotonic (JanusCT _)) = Monotonic Identity
 
-instance (JanusCParam r) => JanusCParam (Monotonic JanusC -> r) where
-  jcparam = mkPtrHandleJCParam Monotonic
+deriving via
+  ViaPtrHandle t (CStruct MonotonicSpine) (Monotonic Identity)
+  instance
+    JanusCArg t (Monotonic (JanusCT t))
 
-instance (JanusCEvaluate r) => JanusCEvaluate (Monotonic JanusC -> r) where
-  jceval = mkPtrHandleJCEval unMonotonic Monotonic
-
-type instance LinuxX86_64CEval (Monotonic LinuxX86_64C -> r) = Monotonic Identity -> LinuxX86_64CEval r
-
-type instance LinuxX86_64BaseRet (Monotonic LinuxX86_64C -> r) = LinuxX86_64BaseRet r
-
-instance (LinuxX86_64Param r) => LinuxX86_64Param (Monotonic LinuxX86_64C -> r) where
-  x86param = mkPtrHandleX86Param Monotonic
-
-instance (X86DeferCont r, LinuxX86_64Evaluate r) => LinuxX86_64Evaluate (Monotonic LinuxX86_64C -> r) where
-  x86eval = mkPtrHandleX86EvalParam unMonotonic Monotonic
-
-instance (X86DeferCont r) => X86DeferCall (Monotonic LinuxX86_64C -> r) where
-  x86DeferArg = mkPtrHandleX86DeferArg unMonotonic Monotonic
-
-instance (X86DeferCont r) => X86DeferCont (Monotonic LinuxX86_64C -> r) where
-  x86DeferCont = mkPtrHandleX86DeferCont unMonotonic Monotonic
-
-instance (LinuxX86_64Param r, JanusCTH r) => JanusCTH (Monotonic LinuxX86_64C -> r) where
-  type JanusCTHEval (Monotonic LinuxX86_64C -> r) = Monotonic Identity -> JanusCTHEval r
-  janusCTHBackend _ = THBackendLinuxX86_64
-  janusCTHCodegen = x86param
-  janusCTHSpec _ =
-    let (ps, retSpec) = janusCTHSpec (Proxy @r)
-     in (mkPtrHandleTHParamSpec (Proxy @(Monotonic Identity)) : ps, retSpec)
+deriving via
+  ViaPtrHandle t (CStruct MonotonicSpine) (Monotonic Identity)
+  instance
+    JanusCValRet t (Monotonic (JanusCT t))

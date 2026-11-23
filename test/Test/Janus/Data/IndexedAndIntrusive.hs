@@ -30,8 +30,9 @@ import Hedgehog (Property, assert, forAll, property, (===))
 import qualified Hedgehog.Gen as Gen
 import qualified Hedgehog.Range as Range
 import Janus.Alloc
+import Janus.Backend.C (acquireJanusC, releaseJanusC)
 import Janus.Backend.C.Build (CBuildConfig, cBuildConfigCacheDir, defaultCBuildConfig)
-import Janus.Backend.C.LinuxX86_64 (LinuxX86_64C, LinuxX86_64CM, acquireLinuxX86_64C, releaseLinuxX86_64C)
+import Janus.Backend.C.LinuxX86_64 (LinuxX86_64C, LinuxX86_64CM)
 import Janus.Command.Array (CmdStorable (peek))
 import Janus.Command.Range (rangeM)
 import Janus.Control.Drain (drainForEach, drainSum, runDrain)
@@ -464,8 +465,8 @@ check_indexed_intrusive_host_c_ffi getCFn = property $ do
 
 test_indexed_and_intrusive_containers :: TestTree
 test_indexed_and_intrusive_containers =
-  let acq = getIdxTestConfig >>= flip acquireLinuxX86_64C cMutateIndexedAndIntrusive
-   in withResource acq releaseLinuxX86_64C $ \rFn ->
+  let acq = getIdxTestConfig >>= flip acquireJanusC cMutateIndexedAndIntrusive
+   in withResource acq releaseJanusC $ \rFn ->
         testGroup
           "SlotMap, SparseSet, SparseVec, Pool, & IntrusiveList"
           [ testProperty "SlotMap generational stale-key rejection & SPMD over denseVals" check_slotmap_generational_safety,

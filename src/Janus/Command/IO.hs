@@ -1,3 +1,4 @@
+{-# LANGUAGE FlexibleInstances #-}
 {-# LANGUAGE FunctionalDependencies #-}
 
 module Janus.Command.IO where
@@ -29,7 +30,7 @@ instance CmdIO IO Identity where
   fopen (Identity cstr) (Identity mode) = Identity <$> c_fopen cstr mode
   fclose (Identity cptr) = Identity <$> c_fclose cptr
 
-instance CmdIO JanusCM JanusC where
+instance CmdIO (JanusCMT t) (JanusCT t) where
   stdout = JanusC $ do
     addHeader "stdio.h"
     pure $ RVal $ Var (Id "stdout" noLoc) noLoc

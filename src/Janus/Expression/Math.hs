@@ -32,14 +32,14 @@ instance FMA CDouble where
 instance FMA a => FMA (Identity a) where
   fma a b c = Identity $ fma (coerce a) (coerce b) (coerce c)
 
-instance FMA (JanusC Float) where
+instance FMA (JanusCT t Float) where
   fma (JanusC a) (JanusC b) (JanusC c) = JanusC $ do
     RVal a' <- a
     RVal b' <- b
     RVal c' <- c
     pure $ RVal $ FnCall (Var (Id "fmaf" noLoc) noLoc) [a', b', c'] noLoc
 
-instance FMA (JanusC Double) where
+instance FMA (JanusCT t Double) where
   fma (JanusC a) (JanusC b) (JanusC c) = JanusC $ do
     RVal a' <- a
     RVal b' <- b
@@ -54,13 +54,13 @@ class Floating a => Hypot a where
   default hypot :: Floating a => a -> a -> a
   hypot a b = sqrt $ a*a + b*b
 
-instance Hypot (JanusC Float) where
+instance Hypot (JanusCT t Float) where
   hypot (JanusC a) (JanusC b) = JanusC $ do
     RVal a' <- a
     RVal b' <- b
     pure $ RVal $ FnCall (Var (Id "hypotf" noLoc) noLoc) [a', b'] noLoc
 
-instance Hypot (JanusC Double) where
+instance Hypot (JanusCT t Double) where
   hypot (JanusC a) (JanusC b) = JanusC $ do
     RVal a' <- a
     RVal b' <- b
@@ -92,7 +92,7 @@ instance ExpComplex Identity a where
   rePart = Identity . realPart . runIdentity
   imPart = Identity . imagPart . runIdentity
 
-instance ExpComplex JanusC Float where
+instance ExpComplex (JanusCT t) Float where
   rePart (JanusC z) = JanusC $ do
     RVal z' <- z
     pure $ RVal $ FnCall (Var (Id "crealf" noLoc) noLoc) [z'] noLoc
@@ -100,7 +100,7 @@ instance ExpComplex JanusC Float where
     RVal z' <- z
     pure $ RVal $ FnCall (Var (Id "cimagf" noLoc) noLoc) [z'] noLoc
 
-instance ExpComplex JanusC Double where
+instance ExpComplex (JanusCT t) Double where
   rePart (JanusC z) = JanusC $ do
     RVal z' <- z
     pure $ RVal $ FnCall (Var (Id "creal" noLoc) noLoc) [z'] noLoc

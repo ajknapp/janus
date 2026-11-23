@@ -3,6 +3,7 @@
 {-# LANGUAGE DataKinds #-}
 {-# LANGUAGE DeriveGeneric #-}
 {-# LANGUAGE DerivingStrategies #-}
+{-# LANGUAGE DerivingVia #-}
 {-# LANGUAGE FlexibleContexts #-}
 {-# LANGUAGE FlexibleInstances #-}
 {-# LANGUAGE KindSignatures #-}
@@ -58,7 +59,6 @@ where
 import Data.Functor.Identity (Identity (..))
 import Data.Int (Int64)
 import qualified Data.Kind as K
-import Data.Proxy (Proxy (..))
 import Data.Typeable (Typeable)
 import Data.Word (Word8)
 import Foreign.Ptr (Ptr)
@@ -66,8 +66,6 @@ import GHC.Generics (Generic, Rep)
 import Janus.Alloc.Dynamic (CmdAllocBase)
 import Janus.Alloc.Policy (Alloc, CmdAlloc, allocStruct, freeStruct)
 import Janus.Backend.C
-import Janus.Backend.C.LinuxX86_64
-import Janus.Backend.C.TH
 import Janus.Command.Cond (ifThenElseM_, whenM_)
 import Janus.Command.Memory (CmdStorable (..), ExpPtr (..), ExpSized (..))
 import Janus.Command.Ref (newRef, readRef, writeRef)
@@ -748,69 +746,14 @@ drainAllocAppendHeap alloc hp =
 -- Host <-> C FFI Marshalling Instances
 --------------------------------------------------------------------------------
 
-type instance JanusCEval (IntrusiveHeap s k JanusC -> r) = IntrusiveHeap s k Identity -> JanusCEval r
+type instance JanusCHost (IntrusiveHeap s k (JanusCT _)) = IntrusiveHeap s k Identity
 
-type instance JanusCRetType (IntrusiveHeap s k JanusC -> r) = JanusCRetType r
+deriving via
+  ViaPtrHandle t (CStruct IntrusiveHeapSpine) (IntrusiveHeap s k Identity)
+  instance
+    (Typeable s, Typeable k) => JanusCArg t (IntrusiveHeap s k (JanusCT t))
 
-instance (Typeable s, Typeable k, JanusCParam r) => JanusCParam (IntrusiveHeap s k JanusC -> r) where
-  jcparam = mkPtrHandleJCParam IntrusiveHeap
-
-instance (Typeable s, Typeable k, JanusCEvaluate r) => JanusCEvaluate (IntrusiveHeap s k JanusC -> r) where
-  jceval = mkPtrHandleJCEval unIntrusiveHeap IntrusiveHeap
-
-type instance JanusCEval (JanusCM (IntrusiveHeap s k JanusC)) = IO (IntrusiveHeap s k Identity)
-
-type instance JanusCRetType (JanusCM (IntrusiveHeap s k JanusC)) = IntrusiveHeap s k Identity
-
-instance (Typeable s, Typeable k) => JanusCParam (JanusCM (IntrusiveHeap s k JanusC)) where
-  jcparam = mkPtrHandleJCRetParam unIntrusiveHeap
-
-instance (Typeable s, Typeable k) => JanusCEvaluate (JanusCM (IntrusiveHeap s k JanusC)) where
-  jceval = mkPtrHandleJCRetEval IntrusiveHeap
-
-type instance LinuxX86_64CEval (IntrusiveHeap s k LinuxX86_64C -> r) = IntrusiveHeap s k Identity -> LinuxX86_64CEval r
-
-type instance LinuxX86_64BaseRet (IntrusiveHeap s k LinuxX86_64C -> r) = LinuxX86_64BaseRet r
-
-instance (Typeable s, Typeable k, LinuxX86_64Param r) => LinuxX86_64Param (IntrusiveHeap s k LinuxX86_64C -> r) where
-  x86param = mkPtrHandleX86Param IntrusiveHeap
-
-instance (Typeable s, Typeable k, X86DeferCont r, LinuxX86_64Evaluate r) => LinuxX86_64Evaluate (IntrusiveHeap s k LinuxX86_64C -> r) where
-  x86eval = mkPtrHandleX86EvalParam unIntrusiveHeap IntrusiveHeap
-
-instance (Typeable s, Typeable k, X86DeferCont r) => X86DeferCall (IntrusiveHeap s k LinuxX86_64C -> r) where
-  x86DeferArg = mkPtrHandleX86DeferArg unIntrusiveHeap IntrusiveHeap
-
-instance (Typeable s, Typeable k, X86DeferCont r) => X86DeferCont (IntrusiveHeap s k LinuxX86_64C -> r) where
-  x86DeferCont = mkPtrHandleX86DeferCont unIntrusiveHeap IntrusiveHeap
-
-type instance LinuxX86_64CEval (LinuxX86_64CM (IntrusiveHeap s k LinuxX86_64C)) = IO (IntrusiveHeap s k Identity)
-
-type instance LinuxX86_64BaseRet (LinuxX86_64CM (IntrusiveHeap s k LinuxX86_64C)) = IntrusiveHeap s k Identity
-
-instance (Typeable s, Typeable k) => LinuxX86_64Param (LinuxX86_64CM (IntrusiveHeap s k LinuxX86_64C)) where
-  x86param = mkPtrHandleX86RetParam unIntrusiveHeap
-
-instance (Typeable s, Typeable k) => LinuxX86_64Evaluate (LinuxX86_64CM (IntrusiveHeap s k LinuxX86_64C)) where
-  x86eval = mkPtrHandleX86RetEval IntrusiveHeap
-
-instance (Typeable s, Typeable k) => X86DeferCall (LinuxX86_64CM (IntrusiveHeap s k LinuxX86_64C)) where
-  x86DeferArg = mkPtrHandleX86RetDeferArg IntrusiveHeap
-
-instance (Typeable s, Typeable k) => X86DeferCont (LinuxX86_64CM (IntrusiveHeap s k LinuxX86_64C)) where
-  x86DeferCont = mkPtrHandleX86RetDeferCont IntrusiveHeap
-
-instance (Typeable s, Typeable k, LinuxX86_64Param r, JanusCTH r) => JanusCTH (IntrusiveHeap s k LinuxX86_64C -> r) where
-  type JanusCTHEval (IntrusiveHeap s k LinuxX86_64C -> r) = IntrusiveHeap s k Identity -> JanusCTHEval r
-  janusCTHBackend _ = THBackendLinuxX86_64
-  janusCTHCodegen = x86param
-  janusCTHSpec _ =
-    let (ps, retSpec) = janusCTHSpec (Proxy @r)
-     in (mkPtrHandleTHParamSpec (Proxy @(IntrusiveHeap s k Identity)) : ps, retSpec)
-
-instance (Typeable s, Typeable k) => JanusCTH (LinuxX86_64CM (IntrusiveHeap s k LinuxX86_64C)) where
-  type JanusCTHEval (LinuxX86_64CM (IntrusiveHeap s k LinuxX86_64C)) = IO (IntrusiveHeap s k Identity)
-  janusCTHBackend _ = THBackendLinuxX86_64
-  janusCTHCodegen = x86param
-  janusCTHSpec _ =
-    ([], mkPtrHandleTHRetSpec THRetIO (Proxy @(IntrusiveHeap s k Identity)) (Proxy @(CStruct IntrusiveHeapSpine)))
+deriving via
+  ViaPtrHandle t (CStruct IntrusiveHeapSpine) (IntrusiveHeap s k Identity)
+  instance
+    (Typeable s, Typeable k) => JanusCValRet t (IntrusiveHeap s k (JanusCT t))

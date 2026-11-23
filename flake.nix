@@ -48,10 +48,14 @@
           , async
           , base16-bytestring
           , concurrency
+          , constraints
+          , constraints-extras
           , containers
           , cryptohash-sha256
           , cudaPackages
           , dejafu
+          , dependent-hashmap
+          , dependent-sum
           , dependent-sum-template
           , exceptions
           , gcc
@@ -83,9 +87,13 @@
                 async
                 base16-bytestring
                 concurrency
+                constraints
+                constraints-extras
                 containers
                 cryptohash-sha256
                 dejafu
+                dependent-hashmap
+                dependent-sum
                 dependent-sum-template
                 exceptions
                 hashable

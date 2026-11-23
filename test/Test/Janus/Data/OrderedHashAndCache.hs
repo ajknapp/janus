@@ -29,8 +29,9 @@ import Hedgehog (Gen, Property, assert, forAll, property, (===))
 import qualified Hedgehog.Gen as Gen
 import qualified Hedgehog.Range as Range
 import Janus.Alloc
+import Janus.Backend.C (acquireJanusC, releaseJanusC)
 import Janus.Backend.C.Build (CBuildConfig, cBuildConfigCacheDir, defaultCBuildConfig)
-import Janus.Backend.C.LinuxX86_64 (LinuxX86_64C, LinuxX86_64CM, acquireLinuxX86_64C, releaseLinuxX86_64C)
+import Janus.Backend.C.LinuxX86_64 (LinuxX86_64C, LinuxX86_64CM)
 import Janus.Control.Drain (drainForEach, drainSum, runDrain)
 import Janus.Control.Stream (Stream, rangeS)
 import Janus.Data.ClockCache (ClockCache)
@@ -685,7 +686,7 @@ check_clock_cache_second_chance_and_zero_steady_allocs = property $ do
   liveEnd === (0, 0)
 
 --------------------------------------------------------------------------------
--- 5. Host <-> Compiled C FFI Round-Trip (`compileLinuxX86_64C`)
+-- 5. Host <-> Compiled C FFI Round-Trip (`compileJanusC`)
 --------------------------------------------------------------------------------
 
 cMutateOrderedAndCaches ::
@@ -782,8 +783,8 @@ check_ordered_and_cache_host_c_ffi getCFn = property $ do
 
 test_ordered_hash_and_cache :: TestTree
 test_ordered_hash_and_cache =
-  let acq = getOrderedCacheTestConfig >>= flip acquireLinuxX86_64C cMutateOrderedAndCaches
-   in withResource acq releaseLinuxX86_64C $ \rFn ->
+  let acq = getOrderedCacheTestConfig >>= flip acquireJanusC cMutateOrderedAndCaches
+   in withResource acq releaseJanusC $ \rFn ->
         testGroup
           "Insertion-Ordered SwissTables (IndexMap, IndexSet) & Bounded Caches (ClockCache, LruCache)"
           [ testProperty "IndexMap exact insertion order, shiftRemove, swapRemove, popBack, & zero-alloc sortByKey" check_indexmap_order_and_ops,

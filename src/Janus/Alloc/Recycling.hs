@@ -2,6 +2,7 @@
 {-# LANGUAGE DataKinds #-}
 {-# LANGUAGE DeriveGeneric #-}
 {-# LANGUAGE DerivingStrategies #-}
+{-# LANGUAGE DerivingVia #-}
 {-# LANGUAGE FlexibleContexts #-}
 {-# LANGUAGE FlexibleInstances #-}
 {-# LANGUAGE MultiParamTypeClasses #-}
@@ -27,14 +28,11 @@ where
 
 import Data.Functor.Identity (Identity (..))
 import Data.Int (Int64)
-import Data.Proxy (Proxy (..))
 import Data.Word (Word8)
 import Foreign.Ptr (Ptr)
 import GHC.Generics (Generic)
 import Janus.Alloc.Dynamic (CmdAllocBase, isNullVoidPtr)
 import Janus.Backend.C
-import Janus.Backend.C.LinuxX86_64
-import Janus.Backend.C.TH
 import Janus.Command.Array (CmdMemCopy (..), CmdStorable (..), ExpPtr (..))
 import Janus.Command.Cond (ifThenElseM_, whenM_)
 import Janus.Command.Ref (letM, newRef, readRef, writeRef)
@@ -300,36 +298,15 @@ recyclerDestroyImpl parentFree spineSz rec@(Recycler hdr) = do
   parentFree (toVoidPtr hdr) spineSz
 
 -- Host <-> C FFI Marshalling Instances
-type instance JanusCEval (Recycler JanusC -> r) = Recycler Identity -> JanusCEval r
 
-type instance JanusCRetType (Recycler JanusC -> r) = JanusCRetType r
+type instance JanusCHost (Recycler (JanusCT _)) = Recycler Identity
 
-instance (JanusCParam r) => JanusCParam (Recycler JanusC -> r) where
-  jcparam = mkPtrHandleJCParam Recycler
+deriving via
+  ViaPtrHandle t (CStruct RecyclerSpine) (Recycler Identity)
+  instance
+    JanusCArg t (Recycler (JanusCT t))
 
-instance (JanusCEvaluate r) => JanusCEvaluate (Recycler JanusC -> r) where
-  jceval = mkPtrHandleJCEval unRecycler Recycler
-
-type instance LinuxX86_64CEval (Recycler LinuxX86_64C -> r) = Recycler Identity -> LinuxX86_64CEval r
-
-type instance LinuxX86_64BaseRet (Recycler LinuxX86_64C -> r) = LinuxX86_64BaseRet r
-
-instance (LinuxX86_64Param r) => LinuxX86_64Param (Recycler LinuxX86_64C -> r) where
-  x86param = mkPtrHandleX86Param Recycler
-
-instance (X86DeferCont r, LinuxX86_64Evaluate r) => LinuxX86_64Evaluate (Recycler LinuxX86_64C -> r) where
-  x86eval = mkPtrHandleX86EvalParam unRecycler Recycler
-
-instance (X86DeferCont r) => X86DeferCall (Recycler LinuxX86_64C -> r) where
-  x86DeferArg = mkPtrHandleX86DeferArg unRecycler Recycler
-
-instance (X86DeferCont r) => X86DeferCont (Recycler LinuxX86_64C -> r) where
-  x86DeferCont = mkPtrHandleX86DeferCont unRecycler Recycler
-
-instance (LinuxX86_64Param r, JanusCTH r) => JanusCTH (Recycler LinuxX86_64C -> r) where
-  type JanusCTHEval (Recycler LinuxX86_64C -> r) = Recycler Identity -> JanusCTHEval r
-  janusCTHBackend _ = THBackendLinuxX86_64
-  janusCTHCodegen = x86param
-  janusCTHSpec _ =
-    let (ps, retSpec) = janusCTHSpec (Proxy @r)
-     in (mkPtrHandleTHParamSpec (Proxy @(Recycler Identity)) : ps, retSpec)
+deriving via
+  ViaPtrHandle t (CStruct RecyclerSpine) (Recycler Identity)
+  instance
+    JanusCValRet t (Recycler (JanusCT t))

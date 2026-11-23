@@ -73,14 +73,14 @@ murmurHash = murmurHashWithSalt defaultHashSalt
 instance ExpMurmurHash Identity (Identity Bool) where
   murmurHashWithSalt seed (Identity b) = hash64WithSalt seed (Identity (if b then 1 else 0))
 
-instance ExpMurmurHash JanusC (JanusC Bool) where
+instance ExpMurmurHash (JanusCT t) (JanusCT t Bool) where
   murmurHashWithSalt seed b = hash64WithSalt seed (fromBool b)
 
 instance ExpMurmurHash Identity (Identity (Ptr p)) where
   murmurHashWithSalt seed (Identity p) =
     hash64WithSalt seed (Identity (fromIntegral (ptrToWordPtr p) :: Word64))
 
-instance ExpMurmurHash JanusC (JanusC (Ptr p)) where
+instance ExpMurmurHash (JanusCT t) (JanusCT t (Ptr p)) where
   murmurHashWithSalt seed (JanusC mp) =
     let asW64 = JanusC $ do
           addHeader "stdint.h"
@@ -92,7 +92,7 @@ instance ExpMurmurHash JanusC (JanusC (Ptr p)) where
 
 $( let inst t =
          [d|
-           instance ExpMurmurHash JanusC (JanusC $t) where
+           instance ExpMurmurHash (JanusCT target) (JanusCT target $t) where
              murmurHashWithSalt seed x = hash64WithSalt seed (toIntegral x)
 
            instance ExpMurmurHash Identity (Identity $t) where
@@ -102,7 +102,7 @@ $( let inst t =
     in concat <$> traverse (inst . pure . ConT) tys
  )
 
-jcBitcastToUInt :: forall src dst. (JanusCTyped src, JanusCTyped dst) => Int -> JanusC src -> JanusC dst
+jcBitcastToUInt :: forall src dst t. (JanusCTyped src, JanusCTyped dst) => Int -> JanusCT t src -> JanusCT t dst
 jcBitcastToUInt bytes (JanusC mx) = JanusC $ do
   addHeader "string.h"
   addHeader "stdint.h"
@@ -135,12 +135,12 @@ instance ExpMurmurHash Identity (Identity Float) where
 instance ExpMurmurHash Identity (Identity Double) where
   murmurHashWithSalt salt x = hash64WithSalt salt (fmap castDoubleToWord64 x)
 
-instance ExpMurmurHash JanusC (JanusC Float) where
+instance ExpMurmurHash (JanusCT t) (JanusCT t Float) where
   murmurHashWithSalt salt x =
     let w32 = jcBitcastToUInt @Float @Word32 4 x
      in hash64WithSalt salt (toIntegral w32)
 
-instance ExpMurmurHash JanusC (JanusC Double) where
+instance ExpMurmurHash (JanusCT t) (JanusCT t Double) where
   murmurHashWithSalt salt x =
     let w64 = jcBitcastToUInt @Double @Word64 8 x
      in hash64WithSalt salt w64

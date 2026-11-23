@@ -21,8 +21,9 @@ import Hedgehog (Gen, Property, assert, forAll, property, (===))
 import qualified Hedgehog.Gen as Gen
 import qualified Hedgehog.Range as Range
 import Janus.Alloc
+import Janus.Backend.C (acquireJanusC, releaseJanusC)
 import Janus.Backend.C.Build (CBuildConfig, cBuildConfigCacheDir, defaultCBuildConfig)
-import Janus.Backend.C.LinuxX86_64 (LinuxX86_64C, LinuxX86_64CM, acquireLinuxX86_64C, releaseLinuxX86_64C)
+import Janus.Backend.C.LinuxX86_64 (LinuxX86_64C, LinuxX86_64CM)
 import Janus.Command.Range (rangeM)
 import Janus.Control.Drain
   ( drainAll,
@@ -513,10 +514,10 @@ check_sequential_host_c_ffi getMutFn getBuildFn = property $ do
 
 test_sequential_containers :: TestTree
 test_sequential_containers =
-  let acqMut = getSeqTestConfig >>= flip acquireLinuxX86_64C cMutateHostDynVecAndDeque
-      acqBuild = getSeqTestConfig >>= flip acquireLinuxX86_64C cBuildVecViaDrainInC
-   in withResource acqMut releaseLinuxX86_64C $ \rMut ->
-        withResource acqBuild releaseLinuxX86_64C $ \rBuild ->
+  let acqMut = getSeqTestConfig >>= flip acquireJanusC cMutateHostDynVecAndDeque
+      acqBuild = getSeqTestConfig >>= flip acquireJanusC cBuildVecViaDrainInC
+   in withResource acqMut releaseJanusC $ \rMut ->
+        withResource acqBuild releaseJanusC $ \rBuild ->
           testGroup
             "Sequential & Positional Data Structures"
             [ testProperty "DynVec stateful trace + drainToVect + expanded Drain suite" check_dynvec_stateful_and_drains,

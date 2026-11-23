@@ -23,7 +23,7 @@ instance (Integral a) => ExpIntegral Identity a where
 
 $( let inst t =
          [d|
-           instance ExpIntegral JanusC $t where
+           instance ExpIntegral (JanusCT target) $t where
              quotient = janusCBinOp Div
              remainder = janusCBinOp Mod
            |]

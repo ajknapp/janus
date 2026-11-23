@@ -3,6 +3,7 @@
 {-# LANGUAGE DataKinds #-}
 {-# LANGUAGE DeriveGeneric #-}
 {-# LANGUAGE DerivingStrategies #-}
+{-# LANGUAGE DerivingVia #-}
 {-# LANGUAGE FlexibleContexts #-}
 {-# LANGUAGE FlexibleInstances #-}
 {-# LANGUAGE KindSignatures #-}
@@ -87,8 +88,6 @@ import Janus.Alloc.Policy
     freeStruct,
   )
 import Janus.Backend.C
-import Janus.Backend.C.LinuxX86_64
-import Janus.Backend.C.TH
 import Janus.Command.Cond (ifThenElseM_, whenM_)
 import Janus.Command.Memory (CmdStorable (..), ExpPtr (..), ExpSized (..))
 import Janus.Command.Ref (RefCell, newRef, readRef, writeRef)
@@ -1597,69 +1596,14 @@ drainAppendBTreeMapWith alloc combine bm =
 -- Host <-> C FFI Marshalling Instances
 --------------------------------------------------------------------------------
 
-type instance JanusCEval (BTreeMap JanusC k v -> r) = BTreeMap Identity k v -> JanusCEval r
+type instance JanusCHost (BTreeMap (JanusCT _) k v) = BTreeMap Identity k v
 
-type instance JanusCRetType (BTreeMap JanusC k v -> r) = JanusCRetType r
+deriving via
+  ViaPtrHandle t (CStruct (BTreeMapSpine k v)) (BTreeMap Identity k v)
+  instance
+    (Typeable k, Typeable v) => JanusCArg t (BTreeMap (JanusCT t) k v)
 
-instance (Typeable k, Typeable v, JanusCParam r) => JanusCParam (BTreeMap JanusC k v -> r) where
-  jcparam = mkPtrHandleJCParam BTreeMap
-
-instance (Typeable k, Typeable v, JanusCEvaluate r) => JanusCEvaluate (BTreeMap JanusC k v -> r) where
-  jceval = mkPtrHandleJCEval unBTreeMap BTreeMap
-
-type instance JanusCEval (JanusCM (BTreeMap JanusC k v)) = IO (BTreeMap Identity k v)
-
-type instance JanusCRetType (JanusCM (BTreeMap JanusC k v)) = BTreeMap Identity k v
-
-instance (Typeable k, Typeable v) => JanusCParam (JanusCM (BTreeMap JanusC k v)) where
-  jcparam = mkPtrHandleJCRetParam unBTreeMap
-
-instance (Typeable k, Typeable v) => JanusCEvaluate (JanusCM (BTreeMap JanusC k v)) where
-  jceval = mkPtrHandleJCRetEval BTreeMap
-
-type instance LinuxX86_64CEval (BTreeMap LinuxX86_64C k v -> r) = BTreeMap Identity k v -> LinuxX86_64CEval r
-
-type instance LinuxX86_64BaseRet (BTreeMap LinuxX86_64C k v -> r) = LinuxX86_64BaseRet r
-
-instance (Typeable k, Typeable v, LinuxX86_64Param r) => LinuxX86_64Param (BTreeMap LinuxX86_64C k v -> r) where
-  x86param = mkPtrHandleX86Param BTreeMap
-
-instance (Typeable k, Typeable v, X86DeferCont r, LinuxX86_64Evaluate r) => LinuxX86_64Evaluate (BTreeMap LinuxX86_64C k v -> r) where
-  x86eval = mkPtrHandleX86EvalParam unBTreeMap BTreeMap
-
-instance (Typeable k, Typeable v, X86DeferCont r) => X86DeferCall (BTreeMap LinuxX86_64C k v -> r) where
-  x86DeferArg = mkPtrHandleX86DeferArg unBTreeMap BTreeMap
-
-instance (Typeable k, Typeable v, X86DeferCont r) => X86DeferCont (BTreeMap LinuxX86_64C k v -> r) where
-  x86DeferCont = mkPtrHandleX86DeferCont unBTreeMap BTreeMap
-
-type instance LinuxX86_64CEval (LinuxX86_64CM (BTreeMap LinuxX86_64C k v)) = IO (BTreeMap Identity k v)
-
-type instance LinuxX86_64BaseRet (LinuxX86_64CM (BTreeMap LinuxX86_64C k v)) = BTreeMap Identity k v
-
-instance (Typeable k, Typeable v) => LinuxX86_64Param (LinuxX86_64CM (BTreeMap LinuxX86_64C k v)) where
-  x86param = mkPtrHandleX86RetParam unBTreeMap
-
-instance (Typeable k, Typeable v) => LinuxX86_64Evaluate (LinuxX86_64CM (BTreeMap LinuxX86_64C k v)) where
-  x86eval = mkPtrHandleX86RetEval BTreeMap
-
-instance (Typeable k, Typeable v) => X86DeferCall (LinuxX86_64CM (BTreeMap LinuxX86_64C k v)) where
-  x86DeferArg = mkPtrHandleX86RetDeferArg BTreeMap
-
-instance (Typeable k, Typeable v) => X86DeferCont (LinuxX86_64CM (BTreeMap LinuxX86_64C k v)) where
-  x86DeferCont = mkPtrHandleX86RetDeferCont BTreeMap
-
-instance (Typeable k, Typeable v, LinuxX86_64Param r, JanusCTH r) => JanusCTH (BTreeMap LinuxX86_64C k v -> r) where
-  type JanusCTHEval (BTreeMap LinuxX86_64C k v -> r) = BTreeMap Identity k v -> JanusCTHEval r
-  janusCTHBackend _ = THBackendLinuxX86_64
-  janusCTHCodegen = x86param
-  janusCTHSpec _ =
-    let (ps, retSpec) = janusCTHSpec (Proxy @r)
-     in (mkPtrHandleTHParamSpec (Proxy @(BTreeMap Identity k v)) : ps, retSpec)
-
-instance (Typeable k, Typeable v) => JanusCTH (LinuxX86_64CM (BTreeMap LinuxX86_64C k v)) where
-  type JanusCTHEval (LinuxX86_64CM (BTreeMap LinuxX86_64C k v)) = IO (BTreeMap Identity k v)
-  janusCTHBackend _ = THBackendLinuxX86_64
-  janusCTHCodegen = x86param
-  janusCTHSpec _ =
-    ([], mkPtrHandleTHRetSpec THRetIO (Proxy @(BTreeMap Identity k v)) (Proxy @(CStruct (BTreeMapSpine k v))))
+deriving via
+  ViaPtrHandle t (CStruct (BTreeMapSpine k v)) (BTreeMap Identity k v)
+  instance
+    (Typeable k, Typeable v) => JanusCValRet t (BTreeMap (JanusCT t) k v)

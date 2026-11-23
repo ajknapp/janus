@@ -3,6 +3,7 @@
 {-# LANGUAGE DataKinds #-}
 {-# LANGUAGE DeriveGeneric #-}
 {-# LANGUAGE DerivingStrategies #-}
+{-# LANGUAGE DerivingVia #-}
 {-# LANGUAGE FlexibleContexts #-}
 {-# LANGUAGE FlexibleInstances #-}
 {-# LANGUAGE KindSignatures #-}
@@ -80,8 +81,6 @@ import Janus.Alloc.Policy
     freeTypedArray,
   )
 import Janus.Backend.C
-import Janus.Backend.C.LinuxX86_64
-import Janus.Backend.C.TH
 import Janus.Command.Cond (ifThenElseM_, whenM_)
 import Janus.Command.Memory
   ( CmdMemCopy (..),
@@ -878,69 +877,14 @@ drainAppendIndexSet alloc is = drainForEach (\x -> insert alloc is x >> pure ())
 
 type IndexSetABI k = (Typeable k, JanusStruct (Buf k))
 
-type instance JanusCEval (IndexSet JanusC k -> r) = IndexSet Identity k -> JanusCEval r
+type instance JanusCHost (IndexSet (JanusCT _) k) = IndexSet Identity k
 
-type instance JanusCRetType (IndexSet JanusC k -> r) = JanusCRetType r
+deriving via
+  ViaPtrHandle t (CStruct (IndexSetSpine k)) (IndexSet Identity k)
+  instance
+    (IndexSetABI k) => JanusCArg t (IndexSet (JanusCT t) k)
 
-instance (IndexSetABI k, JanusCParam r) => JanusCParam (IndexSet JanusC k -> r) where
-  jcparam = mkPtrHandleJCParam IndexSet
-
-instance (IndexSetABI k, JanusCEvaluate r) => JanusCEvaluate (IndexSet JanusC k -> r) where
-  jceval = mkPtrHandleJCEval unIndexSet IndexSet
-
-type instance JanusCEval (JanusCM (IndexSet JanusC k)) = IO (IndexSet Identity k)
-
-type instance JanusCRetType (JanusCM (IndexSet JanusC k)) = IndexSet Identity k
-
-instance (IndexSetABI k) => JanusCParam (JanusCM (IndexSet JanusC k)) where
-  jcparam = mkPtrHandleJCRetParam unIndexSet
-
-instance (IndexSetABI k) => JanusCEvaluate (JanusCM (IndexSet JanusC k)) where
-  jceval = mkPtrHandleJCRetEval IndexSet
-
-type instance LinuxX86_64CEval (IndexSet LinuxX86_64C k -> r) = IndexSet Identity k -> LinuxX86_64CEval r
-
-type instance LinuxX86_64BaseRet (IndexSet LinuxX86_64C k -> r) = LinuxX86_64BaseRet r
-
-instance (IndexSetABI k, LinuxX86_64Param r) => LinuxX86_64Param (IndexSet LinuxX86_64C k -> r) where
-  x86param = mkPtrHandleX86Param IndexSet
-
-instance (IndexSetABI k, X86DeferCont r, LinuxX86_64Evaluate r) => LinuxX86_64Evaluate (IndexSet LinuxX86_64C k -> r) where
-  x86eval = mkPtrHandleX86EvalParam unIndexSet IndexSet
-
-instance (IndexSetABI k, X86DeferCont r) => X86DeferCall (IndexSet LinuxX86_64C k -> r) where
-  x86DeferArg = mkPtrHandleX86DeferArg unIndexSet IndexSet
-
-instance (IndexSetABI k, X86DeferCont r) => X86DeferCont (IndexSet LinuxX86_64C k -> r) where
-  x86DeferCont = mkPtrHandleX86DeferCont unIndexSet IndexSet
-
-type instance LinuxX86_64CEval (LinuxX86_64CM (IndexSet LinuxX86_64C k)) = IO (IndexSet Identity k)
-
-type instance LinuxX86_64BaseRet (LinuxX86_64CM (IndexSet LinuxX86_64C k)) = IndexSet Identity k
-
-instance (IndexSetABI k) => LinuxX86_64Param (LinuxX86_64CM (IndexSet LinuxX86_64C k)) where
-  x86param = mkPtrHandleX86RetParam unIndexSet
-
-instance (IndexSetABI k) => LinuxX86_64Evaluate (LinuxX86_64CM (IndexSet LinuxX86_64C k)) where
-  x86eval = mkPtrHandleX86RetEval IndexSet
-
-instance (IndexSetABI k) => X86DeferCall (LinuxX86_64CM (IndexSet LinuxX86_64C k)) where
-  x86DeferArg = mkPtrHandleX86RetDeferArg IndexSet
-
-instance (IndexSetABI k) => X86DeferCont (LinuxX86_64CM (IndexSet LinuxX86_64C k)) where
-  x86DeferCont = mkPtrHandleX86RetDeferCont IndexSet
-
-instance (IndexSetABI k, LinuxX86_64Param r, JanusCTH r) => JanusCTH (IndexSet LinuxX86_64C k -> r) where
-  type JanusCTHEval (IndexSet LinuxX86_64C k -> r) = IndexSet Identity k -> JanusCTHEval r
-  janusCTHBackend _ = THBackendLinuxX86_64
-  janusCTHCodegen = x86param
-  janusCTHSpec _ =
-    let (ps, retSpec) = janusCTHSpec (Proxy @r)
-     in (mkPtrHandleTHParamSpec (Proxy @(IndexSet Identity k)) : ps, retSpec)
-
-instance (IndexSetABI k) => JanusCTH (LinuxX86_64CM (IndexSet LinuxX86_64C k)) where
-  type JanusCTHEval (LinuxX86_64CM (IndexSet LinuxX86_64C k)) = IO (IndexSet Identity k)
-  janusCTHBackend _ = THBackendLinuxX86_64
-  janusCTHCodegen = x86param
-  janusCTHSpec _ =
-    ([], mkPtrHandleTHRetSpec THRetIO (Proxy @(IndexSet Identity k)) (Proxy @(CStruct (IndexSetSpine k))))
+deriving via
+  ViaPtrHandle t (CStruct (IndexSetSpine k)) (IndexSet Identity k)
+  instance
+    (IndexSetABI k) => JanusCValRet t (IndexSet (JanusCT t) k)

@@ -3,6 +3,7 @@
 {-# LANGUAGE DataKinds #-}
 {-# LANGUAGE DeriveGeneric #-}
 {-# LANGUAGE DerivingStrategies #-}
+{-# LANGUAGE DerivingVia #-}
 {-# LANGUAGE FlexibleContexts #-}
 {-# LANGUAGE FlexibleInstances #-}
 {-# LANGUAGE KindSignatures #-}
@@ -73,8 +74,6 @@ import Foreign.Ptr (Ptr)
 import GHC.Generics (Generic)
 import Janus.Alloc.Policy (Alloc, allocStruct, freeStruct)
 import Janus.Backend.C
-import Janus.Backend.C.LinuxX86_64
-import Janus.Backend.C.TH
 import Janus.Command.Cond (ifThenElseM_, whenM_)
 import Janus.Command.Memory (CmdStorable (..), ExpSized (..))
 import Janus.Command.Ref (letM, newRef, readRef, writeRef)
@@ -554,69 +553,14 @@ foldSPMD pw rb s0 step = do
 -- Host <-> C FFI Marshalling Instances
 --------------------------------------------------------------------------------
 
-type instance JanusCEval (RingBuffer JanusC a -> r) = RingBuffer Identity a -> JanusCEval r
+type instance JanusCHost (RingBuffer (JanusCT _) a) = RingBuffer Identity a
 
-type instance JanusCRetType (RingBuffer JanusC a -> r) = JanusCRetType r
+deriving via
+  ViaPtrHandle t (CStruct (RingBufferSpine a)) (RingBuffer Identity a)
+  instance
+    (Typeable a, JanusStruct (Buf a)) => JanusCArg t (RingBuffer (JanusCT t) a)
 
-instance (Typeable a, JanusStruct (Buf a), JanusCParam r) => JanusCParam (RingBuffer JanusC a -> r) where
-  jcparam = mkPtrHandleJCParam RingBuffer
-
-instance (Typeable a, JanusStruct (Buf a), JanusCEvaluate r) => JanusCEvaluate (RingBuffer JanusC a -> r) where
-  jceval = mkPtrHandleJCEval unRingBuffer RingBuffer
-
-type instance JanusCEval (JanusCM (RingBuffer JanusC a)) = IO (RingBuffer Identity a)
-
-type instance JanusCRetType (JanusCM (RingBuffer JanusC a)) = RingBuffer Identity a
-
-instance (Typeable a, JanusStruct (Buf a)) => JanusCParam (JanusCM (RingBuffer JanusC a)) where
-  jcparam = mkPtrHandleJCRetParam unRingBuffer
-
-instance (Typeable a, JanusStruct (Buf a)) => JanusCEvaluate (JanusCM (RingBuffer JanusC a)) where
-  jceval = mkPtrHandleJCRetEval RingBuffer
-
-type instance LinuxX86_64CEval (RingBuffer LinuxX86_64C a -> r) = RingBuffer Identity a -> LinuxX86_64CEval r
-
-type instance LinuxX86_64BaseRet (RingBuffer LinuxX86_64C a -> r) = LinuxX86_64BaseRet r
-
-instance (Typeable a, JanusStruct (Buf a), LinuxX86_64Param r) => LinuxX86_64Param (RingBuffer LinuxX86_64C a -> r) where
-  x86param = mkPtrHandleX86Param RingBuffer
-
-instance (Typeable a, JanusStruct (Buf a), X86DeferCont r, LinuxX86_64Evaluate r) => LinuxX86_64Evaluate (RingBuffer LinuxX86_64C a -> r) where
-  x86eval = mkPtrHandleX86EvalParam unRingBuffer RingBuffer
-
-instance (Typeable a, JanusStruct (Buf a), X86DeferCont r) => X86DeferCall (RingBuffer LinuxX86_64C a -> r) where
-  x86DeferArg = mkPtrHandleX86DeferArg unRingBuffer RingBuffer
-
-instance (Typeable a, JanusStruct (Buf a), X86DeferCont r) => X86DeferCont (RingBuffer LinuxX86_64C a -> r) where
-  x86DeferCont = mkPtrHandleX86DeferCont unRingBuffer RingBuffer
-
-type instance LinuxX86_64CEval (LinuxX86_64CM (RingBuffer LinuxX86_64C a)) = IO (RingBuffer Identity a)
-
-type instance LinuxX86_64BaseRet (LinuxX86_64CM (RingBuffer LinuxX86_64C a)) = RingBuffer Identity a
-
-instance (Typeable a, JanusStruct (Buf a)) => LinuxX86_64Param (LinuxX86_64CM (RingBuffer LinuxX86_64C a)) where
-  x86param = mkPtrHandleX86RetParam unRingBuffer
-
-instance (Typeable a, JanusStruct (Buf a)) => LinuxX86_64Evaluate (LinuxX86_64CM (RingBuffer LinuxX86_64C a)) where
-  x86eval = mkPtrHandleX86RetEval RingBuffer
-
-instance (Typeable a, JanusStruct (Buf a)) => X86DeferCall (LinuxX86_64CM (RingBuffer LinuxX86_64C a)) where
-  x86DeferArg = mkPtrHandleX86RetDeferArg RingBuffer
-
-instance (Typeable a, JanusStruct (Buf a)) => X86DeferCont (LinuxX86_64CM (RingBuffer LinuxX86_64C a)) where
-  x86DeferCont = mkPtrHandleX86RetDeferCont RingBuffer
-
-instance (Typeable a, JanusStruct (Buf a), LinuxX86_64Param r, JanusCTH r) => JanusCTH (RingBuffer LinuxX86_64C a -> r) where
-  type JanusCTHEval (RingBuffer LinuxX86_64C a -> r) = RingBuffer Identity a -> JanusCTHEval r
-  janusCTHBackend _ = THBackendLinuxX86_64
-  janusCTHCodegen = x86param
-  janusCTHSpec _ =
-    let (ps, retSpec) = janusCTHSpec (Proxy @r)
-     in (mkPtrHandleTHParamSpec (Proxy @(RingBuffer Identity a)) : ps, retSpec)
-
-instance (Typeable a, JanusStruct (Buf a)) => JanusCTH (LinuxX86_64CM (RingBuffer LinuxX86_64C a)) where
-  type JanusCTHEval (LinuxX86_64CM (RingBuffer LinuxX86_64C a)) = IO (RingBuffer Identity a)
-  janusCTHBackend _ = THBackendLinuxX86_64
-  janusCTHCodegen = x86param
-  janusCTHSpec _ =
-    ([], mkPtrHandleTHRetSpec THRetIO (Proxy @(RingBuffer Identity a)) (Proxy @(CStruct (RingBufferSpine a))))
+deriving via
+  ViaPtrHandle t (CStruct (RingBufferSpine a)) (RingBuffer Identity a)
+  instance
+    (Typeable a, JanusStruct (Buf a)) => JanusCValRet t (RingBuffer (JanusCT t) a)

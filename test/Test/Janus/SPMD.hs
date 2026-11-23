@@ -26,7 +26,7 @@ import GHC.Generics (Generic, Rep)
 import Hedgehog (Property, assert, forAll, property)
 import qualified Hedgehog.Gen as Gen
 import qualified Hedgehog.Range as Range
-import Janus.Backend.C (JanusC, JanusCM, withJanusC)
+import Janus.Backend.C (JanusC, JanusCM, acquireJanusC, acquireJanusCWith, releaseJanusC, showJanusCWith, withJanusC, withJanusCWith)
 import Janus.Backend.C.Build (CBuildConfig, cBuildConfigCacheDir, defaultCBuildConfig)
 import Janus.Backend.C.CUDA
 import Janus.Backend.C.CUDA.Foreign
@@ -206,8 +206,8 @@ unit_optimal_gang_selection_and_aligned_codegen = do
         foreachOptimalTensorM (Proxy @Float) vx $ \idx ->
           abstractFmaReluStep (uniform alpha) (liftTensor vx) (liftTensor vy) (liftTensor vout) idx
 
-      cFloatSSE2 = showLinuxX86_64CWith x86Baseline "spmd_f32_sse2" floatX86Kern
-      cFloatAVX2 = showLinuxX86_64CWith x86AVX2 "spmd_f32_avx2" floatX86Kern
+      cFloatSSE2 = showJanusCWith x86Baseline "spmd_f32_sse2" floatX86Kern
+      cFloatAVX2 = showJanusCWith x86AVX2 "spmd_f32_avx2" floatX86Kern
 
   assertBool "SSE2 Float uses aligned _mm_load_ps" ("_mm_load_ps" `isInfixOf` cFloatSSE2)
   assertBool "SSE2 Float uses aligned _mm_store_ps" ("_mm_store_ps" `isInfixOf` cFloatSSE2)
@@ -230,8 +230,8 @@ unit_optimal_gang_selection_and_aligned_codegen = do
           x <- A.readTensor (liftTensor vx) idx
           A.writeTensor (liftTensor vout) idx (x * 3 + 1)
 
-      cIntAVX1 = showLinuxX86_64CWith x86AVX "spmd_i32_avx1" int32X86Kern
-      cIntAVX2 = showLinuxX86_64CWith x86AVX2 "spmd_i32_avx2" int32X86Kern
+      cIntAVX1 = showJanusCWith x86AVX "spmd_i32_avx1" int32X86Kern
+      cIntAVX2 = showJanusCWith x86AVX2 "spmd_i32_avx2" int32X86Kern
 
   assertBool "AVX1 Int32 picks 4-wide _mm_load_si128 without splitting" ("_mm_load_si128" `isInfixOf` cIntAVX1 && not ("simdPairFst" `isInfixOf` cIntAVX1))
   assertBool "AVX2 Int32 picks 8-wide _mm256_load_si256" ("_mm256_load_si256" `isInfixOf` cIntAVX2)
@@ -248,7 +248,7 @@ unit_optimal_gang_selection_and_aligned_codegen = do
           x <- A.readTensor (liftTensor vx) idx
           A.writeTensor (liftTensor vout) idx (x * x)
 
-      cDblAVX2 = showLinuxX86_64CWith x86AVX2 "spmd_f64_avx2" doubleX86Kern
+      cDblAVX2 = showJanusCWith x86AVX2 "spmd_f64_avx2" doubleX86Kern
 
   assertBool "AVX2 Double picks 4-wide _mm256_load_pd without splitting" ("_mm256_load_pd" `isInfixOf` cDblAVX2 && "_mm256_store_pd" `isInfixOf` cDblAVX2 && not ("simdPairFst" `isInfixOf` cDblAVX2))
 
@@ -263,7 +263,7 @@ unit_optimal_gang_selection_and_aligned_codegen = do
         foreachAlignedM (Proxy @8) 8 56 $ \i ->
           abstractStencilStep (liftTensor vin) (liftTensor vout) i
 
-      cStencil = showLinuxX86_64CWith x86AVX2 "spmd_stencil" stencilKern
+      cStencil = showJanusCWith x86AVX2 "spmd_stencil" stencilKern
 
   assertBool "Stencil emits _mm256_load_ps for aligned center" ("_mm256_load_ps" `isInfixOf` cStencil)
   assertBool "Stencil emits _mm256_loadu_ps for shifted neighbors" ("_mm256_loadu_ps" `isInfixOf` cStencil)
@@ -286,7 +286,7 @@ unit_optimal_gang_selection_and_aligned_codegen = do
   assertBool "CUDA Float SPMD uses float4 without splitting" ("float4" `isInfixOf` cuCode && not ("simdPairFst" `isInfixOf` cuCode))
   assertBool "CUDA vloadAligned qualifies pointee (const float4 *), not pointer" ("const float4 *" `isInfixOf` cuCode && not ("float4 *const" `isInfixOf` cuCode))
 
-  let minBoundC = showLinuxX86_64CWith x86AVX2 "spmd_minbound_i64" (minBound :: SPMD 4 LinuxX86_64C Int64)
+  let minBoundC = showJanusCWith x86AVX2 "spmd_minbound_i64" (minBound :: SPMD 4 LinuxX86_64C Int64)
   assertBool "Int64 minBound avoids unsigned-overflow decimal literal" (not ("-9223372036854775808" `isInfixOf` minBoundC))
 
 --------------------------------------------------------------------------------
@@ -362,19 +362,19 @@ unit_mixed_unlifted_and_spmd_subprograms = do
 
         -- 2. LinuxX86_64C (SSE2, AVX1, Host AVX2)
         resetOut
-        dotC_SSE2 <- withLinuxX86_64CWith x86Baseline cfg (mixedUnliftedProgram @LinuxX86_64CM @LinuxX86_64C) $ \fn ->
+        dotC_SSE2 <- withJanusCWith x86Baseline cfg (mixedUnliftedProgram @LinuxX86_64CM @LinuxX86_64C) $ \fn ->
           fn alpha px py pout
         checkOut "LinuxX86_64C (SSE2)" dotC_SSE2
 
         hostFs <- observeHostX86Features
         when (admitsX86Features hostFs x86AVX) $ do
           resetOut
-          dotC_AVX <- withLinuxX86_64CWith x86AVX cfg (mixedUnliftedProgram @LinuxX86_64CM @LinuxX86_64C) $ \fn ->
+          dotC_AVX <- withJanusCWith x86AVX cfg (mixedUnliftedProgram @LinuxX86_64CM @LinuxX86_64C) $ \fn ->
             fn alpha px py pout
           checkOut "LinuxX86_64C (AVX1)" dotC_AVX
 
         resetOut
-        dotC_Host <- withLinuxX86_64C cfg (mixedUnliftedProgram @LinuxX86_64CM @LinuxX86_64C) $ \fn ->
+        dotC_Host <- withJanusC cfg (mixedUnliftedProgram @LinuxX86_64CM @LinuxX86_64C) $ \fn ->
           fn alpha px py pout
         checkOut "LinuxX86_64C (Host)" dotC_Host
 
@@ -599,7 +599,7 @@ unit_divergent_control_flow_and_safe_division = do
 
   -- Compiled LinuxX86_64C Mandelbrot (direct SPMD ABI evaluation!)
   spmdMandelC <-
-    withLinuxX86_64C cfg (mandelbrot @(SPMDM 8 LinuxX86_64CM LinuxX86_64C) @(SPMD 8 LinuxX86_64C)) $ \fn ->
+    withJanusC cfg (mandelbrot @(SPMDM 8 LinuxX86_64CM LinuxX86_64C) @(SPMD 8 LinuxX86_64C)) $ \fn ->
       fn maxIters cxs cys
   spmdMandelC @?= expectedMandel
 
@@ -613,7 +613,7 @@ unit_divergent_control_flow_and_safe_division = do
         (spmdHostFromList divXs)
         (spmdHostFromList divYs)
   divOutC <-
-    withLinuxX86_64C cfg (safeDivKernel @(SPMDM 8 LinuxX86_64CM LinuxX86_64C) @(SPMD 8 LinuxX86_64C)) $ \fn ->
+    withJanusC cfg (safeDivKernel @(SPMDM 8 LinuxX86_64CM LinuxX86_64C) @(SPMD 8 LinuxX86_64C)) $ \fn ->
       fn divXs divYs
   spmdHostToList divOutIO @?= divOutC
   -- Check non-overflow lanes against scalar Identity
@@ -639,7 +639,7 @@ unit_divergent_control_flow_and_safe_division = do
   spmdHostToList scratchIO @?= expectedScratch
 
   scratchC <-
-    withLinuxX86_64C cfg (divergentScratchKernel @(SPMDM 8 LinuxX86_64CM LinuxX86_64C) @(SPMD 8 LinuxX86_64C)) $ \fn ->
+    withJanusC cfg (divergentScratchKernel @(SPMDM 8 LinuxX86_64CM LinuxX86_64C) @(SPMD 8 LinuxX86_64C)) $ \fn ->
       fn tags los his
   scratchC @?= expectedScratch
 
@@ -732,7 +732,7 @@ unit_unmodified_streams_complex_hash_and_fix = do
   pipeIO <- runSPMDM $ spmdPipelineSum @(SPMDM 8 IO Identity) @(SPMD 8 Identity) (spmdHostFromList ns8)
   spmdHostToList pipeIO @?= expectedPipe
 
-  pipeC <- withLinuxX86_64C cfg (spmdPipelineSum @(SPMDM 8 LinuxX86_64CM LinuxX86_64C) @(SPMD 8 LinuxX86_64C)) ($ ns8)
+  pipeC <- withJanusC cfg (spmdPipelineSum @(SPMDM 8 LinuxX86_64CM LinuxX86_64C) @(SPMD 8 LinuxX86_64C)) ($ ns8)
   pipeC @?= expectedPipe
 
   -- 2. Nested Stream Monad bind (spmdCartesianSum) with varying bounds [0..5]
@@ -742,7 +742,7 @@ unit_unmodified_streams_complex_hash_and_fix = do
   cartIO <- runSPMDM $ spmdCartesianSum @(SPMDM 4 IO Identity) @(SPMD 4 Identity) (spmdHostFromList cs4)
   spmdHostToList cartIO @?= expectedCart
 
-  cartC <- withLinuxX86_64C cfg (spmdCartesianSum @(SPMDM 4 LinuxX86_64CM LinuxX86_64C) @(SPMD 4 LinuxX86_64C)) ($ cs4)
+  cartC <- withJanusC cfg (spmdCartesianSum @(SPMDM 4 LinuxX86_64CM LinuxX86_64C) @(SPMD 4 LinuxX86_64C)) ($ cs4)
   cartC @?= expectedCart
 
   -- 3. Unfold + Applicative Fold (sumF, minimumF, maximumF using Bounded)
@@ -751,7 +751,7 @@ unit_unmodified_streams_complex_hash_and_fix = do
   expectedFold <- mapM (\(l, u) -> runIdentity <$> spmdUnfoldFoldStats @IO @Identity (Identity l) (Identity u)) (zip fls fus)
   foldIO <- runSPMDM $ spmdUnfoldFoldStats @(SPMDM 4 IO Identity) @(SPMD 4 Identity) (spmdHostFromList fls) (spmdHostFromList fus)
   spmdHostToList foldIO @?= expectedFold
-  foldC <- withLinuxX86_64C cfg (spmdUnfoldFoldStats @(SPMDM 4 LinuxX86_64CM LinuxX86_64C) @(SPMD 4 LinuxX86_64C)) (\fn -> fn fls fus)
+  foldC <- withJanusC cfg (spmdUnfoldFoldStats @(SPMDM 4 LinuxX86_64CM LinuxX86_64C) @(SPMD 4 LinuxX86_64C)) (\fn -> fn fls fus)
   foldC @?= expectedFold
 
   -- 4. Complex Float SoA SIMD math across Identity and LinuxX86_64C
@@ -759,7 +759,7 @@ unit_unmodified_streams_complex_hash_and_fix = do
       zs2 = [0.6 :+ (-0.1), 0.3 :+ 0.4, (-0.2) :+ 0.5, 0.8 :+ (-0.3) :: Complex Float]
       refComplex = [runIdentity (complexExpr @Identity (Identity a) (Identity b)) | (a, b) <- zip zs1 zs2]
       spmdComplexIO = spmdHostToList $ complexExpr @(SPMD 4 Identity) (spmdHostFromList zs1) (spmdHostFromList zs2)
-  spmdComplexC <- withLinuxX86_64C cfg (complexExpr @(SPMD 4 LinuxX86_64C)) (\fn -> pure (fn zs1 zs2))
+  spmdComplexC <- withJanusC cfg (complexExpr @(SPMD 4 LinuxX86_64C)) (\fn -> pure (fn zs1 zs2))
   forM_ (zip spmdComplexIO refComplex) $ \(a, b) -> assertBool "Complex IO accuracy" (abs (a - b) < 1e-4)
   forM_ (zip spmdComplexC refComplex) $ \(a, b) -> assertBool "Complex C accuracy" (abs (a - b) < 1e-4)
 
@@ -799,7 +799,7 @@ unit_unmodified_streams_complex_hash_and_fix = do
             (spmdHostFromList scores)
             (spmdHostFromList counts)
   hashIO @?= expectedHash
-  hashC <- withLinuxX86_64C cfg (hashKern @(SPMD 4 LinuxX86_64C)) (\fn -> pure (fn salts ids scores counts))
+  hashC <- withJanusC cfg (hashKern @(SPMD 4 LinuxX86_64C)) (\fn -> pure (fn salts ids scores counts))
   hashC @?= expectedHash
 
   -- 6. Effectful recursive factorial via ExpFix on SPMD 4 Identity
@@ -895,12 +895,12 @@ test_spmd_differential :: TestTree
 test_spmd_differential =
   let acqSSE2 = do
         cfg <- getSPMDTestConfig
-        acquireLinuxX86_64CWith x86Baseline cfg (spmdCompositeKernel @(SPMDM 8 LinuxX86_64CM LinuxX86_64C) @(SPMD 8 LinuxX86_64C))
+        acquireJanusCWith x86Baseline cfg (spmdCompositeKernel @(SPMDM 8 LinuxX86_64CM LinuxX86_64C) @(SPMD 8 LinuxX86_64C))
       acqHost = do
         cfg <- getSPMDTestConfig
-        acquireLinuxX86_64C cfg (spmdCompositeKernel @(SPMDM 8 LinuxX86_64CM LinuxX86_64C) @(SPMD 8 LinuxX86_64C))
-   in withResource acqSSE2 releaseLinuxX86_64C $ \rSSE2 ->
-        withResource acqHost releaseLinuxX86_64C $ \rHost ->
+        acquireJanusC cfg (spmdCompositeKernel @(SPMDM 8 LinuxX86_64CM LinuxX86_64C) @(SPMD 8 LinuxX86_64C))
+   in withResource acqSSE2 releaseJanusC $ \rSSE2 ->
+        withResource acqHost releaseJanusC $ \rHost ->
           testGroup
             "SPMD cross-tier differential properties"
             [ testProperty "8-lane divergent loop + math + casts matches scalar Identity across IO, SSE2 C, & Host AVX2 C" $

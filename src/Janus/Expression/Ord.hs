@@ -29,7 +29,7 @@ instance (Ord a) => ExpOrd Identity a where
 
 $( let inst t =
          [d|
-           instance ExpOrd JanusC $t where
+           instance ExpOrd (JanusCT target) $t where
              lt = janusCBoolBinOp Lt
              le = janusCBoolBinOp Le
              gt = janusCBoolBinOp Gt

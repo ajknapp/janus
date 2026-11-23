@@ -18,8 +18,9 @@ import Hedgehog (Gen, Property, assert, forAll, property, (===))
 import qualified Hedgehog.Gen as Gen
 import qualified Hedgehog.Range as Range
 import Janus.Alloc
+import Janus.Backend.C (acquireJanusC, releaseJanusC)
 import Janus.Backend.C.Build (CBuildConfig, cBuildConfigCacheDir, defaultCBuildConfig)
-import Janus.Backend.C.LinuxX86_64 (LinuxX86_64C, LinuxX86_64CM, acquireLinuxX86_64C, releaseLinuxX86_64C)
+import Janus.Backend.C.LinuxX86_64 (LinuxX86_64C, LinuxX86_64CM)
 import Janus.Command.Range (rangeM)
 import Janus.Control.Drain (drainForEach, drainSum, runDrain)
 import Janus.Control.Stream (Stream)
@@ -356,8 +357,8 @@ check_ordered_host_c_ffi getCFn = property $ do
 
 test_ordered_containers :: TestTree
 test_ordered_containers =
-  let acq = getOrdTestConfig >>= flip acquireLinuxX86_64C cMutateOrderedContainers
-   in withResource acq releaseLinuxX86_64C $ \rFn ->
+  let acq = getOrdTestConfig >>= flip acquireJanusC cMutateOrderedContainers
+   in withResource acq releaseJanusC $ \rFn ->
         testGroup
           "Ordered Data Structures (FlatMap, FlatSet, BTreeMap, BTreeSet)"
           [ testProperty "FlatMap & FlatSet stateful trace, rangeStream, set-algebra merges, & bulk drain" check_flatmap_and_flatset,

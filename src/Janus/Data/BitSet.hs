@@ -3,6 +3,7 @@
 {-# LANGUAGE DataKinds #-}
 {-# LANGUAGE DeriveGeneric #-}
 {-# LANGUAGE DerivingStrategies #-}
+{-# LANGUAGE DerivingVia #-}
 {-# LANGUAGE FlexibleContexts #-}
 {-# LANGUAGE FlexibleInstances #-}
 {-# LANGUAGE KindSignatures #-}
@@ -103,8 +104,6 @@ import Janus.Alloc.Policy
     reallocTypedArray,
   )
 import Janus.Backend.C
-import Janus.Backend.C.LinuxX86_64
-import Janus.Backend.C.TH
 import Janus.Command.Cond (ifThenElseM_, whenM_)
 import Janus.Command.Memory (CmdMemCopy (..), CmdStorable (..), ExpPtr (..), ExpSized (..))
 import Janus.Command.Ref (letM, newRef, readRef, writeRef)
@@ -1111,69 +1110,14 @@ drainAppendBitSet alloc bs = drainForEach (\x -> setBit alloc bs x >> pure ())
 -- Host <-> C FFI Marshalling Instances
 --------------------------------------------------------------------------------
 
-type instance JanusCEval (BitSet JanusC -> r) = BitSet Identity -> JanusCEval r
+type instance JanusCHost (BitSet (JanusCT _)) = BitSet Identity
 
-type instance JanusCRetType (BitSet JanusC -> r) = JanusCRetType r
+deriving via
+  ViaPtrHandle t (CStruct BitSetSpine) (BitSet Identity)
+  instance
+    JanusCArg t (BitSet (JanusCT t))
 
-instance (JanusCParam r) => JanusCParam (BitSet JanusC -> r) where
-  jcparam = mkPtrHandleJCParam BitSet
-
-instance (JanusCEvaluate r) => JanusCEvaluate (BitSet JanusC -> r) where
-  jceval = mkPtrHandleJCEval unBitSet BitSet
-
-type instance JanusCEval (JanusCM (BitSet JanusC)) = IO (BitSet Identity)
-
-type instance JanusCRetType (JanusCM (BitSet JanusC)) = BitSet Identity
-
-instance JanusCParam (JanusCM (BitSet JanusC)) where
-  jcparam = mkPtrHandleJCRetParam unBitSet
-
-instance JanusCEvaluate (JanusCM (BitSet JanusC)) where
-  jceval = mkPtrHandleJCRetEval BitSet
-
-type instance LinuxX86_64CEval (BitSet LinuxX86_64C -> r) = BitSet Identity -> LinuxX86_64CEval r
-
-type instance LinuxX86_64BaseRet (BitSet LinuxX86_64C -> r) = LinuxX86_64BaseRet r
-
-instance (LinuxX86_64Param r) => LinuxX86_64Param (BitSet LinuxX86_64C -> r) where
-  x86param = mkPtrHandleX86Param BitSet
-
-instance (X86DeferCont r, LinuxX86_64Evaluate r) => LinuxX86_64Evaluate (BitSet LinuxX86_64C -> r) where
-  x86eval = mkPtrHandleX86EvalParam unBitSet BitSet
-
-instance (X86DeferCont r) => X86DeferCall (BitSet LinuxX86_64C -> r) where
-  x86DeferArg = mkPtrHandleX86DeferArg unBitSet BitSet
-
-instance (X86DeferCont r) => X86DeferCont (BitSet LinuxX86_64C -> r) where
-  x86DeferCont = mkPtrHandleX86DeferCont unBitSet BitSet
-
-type instance LinuxX86_64CEval (LinuxX86_64CM (BitSet LinuxX86_64C)) = IO (BitSet Identity)
-
-type instance LinuxX86_64BaseRet (LinuxX86_64CM (BitSet LinuxX86_64C)) = BitSet Identity
-
-instance LinuxX86_64Param (LinuxX86_64CM (BitSet LinuxX86_64C)) where
-  x86param = mkPtrHandleX86RetParam unBitSet
-
-instance LinuxX86_64Evaluate (LinuxX86_64CM (BitSet LinuxX86_64C)) where
-  x86eval = mkPtrHandleX86RetEval BitSet
-
-instance X86DeferCall (LinuxX86_64CM (BitSet LinuxX86_64C)) where
-  x86DeferArg = mkPtrHandleX86RetDeferArg BitSet
-
-instance X86DeferCont (LinuxX86_64CM (BitSet LinuxX86_64C)) where
-  x86DeferCont = mkPtrHandleX86RetDeferCont BitSet
-
-instance (LinuxX86_64Param r, JanusCTH r) => JanusCTH (BitSet LinuxX86_64C -> r) where
-  type JanusCTHEval (BitSet LinuxX86_64C -> r) = BitSet Identity -> JanusCTHEval r
-  janusCTHBackend _ = THBackendLinuxX86_64
-  janusCTHCodegen = x86param
-  janusCTHSpec _ =
-    let (ps, retSpec) = janusCTHSpec (Proxy @r)
-     in (mkPtrHandleTHParamSpec (Proxy @(BitSet Identity)) : ps, retSpec)
-
-instance JanusCTH (LinuxX86_64CM (BitSet LinuxX86_64C)) where
-  type JanusCTHEval (LinuxX86_64CM (BitSet LinuxX86_64C)) = IO (BitSet Identity)
-  janusCTHBackend _ = THBackendLinuxX86_64
-  janusCTHCodegen = x86param
-  janusCTHSpec _ =
-    ([], mkPtrHandleTHRetSpec THRetIO (Proxy @(BitSet Identity)) (Proxy @(CStruct BitSetSpine)))
+deriving via
+  ViaPtrHandle t (CStruct BitSetSpine) (BitSet Identity)
+  instance
+    JanusCValRet t (BitSet (JanusCT t))

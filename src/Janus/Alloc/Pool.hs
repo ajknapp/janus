@@ -1,6 +1,7 @@
 {-# LANGUAGE ConstraintKinds #-}
 {-# LANGUAGE DeriveGeneric #-}
 {-# LANGUAGE DerivingStrategies #-}
+{-# LANGUAGE DerivingVia #-}
 {-# LANGUAGE FlexibleContexts #-}
 {-# LANGUAGE FlexibleInstances #-}
 {-# LANGUAGE MultiParamTypeClasses #-}
@@ -27,14 +28,11 @@ where
 
 import Data.Functor.Identity (Identity (..))
 import Data.Int (Int64)
-import Data.Proxy (Proxy (..))
 import Data.Word (Word64, Word8)
 import Foreign.Ptr (Ptr)
 import GHC.Generics (Generic)
 import Janus.Alloc.Dynamic (CmdAllocBase, alignUpWord64, isNullVoidPtr)
 import Janus.Backend.C
-import Janus.Backend.C.LinuxX86_64
-import Janus.Backend.C.TH
 import Janus.Command.Array (CmdStorable (..), ExpPtr (..), janusSIMDAlignment)
 import Janus.Command.Cond (ifThenElseM_, whenM_)
 import Janus.Command.Ref (newRef, readRef, writeRef)
@@ -322,36 +320,15 @@ poolDestroyImpl parentFree spineSz (MemPool hdr) = do
   parentFree (toVoidPtr hdr) spineSz
 
 -- Host <-> C FFI Marshalling Instances
-type instance JanusCEval (MemPool JanusC -> r) = MemPool Identity -> JanusCEval r
 
-type instance JanusCRetType (MemPool JanusC -> r) = JanusCRetType r
+type instance JanusCHost (MemPool (JanusCT _)) = MemPool Identity
 
-instance (JanusCParam r) => JanusCParam (MemPool JanusC -> r) where
-  jcparam = mkPtrHandleJCParam MemPool
+deriving via
+  ViaPtrHandle t (CStruct MemPoolSpine) (MemPool Identity)
+  instance
+    JanusCArg t (MemPool (JanusCT t))
 
-instance (JanusCEvaluate r) => JanusCEvaluate (MemPool JanusC -> r) where
-  jceval = mkPtrHandleJCEval unMemPool MemPool
-
-type instance LinuxX86_64CEval (MemPool LinuxX86_64C -> r) = MemPool Identity -> LinuxX86_64CEval r
-
-type instance LinuxX86_64BaseRet (MemPool LinuxX86_64C -> r) = LinuxX86_64BaseRet r
-
-instance (LinuxX86_64Param r) => LinuxX86_64Param (MemPool LinuxX86_64C -> r) where
-  x86param = mkPtrHandleX86Param MemPool
-
-instance (X86DeferCont r, LinuxX86_64Evaluate r) => LinuxX86_64Evaluate (MemPool LinuxX86_64C -> r) where
-  x86eval = mkPtrHandleX86EvalParam unMemPool MemPool
-
-instance (X86DeferCont r) => X86DeferCall (MemPool LinuxX86_64C -> r) where
-  x86DeferArg = mkPtrHandleX86DeferArg unMemPool MemPool
-
-instance (X86DeferCont r) => X86DeferCont (MemPool LinuxX86_64C -> r) where
-  x86DeferCont = mkPtrHandleX86DeferCont unMemPool MemPool
-
-instance (LinuxX86_64Param r, JanusCTH r) => JanusCTH (MemPool LinuxX86_64C -> r) where
-  type JanusCTHEval (MemPool LinuxX86_64C -> r) = MemPool Identity -> JanusCTHEval r
-  janusCTHBackend _ = THBackendLinuxX86_64
-  janusCTHCodegen = x86param
-  janusCTHSpec _ =
-    let (ps, retSpec) = janusCTHSpec (Proxy @r)
-     in (mkPtrHandleTHParamSpec (Proxy @(MemPool Identity)) : ps, retSpec)
+deriving via
+  ViaPtrHandle t (CStruct MemPoolSpine) (MemPool Identity)
+  instance
+    JanusCValRet t (MemPool (JanusCT t))

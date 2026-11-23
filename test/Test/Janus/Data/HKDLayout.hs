@@ -24,9 +24,9 @@ import Hedgehog (Property, assert, forAll, property, (===))
 import qualified Hedgehog.Gen as Gen
 import qualified Hedgehog.Range as Range
 import Janus.Alloc (dynamicAlloc, readAllocSnapshot, snapLiveBlocks, snapLiveBytes, statsAlloc, withAllocTracker)
-import Janus.Backend.C (JanusC, JanusCM, withJanusC)
+import Janus.Backend.C (JanusC, JanusCM, acquireJanusC, releaseJanusC, withJanusC)
 import Janus.Backend.C.Build (CBuildConfig, cBuildConfigCacheDir, defaultCBuildConfig)
-import Janus.Backend.C.LinuxX86_64 (LinuxX86_64C, LinuxX86_64CM, acquireLinuxX86_64C, releaseLinuxX86_64C)
+import Janus.Backend.C.LinuxX86_64 (LinuxX86_64C, LinuxX86_64CM)
 import Janus.Command.Array (ExpSized (..))
 import Janus.Control.Drain (drainSum, runDrain)
 import Janus.Data
@@ -154,9 +154,9 @@ unit_cstruct_abi_layout_matches_compiled_c = do
 
   -- Also verify Storable peek/poke round-trip and HKD parameter FFI
   resDot <- do
-    hdl <- acquireLinuxX86_64C cfg cParticleHKDKernel
+    hdl <- acquireJanusC cfg cParticleHKDKernel
     out <- fst hdl (Particle (Identity 2.0) (Identity 3.0) (Identity 4.0) (Identity 5.0))
-    releaseLinuxX86_64C hdl
+    releaseJanusC hdl
     pure out
   resDot @?= 23.0
 
@@ -318,10 +318,10 @@ check_compiled_c_spmd_soa_and_aosoa getSoAFn getAoSoAFn = property $ do
 
 test_hkd_layouts_and_spmd :: TestTree
 test_hkd_layouts_and_spmd =
-  let acqSoA = getLayoutTestConfig >>= flip acquireLinuxX86_64C cIntegrateSoAKernel
-      acqAoSoA = getLayoutTestConfig >>= flip acquireLinuxX86_64C cIntegrateAoSoAKernel
-   in withResource acqSoA releaseLinuxX86_64C $ \rSoA ->
-        withResource acqAoSoA releaseLinuxX86_64C $ \rAoSoA ->
+  let acqSoA = getLayoutTestConfig >>= flip acquireJanusC cIntegrateSoAKernel
+      acqAoSoA = getLayoutTestConfig >>= flip acquireJanusC cIntegrateAoSoAKernel
+   in withResource acqSoA releaseJanusC $ \rSoA ->
+        withResource acqAoSoA releaseJanusC $ \rAoSoA ->
           testGroup
             "HKD Storage Layouts & Compiled C SPMD"
             [ testProperty "Scalar / AoS / SoA / AoSoA 8 / SOAOA 8 equivalence & zero-leak tracking" check_all_five_layouts_equivalent,

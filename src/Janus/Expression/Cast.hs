@@ -29,20 +29,20 @@ instance (Num a, Eq a) => ExpBoolCast Identity a where
   fromBool (Identity a) = Identity (fromInteger . toInteger $ fromEnum a)
   toBool (Identity a) = Identity (a /= 0)
 
-janusCUnsafeCast :: forall a b. (JanusCTyped b) => JanusC a -> JanusC b
+janusCUnsafeCast :: forall a b t. (JanusCTyped b) => JanusCT t a -> JanusCT t b
 janusCUnsafeCast (JanusC a) = JanusC $ do
   RVal a' <- a
   JCType spec dec <- getJanusCType (Proxy @b)
   pure $ RVal $ Cast (Type spec dec noLoc) a' noLoc
 
-janusCReallyUnsafeCast :: JanusC a -> JanusC b
+janusCReallyUnsafeCast :: JanusCT t a -> JanusCT t b
 janusCReallyUnsafeCast (JanusC a) = JanusC $ do
   RVal a' <- a
   pure $ RVal a'
 
 $( let inst t =
          [d|
-           instance ExpBoolCast JanusC $t where
+           instance ExpBoolCast (JanusCT target) $t where
              fromBool = janusCUnsafeCast
              toBool = janusCUnsafeCast
            |]
@@ -58,7 +58,7 @@ instance (Real a, Fractional b) => ExpFloatingCast Identity a b where
 
 $( let inst ta tb =
          [d|
-           instance ExpFloatingCast JanusC $ta $tb where
+           instance ExpFloatingCast (JanusCT target) $ta $tb where
              toFloating = janusCUnsafeCast
            |]
        sourcetys = Set.toList (foldl1 Set.union [janusSignedIntTypes, janusUnsignedIntTypes, janusFloatTypes])
@@ -76,7 +76,7 @@ instance (Integral a, Num b) => ExpIntegralCast Identity a b where
 
 $( let inst ta tb =
          [d|
-           instance ExpIntegralCast JanusC $ta $tb where
+           instance ExpIntegralCast (JanusCT target) $ta $tb where
              toIntegral = janusCUnsafeCast
            |]
        sourcetys = Set.toList (foldl1 Set.union [janusSignedIntTypes, janusUnsignedIntTypes, janusFloatTypes])
@@ -98,12 +98,12 @@ instance ExpPtrCast Identity where
   toVoidPtr = fmap castPtr
   fromVoidPtr = fmap castPtr
 
-instance ExpPtrCast JanusC where
+instance ExpPtrCast (JanusCT t) where
   ptrCast ::
     forall a b.
-    (JanusTyped JanusC b) =>
-    JanusC (Ptr a) ->
-    JanusC (Ptr b)
+    (JanusTyped (JanusCT t) b) =>
+    JanusCT t (Ptr a) ->
+    JanusCT t (Ptr b)
   ptrCast (JanusC a) = JanusC $ do
     RVal a' <- a
     JCType spec dec <- jctype (Proxy @(Ptr b))
@@ -112,7 +112,7 @@ instance ExpPtrCast JanusC where
     RVal a' <- a
     let JCType spec dec = voidPtrType
     pure $ RVal $ Cast (Type spec dec noLoc) a' noLoc
-  fromVoidPtr :: forall a. (JanusTyped JanusC a) => JanusC (Ptr ()) -> JanusC (Ptr a)
+  fromVoidPtr :: forall a. (JanusTyped (JanusCT t) a) => JanusCT t (Ptr ()) -> JanusCT t (Ptr a)
   fromVoidPtr (JanusC a) = JanusC $ do
     RVal a' <- a
     JCType spec dec <- getJanusCType (Proxy @a)

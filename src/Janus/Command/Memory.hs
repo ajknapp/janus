@@ -1,6 +1,7 @@
 {-# LANGUAGE FlexibleContexts #-}
 {-# LANGUAGE FlexibleInstances #-}
 {-# LANGUAGE FunctionalDependencies #-}
+{-# LANGUAGE MultiParamTypeClasses #-}
 {-# LANGUAGE RankNTypes #-}
 {-# LANGUAGE ScopedTypeVariables #-}
 {-# LANGUAGE TypeApplications #-}
@@ -39,7 +40,7 @@ import Foreign.Ptr (Ptr, castPtr, plusPtr)
 import qualified Foreign.Ptr as Ptr
 import qualified Foreign.Storable as Storable
 import Janus.Backend.C
-import Janus.Command.Ref (CmdRef (..), JanusCRef (..))
+import Janus.Command.Ref (CmdRef (..), JanusCRefT (..))
 import Janus.Typed (JanusTyped)
 import Language.C.Quote
 import qualified Language.C.Quote as C
@@ -54,7 +55,7 @@ instance (Storable.Storable a) => ExpSized Identity a where
   sizeOf _ = fromIntegral $ Storable.sizeOf (undefined :: a)
   alignOf _ = fromIntegral $ Storable.alignment (undefined :: a)
 
-instance (JanusCTyped a) => ExpSized JanusC a where
+instance (JanusCTyped a) => ExpSized (JanusCT t) a where
   sizeOf p = JanusC $ do
     JCType spec dec <- getJanusCType p
     pure $ RVal $ SizeofType (Type spec dec noLoc) noLoc
@@ -78,7 +79,7 @@ instance (Storable.Storable a) => ExpPtr Identity a where
   ptrAdd (Identity p) (Identity i) = Identity $ plusPtr p (fromIntegral i)
   ptrIndex (Identity p) (Identity i) = Identity $ plusPtr p (fromIntegral i * Storable.sizeOf (undefined :: a))
 
-instance (JanusCTyped a) => ExpPtr JanusC a where
+instance (JanusCTyped a) => ExpPtr (JanusCT t) a where
   nullPtr = JanusC $ do
     addHeader "stddef.h"
     pure $ RVal $ Var (Id "NULL" noLoc) noLoc
@@ -148,7 +149,7 @@ cAlignedRoundUp szExp =
 cSizeCast :: Exp -> Exp
 cSizeCast e = Cast (Type (DeclSpec [] [] (Tnamed (Id "size_t" noLoc) [] noLoc) noLoc) (DeclRoot noLoc) noLoc) e noLoc
 
-instance CmdMem JanusCM JanusC where
+instance CmdMem (JanusCMT t) (JanusCT t) where
   malloc (JanusC mi) = do
     backend <- asks _jcfiBackend
     case backend of
@@ -156,7 +157,7 @@ instance CmdMem JanusCM JanusC where
       JC -> do
         addHeader "stdlib.h"
         addHeader "stddef.h"
-        RVal i' <- mi
+        RVal i' <- liftJanusCM mi
         sz <- emitLocalVal (JCType (DeclSpec [] [] (Tnamed (Id "size_t" noLoc) [] noLoc) noLoc) (DeclRoot noLoc)) (cSizeCast i')
         let alignE = unsignedIntConst (fromIntegral janusSIMDAlignment :: Word)
             callE = FnCall (Var (Id "aligned_alloc" noLoc) noLoc) [alignE, cAlignedRoundUp sz] noLoc
@@ -167,8 +168,8 @@ instance CmdMem JanusCM JanusC where
     addHeader "stdlib.h"
     addHeader "stddef.h"
     addHeader "string.h"
-    RVal n' <- mn
-    RVal s' <- ms
+    RVal n' <- liftJanusCM mn
+    RVal s' <- liftJanusCM ms
     let sizeTy = JCType (DeclSpec [] [] (Tnamed (Id "size_t" noLoc) [] noLoc) noLoc) (DeclRoot noLoc)
     total <- emitLocalVal sizeTy (BinOp Mul (cSizeCast n') (cSizeCast s') noLoc)
     p <- case backend of
@@ -194,8 +195,8 @@ instance CmdMem JanusCM JanusC where
         addHeader "stddef.h"
         addHeader "string.h"
         addHeader "malloc.h"
-        RVal p' <- mp
-        RVal i' <- mi
+        RVal p' <- liftJanusCM mp
+        RVal i' <- liftJanusCM mi
         let sizeTy = JCType (DeclSpec [] [] (Tnamed (Id "size_t" noLoc) [] noLoc) noLoc) (DeclRoot noLoc)
             alignE = unsignedIntConst (fromIntegral janusSIMDAlignment :: Word)
             nullE = Var (Id "NULL" noLoc) noLoc
@@ -267,7 +268,7 @@ instance CmdDynamicAligned IO Identity where
         rawSz = max 0 sz
      in Identity <$> c_janus_aligned_alloc (fromIntegral effAl) (fromIntegral rawSz)
 
-instance CmdDynamicAligned JanusCM JanusC where
+instance CmdDynamicAligned (JanusCMT t) (JanusCT t) where
   alignedMalloc (JanusC msz) (JanusC mal) = do
     backend <- asks _jcfiBackend
     case backend of
@@ -275,8 +276,8 @@ instance CmdDynamicAligned JanusCM JanusC where
       JC -> do
         addHeader "stdlib.h"
         addHeader "stddef.h"
-        RVal szE <- msz
-        RVal alE <- mal
+        RVal szE <- liftJanusCM msz
+        RVal alE <- liftJanusCM mal
         let sizeTy = JCType (DeclSpec [] [] (Tnamed (Id "size_t" noLoc) [] noLoc) noLoc) (DeclRoot noLoc)
             minAl = unsignedIntConst (fromIntegral janusSIMDAlignment :: Word)
         reqAl <- emitLocalVal sizeTy (cSizeCast alE)
@@ -302,7 +303,7 @@ instance CmdMemCopy IO Identity where
   cmdMemset (Identity dst) (Identity val) (Identity n) =
     when (n > 0) $ MarshalUtils.fillBytes dst val (fromIntegral n)
 
-emitGuardedMemCall :: String -> [Exp] -> Exp -> JanusCM ()
+emitGuardedMemCall :: String -> [Exp] -> Exp -> JanusCMT t ()
 emitGuardedMemCall fnName callArgs nExp = do
   addHeader "string.h"
   addHeader "stddef.h"
@@ -319,21 +320,21 @@ emitGuardedMemCall fnName callArgs nExp = do
             noLoc
   modifyFunction $ \fn -> fn & jcfBlock %~ flip appendBlock [stm]
 
-instance CmdMemCopy JanusCM JanusC where
+instance CmdMemCopy (JanusCMT t) (JanusCT t) where
   cmdMemcpy (JanusC mdst) (JanusC msrc) (JanusC mn) = do
-    RVal dst <- mdst
-    RVal src <- msrc
-    RVal n <- mn
+    RVal dst <- liftJanusCM mdst
+    RVal src <- liftJanusCM msrc
+    RVal n <- liftJanusCM mn
     emitGuardedMemCall "memcpy" [dst, src] n
   cmdMemmove (JanusC mdst) (JanusC msrc) (JanusC mn) = do
-    RVal dst <- mdst
-    RVal src <- msrc
-    RVal n <- mn
+    RVal dst <- liftJanusCM mdst
+    RVal src <- liftJanusCM msrc
+    RVal n <- liftJanusCM mn
     emitGuardedMemCall "memmove" [dst, src] n
   cmdMemset (JanusC mdst) (JanusC mval) (JanusC mn) = do
-    RVal dst <- mdst
-    RVal val <- mval
-    RVal n <- mn
+    RVal dst <- liftJanusCM mdst
+    RVal val <- liftJanusCM mval
+    RVal n <- liftJanusCM mn
     let intTy = Type (DeclSpec [] [] (Tint Nothing noLoc) noLoc) (DeclRoot noLoc) noLoc
     emitGuardedMemCall "memset" [dst, Cast intTy val noLoc] n
 
@@ -353,24 +354,24 @@ cDerefPtr :: Exp -> Exp
 cDerefPtr (UnOp AddrOf lval _) = lval
 cDerefPtr p = UnOp Deref p noLoc
 
-instance (JanusCTyped a) => CmdStorable JanusCM JanusC a where
+instance (JanusCTyped a) => CmdStorable (JanusCMT t) (JanusCT t) a where
   peek (JanusC p) = do
-    RVal p' <- p
+    RVal p' <- liftJanusCM p
     letM $ JanusC $ pure $ RVal $ cDerefPtr p'
   poke (JanusC p) (JanusC e) = do
-    RVal p' <- p
-    RVal e' <- e
+    RVal p' <- liftJanusCM p
+    RVal e' <- liftJanusCM e
     modifyFunction $ \f ->
       let pokestm = [BlockStm $ Exp (Just $ Assign (cDerefPtr p') JustAssign e' noLoc) noLoc]
        in f & jcfBlock %~ flip appendBlock pokestm
   peekElemOff (JanusC p) (JanusC i) = do
-    RVal p' <- p
-    RVal i' <- i
+    RVal p' <- liftJanusCM p
+    RVal i' <- liftJanusCM i
     letM $ JanusC $ pure $ RVal $ Index p' i' noLoc
   pokeElemOff (JanusC p) (JanusC e) (JanusC i) = do
-    RVal p' <- p
-    RVal e' <- e
-    RVal i' <- i
+    RVal p' <- liftJanusCM p
+    RVal e' <- liftJanusCM e
+    RVal i' <- liftJanusCM i
     modifyFunction $ \f ->
       let pokestm = [BlockStm $ Exp (Just $ Assign (Index p' i' noLoc) JustAssign e' noLoc) noLoc]
        in f & jcfBlock %~ flip appendBlock pokestm
@@ -388,5 +389,5 @@ instance (Storable.Storable a) => CmdRefPtr IO Identity a where
       Storable.peek p >>= writeRef r . Identity
       pure b
 
-instance (JanusCTyped a) => CmdRefPtr JanusCM JanusC a where
-  withRefPtr (JanusCRef (LVal r)) f = f $ JanusC $ pure $ RVal $ UnOp AddrOf r noLoc
+instance (JanusCTyped a) => CmdRefPtr (JanusCMT t) (JanusCT t) a where
+  withRefPtr (JanusCRefT (LVal r)) f = f $ JanusC $ pure $ RVal $ UnOp AddrOf r noLoc

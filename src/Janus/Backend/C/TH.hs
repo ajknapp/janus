@@ -15,7 +15,6 @@ module Janus.Backend.C.TH
 
     -- * Unified Template Haskell Compilation & Linking Class
     JanusCTH (..),
-    THBackend (..),
     THParamMode (..),
     THParamSpec (..),
     THRetEffect (..),
@@ -35,8 +34,6 @@ module Janus.Backend.C.TH
     -- * Low-Level Declaration Builder, Spec Helpers & Validation
     scalarParamSpec,
     scalarRetSpec,
-    x86THParamSpec,
-    x86THRetSpec,
     typeRepToTHType,
     buildForeignAndWrapperDecls,
     checkCSymbolName,
@@ -54,8 +51,6 @@ module Janus.Backend.C.TH
     THNat64,
     boolToWord8,
     word8ToBool,
-    spmdFromListProxy,
-    spmdToListProxy,
 
     -- * Re-exported C Newtype Constructors (for FFI unwrapping convenience)
     CBool (..),
@@ -82,9 +77,6 @@ import Data.Char (isAsciiLower, isAsciiUpper, isDigit)
 import qualified Data.Kind as K
 import Data.Proxy (Proxy (..))
 import qualified Data.Set as Set
-import Data.Type.Equality ((:~:) (..))
-import Data.Typeable (TypeRep, Typeable, eqT, splitTyConApp, tyConModule, tyConName, tyConPackage, typeRep)
-import Data.Word (Word8)
 import Foreign.C.Types
   ( CBool (..),
     CChar (..),
@@ -103,24 +95,35 @@ import Foreign.C.Types
     CUShort (..),
     CWchar (..),
   )
-import Foreign.Ptr (Ptr)
-import GHC.TypeNats (KnownNat, natVal)
 import Janus.Backend.C
 import Janus.Backend.C.Build
-import Janus.Backend.C.LinuxX86_64
-import Janus.Backend.C.Target
-import Janus.FFI.Arg (FFIArg)
-import Janus.FFI.Ret (FFIRet)
-import Janus.SPMD.Host (HostSPMDValue (..))
-import Janus.SPMD.Typed (SPMDTyped)
-import Janus.SPMD.Types (SPMD (..), SPMDM (..), SPMDRep, SPMDUnit (..), VoidPtr (..))
-import Language.C.Quote (Param)
+import Janus.FFI.Arg
+  ( THNat1,
+    THNat16,
+    THNat2,
+    THNat32,
+    THNat4,
+    THNat64,
+    THNat8,
+    THParamMode (..),
+    THParamSpec (..),
+    boolToWord8,
+    typeRepToTHType,
+    unitTHType,
+    voidPtrTHType,
+  )
+import Janus.FFI.Ret
+  ( THRetEffect (..),
+    THRetMode (..),
+    THRetSpec (..),
+    word8ToBool,
+  )
 import Language.Haskell.TH
   ( Body (NormalB),
     Callconv (CCall),
     Clause (Clause),
     Dec (ForeignD, FunD, PragmaD, SigD, ValD),
-    Exp (AppE, ConE, LamE, SigE, VarE),
+    Exp (AppE, LamE, VarE),
     Foreign (ImportF),
     Inline (Inline),
     Pat (VarP),
@@ -129,8 +132,7 @@ import Language.Haskell.TH
     Q,
     RuleMatch (FunLike),
     Safety (Interruptible, Safe, Unsafe),
-    TyLit (NumTyLit),
-    Type (AppT, ArrowT, ConT, ListT, LitT, PromotedT, TupleT),
+    Type (AppT, ArrowT, ConT),
     mkName,
     newName,
     runIO,
@@ -142,418 +144,25 @@ import Language.Haskell.TH.Syntax
     addForeignFilePath,
     addTempFile,
     addTopDecls,
-    mkNameG_d,
-    mkNameG_tc,
   )
 import System.IO.Unsafe (unsafePerformIO)
 
 --------------------------------------------------------------------------------
--- Internal Type Synonyms & Inline Helpers for Extension-Free Splice Sites
---------------------------------------------------------------------------------
-
-type THNat1 = 1
-
-type THNat2 = 2
-
-type THNat4 = 4
-
-type THNat8 = 8
-
-type THNat16 = 16
-
-type THNat32 = 32
-
-type THNat64 = 64
-
-{-# INLINE boolToWord8 #-}
-boolToWord8 :: Bool -> Word8
-boolToWord8 b = if b then 1 else 0
-
-{-# INLINE word8ToBool #-}
-word8ToBool :: Word8 -> Bool
-word8ToBool b = b /= 0
-
-{-# INLINE spmdFromListProxy #-}
-spmdFromListProxy ::
-  forall n e a.
-  (HostSPMDValue n e a) =>
-  Proxy n ->
-  Proxy e ->
-  Proxy a ->
-  [a] ->
-  SPMDRep n e a
-spmdFromListProxy _ _ _ = spmdRawFromList @n @e @a
-
-{-# INLINE spmdToListProxy #-}
-spmdToListProxy ::
-  forall n e a.
-  (HostSPMDValue n e a) =>
-  Proxy n ->
-  Proxy e ->
-  Proxy a ->
-  SPMDRep n e a ->
-  [a]
-spmdToListProxy _ _ _ = spmdRawToList @n @e @a
-
---------------------------------------------------------------------------------
--- TypeRep -> TH.Type Conversion
---------------------------------------------------------------------------------
-
-natToTHType :: Integer -> TH.Type
-natToTHType 1 = ConT ''THNat1
-natToTHType 2 = ConT ''THNat2
-natToTHType 4 = ConT ''THNat4
-natToTHType 8 = ConT ''THNat8
-natToTHType 16 = ConT ''THNat16
-natToTHType 32 = ConT ''THNat32
-natToTHType 64 = ConT ''THNat64
-natToTHType n = LitT (NumTyLit n)
-
-typeRepToTHType :: TypeRep -> TH.Type
-typeRepToTHType tr =
-  let (tc, args) = splitTyConApp tr
-      pkg = tyConPackage tc
-      modl = tyConModule tc
-      nm = tyConName tc
-      argTys = map typeRepToTHType args
-      applyAll hd = foldl AppT hd argTys
-   in case nm of
-        "Unit" | null argTys -> TupleT 0
-        "()" | null argTys -> TupleT 0
-        "List" -> applyAll ListT
-        "[]" -> applyAll ListT
-        "->" -> applyAll ArrowT
-        "FUN" | [_, a, b] <- argTys -> AppT (AppT ArrowT a) b
-        _
-          | not (null nm) && all isDigit nm && null argTys ->
-              natToTHType (read nm)
-          | '\'' : rest <- nm,
-            not (null rest) ->
-              applyAll (PromotedT (mkNameG_d pkg modl rest))
-          | otherwise ->
-              applyAll (ConT (mkNameG_tc pkg modl nm))
-
-voidPtrTHType :: TH.Type
-voidPtrTHType = AppT (ConT ''Ptr) (TupleT 0)
-
-unitTHType :: TH.Type
-unitTHType = TupleT 0
-
---------------------------------------------------------------------------------
--- TH ABI Parameter & Return Specifications
---------------------------------------------------------------------------------
-
-data THBackend
-  = THBackendJanusC
-  | THBackendLinuxX86_64
-  deriving (Eq, Ord, Show)
-
-data THParamMode
-  = THParamDirect
-  | THParamPure (TH.Exp -> TH.Exp)
-  | THParamIO ((TH.Exp -> Q TH.Exp) -> TH.Exp -> Q TH.Exp)
-
-data THParamSpec = THParamSpec
-  { thParamUserType :: TH.Type,
-    thParamRawType :: TH.Type,
-    thParamMode :: THParamMode
-  }
-
-data THRetEffect
-  = THRetPure
-  | THRetIO
-  deriving (Eq, Ord, Show)
-
-data THRetMode
-  = THRetDirect TH.Type
-  | THRetPureMap TH.Type (TH.Exp -> TH.Exp)
-  | THRetOutPtr ((TH.Exp -> Q TH.Exp) -> Q TH.Exp)
-
-data THRetSpec = THRetSpec
-  { thRetEffect :: THRetEffect,
-    thRetUserBaseType :: TH.Type,
-    thRetMode :: THRetMode
-  }
-
-scalarParamSpec :: forall a. (Typeable a) => Proxy a -> THParamSpec
-scalarParamSpec p =
-  let userTy = typeRepToTHType (typeRep p)
-   in case eqT @a @Bool of
-        Just Refl ->
-          THParamSpec
-            { thParamUserType = userTy,
-              thParamRawType = ConT ''Word8,
-              thParamMode = THParamPure (AppE (VarE 'boolToWord8))
-            }
-        Nothing -> case eqT @a @VoidPtr of
-          Just Refl ->
-            THParamSpec
-              { thParamUserType = userTy,
-                thParamRawType = voidPtrTHType,
-                thParamMode = THParamPure (AppE (VarE 'getVoidPtr))
-              }
-          Nothing -> case eqT @a @SPMDUnit of
-            Just Refl ->
-              THParamSpec
-                { thParamUserType = userTy,
-                  thParamRawType = ConT ''Word8,
-                  thParamMode = THParamPure (AppE (VarE 'getSPMDUnit))
-                }
-            Nothing ->
-              THParamSpec
-                { thParamUserType = userTy,
-                  thParamRawType = userTy,
-                  thParamMode = THParamDirect
-                }
-
-scalarRetSpec :: forall a. (Typeable a) => THRetEffect -> Proxy a -> THRetSpec
-scalarRetSpec eff p =
-  let userTy = typeRepToTHType (typeRep p)
-   in case eqT @a @Bool of
-        Just Refl ->
-          THRetSpec
-            { thRetEffect = eff,
-              thRetUserBaseType = userTy,
-              thRetMode = THRetPureMap (ConT ''Word8) (AppE (VarE 'word8ToBool))
-            }
-        Nothing -> case eqT @a @VoidPtr of
-          Just Refl ->
-            THRetSpec
-              { thRetEffect = eff,
-                thRetUserBaseType = userTy,
-                thRetMode = THRetPureMap voidPtrTHType (AppE (ConE 'VoidPtr))
-              }
-          Nothing -> case eqT @a @SPMDUnit of
-            Just Refl ->
-              THRetSpec
-                { thRetEffect = eff,
-                  thRetUserBaseType = userTy,
-                  thRetMode = THRetPureMap (ConT ''Word8) (AppE (ConE 'SPMDUnit))
-                }
-            Nothing ->
-              THRetSpec
-                { thRetEffect = eff,
-                  thRetUserBaseType = userTy,
-                  thRetMode = THRetDirect userTy
-                }
-
-x86THParamSpec :: forall a. (LinuxX86_64ABIParam a) => Proxy a -> THParamSpec
-x86THParamSpec p
-  | x86ParamIsIndirect p =
-      THParamSpec
-        { thParamUserType = typeRepToTHType (typeRep p),
-          thParamRawType = voidPtrTHType,
-          thParamMode = THParamIO $ \k argExp -> do
-            pName <- newName "p_arg"
-            inner <- k (VarE pName)
-            pure $
-              AppE
-                (AppE (VarE 'withX86StorableArg) argExp)
-                (LamE [VarP pName] inner)
-        }
-  | otherwise = scalarParamSpec p
-
-x86THRetSpec :: forall a. (LinuxX86_64ABIRet a, Typeable a) => THRetEffect -> Proxy a -> THRetSpec
-x86THRetSpec eff p
-  | x86RetIsIndirect p =
-      THRetSpec
-        { thRetEffect = eff,
-          thRetUserBaseType = typeRepToTHType (typeRep p),
-          thRetMode = THRetOutPtr $ \callWithOut -> do
-            pOutName <- newName "p_out"
-            callExp <- callWithOut (VarE pOutName)
-            pure $ AppE (VarE 'withX86StorableRet) (LamE [VarP pOutName] callExp)
-        }
-  | otherwise = scalarRetSpec eff p
-
-spmdProxyExps :: forall n a. (KnownNat n, Typeable a) => (TH.Exp, TH.Exp, TH.Exp)
-spmdProxyExps =
-  let mkProxy ty = SigE (ConE 'Proxy) (AppT (ConT ''Proxy) ty)
-      pN = mkProxy (natToTHType (toInteger (natVal (Proxy @n))))
-      pE = mkProxy (ConT ''LinuxX86_64C)
-      pA = mkProxy (typeRepToTHType (typeRep (Proxy @a)))
-   in (pN, pE, pA)
-
-spmdTHParamSpec ::
-  forall n a.
-  ( KnownNat n,
-    Typeable a,
-    LinuxX86_64ABIParam (SPMDRep n LinuxX86_64C a),
-    HostSPMDValue n LinuxX86_64C a
-  ) =>
-  THParamSpec
-spmdTHParamSpec =
-  let (pN, pE, pA) = spmdProxyExps @n @a
-      fromListCall = AppE (AppE (AppE (VarE 'spmdFromListProxy) pN) pE) pA
-      repSpec = x86THParamSpec (Proxy @(SPMDRep n LinuxX86_64C a))
-      userTy = AppT ListT (typeRepToTHType (typeRep (Proxy @a)))
-      mode = case thParamMode repSpec of
-        THParamDirect -> THParamPure (AppE fromListCall)
-        THParamPure conv -> THParamPure (conv . AppE fromListCall)
-        THParamIO withIO -> THParamIO (\k xsExp -> withIO k (AppE fromListCall xsExp))
-   in THParamSpec
-        { thParamUserType = userTy,
-          thParamRawType = thParamRawType repSpec,
-          thParamMode = mode
-        }
-
-spmdTHRetSpec ::
-  forall n a.
-  ( SPMDTyped n LinuxX86_64C a,
-    Typeable a,
-    LinuxX86_64ABIRet (SPMDRep n LinuxX86_64C a),
-    HostSPMDValue n LinuxX86_64C a
-  ) =>
-  THRetEffect ->
-  THRetSpec
-spmdTHRetSpec eff =
-  let (pN, pE, pA) = spmdProxyExps @n @a
-      toListFn = AppE (AppE (AppE (VarE 'spmdToListProxy) pN) pE) pA
-      repSpec = x86THRetSpec eff (Proxy @(SPMDRep n LinuxX86_64C a))
-      userTy = AppT ListT (typeRepToTHType (typeRep (Proxy @a)))
-      mode = case thRetMode repSpec of
-        THRetDirect rawTy -> THRetPureMap rawTy (AppE toListFn)
-        THRetPureMap rawTy conv -> THRetPureMap rawTy (AppE toListFn . conv)
-        THRetOutPtr runWithOut ->
-          THRetOutPtr $ \callWithOut -> do
-            ioRepExp <- runWithOut callWithOut
-            pure $ AppE (AppE (VarE 'fmap) toListFn) ioRepExp
-   in THRetSpec
-        { thRetEffect = eff,
-          thRetUserBaseType = userTy,
-          thRetMode = mode
-        }
-
---------------------------------------------------------------------------------
--- Unified JanusCTH Class & Instances
+-- Unified Target-Polymorphic JanusCTH Class & Blanket Instance
 --------------------------------------------------------------------------------
 
 class JanusCTH r where
   type JanusCTHEval r :: K.Type
-  janusCTHBackend :: Proxy r -> THBackend
-  janusCTHCodegen :: X86Features -> String -> Int -> JanusCM [Param] -> r -> [JCFunc]
+  janusCTHPrepare :: CBuildConfig -> String -> r -> IO (String, [String])
   janusCTHSpec :: Proxy r -> ([THParamSpec], THRetSpec)
 
--- JanusC / JanusCM Instances
-
-instance (FFIRet a, JanusCTyped a) => JanusCTH (JanusC a) where
-  type JanusCTHEval (JanusC a) = a
-  janusCTHBackend _ = THBackendJanusC
-  janusCTHCodegen _ name n params a = jcparam name n params JC a
-  janusCTHSpec _ = ([], scalarRetSpec THRetPure (Proxy @a))
-
-instance (FFIRet a, JanusCTyped a) => JanusCTH (JanusCM (JanusC a)) where
-  type JanusCTHEval (JanusCM (JanusC a)) = IO a
-  janusCTHBackend _ = THBackendJanusC
-  janusCTHCodegen _ name n params a = jcparam name n params JC a
-  janusCTHSpec _ = ([], scalarRetSpec THRetIO (Proxy @a))
-
-instance JanusCTH (JanusCM ()) where
-  type JanusCTHEval (JanusCM ()) = IO ()
-  janusCTHBackend _ = THBackendJanusC
-  janusCTHCodegen _ name n params a = jcparam name n params JC a
-  janusCTHSpec _ = ([], THRetSpec THRetIO unitTHType (THRetDirect unitTHType))
-
-instance
-  ( FFIArg a,
-    JanusCTyped a,
-    JanusCParam r,
-    JanusCParamImpl JanusC JanusCM r,
-    JanusCTH r
-  ) =>
-  JanusCTH (JanusC a -> r)
-  where
-  type JanusCTHEval (JanusC a -> r) = a -> JanusCTHEval r
-  janusCTHBackend _ = THBackendJanusC
-  janusCTHCodegen _ name n params f = jcparam name n params JC f
-  janusCTHSpec _ =
-    let (ps, retSpec) = janusCTHSpec (Proxy @r)
-     in (scalarParamSpec (Proxy @a) : ps, retSpec)
-
--- LinuxX86_64C / LinuxX86_64CM Instances
-
-instance (LinuxX86_64ABIRet a, JanusCTyped a) => JanusCTH (LinuxX86_64C a) where
-  type JanusCTHEval (LinuxX86_64C a) = a
-  janusCTHBackend _ = THBackendLinuxX86_64
-  janusCTHCodegen = x86param
-  janusCTHSpec _ = ([], x86THRetSpec THRetPure (Proxy @a))
-
-instance (LinuxX86_64ABIRet a, JanusCTyped a) => JanusCTH (LinuxX86_64CM (LinuxX86_64C a)) where
-  type JanusCTHEval (LinuxX86_64CM (LinuxX86_64C a)) = IO a
-  janusCTHBackend _ = THBackendLinuxX86_64
-  janusCTHCodegen = x86param
-  janusCTHSpec _ = ([], x86THRetSpec THRetIO (Proxy @a))
-
-instance JanusCTH (LinuxX86_64CM ()) where
-  type JanusCTHEval (LinuxX86_64CM ()) = IO ()
-  janusCTHBackend _ = THBackendLinuxX86_64
-  janusCTHCodegen = x86param
-  janusCTHSpec _ = ([], THRetSpec THRetIO unitTHType (THRetDirect unitTHType))
-
-instance
-  ( LinuxX86_64ABIParam a,
-    LinuxX86_64Param r,
-    JanusCTH r
-  ) =>
-  JanusCTH (LinuxX86_64C a -> r)
-  where
-  type JanusCTHEval (LinuxX86_64C a -> r) = a -> JanusCTHEval r
-  janusCTHBackend _ = THBackendLinuxX86_64
-  janusCTHCodegen = x86param
-  janusCTHSpec _ =
-    let (ps, retSpec) = janusCTHSpec (Proxy @r)
-     in (x86THParamSpec (Proxy @a) : ps, retSpec)
-
--- SPMD n LinuxX86_64C Instances
-
-instance
-  ( SPMDTyped n LinuxX86_64C a,
-    LinuxX86_64ABIRet (SPMDRep n LinuxX86_64C a),
-    HostSPMDValue n LinuxX86_64C a,
-    Typeable a
-  ) =>
-  JanusCTH (SPMD n LinuxX86_64C a)
-  where
-  type JanusCTHEval (SPMD n LinuxX86_64C a) = [a]
-  janusCTHBackend _ = THBackendLinuxX86_64
-  janusCTHCodegen = x86param
-  janusCTHSpec _ = ([], spmdTHRetSpec @n @a THRetPure)
-
-instance
-  ( SPMDTyped n LinuxX86_64C a,
-    LinuxX86_64ABIRet (SPMDRep n LinuxX86_64C a),
-    HostSPMDValue n LinuxX86_64C a,
-    Typeable a
-  ) =>
-  JanusCTH (SPMDM n LinuxX86_64CM LinuxX86_64C (SPMD n LinuxX86_64C a))
-  where
-  type JanusCTHEval (SPMDM n LinuxX86_64CM LinuxX86_64C (SPMD n LinuxX86_64C a)) = IO [a]
-  janusCTHBackend _ = THBackendLinuxX86_64
-  janusCTHCodegen = x86param
-  janusCTHSpec _ = ([], spmdTHRetSpec @n @a THRetIO)
-
-instance JanusCTH (SPMDM n LinuxX86_64CM LinuxX86_64C ()) where
-  type JanusCTHEval (SPMDM n LinuxX86_64CM LinuxX86_64C ()) = IO ()
-  janusCTHBackend _ = THBackendLinuxX86_64
-  janusCTHCodegen = x86param
-  janusCTHSpec _ = ([], THRetSpec THRetIO unitTHType (THRetDirect unitTHType))
-
-instance
-  ( SPMDTyped n LinuxX86_64C a,
-    LinuxX86_64ABIParam (SPMDRep n LinuxX86_64C a),
-    HostSPMDValue n LinuxX86_64C a,
-    Typeable a,
-    LinuxX86_64Param r,
-    JanusCTH r
-  ) =>
-  JanusCTH (SPMD n LinuxX86_64C a -> r)
-  where
-  type JanusCTHEval (SPMD n LinuxX86_64C a -> r) = [a] -> JanusCTHEval r
-  janusCTHBackend _ = THBackendLinuxX86_64
-  janusCTHCodegen = x86param
-  janusCTHSpec _ =
-    let (ps, retSpec) = janusCTHSpec (Proxy @r)
-     in (spmdTHParamSpec @n @a : ps, retSpec)
+instance (JanusCTarget t, JanusCParam t r) => JanusCTH r where
+  type JanusCTHEval r = JanusCEval r
+  janusCTHPrepare config cSymName prog = do
+    fs <- resolveCTargetFeatures (Proxy @t) config
+    (cSrc, cflags, _ldflags) <- prepareJanusCUnit fs cSymName prog
+    pure (cSrc, cflags)
+  janusCTHSpec = jcTHSpec @t @r
 
 --------------------------------------------------------------------------------
 -- Identifier Validation, Object Linking, & Declaration Generation
@@ -667,23 +276,6 @@ checkHsVarName s@(c0 : cs)
 
 validateHsVarName :: String -> Q ()
 validateHsVarName = either fail pure . checkHsVarName
-
-prepareJanusCTHUnit :: forall r. (JanusCTH r) => CBuildConfig -> String -> r -> IO (String, [String])
-prepareJanusCTHUnit config cSymName prog =
-  case janusCTHBackend (Proxy @r) of
-    THBackendJanusC ->
-      let funcs = janusCTHCodegen x86Baseline cSymName 0 (pure []) prog
-       in pure (renderJCProgram cSymName funcs, [])
-    THBackendLinuxX86_64 -> do
-      fs <- case config ^. cBuildConfigX86Features of
-        Just req -> pure req
-        Nothing -> observeHostX86Features
-      let funcs = janusCTHCodegen fs cSymName 0 (pure []) prog
-          targetBanner = "/* janus-x86-target: " <> unwords (x86CompilerFlags fs) <> " */\n"
-          cSource = targetBanner <> renderJCProgram cSymName funcs
-          needsSleef = any (Set.member "sleef.h" . _jcfHeaders) funcs
-      (sleefCFlags, _) <- if needsSleef then observeSleefFlags else pure ([], [])
-      pure (cSource, x86CompilerFlags fs <> sleefCFlags)
 
 linkJanusCObject :: CBuildConfig -> [String] -> String -> Q ()
 linkJanusCObject config extraCFlags cSource = do
@@ -801,7 +393,7 @@ compileAndBuildDecls ::
   Q [Dec]
 compileAndBuildDecls config safety cSymName hsName prog = do
   validateCSymbolName cSymName
-  (cSource, extraCFlags) <- runIO (prepareJanusCTHUnit config cSymName prog)
+  (cSource, extraCFlags) <- runIO (janusCTHPrepare config cSymName prog)
   linkJanusCObject config extraCFlags cSource
   buildForeignAndWrapperDecls safety cSymName hsName (janusCTHSpec (Proxy @r))
 
@@ -821,7 +413,7 @@ declareJanusCAs :: (JanusCTH r) => Safety -> String -> String -> r -> Q [Dec]
 declareJanusCAs = declareJanusCAsWithConfig defaultTHBuildConfig
 
 -- | Like 'declareJanusC', using an explicit 'CBuildConfig' (for custom compiler
--- flags, 'X86Features', or 'Rock' object caching).
+-- flags, target features, or 'Rock' object caching).
 declareJanusCWithConfig :: (JanusCTH r) => CBuildConfig -> Safety -> String -> r -> Q [Dec]
 declareJanusCWithConfig config safety name =
   declareJanusCAsWithConfig config safety name name

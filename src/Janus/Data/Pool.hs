@@ -3,6 +3,7 @@
 {-# LANGUAGE DataKinds #-}
 {-# LANGUAGE DeriveGeneric #-}
 {-# LANGUAGE DerivingStrategies #-}
+{-# LANGUAGE DerivingVia #-}
 {-# LANGUAGE FlexibleContexts #-}
 {-# LANGUAGE FlexibleInstances #-}
 {-# LANGUAGE KindSignatures #-}
@@ -79,8 +80,6 @@ import Janus.Alloc.Policy
     reallocTypedArray,
   )
 import Janus.Backend.C
-import Janus.Backend.C.LinuxX86_64
-import Janus.Backend.C.TH
 import Janus.Command.Cond (ifThenElseM_, whenM_)
 import Janus.Command.Memory (CmdStorable (..), ExpPtr (..), ExpSized (..))
 import Janus.Command.Ref (newRef, readRef, writeRef)
@@ -672,69 +671,14 @@ foldOccupiedSPMD pw (Pool hdr) s0 step = do
 
 type PoolABI a = (Typeable a, JanusStruct (Buf a))
 
-type instance JanusCEval (Pool JanusC a -> r) = Pool Identity a -> JanusCEval r
+type instance JanusCHost (Pool (JanusCT _) a) = Pool Identity a
 
-type instance JanusCRetType (Pool JanusC a -> r) = JanusCRetType r
+deriving via
+  ViaPtrHandle t (CStruct (PoolSpine a)) (Pool Identity a)
+  instance
+    (PoolABI a) => JanusCArg t (Pool (JanusCT t) a)
 
-instance (PoolABI a, JanusCParam r) => JanusCParam (Pool JanusC a -> r) where
-  jcparam = mkPtrHandleJCParam Pool
-
-instance (PoolABI a, JanusCEvaluate r) => JanusCEvaluate (Pool JanusC a -> r) where
-  jceval = mkPtrHandleJCEval unPool Pool
-
-type instance JanusCEval (JanusCM (Pool JanusC a)) = IO (Pool Identity a)
-
-type instance JanusCRetType (JanusCM (Pool JanusC a)) = Pool Identity a
-
-instance (PoolABI a) => JanusCParam (JanusCM (Pool JanusC a)) where
-  jcparam = mkPtrHandleJCRetParam unPool
-
-instance (PoolABI a) => JanusCEvaluate (JanusCM (Pool JanusC a)) where
-  jceval = mkPtrHandleJCRetEval Pool
-
-type instance LinuxX86_64CEval (Pool LinuxX86_64C a -> r) = Pool Identity a -> LinuxX86_64CEval r
-
-type instance LinuxX86_64BaseRet (Pool LinuxX86_64C a -> r) = LinuxX86_64BaseRet r
-
-instance (PoolABI a, LinuxX86_64Param r) => LinuxX86_64Param (Pool LinuxX86_64C a -> r) where
-  x86param = mkPtrHandleX86Param Pool
-
-instance (PoolABI a, X86DeferCont r, LinuxX86_64Evaluate r) => LinuxX86_64Evaluate (Pool LinuxX86_64C a -> r) where
-  x86eval = mkPtrHandleX86EvalParam unPool Pool
-
-instance (PoolABI a, X86DeferCont r) => X86DeferCall (Pool LinuxX86_64C a -> r) where
-  x86DeferArg = mkPtrHandleX86DeferArg unPool Pool
-
-instance (PoolABI a, X86DeferCont r) => X86DeferCont (Pool LinuxX86_64C a -> r) where
-  x86DeferCont = mkPtrHandleX86DeferCont unPool Pool
-
-type instance LinuxX86_64CEval (LinuxX86_64CM (Pool LinuxX86_64C a)) = IO (Pool Identity a)
-
-type instance LinuxX86_64BaseRet (LinuxX86_64CM (Pool LinuxX86_64C a)) = Pool Identity a
-
-instance (PoolABI a) => LinuxX86_64Param (LinuxX86_64CM (Pool LinuxX86_64C a)) where
-  x86param = mkPtrHandleX86RetParam unPool
-
-instance (PoolABI a) => LinuxX86_64Evaluate (LinuxX86_64CM (Pool LinuxX86_64C a)) where
-  x86eval = mkPtrHandleX86RetEval Pool
-
-instance (PoolABI a) => X86DeferCall (LinuxX86_64CM (Pool LinuxX86_64C a)) where
-  x86DeferArg = mkPtrHandleX86RetDeferArg Pool
-
-instance (PoolABI a) => X86DeferCont (LinuxX86_64CM (Pool LinuxX86_64C a)) where
-  x86DeferCont = mkPtrHandleX86RetDeferCont Pool
-
-instance (PoolABI a, LinuxX86_64Param r, JanusCTH r) => JanusCTH (Pool LinuxX86_64C a -> r) where
-  type JanusCTHEval (Pool LinuxX86_64C a -> r) = Pool Identity a -> JanusCTHEval r
-  janusCTHBackend _ = THBackendLinuxX86_64
-  janusCTHCodegen = x86param
-  janusCTHSpec _ =
-    let (ps, retSpec) = janusCTHSpec (Proxy @r)
-     in (mkPtrHandleTHParamSpec (Proxy @(Pool Identity a)) : ps, retSpec)
-
-instance (PoolABI a) => JanusCTH (LinuxX86_64CM (Pool LinuxX86_64C a)) where
-  type JanusCTHEval (LinuxX86_64CM (Pool LinuxX86_64C a)) = IO (Pool Identity a)
-  janusCTHBackend _ = THBackendLinuxX86_64
-  janusCTHCodegen = x86param
-  janusCTHSpec _ =
-    ([], mkPtrHandleTHRetSpec THRetIO (Proxy @(Pool Identity a)) (Proxy @(CStruct (PoolSpine a))))
+deriving via
+  ViaPtrHandle t (CStruct (PoolSpine a)) (Pool Identity a)
+  instance
+    (PoolABI a) => JanusCValRet t (Pool (JanusCT t) a)

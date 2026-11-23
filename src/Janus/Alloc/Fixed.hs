@@ -1,5 +1,6 @@
 {-# LANGUAGE DeriveGeneric #-}
 {-# LANGUAGE DerivingStrategies #-}
+{-# LANGUAGE DerivingVia #-}
 {-# LANGUAGE FlexibleContexts #-}
 {-# LANGUAGE FlexibleInstances #-}
 {-# LANGUAGE MultiParamTypeClasses #-}
@@ -25,14 +26,11 @@ where
 
 import Data.Functor.Identity (Identity (..))
 import Data.Int (Int64)
-import Data.Proxy (Proxy (..))
 import Data.Word (Word64, Word8)
 import Foreign.Ptr (Ptr)
 import GHC.Generics (Generic)
 import Janus.Alloc.Dynamic (CmdAllocBase, alignUpWord64, isNullVoidPtr, sameVoidPtr)
 import Janus.Backend.C
-import Janus.Backend.C.LinuxX86_64
-import Janus.Backend.C.TH
 import Janus.Command.Array (CmdMemCopy (..), CmdStorable (..), ExpPtr (..), allocaAligned, janusSIMDAlignment)
 import Janus.Command.Cond (ifThenElseM_, whenM_)
 import Janus.Command.Ref (letM, newRef, readRef, writeRef)
@@ -209,36 +207,15 @@ fixedFreeImpl (FixedBuf hdr) ptr _ =
       poke (getPtrOf (fbsLastPtr f)) nullPtr
 
 -- Host <-> C FFI Marshalling Instances
-type instance JanusCEval (FixedBuf JanusC -> r) = FixedBuf Identity -> JanusCEval r
 
-type instance JanusCRetType (FixedBuf JanusC -> r) = JanusCRetType r
+type instance JanusCHost (FixedBuf (JanusCT _)) = FixedBuf Identity
 
-instance (JanusCParam r) => JanusCParam (FixedBuf JanusC -> r) where
-  jcparam = mkPtrHandleJCParam FixedBuf
+deriving via
+  ViaPtrHandle t (CStruct FixedBufSpine) (FixedBuf Identity)
+  instance
+    JanusCArg t (FixedBuf (JanusCT t))
 
-instance (JanusCEvaluate r) => JanusCEvaluate (FixedBuf JanusC -> r) where
-  jceval = mkPtrHandleJCEval unFixedBuf FixedBuf
-
-type instance LinuxX86_64CEval (FixedBuf LinuxX86_64C -> r) = FixedBuf Identity -> LinuxX86_64CEval r
-
-type instance LinuxX86_64BaseRet (FixedBuf LinuxX86_64C -> r) = LinuxX86_64BaseRet r
-
-instance (LinuxX86_64Param r) => LinuxX86_64Param (FixedBuf LinuxX86_64C -> r) where
-  x86param = mkPtrHandleX86Param FixedBuf
-
-instance (X86DeferCont r, LinuxX86_64Evaluate r) => LinuxX86_64Evaluate (FixedBuf LinuxX86_64C -> r) where
-  x86eval = mkPtrHandleX86EvalParam unFixedBuf FixedBuf
-
-instance (X86DeferCont r) => X86DeferCall (FixedBuf LinuxX86_64C -> r) where
-  x86DeferArg = mkPtrHandleX86DeferArg unFixedBuf FixedBuf
-
-instance (X86DeferCont r) => X86DeferCont (FixedBuf LinuxX86_64C -> r) where
-  x86DeferCont = mkPtrHandleX86DeferCont unFixedBuf FixedBuf
-
-instance (LinuxX86_64Param r, JanusCTH r) => JanusCTH (FixedBuf LinuxX86_64C -> r) where
-  type JanusCTHEval (FixedBuf LinuxX86_64C -> r) = FixedBuf Identity -> JanusCTHEval r
-  janusCTHBackend _ = THBackendLinuxX86_64
-  janusCTHCodegen = x86param
-  janusCTHSpec _ =
-    let (ps, retSpec) = janusCTHSpec (Proxy @r)
-     in (mkPtrHandleTHParamSpec (Proxy @(FixedBuf Identity)) : ps, retSpec)
+deriving via
+  ViaPtrHandle t (CStruct FixedBufSpine) (FixedBuf Identity)
+  instance
+    JanusCValRet t (FixedBuf (JanusCT t))

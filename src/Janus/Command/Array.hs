@@ -46,7 +46,7 @@ import Prelude hiding (id, (.))
 data Tensor (ds :: [Nat]) e a where
   Tensor :: TensorBound ds e -> e (Ptr a) -> Tensor ds e a
 
-instance (JanusCTyped a, Typeable ds) => JanusCTyped (Tensor ds JanusC a) where
+instance (Typeable t, JanusCTyped a, Typeable ds) => JanusCTyped (Tensor ds (JanusCT t) a) where
   jctype _ = jctype (Proxy @(Ptr a))
 
 data TensorBound (ds :: [Nat]) (e :: K.Type -> K.Type) where

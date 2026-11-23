@@ -1,5 +1,6 @@
 {-# LANGUAGE DefaultSignatures #-}
 {-# LANGUAGE FlexibleContexts #-}
+{-# LANGUAGE FlexibleInstances #-}
 {-# LANGUAGE FunctionalDependencies #-}
 {-# LANGUAGE InstanceSigs #-}
 {-# LANGUAGE ScopedTypeVariables #-}
@@ -40,15 +41,15 @@ class (JanusTyped e Int64, ExpOrd e Int64, Num (e Int64)) => CmdRange m e | m ->
 
 instance CmdRange IO Identity where
 
-instance CmdRange JanusCM JanusC where
+instance CmdRange (JanusCMT t) (JanusCT t) where
   rangeM :: forall a. JanusCTyped a =>
-    JanusC a ->
-    JanusC a ->
-    (JanusC a -> JanusCM ()) ->
-    JanusCM ()
+    JanusCT t a ->
+    JanusCT t a ->
+    (JanusCT t a -> JanusCMT t ()) ->
+    JanusCMT t ()
   rangeM (JanusC l) (JanusC u) body = do
-    RVal l' <- l
-    RVal u' <- u
+    RVal l' <- liftJanusCM l
+    RVal u' <- liftJanusCM u
     JCType spec dec <- getJanusCType (Proxy @a)
     case spec of
       DeclSpec _ _ tspec _ -> do

@@ -1,12 +1,10 @@
 {-# LANGUAGE AllowAmbiguousTypes #-}
 {-# LANGUAGE DataKinds #-}
 {-# LANGUAGE DerivingStrategies #-}
-{-# LANGUAGE DerivingVia #-}
 {-# LANGUAGE FlexibleContexts #-}
 {-# LANGUAGE FlexibleInstances #-}
 {-# LANGUAGE GeneralizedNewtypeDeriving #-}
 {-# LANGUAGE InstanceSigs #-}
-{-# LANGUAGE LambdaCase #-}
 {-# LANGUAGE MultiParamTypeClasses #-}
 {-# LANGUAGE ScopedTypeVariables #-}
 {-# LANGUAGE StandaloneDeriving #-}
@@ -18,225 +16,74 @@ module Janus.Backend.C.LinuxX86_64 where
 
 import Control.Lens
 import Control.Monad (forM_, when)
-import Control.Monad.Fix
-import Control.Monad.Reader
-import Control.Monad.State
+import Control.Monad.State (get, modify, put)
 import Data.Bits (Bits (..))
-import Data.Coerce
-import Data.Complex
 import Data.Int
 import Data.Loc
 import qualified Data.Map as Map
 import Data.Proxy
-import qualified Data.Set as Set
 import Data.Semilattice.Join (Join (..))
 import Data.Semilattice.Lower (Lower (..))
 import Data.Semilattice.Meet (Meet (..))
 import Data.Semilattice.Upper (Upper (..))
+import qualified Data.Set as Set
 import Data.Typeable (Typeable)
 import Data.Word
-import Foreign.ForeignPtr (ForeignPtr, withForeignPtr)
-import Foreign.LibFFI (Arg, argPtr, callFFI, retVoid)
-import Foreign.Marshal.Alloc (allocaBytesAligned)
-import Foreign.Ptr (FunPtr, Ptr, castPtr, castPtrToFunPtr)
+import Foreign.LibFFI (argPtr, callFFI, retVoid)
+import Foreign.Ptr (Ptr)
 import qualified Foreign.Storable as Storable
 import GHC.Float (expm1, log1p)
 import GHC.TypeLits (natVal)
 import Janus.Backend.C
-import Janus.Backend.C.Build
 import Janus.Backend.C.Target
-import Janus.Command.Array
-import Janus.Command.Case
-import Janus.Command.Cond
-import Janus.Command.Format
-import Janus.Command.IO
-import Janus.Command.Range
-import Janus.Command.Ref
+import Janus.Command.Ref (JanusCRefT)
 import Janus.Command.TicToc
-import Janus.Command.While
-import Janus.Expression.Bits
-import Janus.Expression.Bool
-import Janus.Expression.Cast
-import Janus.Expression.Cond
-import Janus.Expression.Eq
-import Janus.Expression.Extract
-import Janus.Expression.Inject
-import Janus.Expression.Integral
-import Janus.Expression.Let
-import Janus.Expression.Math
-import Janus.Expression.MurmurHash
-import Janus.Expression.Ord
+import Janus.Expression.Cast (janusCReallyUnsafeCast)
+import Janus.Expression.Eq (eq, ne)
+import Janus.Expression.Inject (inject)
+import Janus.Expression.Math (FMA (..), Hypot (..))
 import Janus.Expression.SIMD
 import Janus.Expression.SIMD.Types (rawMaskFromBools, rawMaskToBools, rawSIMDFromList, rawSIMDToList)
-import Janus.FFI.Arg (FFIArg (..))
-import Janus.FFI.Ret (FFIRet (..))
-import Janus.Typed
+import Janus.SPMD.Gang (CmdOptimalGang (..), dispatchGangInt, optimalX86GangSize)
 import Language.C.Quote as C
-import System.IO.Unsafe (unsafePerformIO)
 
-newtype LinuxX86_64C a = LinuxX86_64C {getLinuxX86_64C :: JanusC a}
+--------------------------------------------------------------------------------
+-- LinuxX86_64 Target Descriptor & Type Aliases
+--------------------------------------------------------------------------------
 
-newtype LinuxX86_64CM a = LinuxX86_64CM {getLinuxX86_64CM :: JanusCM a}
-  deriving (Functor, Applicative, Monad, MonadFix) via JanusCM
+-- | Target tag for Linux x86-64 hosts with ISA feature gating (SSE2..AVX2/FMA/BMI2) and SLEEF vector math.
+data LinuxX86_64
 
-type instance JanusTyped LinuxX86_64C = JanusCTyped
+type LinuxX86_64C = JanusCT LinuxX86_64
 
-instance JanusCBackendTypes LinuxX86_64C LinuxX86_64CM where
-  toJanusC = getLinuxX86_64C
-  fromJanusC = LinuxX86_64C
-  toJanusCM = getLinuxX86_64CM
-  fromJanusCM = LinuxX86_64CM
+type LinuxX86_64CM = JanusCMT LinuxX86_64
 
-deriving via JanusC a instance (JanusLitC a, Num a) => Num (LinuxX86_64C a)
+type LinuxX86_64CRef = JanusCRefT LinuxX86_64
 
-deriving via JanusC a instance (Bounded (JanusC a)) => Bounded (LinuxX86_64C a)
+askX86Features :: JanusCMT t X86Features
+askX86Features = askCTargetFeatures @LinuxX86_64
 
-deriving via JanusC a instance (JanusLitC a, Fractional a) => Fractional (LinuxX86_64C a)
+instance JanusCTarget LinuxX86_64 where
+  type CTargetFeatures LinuxX86_64 = X86Features
+  cTargetFeatureKey _ = x86FeatureKey
+  observeCTargetFeatures _ = observeHostX86Features
+  ensureCTargetAdmitted _ req = do
+    observed <- observeHostX86Features
+    ensureX86Admitted observed req
+  cTargetBanner _ fs =
+    "/* janus-x86-target: " <> unwords (x86CompilerFlags fs) <> " */\n"
+  cTargetBuildFlags _ fs funcs = do
+    let needsSleef = any (Set.member "sleef.h" . _jcfHeaders) funcs
+    (sleefCFlags, sleefLDFlags) <- if needsSleef then observeSleefFlags else pure ([], [])
+    pure (x86CompilerFlags fs <> sleefCFlags, sleefLDFlags)
 
-deriving via JanusC Float instance Floating (LinuxX86_64C Float)
-
-deriving via JanusC Double instance Floating (LinuxX86_64C Double)
-
-deriving via JanusC (Complex Float) instance Floating (LinuxX86_64C (Complex Float))
-
-deriving via JanusC (Complex Double) instance Floating (LinuxX86_64C (Complex Double))
-
-deriving via JanusC instance ExpBool LinuxX86_64C
-
-instance (ExpBits JanusC a) => ExpBits LinuxX86_64C a where
-  iand = coerce (iand @JanusC @a)
-  ior = coerce (ior @JanusC @a)
-  ieor = coerce (ieor @JanusC @a)
-  inot = coerce (inot @JanusC @a)
-  lshift = coerce (lshift @JanusC @a)
-  rshift = coerce (rshift @JanusC @a)
-
-instance (ExpBoolCast JanusC a) => ExpBoolCast LinuxX86_64C a where
-  toBool = coerce (toBool @JanusC @a)
-  fromBool = coerce (fromBool @JanusC @a)
-
-instance (ExpIntegralCast JanusC a b) => ExpIntegralCast LinuxX86_64C a b where
-  toIntegral = coerce (toIntegral @JanusC @a @b)
-
-instance (ExpFloatingCast JanusC a b) => ExpFloatingCast LinuxX86_64C a b where
-  toFloating = coerce (toFloating @JanusC @a @b)
-
-deriving via JanusC instance ExpPtrCast LinuxX86_64C
-
-deriving via JanusC instance ExpCond LinuxX86_64C
-
-instance (ExpEq JanusC a) => ExpEq LinuxX86_64C a where
-  eq = coerce (eq @JanusC @a)
-  ne = coerce (ne @JanusC @a)
-
-instance (ExpExtract JanusC a) => ExpExtract LinuxX86_64C a where
-  extract = coerce (extract @JanusC @a)
-
-instance (ExpInject JanusC a) => ExpInject LinuxX86_64C a where
-  inject = coerce (inject @JanusC @a)
-
-instance (Num a, JanusLitC a, ExpIntegral JanusC a) => ExpIntegral LinuxX86_64C a where
-  remainder = coerce (remainder @JanusC @a)
-  quotient = coerce (quotient @JanusC @a)
-
-deriving via JanusC instance ExpLet LinuxX86_64C
-
-deriving via JanusC a instance (FMA (JanusC a), JanusLitC a, Num a) => FMA (LinuxX86_64C a)
-
-deriving via JanusC a instance (Hypot (JanusC a), JanusLitC a, Floating (LinuxX86_64C a)) => Hypot (LinuxX86_64C a)
-
-instance (ExpMurmurHash JanusC (JanusC a)) => ExpMurmurHash LinuxX86_64C (LinuxX86_64C a) where
-  murmurHashWithSalt = coerce (murmurHashWithSalt @JanusC @(JanusC a))
-
-instance (ExpOrd JanusC a) => ExpOrd LinuxX86_64C a where
-  lt = coerce (lt @JanusC @a)
-  le = coerce (le @JanusC @a)
-  gt = coerce (gt @JanusC @a)
-  ge = coerce (ge @JanusC @a)
-
-instance (JanusCTyped a, ExpSized JanusC a) => ExpSized LinuxX86_64C a where
-  sizeOf = coerce (sizeOf @JanusC @a)
-  alignOf = coerce (alignOf @JanusC @a)
-
-instance (ExpPtr JanusC a) => ExpPtr LinuxX86_64C a where
-  nullPtr = coerce (nullPtr @JanusC @a)
-  ptrAdd = coerce (ptrAdd @JanusC @a)
-  ptrIndex = coerce (ptrIndex @JanusC @a)
-
-instance CmdMem LinuxX86_64CM LinuxX86_64C where
-  malloc = coerce (malloc @JanusCM @JanusC)
-  calloc = coerce (calloc @JanusCM @JanusC)
-  realloc = coerce (realloc @JanusCM @JanusC)
-  free = coerce (free @JanusCM @JanusC)
-
-instance CmdDynamicAligned LinuxX86_64CM LinuxX86_64C where
-  alignedMalloc = coerce (alignedMalloc @JanusCM @JanusC)
-
-instance CmdMemCopy LinuxX86_64CM LinuxX86_64C where
-  cmdMemcpy = coerce (cmdMemcpy @JanusCM @JanusC)
-  cmdMemmove = coerce (cmdMemmove @JanusCM @JanusC)
-  cmdMemset = coerce (cmdMemset @JanusCM @JanusC)
-
-instance (ExpSized LinuxX86_64C a, JanusCTyped a) => CmdStorable LinuxX86_64CM LinuxX86_64C a where
-  peek = coerce (peek @JanusCM @JanusC @a)
-  poke = coerce (poke @JanusCM @JanusC @a)
-  peekElemOff = coerce (peekElemOff @JanusCM @JanusC @a)
-  pokeElemOff = coerce (pokeElemOff @JanusCM @JanusC @a)
-
-instance (JanusCTyped a) => CmdRefPtr LinuxX86_64CM LinuxX86_64C a where
-  withRefPtr (LinuxX86_64CRef r) f =
-    LinuxX86_64CM $ withRefPtr @JanusCM @JanusC r (getLinuxX86_64CM . f . LinuxX86_64C)
-
-instance CmdCase LinuxX86_64CM LinuxX86_64C where
-  switchCase_ = coerce (switchCase_ @JanusCM @JanusC)
-
-instance CmdCond LinuxX86_64CM LinuxX86_64C where
-  ifThenElseM_ = coerce (ifThenElseM_ @JanusCM @JanusC)
-
-instance CmdIO LinuxX86_64CM LinuxX86_64C where
-  stdout = coerce (stdout @JanusCM @JanusC)
-  stderr = coerce (stderr @JanusCM @JanusC)
-  fopen = coerce (fopen @JanusCM @JanusC)
-  fclose = coerce (fclose @JanusCM @JanusC)
-
-instance CmdString LinuxX86_64CM LinuxX86_64C where
-  withString s f = LinuxX86_64CM (withString @JanusCM @JanusC s $ getLinuxX86_64CM . f . LinuxX86_64C)
-
-instance CmdPutString LinuxX86_64CM LinuxX86_64C where
-  hputString = coerce (hputString @JanusCM @JanusC)
-
-instance (CmdFormat JanusCM JanusC a) => CmdFormat LinuxX86_64CM LinuxX86_64C a where
-  hformat = coerce (hformat @JanusCM @JanusC @a)
-
-newtype LinuxX86_64CRef a = LinuxX86_64CRef {getLinuxX86_64CRef :: JanusCRef a}
-
-instance CmdRef LinuxX86_64CM LinuxX86_64C where
-  type Ref LinuxX86_64CM LinuxX86_64C a = LinuxX86_64CRef a
-  letM (LinuxX86_64C a) = LinuxX86_64CM $ LinuxX86_64C <$> letM a
-  newRef (LinuxX86_64C a) = LinuxX86_64CM (LinuxX86_64CRef <$> newRef a)
-  newRef' = LinuxX86_64CM (LinuxX86_64CRef <$> newRef')
-  readRef (LinuxX86_64CRef r) = LinuxX86_64CM (LinuxX86_64C <$> readRef r)
-  writeRef (LinuxX86_64CRef r) (LinuxX86_64C a) = LinuxX86_64CM (writeRef r a)
-
-instance (JanusCTyped a) => RefCell LinuxX86_64CM LinuxX86_64C (LinuxX86_64C a) where
-  newCell x = do
-    r <- newRef x
-    pure (Cell (readRef r) (writeRef r))
-  newCell' = do
-    r <- newRef'
-    pure (Cell (readRef r) (writeRef r))
-
-instance CmdRange LinuxX86_64CM LinuxX86_64C where
-  rangeM = coerce (rangeM @JanusCM @JanusC)
-
-instance CmdWhile LinuxX86_64CM LinuxX86_64C where
-  whileM = coerce (whileM @JanusCM @JanusC)
-
+--------------------------------------------------------------------------------
+-- Cycle-Counter Hardware Intrinsics (RDTSC / RDTSCP)
 --------------------------------------------------------------------------------
 
 ticTocAsmBlock ::
   (LinuxX86_64C a -> b) -> String -> LinuxX86_64CM b
-ticTocAsmBlock newty str = LinuxX86_64CM $ do
+ticTocAsmBlock newty str = do
   fname <- askFuncName
   JCType spec dec <- getJanusCType (Proxy @Word64)
   jcs <- get
@@ -246,13 +93,12 @@ ticTocAsmBlock newty str = LinuxX86_64CM $ do
           vid = Id ("x_" <> show c) noLoc
           ini = Init vid dec Nothing Nothing [] noLoc
           asm = Asm True [] (StringLit [show str] "" noLoc) [AsmOut Nothing "\"=a\"" vid] [] ["\"rdx\""] noLoc
-
           block = appendBlock (f ^. jcfBlock) [BlockDecl (InitGroup spec [] [ini] noLoc), BlockStm asm]
       put $
         jcs
           & at fname . _Just . jcfVarCounter +~ 1
           & at fname . _Just . jcfBlock .~ block
-      pure $ newty $ LinuxX86_64C $ JanusC $ pure $ RVal (Var vid noLoc)
+      pure $ newty $ JanusC $ pure $ RVal (Var vid noLoc)
     Nothing -> error "tic: the impossible happened"
 
 instance CmdTicToc LinuxX86_64CM LinuxX86_64C where
@@ -260,52 +106,8 @@ instance CmdTicToc LinuxX86_64CM LinuxX86_64C where
   toc = ticTocAsmBlock Toc "rdtscp\n\tshl $32, %%rdx\n\tor %%rdx, %0"
 
 --------------------------------------------------------------------------------
--- LinuxX86_64C Compilation, Inspection, & ABI-Safe Evaluation
+-- ExpSIMD LinuxX86_64C: Associated Types, Indirect Value ABI, & Register Types
 --------------------------------------------------------------------------------
-
-type family LinuxX86_64CEval a
-
-type instance LinuxX86_64CEval (LinuxX86_64C a -> r) = a -> LinuxX86_64CEval r
-type instance LinuxX86_64CEval (LinuxX86_64C a) = a
-type instance LinuxX86_64CEval (LinuxX86_64CM (LinuxX86_64C a)) = IO a
-type instance LinuxX86_64CEval (LinuxX86_64CM ()) = IO ()
-
-class (JanusCTyped a) => LinuxX86_64ABIParam a where
-  x86EmitParam :: Int -> JanusCM (Param, Exp)
-  x86WithArg :: a -> (Arg -> IO b) -> IO b
-  x86ParamIsIndirect :: Proxy a -> Bool
-  x86ParamIsIndirect _ = False
-
-class LinuxX86_64ABIRet a where
-  x86FinishReturn :: JanusC a -> JanusCM [Param]
-  x86CallReturn :: Proxy a -> FunPtr () -> [Arg] -> IO a
-  x86RetIsIndirect :: Proxy a -> Bool
-  x86RetIsIndirect _ = False
-
-{-# INLINE withX86StorableArg #-}
-withX86StorableArg :: (Storable.Storable a) => a -> (Ptr () -> IO b) -> IO b
-withX86StorableArg v k =
-  let b = Storable.sizeOf v
-      al = max 32 (Storable.alignment v)
-   in allocaBytesAligned b al $ \p -> Storable.poke p v >> k (castPtr p)
-
-{-# INLINE withX86StorableRet #-}
-withX86StorableRet :: forall a. (Storable.Storable a) => (Ptr () -> IO ()) -> IO a
-withX86StorableRet callOut =
-  let b = Storable.sizeOf (undefined :: a)
-      al = max 32 (Storable.alignment (undefined :: a))
-   in allocaBytesAligned b al $ \pOut -> callOut (castPtr pOut) >> Storable.peek pOut
-
-instance {-# OVERLAPPABLE #-} (JanusCTyped a, FFIArg a) => LinuxX86_64ABIParam a where
-  x86EmitParam n = do
-    JCType spec dec <- getJanusCType (Proxy @a)
-    let aid = mkArgId n
-    pure (Param (Just aid) spec dec noLoc, Var aid noLoc)
-  x86WithArg a k = k (arg a)
-
-instance {-# OVERLAPPABLE #-} (JanusCTyped a, FFIRet a) => LinuxX86_64ABIRet a where
-  x86FinishReturn a = finishFunction a >> pure []
-  x86CallReturn p fp args = callFFI fp (ret p) (reverse args)
 
 emitMemcpyLoad :: forall a. (JanusCTyped a) => Int -> Exp -> JanusCM Exp
 emitMemcpyLoad bytes ptrExp = do
@@ -321,300 +123,6 @@ emitMemcpyLoad bytes ptrExp = do
       stm = BlockStm $ Exp (Just cp) noLoc
   modify $ \st -> st & ix fname .~ (fn & jcfVarCounter +~ 1 & jcfBlock %~ flip appendBlock [decl, stm])
   pure (Var vid noLoc)
-
-emitMemcpyRet :: forall a. (JanusCTyped a) => Int -> JanusC a -> JanusCM [Param]
-emitMemcpyRet bytes (JanusC mval) = do
-  addHeader "string.h"
-  RVal e <- mval
-  ty <- getJanusCType (Proxy @a)
-  v <- emitLocalVal ty e
-  let outId = Id "janus_ret_out" noLoc
-      JCType vspec vdec = voidPtrType
-      outParam = Param (Just outId) vspec vdec noLoc
-      cp = FnCall (Var (Id "memcpy" noLoc) noLoc) [Var outId noLoc, UnOp AddrOf v noLoc, signedIntConst bytes] noLoc
-  modifyFunction $ \fn -> fn & jcfBlock %~ flip appendBlock [BlockStm $ Exp (Just cp) noLoc]
-  finishFunction_
-  pure [outParam]
-
-class LinuxX86_64Param r where
-  x86param :: X86Features -> String -> Int -> JanusCM [Param] -> r -> [JCFunc]
-
-class LinuxX86_64Evaluate r where
-  x86eval :: ForeignPtr () -> (([Arg] -> IO b) -> [Arg] -> IO b) -> [Arg] -> r -> LinuxX86_64CEval r
-
-{-# NOINLINE evalPureLinuxX86_64FFI #-}
-evalPureLinuxX86_64FFI :: ForeignPtr () -> (FunPtr () -> IO a) -> a
-evalPureLinuxX86_64FFI dlFPtr k = unsafePerformIO $
-  withForeignPtr dlFPtr $ \p ->
-    k (castPtrToFunPtr p)
-
-runX86Codegen :: X86Features -> String -> JanusCM () -> [JCFunc]
-runX86Codegen fs name action =
-  let info = (mkJCFuncInfo name JC False) {_jcfiX86Features = fs}
-      initSt = Map.singleton name (defaultJCFunc name (Params [] False noLoc))
-   in Map.elems $ execState (runReaderT (getJanusCM action) info) initSt
-
-instance (LinuxX86_64ABIRet a) => LinuxX86_64Param (LinuxX86_64C a) where
-  x86param fs name _ mparams (LinuxX86_64C a) = runX86Codegen fs name $ do
-    ps <- mparams
-    extra <- x86FinishReturn a
-    modify $ \s -> s & ix name . jcfParams .~ Params (reverse ps <> extra) False noLoc
-
-instance (LinuxX86_64ABIRet a) => LinuxX86_64Evaluate (LinuxX86_64C a) where
-  x86eval dlFPtr _ args _ = evalPureLinuxX86_64FFI dlFPtr $ \fp -> x86CallReturn (Proxy @a) fp args
-
-instance (LinuxX86_64ABIRet a) => LinuxX86_64Param (LinuxX86_64CM (LinuxX86_64C a)) where
-  x86param fs name _ mparams (LinuxX86_64CM ma) = runX86Codegen fs name $ do
-    ps <- mparams
-    LinuxX86_64C a <- ma
-    extra <- x86FinishReturn a
-    modify $ \s -> s & ix name . jcfParams .~ Params (reverse ps <> extra) False noLoc
-
-instance (LinuxX86_64ABIRet a) => LinuxX86_64Evaluate (LinuxX86_64CM (LinuxX86_64C a)) where
-  x86eval dlFPtr _ args _ =
-    withForeignPtr dlFPtr $ \p -> x86CallReturn (Proxy @a) (castPtrToFunPtr p) args
-
-instance LinuxX86_64Param (LinuxX86_64CM ()) where
-  x86param fs name _ mparams (LinuxX86_64CM ma) = runX86Codegen fs name $ do
-    ps <- mparams
-    modify $ \s -> s & ix name . jcfParams .~ Params (reverse ps) False noLoc
-    ma >> finishFunction_
-
-instance LinuxX86_64Evaluate (LinuxX86_64CM ()) where
-  x86eval dlFPtr _ args _ =
-    withForeignPtr dlFPtr $ \p -> callFFI (castPtrToFunPtr p) retVoid (reverse args)
-
-instance (LinuxX86_64ABIParam a, LinuxX86_64Param r) => LinuxX86_64Param (LinuxX86_64C a -> r) where
-  x86param fs name n mparams f =
-    let stateVarId = Id ("arg_val_" <> show n) noLoc
-        mparams' = do
-          ps <- mparams
-          (p, loadExp) <- x86EmitParam @a n
-          ty <- getJanusCType (Proxy @a)
-          let JCType spec dec = ty
-              ini = Init stateVarId dec Nothing (Just (ExpInitializer loadExp noLoc)) [] noLoc
-          modifyFunction $ \fn -> fn & jcfBlock %~ flip appendBlock [BlockDecl $ InitGroup spec [] [ini] noLoc]
-          pure (p : ps)
-     in x86param fs name (n + 1) mparams' (f (LinuxX86_64C $ JanusC $ pure $ RVal $ Var stateVarId noLoc))
-
-instance (LinuxX86_64ABIParam a, LinuxX86_64Evaluate r, X86DeferCall r) => LinuxX86_64Evaluate (LinuxX86_64C a -> r) where
-  x86eval dlFPtr _ args f val =
-    let dummy = LinuxX86_64C $ JanusC $ pure $ RVal $ Var (Id "this_is_a_bug_if_you_see_this" noLoc) noLoc
-     in x86DeferArg val dlFPtr args (f dummy)
-
-class X86DeferCall r where
-  x86DeferArg :: (LinuxX86_64ABIParam a) => a -> ForeignPtr () -> [Arg] -> r -> LinuxX86_64CEval r
-
-instance (LinuxX86_64ABIRet b) => X86DeferCall (LinuxX86_64C b) where
-  x86DeferArg x dlFPtr args _ =
-    evalPureLinuxX86_64FFI dlFPtr $ \fp -> x86WithArg x $ \a -> x86CallReturn (Proxy @b) fp (a : args)
-
-instance (LinuxX86_64ABIRet b) => X86DeferCall (LinuxX86_64CM (LinuxX86_64C b)) where
-  x86DeferArg x dlFPtr args _ =
-    withForeignPtr dlFPtr $ \p -> x86WithArg x $ \a -> x86CallReturn (Proxy @b) (castPtrToFunPtr p) (a : args)
-
-instance X86DeferCall (LinuxX86_64CM ()) where
-  x86DeferArg x dlFPtr args _ =
-    withForeignPtr dlFPtr $ \p -> x86WithArg x $ \a -> callFFI (castPtrToFunPtr p) retVoid (reverse (a : args))
-
-instance (LinuxX86_64ABIParam b, X86DeferCall r, X86DeferCont r, LinuxX86_64Evaluate r) => X86DeferCall (LinuxX86_64C b -> r) where
-  x86DeferArg x dlFPtr args f y =
-    let dummy = LinuxX86_64C $ JanusC $ pure $ RVal $ Var (Id "this_is_a_bug_if_you_see_this" noLoc) noLoc
-     in x86DeferCont (\k -> x86WithArg x $ \ax -> x86WithArg y $ \ay -> k (ay : ax : args)) dlFPtr (f dummy)
-
-class X86DeferCont r where
-  x86DeferCont :: (([Arg] -> IO (LinuxX86_64BaseRet r)) -> IO (LinuxX86_64BaseRet r)) -> ForeignPtr () -> r -> LinuxX86_64CEval r
-
-type family LinuxX86_64BaseRet r
-
-type instance LinuxX86_64BaseRet (LinuxX86_64C a) = a
-type instance LinuxX86_64BaseRet (LinuxX86_64CM (LinuxX86_64C a)) = a
-type instance LinuxX86_64BaseRet (LinuxX86_64CM ()) = ()
-type instance LinuxX86_64BaseRet (LinuxX86_64C _ -> r) = LinuxX86_64BaseRet r
-
-instance (LinuxX86_64ABIRet a) => X86DeferCont (LinuxX86_64C a) where
-  x86DeferCont withArgs dlFPtr _ =
-    evalPureLinuxX86_64FFI dlFPtr $ \fp -> withArgs (x86CallReturn (Proxy @a) fp)
-
-instance (LinuxX86_64ABIRet a) => X86DeferCont (LinuxX86_64CM (LinuxX86_64C a)) where
-  x86DeferCont withArgs dlFPtr _ =
-    withForeignPtr dlFPtr $ \p -> withArgs (x86CallReturn (Proxy @a) (castPtrToFunPtr p))
-
-instance X86DeferCont (LinuxX86_64CM ()) where
-  x86DeferCont withArgs dlFPtr _ =
-    withForeignPtr dlFPtr $ \p -> withArgs (callFFI (castPtrToFunPtr p) retVoid . reverse)
-
-instance (LinuxX86_64ABIParam a, X86DeferCont r) => X86DeferCont (LinuxX86_64C a -> r) where
-  x86DeferCont withArgs dlFPtr f val =
-    let dummy = LinuxX86_64C $ JanusC $ pure $ RVal $ Var (Id "this_is_a_bug_if_you_see_this" noLoc) noLoc
-     in x86DeferCont (\k -> withArgs $ \as -> x86WithArg val $ \av -> k (av : as)) dlFPtr (f dummy)
-
-showLinuxX86_64CWith :: (LinuxX86_64Param r) => X86Features -> String -> r -> String
-showLinuxX86_64CWith fs name a =
-  let jcs = x86param fs name 0 (pure []) a
-      targetBanner = "/* janus-x86-target: " <> unwords (x86CompilerFlags fs) <> " */\n"
-      sep = "\n" <> replicate 80 '-' <> "\n"
-   in targetBanner <> foldMap ((<> sep) . renderJCFunc) jcs
-
-showLinuxX86_64C :: (LinuxX86_64Param r) => String -> r -> IO String
-showLinuxX86_64C name a = do
-  fs <- observeHostX86Features
-  pure (showLinuxX86_64CWith fs name a)
-
-printLinuxX86_64CWith :: (LinuxX86_64Param r) => X86Features -> r -> IO ()
-printLinuxX86_64CWith fs = putStrLn . showLinuxX86_64CWith fs "janus_main"
-
-printLinuxX86_64C :: (LinuxX86_64Param r) => r -> IO ()
-printLinuxX86_64C a = showLinuxX86_64C "janus_main" a >>= putStrLn
-
-resolveX86Features :: CBuildConfig -> IO X86Features
-resolveX86Features config =
-  case config ^. cBuildConfigX86Features of
-    Just fs -> pure fs
-    Nothing -> observeHostX86Features
-
-prepareLinuxX86_64CUnit ::
-  (LinuxX86_64Param r) =>
-  X86Features ->
-  String ->
-  r ->
-  IO (String, [String])
-prepareLinuxX86_64CUnit reqFeatures name a = do
-  let funcs = x86param reqFeatures name 0 (pure []) a
-      targetBanner = "/* janus-x86-target: " <> unwords (x86CompilerFlags reqFeatures) <> " */\n"
-      cSource = targetBanner <> renderJCProgram name funcs
-      needsSleef = any (Set.member "sleef.h" . _jcfHeaders) funcs
-  (sleefCFlags, _) <- if needsSleef then observeSleefFlags else pure ([], [])
-  pure (cSource, x86CompilerFlags reqFeatures <> sleefCFlags)
-
-compileLinuxX86_64CNamedWith ::
-  forall r.
-  (LinuxX86_64Param r, X86DeferCont r) =>
-  String ->
-  X86Features ->
-  CBuildConfig ->
-  r ->
-  IO (LinuxX86_64CEval r)
-compileLinuxX86_64CNamedWith name reqFeatures config a =
-  fst <$> acquireLinuxX86_64CNamedWith name reqFeatures config a
-
-compileLinuxX86_64CWith ::
-  forall r.
-  (LinuxX86_64Param r, X86DeferCont r) =>
-  X86Features ->
-  CBuildConfig ->
-  r ->
-  IO (LinuxX86_64CEval r)
-compileLinuxX86_64CWith = compileLinuxX86_64CNamedWith "janus_main"
-
-compileLinuxX86_64CNamed ::
-  (LinuxX86_64Param r, X86DeferCont r) =>
-  String ->
-  CBuildConfig ->
-  r ->
-  IO (LinuxX86_64CEval r)
-compileLinuxX86_64CNamed name config a = do
-  fs <- resolveX86Features config
-  compileLinuxX86_64CNamedWith name fs config a
-
-compileLinuxX86_64C ::
-  (LinuxX86_64Param r, X86DeferCont r) =>
-  CBuildConfig ->
-  r ->
-  IO (LinuxX86_64CEval r)
-compileLinuxX86_64C = compileLinuxX86_64CNamed "janus_main"
-
-acquireLinuxX86_64CNamedWith ::
-  forall r.
-  (LinuxX86_64Param r, X86DeferCont r) =>
-  String ->
-  X86Features ->
-  CBuildConfig ->
-  r ->
-  IO (LinuxX86_64CEval r, ForeignPtr ())
-acquireLinuxX86_64CNamedWith name reqFeatures config a = do
-  observed <- observeHostX86Features
-  ensureX86Admitted observed reqFeatures
-  let dir = config ^. cBuildConfigCacheDir
-      funcs = x86param reqFeatures name 0 (pure []) a
-      needsSleef = any (Set.member "sleef.h" . _jcfHeaders) funcs
-  (sleefCFlags, sleefLDFlags) <- if needsSleef then observeSleefFlags else pure ([], [])
-  let cflags = x86CompilerFlags reqFeatures <> sleefCFlags
-  files <- writeJanusCFiles JC dir funcs
-  dlFPtr <- acquireJanusCFunPtrWithConfig config cflags sleefLDFlags files name
-  pure (x86DeferCont ($ []) dlFPtr a, dlFPtr)
-
-acquireLinuxX86_64CWith ::
-  forall r.
-  (LinuxX86_64Param r, X86DeferCont r) =>
-  X86Features ->
-  CBuildConfig ->
-  r ->
-  IO (LinuxX86_64CEval r, ForeignPtr ())
-acquireLinuxX86_64CWith = acquireLinuxX86_64CNamedWith "janus_main"
-
-acquireLinuxX86_64CNamed ::
-  (LinuxX86_64Param r, X86DeferCont r) =>
-  String ->
-  CBuildConfig ->
-  r ->
-  IO (LinuxX86_64CEval r, ForeignPtr ())
-acquireLinuxX86_64CNamed name config a = do
-  fs <- resolveX86Features config
-  acquireLinuxX86_64CNamedWith name fs config a
-
-acquireLinuxX86_64C ::
-  (LinuxX86_64Param r, X86DeferCont r) =>
-  CBuildConfig ->
-  r ->
-  IO (LinuxX86_64CEval r, ForeignPtr ())
-acquireLinuxX86_64C = acquireLinuxX86_64CNamed "janus_main"
-
-releaseLinuxX86_64C :: (a, ForeignPtr ()) -> IO ()
-releaseLinuxX86_64C _ = pure ()
-
-withLinuxX86_64CNamedWith ::
-  (LinuxX86_64Param r, X86DeferCont r) =>
-  String ->
-  X86Features ->
-  CBuildConfig ->
-  r ->
-  (LinuxX86_64CEval r -> IO a) ->
-  IO a
-withLinuxX86_64CNamedWith name fs config a k =
-  compileLinuxX86_64CNamedWith name fs config a >>= k
-
-withLinuxX86_64CWith ::
-  (LinuxX86_64Param r, X86DeferCont r) =>
-  X86Features ->
-  CBuildConfig ->
-  r ->
-  (LinuxX86_64CEval r -> IO a) ->
-  IO a
-withLinuxX86_64CWith = withLinuxX86_64CNamedWith "janus_main"
-
-withLinuxX86_64CNamed ::
-  (LinuxX86_64Param r, X86DeferCont r) =>
-  String ->
-  CBuildConfig ->
-  r ->
-  (LinuxX86_64CEval r -> IO a) ->
-  IO a
-withLinuxX86_64CNamed name config a k = do
-  fs <- resolveX86Features config
-  withLinuxX86_64CNamedWith name fs config a k
-
-withLinuxX86_64C ::
-  (LinuxX86_64Param r, X86DeferCont r) =>
-  CBuildConfig ->
-  r ->
-  (LinuxX86_64CEval r -> IO a) ->
-  IO a
-withLinuxX86_64C = withLinuxX86_64CNamed "janus_main"
-
---------------------------------------------------------------------------------
--- ExpSIMD LinuxX86_64C: Associated Types, ABI, & Register Representation
---------------------------------------------------------------------------------
 
 instance ExpSIMD LinuxX86_64C where
   newtype SIMDVector LinuxX86_64C n a = LinuxX86_64SIMDVector {getLinuxX86_64SIMDVector :: RawSIMD n a}
@@ -635,45 +143,35 @@ instance (SIMDShape n a) => HostSIMDMask (SIMDMask LinuxX86_64C n a) n a where
   simdMaskFromBools = LinuxX86_64SIMDMask . rawMaskFromBools
   simdMaskToBools = rawMaskToBools . getLinuxX86_64SIMDMask
 
-instance (SIMDShape n a) => LinuxX86_64ABIParam (SIMDVector LinuxX86_64C n a) where
-  x86EmitParam k = do
-    let aid = mkArgId k
-        JCType vspec vdec = voidPtrType
-    loadExp <- emitMemcpyLoad @(SIMDVector LinuxX86_64C n a) (simdBytes (Proxy @n) (Proxy @a)) (Var aid noLoc)
-    pure (Param (Just aid) vspec vdec noLoc, loadExp)
-  x86WithArg v k =
-    let b = simdBytes (Proxy @n) (Proxy @a)
-     in allocaBytesAligned b (min 32 b) $ \p -> Storable.poke p v >> k (argPtr p)
-  x86ParamIsIndirect _ = True
+instance (SIMDShape n a) => JanusCABIParam LinuxX86_64 (SIMDVector LinuxX86_64C n a) where
+  jcEmitABIParam _ k =
+    emitIndirectABIParam @(SIMDVector LinuxX86_64C n a) (simdBytes (Proxy @n) (Proxy @a)) k
+  jcWithABIArg _ v k = withIndirectStorableArg v (k . argPtr)
+  jcABIParamIsIndirect _ _ = True
+  jcABIParamTHSpec _ = indirectABIParamTHSpec
 
-instance (SIMDShape n a) => LinuxX86_64ABIRet (SIMDVector LinuxX86_64C n a) where
-  x86FinishReturn = emitMemcpyRet (simdBytes (Proxy @n) (Proxy @a))
-  x86CallReturn _ fp args =
-    let b = simdBytes (Proxy @n) (Proxy @a)
-     in allocaBytesAligned b (min 32 b) $ \pOut -> do
-          callFFI fp retVoid (reverse args <> [argPtr pOut])
-          Storable.peek pOut
-  x86RetIsIndirect _ = True
+instance (SIMDShape n a) => JanusCABIRet LinuxX86_64 (SIMDVector LinuxX86_64C n a) where
+  jcFinishABIRet _ = emitIndirectABIRet (simdBytes (Proxy @n) (Proxy @a))
+  jcCallABIRet _ _ fp args =
+    withIndirectStorableRet $ \pOut ->
+      callFFI fp retVoid (reverse args <> [argPtr pOut])
+  jcABIRetIsIndirect _ _ = True
+  jcABIRetTHSpec _ = indirectABIRetTHSpec
 
-instance (SIMDShape n a) => LinuxX86_64ABIParam (SIMDMask LinuxX86_64C n a) where
-  x86EmitParam k = do
-    let aid = mkArgId k
-        JCType vspec vdec = voidPtrType
-    loadExp <- emitMemcpyLoad @(SIMDMask LinuxX86_64C n a) (simdBytes (Proxy @n) (Proxy @a)) (Var aid noLoc)
-    pure (Param (Just aid) vspec vdec noLoc, loadExp)
-  x86WithArg m k =
-    let b = simdBytes (Proxy @n) (Proxy @a)
-     in allocaBytesAligned b (min 32 b) $ \p -> Storable.poke p m >> k (argPtr p)
-  x86ParamIsIndirect _ = True
+instance (SIMDShape n a) => JanusCABIParam LinuxX86_64 (SIMDMask LinuxX86_64C n a) where
+  jcEmitABIParam _ k =
+    emitIndirectABIParam @(SIMDMask LinuxX86_64C n a) (simdBytes (Proxy @n) (Proxy @a)) k
+  jcWithABIArg _ m k = withIndirectStorableArg m (k . argPtr)
+  jcABIParamIsIndirect _ _ = True
+  jcABIParamTHSpec _ = indirectABIParamTHSpec
 
-instance (SIMDShape n a) => LinuxX86_64ABIRet (SIMDMask LinuxX86_64C n a) where
-  x86FinishReturn = emitMemcpyRet (simdBytes (Proxy @n) (Proxy @a))
-  x86CallReturn _ fp args =
-    let b = simdBytes (Proxy @n) (Proxy @a)
-     in allocaBytesAligned b (min 32 b) $ \pOut -> do
-          callFFI fp retVoid (reverse args <> [argPtr pOut])
-          Storable.peek pOut
-  x86RetIsIndirect _ = True
+instance (SIMDShape n a) => JanusCABIRet LinuxX86_64 (SIMDMask LinuxX86_64C n a) where
+  jcFinishABIRet _ = emitIndirectABIRet (simdBytes (Proxy @n) (Proxy @a))
+  jcCallABIRet _ _ fp args =
+    withIndirectStorableRet $ \pOut ->
+      callFFI fp retVoid (reverse args <> [argPtr pOut])
+  jcABIRetIsIndirect _ _ = True
+  jcABIRetTHSpec _ = indirectABIRetTHSpec
 
 namedCType :: String -> JCType
 namedCType nm = JCType (DeclSpec [] [] (Tnamed (Id nm noLoc) [] noLoc) noLoc) (DeclRoot noLoc)
@@ -926,8 +424,8 @@ liftX86Bin ::
   LinuxX86_64C (SIMDVector LinuxX86_64C n a) ->
   LinuxX86_64C (SIMDVector LinuxX86_64C n a) ->
   LinuxX86_64C (SIMDVector LinuxX86_64C n a)
-liftX86Bin f128 mf256 (LinuxX86_64C (JanusC ma)) (LinuxX86_64C (JanusC mb)) =
-  LinuxX86_64C $ JanusC $ do
+liftX86Bin f128 mf256 (JanusC ma) (JanusC mb) =
+  JanusC $ do
     ty <- getJanusCType (Proxy @(SIMDVector LinuxX86_64C n a))
     fs <- askX86Features
     RVal ea0 <- ma
@@ -963,8 +461,8 @@ liftX86Un ::
   Maybe (X86Features -> Exp -> JanusCM Exp) ->
   LinuxX86_64C (SIMDVector LinuxX86_64C n a) ->
   LinuxX86_64C (SIMDVector LinuxX86_64C n a)
-liftX86Un f128 mf256 (LinuxX86_64C (JanusC ma)) =
-  LinuxX86_64C $ JanusC $ do
+liftX86Un f128 mf256 (JanusC ma) =
+  JanusC $ do
     ty <- getJanusCType (Proxy @(SIMDVector LinuxX86_64C n a))
     fs <- askX86Features
     RVal ea0 <- ma
@@ -1169,8 +667,8 @@ instance {-# OVERLAPPING #-} (SIMDShape n a, CPUSIMDElem a, JanusLitC a) => Num 
   (*) = vmul
   negate = vneg
   abs = vabs
-  signum v = LinuxX86_64C $ JanusC $ do
-    RVal ev <- getJanusC (getLinuxX86_64C v)
+  signum v = JanusC $ do
+    RVal ev <- getJanusC v
     let tag = simdElemTag (Proxy @a)
         z = cInt 0
         one = if simdElemIsFloat (Proxy @a) then C.Const (FloatConst "1.0f" 1.0 noLoc) noLoc else cInt 1
@@ -1293,7 +791,7 @@ instance (SIMDShape n a) => Upper (LinuxX86_64C (SIMDMask LinuxX86_64C n a)) whe
 
 -- 1. ExpSIMDVec
 instance (SIMDShape n a, CPUSIMDElem a) => ExpSIMDVec LinuxX86_64C n a where
-  vzero = LinuxX86_64C $ JanusC $ do
+  vzero = JanusC $ do
     ty <- getJanusCType (Proxy @(SIMDVector LinuxX86_64C n a))
     fs <- askX86Features
     let b = simdBytes (Proxy @n) (Proxy @a)
@@ -1309,7 +807,7 @@ instance (SIMDShape n a, CPUSIMDElem a) => ExpSIMDVec LinuxX86_64C n a where
       _ -> error "vzero: invalid size"
     pure (RVal r)
 
-  vsplat (LinuxX86_64C (JanusC ms)) = LinuxX86_64C $ JanusC $ do
+  vsplat (JanusC ms) = JanusC $ do
     ty <- getJanusCType (Proxy @(SIMDVector LinuxX86_64C n a))
     fs <- askX86Features
     RVal s0 <- ms
@@ -1325,7 +823,7 @@ instance (SIMDShape n a, CPUSIMDElem a) => ExpSIMDVec LinuxX86_64C n a where
       _ -> fromXMM128 @a b (x86Set1_128 @a s)
     pure (RVal r)
 
-  viota = LinuxX86_64C $ JanusC $ do
+  viota = JanusC $ do
     addHeader "string.h"
     ty <- getJanusCType (Proxy @(SIMDVector LinuxX86_64C n a))
     let lanes = simdLanes (Proxy @n) (Proxy @a)
@@ -1339,7 +837,7 @@ instance (SIMDShape n a, CPUSIMDElem a) => ExpSIMDVec LinuxX86_64C n a where
     emitStmt $ Exp (Just $ cCall "memcpy" [UnOp AddrOf res noLoc, arrVar, signedIntConst bytes]) noLoc
     pure (RVal res)
 
-  vfromLanes es = LinuxX86_64C $ JanusC $ do
+  vfromLanes es = JanusC $ do
     addHeader "string.h"
     ty <- getJanusCType (Proxy @(SIMDVector LinuxX86_64C n a))
     let lanes = simdLanes (Proxy @n) (Proxy @a)
@@ -1348,14 +846,14 @@ instance (SIMDShape n a, CPUSIMDElem a) => ExpSIMDVec LinuxX86_64C n a where
         arrDec = Array [] (ArraySize False (signedIntConst lanes) noLoc) (DeclRoot noLoc) noLoc
     when (length es /= lanes) $ error "vfromLanes: lane count mismatch"
     arrVar <- emitUninitLocal (JCType espec arrDec)
-    forM_ (zip [0 :: Int ..] es) $ \(i, LinuxX86_64C (JanusC me)) -> do
+    forM_ (zip [0 :: Int ..] es) $ \(i, JanusC me) -> do
       RVal ev <- me
       emitStmt $ Exp (Just $ Assign (Index arrVar (signedIntConst i) noLoc) JustAssign ev noLoc) noLoc
     res <- emitUninitLocal ty
     emitStmt $ Exp (Just $ cCall "memcpy" [UnOp AddrOf res noLoc, arrVar, signedIntConst bytes]) noLoc
     pure (RVal res)
 
-  vextractLane p (LinuxX86_64C (JanusC mv)) = LinuxX86_64C $ JanusC $ do
+  vextractLane p (JanusC mv) = JanusC $ do
     addHeader "string.h"
     vty <- getJanusCType (Proxy @(SIMDVector LinuxX86_64C n a))
     RVal ev0 <- mv
@@ -1368,7 +866,7 @@ instance (SIMDShape n a, CPUSIMDElem a) => ExpSIMDVec LinuxX86_64C n a where
     emitStmt $ Exp (Just $ cCall "memcpy" [UnOp AddrOf out noLoc, srcPtr, signedIntConst sz]) noLoc
     pure (RVal out)
 
-  vinsertLane p (LinuxX86_64C (JanusC mx)) (LinuxX86_64C (JanusC mv)) = LinuxX86_64C $ JanusC $ do
+  vinsertLane p (JanusC mx) (JanusC mv) = JanusC $ do
     addHeader "string.h"
     vty <- getJanusCType (Proxy @(SIMDVector LinuxX86_64C n a))
     RVal ex <- mx
@@ -1391,8 +889,8 @@ maskBinX86 ::
   LinuxX86_64C (SIMDMask LinuxX86_64C n a) ->
   LinuxX86_64C (SIMDMask LinuxX86_64C n a) ->
   LinuxX86_64C (SIMDMask LinuxX86_64C n a)
-maskBinX86 op128i op256 (LinuxX86_64C (JanusC ma)) (LinuxX86_64C (JanusC mb)) =
-  LinuxX86_64C $ JanusC $ do
+maskBinX86 op128i op256 (JanusC ma) (JanusC mb) =
+  JanusC $ do
     ty <- getJanusCType (Proxy @(SIMDMask LinuxX86_64C n a))
     fs <- askX86Features
     RVal ea0 <- ma
@@ -1415,7 +913,7 @@ maskBinX86 op128i op256 (LinuxX86_64C (JanusC ma)) (LinuxX86_64C (JanusC mb)) =
     pure (RVal r)
 
 instance (SIMDShape n a) => ExpSIMDMask LinuxX86_64C n a where
-  mfalse = LinuxX86_64C $ JanusC $ do
+  mfalse = JanusC $ do
     ty <- getJanusCType (Proxy @(SIMDMask LinuxX86_64C n a))
     fs <- askX86Features
     let b = simdBytes (Proxy @n) (Proxy @a)
@@ -1431,7 +929,7 @@ instance (SIMDShape n a) => ExpSIMDMask LinuxX86_64C n a where
       _ -> error "mfalse: invalid size"
     pure (RVal r)
 
-  mtrue = LinuxX86_64C $ JanusC $ do
+  mtrue = JanusC $ do
     ty <- getJanusCType (Proxy @(SIMDMask LinuxX86_64C n a))
     fs <- askX86Features
     let b = simdBytes (Proxy @n) (Proxy @a)
@@ -1456,8 +954,8 @@ instance (SIMDShape n a) => ExpSIMDMask LinuxX86_64C n a where
   mandnot = maskBinX86 (\x y -> cCall "_mm_andnot_si128" [x, y]) (\p x y -> case simdElemTag p of JanusElemFloat -> cCall "_mm256_andnot_ps" [x, y]; JanusElemDouble -> cCall "_mm256_andnot_pd" [x, y]; _ -> cCall "_mm256_andnot_si256" [x, y])
   mnot m = mxor m mtrue
 
-  vselect (LinuxX86_64C (JanusC mm)) (LinuxX86_64C (JanusC mt)) (LinuxX86_64C (JanusC mf)) =
-    LinuxX86_64C $ JanusC $ do
+  vselect (JanusC mm) (JanusC mt) (JanusC mf) =
+    JanusC $ do
       ty <- getJanusCType (Proxy @(SIMDVector LinuxX86_64C n a))
       mty <- getJanusCType (Proxy @(SIMDMask LinuxX86_64C n a))
       fs <- askX86Features
@@ -1500,7 +998,7 @@ instance (SIMDShape n a) => ExpSIMDMask LinuxX86_64C n a where
           fromXMM128 @a b (sel128 xm xt xf)
       pure (RVal r)
 
-  mmovemask (LinuxX86_64C (JanusC mm)) = LinuxX86_64C $ JanusC $ do
+  mmovemask (JanusC mm) = JanusC $ do
     mty <- getJanusCType (Proxy @(SIMDMask LinuxX86_64C n a))
     fs <- askX86Features
     RVal em0 <- mm
@@ -1537,9 +1035,9 @@ instance (SIMDShape n a) => ExpSIMDMask LinuxX86_64C n a where
           emitStmt $ Exp (Just $ Assign acc OrAssign bitVal noLoc) noLoc
         pure (RVal acc)
 
-  mpopcount m = LinuxX86_64C $ JanusC $ do
+  mpopcount m = JanusC $ do
     fs <- askX86Features
-    RVal bits <- getJanusC (getLinuxX86_64C (mmovemask m))
+    RVal bits <- getJanusC (mmovemask m)
     bvar <- emitLocalVal (namedCType "uint32_t") bits
     let e =
           if hasX86Feature fs X86_POPCNT
@@ -1547,8 +1045,8 @@ instance (SIMDShape n a) => ExpSIMDMask LinuxX86_64C n a where
             else cCast "int32_t" (cCall "__builtin_popcount" [bvar])
     pure (RVal e)
 
-  mfirstTrue m = LinuxX86_64C $ JanusC $ do
-    RVal bits <- getJanusC (getLinuxX86_64C (mmovemask m))
+  mfirstTrue m = JanusC $ do
+    RVal bits <- getJanusC (mmovemask m)
     bvar <- emitLocalVal (namedCType "uint32_t") bits
     let e =
           Cond
@@ -1692,12 +1190,12 @@ x86Cmp256 cop _ a b = case simdElemTag (Proxy @a) of
       _ -> notI (gtSigned ax bx)
 
 instance (SIMDShape n a) => ExpSIMDCmp LinuxX86_64C n a where
-  veq a b = coerce (liftX86Bin @n @a (x86Cmp128 @a Eq) (Just (x86Cmp256 @a Eq)) a b)
-  vne a b = coerce (liftX86Bin @n @a (x86Cmp128 @a Ne) (Just (x86Cmp256 @a Ne)) a b)
-  vlt a b = coerce (liftX86Bin @n @a (x86Cmp128 @a Lt) (Just (x86Cmp256 @a Lt)) a b)
-  vle a b = coerce (liftX86Bin @n @a (x86Cmp128 @a Le) (Just (x86Cmp256 @a Le)) a b)
-  vgt a b = coerce (liftX86Bin @n @a (x86Cmp128 @a Gt) (Just (x86Cmp256 @a Gt)) a b)
-  vge a b = coerce (liftX86Bin @n @a (x86Cmp128 @a Ge) (Just (x86Cmp256 @a Ge)) a b)
+  veq a b = janusCReallyUnsafeCast (liftX86Bin @n @a (x86Cmp128 @a Eq) (Just (x86Cmp256 @a Eq)) a b)
+  vne a b = janusCReallyUnsafeCast (liftX86Bin @n @a (x86Cmp128 @a Ne) (Just (x86Cmp256 @a Ne)) a b)
+  vlt a b = janusCReallyUnsafeCast (liftX86Bin @n @a (x86Cmp128 @a Lt) (Just (x86Cmp256 @a Lt)) a b)
+  vle a b = janusCReallyUnsafeCast (liftX86Bin @n @a (x86Cmp128 @a Le) (Just (x86Cmp256 @a Le)) a b)
+  vgt a b = janusCReallyUnsafeCast (liftX86Bin @n @a (x86Cmp128 @a Gt) (Just (x86Cmp256 @a Gt)) a b)
+  vge a b = janusCReallyUnsafeCast (liftX86Bin @n @a (x86Cmp128 @a Ge) (Just (x86Cmp256 @a Ge)) a b)
 
 -- 4. ExpSIMDArith
 instance (SIMDShape n a, CPUSIMDElem a) => ExpSIMDArith LinuxX86_64C n a where
@@ -1826,14 +1324,14 @@ instance (SIMDShape n a, CPUSIMDElem a) => ExpSIMDSat LinuxX86_64C n a where
          in liftX86Bin @n @a adds128 (Just adds256) a b
     | not (simdElemSigned (Proxy @a)) =
         -- Unsigned saturating add: sum = x + y; sum < x ? ~0 : sum
-        LinuxX86_64C $ JanusC $ do
-          RVal ea <- getJanusC (getLinuxX86_64C a)
-          RVal eb <- getJanusC (getLinuxX86_64C b)
+        JanusC $ do
+          RVal ea <- getJanusC a
+          RVal eb <- getJanusC b
           RVal <$> emitLaneLoopBin @n @a (\x y -> Cond (BinOp Lt (BinOp Add x y noLoc) x noLoc) (UnOp Not (cInt 0) noLoc) (BinOp Add x y noLoc) noLoc) ea eb
     | otherwise =
-        LinuxX86_64C $ JanusC $ do
-          RVal ea <- getJanusC (getLinuxX86_64C a)
-          RVal eb <- getJanusC (getLinuxX86_64C b)
+        JanusC $ do
+          RVal ea <- getJanusC a
+          RVal eb <- getJanusC b
           let bits = simdElemBytes (Proxy @a) * 8
               mx = if bits == 64 then cVar "INT64_MAX" else signedIntConst ((1 `shiftL` (bits - 1)) - 1 :: Int64)
               mn = if bits == 64 then cVar "INT64_MIN" else signedIntConst (-(1 `shiftL` (bits - 1)) :: Int64)
@@ -1858,9 +1356,9 @@ instance (SIMDShape n a, CPUSIMDElem a) => ExpSIMDSat LinuxX86_64C n a where
          in liftX86Bin @n @a subs128 (Just subs256) a b
     | not (simdElemSigned (Proxy @a)) = vsub (vmax a b) b
     | otherwise =
-        LinuxX86_64C $ JanusC $ do
-          RVal ea <- getJanusC (getLinuxX86_64C a)
-          RVal eb <- getJanusC (getLinuxX86_64C b)
+        JanusC $ do
+          RVal ea <- getJanusC a
+          RVal eb <- getJanusC b
           let bits = simdElemBytes (Proxy @a) * 8
               mx = if bits == 64 then cVar "INT64_MAX" else signedIntConst ((1 `shiftL` (bits - 1)) - 1 :: Int64)
               mn = if bits == 64 then cVar "INT64_MIN" else signedIntConst (-(1 `shiftL` (bits - 1)) :: Int64)
@@ -1871,8 +1369,8 @@ instance (SIMDShape n a, CPUSIMDElem a) => ExpSIMDSat LinuxX86_64C n a where
 
   vabss v
     | not (simdElemSigned (Proxy @a)) || simdElemIsFloat (Proxy @a) = vabs v
-    | otherwise = LinuxX86_64C $ JanusC $ do
-        RVal ev <- getJanusC (getLinuxX86_64C v)
+    | otherwise = JanusC $ do
+        RVal ev <- getJanusC v
         let bits = simdElemBytes (Proxy @a) * 8
             sminE = if bits == 64 then cVar "INT64_MIN" else cCast (simdElemCTypeName (Proxy @a)) (signedIntConst (-(1 `shiftL` (bits - 1)) :: Int64))
             smaxE = if bits == 64 then cVar "INT64_MAX" else cCast (simdElemCTypeName (Proxy @a)) (signedIntConst (((1 `shiftL` (bits - 1)) - 1) :: Int64))
@@ -1915,9 +1413,9 @@ instance (SIMDShape n a, CPUSIMDElem a) => ExpSIMDSat LinuxX86_64C n a where
               pure $ cCall "_mm256_xor_si256" [cCall "_mm256_avg_epu16" [cCall "_mm256_xor_si256" [x, bs], cCall "_mm256_xor_si256" [y, bs]], bs]
          in liftX86Bin @n @a avgI16_128 (Just avgI16_256) a b
     | otherwise =
-        LinuxX86_64C $ JanusC $ do
-          RVal ea <- getJanusC (getLinuxX86_64C a)
-          RVal eb <- getJanusC (getLinuxX86_64C b)
+        JanusC $ do
+          RVal ea <- getJanusC a
+          RVal eb <- getJanusC b
           let wideTy = if simdElemSigned (Proxy @a) then "__int128" else "unsigned __int128"
               body x y = cCast (simdElemCTypeName (Proxy @a)) (BinOp Rsh (BinOp Add (BinOp Add (cCast wideTy x) (cCast wideTy y) noLoc) (cInt 1) noLoc) (cInt 1) noLoc)
           RVal <$> emitLaneLoopBin @n @a body ea eb
@@ -1939,8 +1437,8 @@ x86FmaOp ::
   LinuxX86_64C (SIMDVector LinuxX86_64C n a) ->
   LinuxX86_64C (SIMDVector LinuxX86_64C n a) ->
   LinuxX86_64C (SIMDVector LinuxX86_64C n a)
-x86FmaOp fn128 fn256 scalarFallback (LinuxX86_64C (JanusC ma)) (LinuxX86_64C (JanusC mb)) (LinuxX86_64C (JanusC mc)) =
-  LinuxX86_64C $ JanusC $ do
+x86FmaOp fn128 fn256 scalarFallback (JanusC ma) (JanusC mb) (JanusC mc) =
+  JanusC $ do
     addHeader "math.h"
     ty <- getJanusCType (Proxy @(SIMDVector LinuxX86_64C n a))
     fs <- askX86Features
@@ -2038,60 +1536,56 @@ instance (SIMDShape n a, CPUSIMDElem a, Floating a, FMA a) => ExpSIMDFloat Linux
      in x86FmaOp @n @a (if isF32 then "_mm_fnmsub_ps" else "_mm_fnmsub_pd") (if isF32 then "_mm256_fnmsub_ps" else "_mm256_fnmsub_pd") (\x y z -> cCall cFma [UnOp Negate x noLoc, y, UnOp Negate z noLoc])
 
   vmulAdd a b c =
-    LinuxX86_64C $ JanusC $ do
+    JanusC $ do
       fs <- askX86Features
-      getJanusC $ getLinuxX86_64C $ if hasX86Feature fs X86_FMA then vfma a b c else vadd (vmul a b) c
+      getJanusC $ if hasX86Feature fs X86_FMA then vfma a b c else vadd (vmul a b) c
 
-  vfloor (LinuxX86_64C (JanusC mv)) = LinuxX86_64C $ JanusC $ do
+  vfloor (JanusC mv) = JanusC $ do
     fs <- askX86Features
     let isF32 = simdElemTag (Proxy @a) == JanusElemFloat
     if hasX86Feature fs X86_SSE4_1
       then
         getJanusC $
-          getLinuxX86_64C $
             liftX86Un @n @a
               (\_ x -> pure $ cCall (if isF32 then "_mm_floor_ps" else "_mm_floor_pd") [x])
               (Just (\_ x -> pure $ cCall (if isF32 then "_mm256_floor_ps" else "_mm256_floor_pd") [x]))
-              (LinuxX86_64C (JanusC mv))
+              (JanusC mv)
       else mv >>= \(RVal e) -> RVal <$> emitLaneLoopUn @n @a (\x -> cCall (if isF32 then "floorf" else "floor") [x]) e
 
-  vceil (LinuxX86_64C (JanusC mv)) = LinuxX86_64C $ JanusC $ do
+  vceil (JanusC mv) = JanusC $ do
     fs <- askX86Features
     let isF32 = simdElemTag (Proxy @a) == JanusElemFloat
     if hasX86Feature fs X86_SSE4_1
       then
         getJanusC $
-          getLinuxX86_64C $
             liftX86Un @n @a
               (\_ x -> pure $ cCall (if isF32 then "_mm_ceil_ps" else "_mm_ceil_pd") [x])
               (Just (\_ x -> pure $ cCall (if isF32 then "_mm256_ceil_ps" else "_mm256_ceil_pd") [x]))
-              (LinuxX86_64C (JanusC mv))
+              (JanusC mv)
       else mv >>= \(RVal e) -> RVal <$> emitLaneLoopUn @n @a (\x -> cCall (if isF32 then "ceilf" else "ceil") [x]) e
 
-  vtrunc (LinuxX86_64C (JanusC mv)) = LinuxX86_64C $ JanusC $ do
+  vtrunc (JanusC mv) = JanusC $ do
     fs <- askX86Features
     let isF32 = simdElemTag (Proxy @a) == JanusElemFloat
     if hasX86Feature fs X86_SSE4_1
       then
         getJanusC $
-          getLinuxX86_64C $
             liftX86Un @n @a
               (\_ x -> pure $ cCall (if isF32 then "_mm_round_ps" else "_mm_round_pd") [x, cInt 11])
               (Just (\_ x -> pure $ cCall (if isF32 then "_mm256_round_ps" else "_mm256_round_pd") [x, cInt 11]))
-              (LinuxX86_64C (JanusC mv))
+              (JanusC mv)
       else mv >>= \(RVal e) -> RVal <$> emitLaneLoopUn @n @a (\x -> cCall (if isF32 then "truncf" else "trunc") [x]) e
 
-  vroundNearest (LinuxX86_64C (JanusC mv)) = LinuxX86_64C $ JanusC $ do
+  vroundNearest (JanusC mv) = JanusC $ do
     fs <- askX86Features
     let isF32 = simdElemTag (Proxy @a) == JanusElemFloat
     if hasX86Feature fs X86_SSE4_1
       then
         getJanusC $
-          getLinuxX86_64C $
             liftX86Un @n @a
               (\_ x -> pure $ cCall (if isF32 then "_mm_round_ps" else "_mm_round_pd") [x, cInt 8])
               (Just (\_ x -> pure $ cCall (if isF32 then "_mm256_round_ps" else "_mm256_round_pd") [x, cInt 8]))
-              (LinuxX86_64C (JanusC mv))
+              (JanusC mv)
       else mv >>= \(RVal e) -> RVal <$> emitLaneLoopUn @n @a (\x -> cCall (if isF32 then "nearbyintf" else "nearbyint") [x]) e
 
 -- 7. ExpSIMDBits
@@ -2131,7 +1625,7 @@ instance (SIMDShape n a, CPUSIMDElem a) => ExpSIMDBits LinuxX86_64C n a where
           _ -> cCall "_mm256_xor_si256" [x, cCall "_mm256_set1_epi32" [signedIntConst (-1 :: Int32)]]
      in liftX86Un @n @a ones128 (Just ones256) v
 
-  vshl (LinuxX86_64C (JanusC mv)) (LinuxX86_64C (JanusC mc)) = LinuxX86_64C $ JanusC $ do
+  vshl (JanusC mv) (JanusC mc) = JanusC $ do
     RVal ev <- mv
     RVal ec0 <- mc
     c <- emitLocalVal (namedCType "uint32_t") (cCast "uint32_t" ec0)
@@ -2161,7 +1655,7 @@ instance (SIMDShape n a, CPUSIMDElem a) => ExpSIMDBits LinuxX86_64C n a where
         pure (RVal resVar)
       else RVal <$> emitLaneLoopUn @n @a body ev
 
-  vshr (LinuxX86_64C (JanusC mv)) (LinuxX86_64C (JanusC mc)) = LinuxX86_64C $ JanusC $ do
+  vshr (JanusC mv) (JanusC mc) = JanusC $ do
     RVal ev <- mv
     RVal ec0 <- mc
     c <- emitLocalVal (namedCType "uint32_t") (cCast "uint32_t" ec0)
@@ -2200,17 +1694,17 @@ instance (SIMDShape n a, CPUSIMDElem a) => ExpSIMDBits LinuxX86_64C n a where
   vshlImm p v = vshl v (fromIntegral (natVal p))
   vshrImm p v = vshr v (fromIntegral (natVal p))
 
-  vshlVar a b = LinuxX86_64C $ JanusC $ do
+  vshlVar a b = JanusC $ do
     fs <- askX86Features
     let tag = simdElemTag (Proxy @a)
     if hasX86Feature fs X86_AVX2 && tag `elem` [JanusElemInt32, JanusElemWord32, JanusElemInt64, JanusElemWord64]
       then do
         let sll128 = if tag `elem` [JanusElemInt32, JanusElemWord32] then "_mm_sllv_epi32" else "_mm_sllv_epi64"
             sll256 = if tag `elem` [JanusElemInt32, JanusElemWord32] then "_mm256_sllv_epi32" else "_mm256_sllv_epi64"
-        getJanusC $ getLinuxX86_64C $ liftX86Bin @n @a (\_ x y -> pure $ cCall sll128 [x, y]) (Just (\_ x y -> pure $ cCall sll256 [x, y])) a b
+        getJanusC $ liftX86Bin @n @a (\_ x y -> pure $ cCall sll128 [x, y]) (Just (\_ x y -> pure $ cCall sll256 [x, y])) a b
       else do
-        RVal ea <- getJanusC (getLinuxX86_64C a)
-        RVal eb <- getJanusC (getLinuxX86_64C b)
+        RVal ea <- getJanusC a
+        RVal eb <- getJanusC b
         let bits = simdElemBytes (Proxy @a) * 8
             uTy = "uint" <> show bits <> "_t"
             body x y =
@@ -2219,7 +1713,7 @@ instance (SIMDShape n a, CPUSIMDElem a) => ExpSIMDBits LinuxX86_64C n a where
                     Cond (BinOp Ge uc (unsignedIntConst bits) noLoc) (unsignedIntConst (0 :: Word64)) (BinOp Lsh (cCast uTy x) uc noLoc) noLoc
         RVal <$> emitLaneLoopBin @n @a body ea eb
 
-  vshrVar a b = LinuxX86_64C $ JanusC $ do
+  vshrVar a b = JanusC $ do
     fs <- askX86Features
     let tag = simdElemTag (Proxy @a)
     if hasX86Feature fs X86_AVX2 && tag `elem` [JanusElemInt32, JanusElemWord32, JanusElemWord64]
@@ -2232,10 +1726,10 @@ instance (SIMDShape n a, CPUSIMDElem a) => ExpSIMDBits LinuxX86_64C n a where
               JanusElemInt32 -> "_mm256_srav_epi32"
               JanusElemWord32 -> "_mm256_srlv_epi32"
               _ -> "_mm256_srlv_epi64"
-        getJanusC $ getLinuxX86_64C $ liftX86Bin @n @a (\_ x y -> pure $ cCall srl128 [x, y]) (Just (\_ x y -> pure $ cCall srl256 [x, y])) a b
+        getJanusC $ liftX86Bin @n @a (\_ x y -> pure $ cCall srl128 [x, y]) (Just (\_ x y -> pure $ cCall srl256 [x, y])) a b
       else do
-        RVal ea <- getJanusC (getLinuxX86_64C a)
-        RVal eb <- getJanusC (getLinuxX86_64C b)
+        RVal ea <- getJanusC a
+        RVal eb <- getJanusC b
         let bits = simdElemBytes (Proxy @a) * 8
             uTy = "uint" <> show bits <> "_t"
             sTy = "int" <> show bits <> "_t"
@@ -2250,7 +1744,7 @@ instance (SIMDShape n a, CPUSIMDElem a) => ExpSIMDBits LinuxX86_64C n a where
                    in cCast (simdElemCTypeName (Proxy @a)) $ Cond (BinOp Ge uc (unsignedIntConst bits) noLoc) (unsignedIntConst (0 :: Word64)) (BinOp Rsh (cCast uTy x) uc noLoc) noLoc
         RVal <$> emitLaneLoopBin @n @a body ea eb
 
-  vpopcnt v = LinuxX86_64C $ JanusC $ do
+  vpopcnt v = JanusC $ do
     fs <- askX86Features
     let tag = simdElemTag (Proxy @a)
     if hasX86Feature fs X86_SSSE3 && tag `elem` [JanusElemInt8, JanusElemWord8]
@@ -2267,9 +1761,9 @@ instance (SIMDShape n a, CPUSIMDElem a) => ExpSIMDBits LinuxX86_64C n a where
               let lo = cCall "_mm256_shuffle_epi8" [lut, cCall "_mm256_and_si256" [x, msk]]
                   hi = cCall "_mm256_shuffle_epi8" [lut, cCall "_mm256_and_si256" [cCall "_mm256_srli_epi16" [x, cInt 4], msk]]
               pure $ cCall "_mm256_add_epi8" [lo, hi]
-        getJanusC $ getLinuxX86_64C $ liftX86Un @n @a pop8_128 (Just pop8_256) v
+        getJanusC $ liftX86Un @n @a pop8_128 (Just pop8_256) v
       else do
-        RVal ev <- getJanusC (getLinuxX86_64C v)
+        RVal ev <- getJanusC v
         let bits = simdElemBytes (Proxy @a) * 8
             uTy = "uint" <> show bits <> "_t"
             body x = cCast (simdElemCTypeName (Proxy @a)) (cCall "__builtin_popcountll" [cCast "uint64_t" (cCast uTy x)])
@@ -2277,7 +1771,7 @@ instance (SIMDShape n a, CPUSIMDElem a) => ExpSIMDBits LinuxX86_64C n a where
 
 -- 8. ExpSIMDShuffle & ExpSIMDSplit
 instance (SIMDShape n a, CPUSIMDElem a) => ExpSIMDShuffle LinuxX86_64C n a where
-  vshuffleLanes idxs (LinuxX86_64C (JanusC mv)) = LinuxX86_64C $ JanusC $ do
+  vshuffleLanes idxs (JanusC mv) = JanusC $ do
     addHeader "string.h"
     ty <- getJanusCType (Proxy @(SIMDVector LinuxX86_64C n a))
     RVal ev0 <- mv
@@ -2298,7 +1792,7 @@ instance (SIMDShape n a, CPUSIMDElem a) => ExpSIMDShuffle LinuxX86_64C n a where
     emitStmt $ Exp (Just $ cCall "memcpy" [UnOp AddrOf res noLoc, dstArr, signedIntConst bytes]) noLoc
     pure (RVal res)
 
-  vpermuteVar (LinuxX86_64C (JanusC mv)) (LinuxX86_64C (JanusC midx)) = LinuxX86_64C $ JanusC $ do
+  vpermuteVar (JanusC mv) (JanusC midx) = JanusC $ do
     addHeader "string.h"
     fs <- askX86Features
     ty <- getJanusCType (Proxy @(SIMDVector LinuxX86_64C n a))
@@ -2339,7 +1833,7 @@ instance (SIMDShape n a, CPUSIMDElem a) => ExpSIMDShuffle LinuxX86_64C n a where
     LinuxX86_64C (SIMDVector LinuxX86_64C n a) ->
     LinuxX86_64C (SIMDVector LinuxX86_64C b Word8) ->
     LinuxX86_64C (SIMDVector LinuxX86_64C n a)
-  vshuffleBytes (LinuxX86_64C (JanusC mv)) (LinuxX86_64C (JanusC mc)) = LinuxX86_64C $ JanusC $ do
+  vshuffleBytes (JanusC mv) (JanusC mc) = JanusC $ do
     addHeader "string.h"
     fs <- askX86Features
     ty <- getJanusCType (Proxy @(SIMDVector LinuxX86_64C n a))
@@ -2368,7 +1862,7 @@ instance (SIMDShape n a, CPUSIMDElem a) => ExpSIMDShuffle LinuxX86_64C n a where
         emitStmt $ Exp (Just $ cCall "memcpy" [UnOp AddrOf res noLoc, db, signedIntConst bytes]) noLoc
         pure (RVal res)
 
-  vzipLo (LinuxX86_64C (JanusC ma)) (LinuxX86_64C (JanusC mb)) = LinuxX86_64C $ JanusC $ do
+  vzipLo (JanusC ma) (JanusC mb) = JanusC $ do
     ty <- getJanusCType (Proxy @(SIMDVector LinuxX86_64C n a))
     RVal ea0 <- ma
     RVal eb0 <- mb
@@ -2406,7 +1900,7 @@ instance (SIMDShape n a, CPUSIMDElem a) => ExpSIMDShuffle LinuxX86_64C n a where
         emitStmt $ Exp (Just $ cCall "memcpy" [UnOp AddrOf res noLoc, ar, signedIntConst bytes]) noLoc
         pure (RVal res)
 
-  vzipHi (LinuxX86_64C (JanusC ma)) (LinuxX86_64C (JanusC mb)) = LinuxX86_64C $ JanusC $ do
+  vzipHi (JanusC ma) (JanusC mb) = JanusC $ do
     ty <- getJanusCType (Proxy @(SIMDVector LinuxX86_64C n a))
     RVal ea0 <- ma
     RVal eb0 <- mb
@@ -2445,9 +1939,9 @@ instance (SIMDShape n a, CPUSIMDElem a) => ExpSIMDShuffle LinuxX86_64C n a where
         pure (RVal res)
 
 instance (SIMDHalfPair n2 n a) => ExpSIMDSplit LinuxX86_64C n2 n a where
-  vsplit (LinuxX86_64C (JanusC mv)) =
+  vsplit (JanusC mv) =
     let halfB = simdBytes (Proxy @n) (Proxy @a)
-        extractPart offset = LinuxX86_64C $ JanusC $ do
+        extractPart offset = JanusC $ do
           addHeader "string.h"
           ty2 <- getJanusCType (Proxy @(SIMDVector LinuxX86_64C n2 a))
           ty1 <- getJanusCType (Proxy @(SIMDVector LinuxX86_64C n a))
@@ -2459,7 +1953,7 @@ instance (SIMDHalfPair n2 n a) => ExpSIMDSplit LinuxX86_64C n2 n a where
           pure (RVal out)
      in (extractPart 0, extractPart halfB)
 
-  vconcat (LinuxX86_64C (JanusC mlo)) (LinuxX86_64C (JanusC mhi)) = LinuxX86_64C $ JanusC $ do
+  vconcat (JanusC mlo) (JanusC mhi) = JanusC $ do
     addHeader "string.h"
     ty1 <- getJanusCType (Proxy @(SIMDVector LinuxX86_64C n a))
     ty2 <- getJanusCType (Proxy @(SIMDVector LinuxX86_64C n2 a))
@@ -2481,7 +1975,7 @@ emitX86Reduce ::
   (Exp -> Exp -> Exp) ->
   LinuxX86_64C (SIMDVector LinuxX86_64C n a) ->
   LinuxX86_64C a
-emitX86Reduce combine (LinuxX86_64C (JanusC mv)) = LinuxX86_64C $ JanusC $ do
+emitX86Reduce combine (JanusC mv) = JanusC $ do
   addHeader "string.h"
   ty <- getJanusCType (Proxy @(SIMDVector LinuxX86_64C n a))
   RVal ev0 <- mv
@@ -2508,10 +2002,10 @@ instance (SIMDShape n a, CPUSIMDElem a, JanusCTyped a) => ExpSIMDReduce LinuxX86
      in emitX86Reduce comb
   vreduceMin = emitX86Reduce (\x y -> Cond (BinOp Lt x y noLoc) x y noLoc)
   vreduceMax = emitX86Reduce (\x y -> Cond (BinOp Gt x y noLoc) x y noLoc)
-  vreduceAnd v = LinuxX86_64C $ JanusC $ do
+  vreduceAnd v = JanusC $ do
     addHeader "string.h"
     ty <- getJanusCType (Proxy @(SIMDVector LinuxX86_64C n a))
-    RVal ev0 <- getJanusC (getLinuxX86_64C v)
+    RVal ev0 <- getJanusC v
     ev <- emitLocalVal ty ev0
     let lanes = simdLanes (Proxy @n) (Proxy @a)
         sz = simdElemBytes (Proxy @a)
@@ -2525,10 +2019,10 @@ instance (SIMDShape n a, CPUSIMDElem a, JanusCTyped a) => ExpSIMDReduce LinuxX86
     out <- emitUninitLocal (namedCType (simdElemCTypeName (Proxy @a)))
     emitStmt $ Exp (Just $ cCall "memcpy" [UnOp AddrOf out noLoc, UnOp AddrOf acc noLoc, signedIntConst sz]) noLoc
     pure (RVal out)
-  vreduceOr v = LinuxX86_64C $ JanusC $ do
+  vreduceOr v = JanusC $ do
     addHeader "string.h"
     ty <- getJanusCType (Proxy @(SIMDVector LinuxX86_64C n a))
-    RVal ev0 <- getJanusC (getLinuxX86_64C v)
+    RVal ev0 <- getJanusC v
     ev <- emitLocalVal ty ev0
     let lanes = simdLanes (Proxy @n) (Proxy @a)
         sz = simdElemBytes (Proxy @a)
@@ -2542,10 +2036,10 @@ instance (SIMDShape n a, CPUSIMDElem a, JanusCTyped a) => ExpSIMDReduce LinuxX86
     out <- emitUninitLocal (namedCType (simdElemCTypeName (Proxy @a)))
     emitStmt $ Exp (Just $ cCall "memcpy" [UnOp AddrOf out noLoc, UnOp AddrOf acc noLoc, signedIntConst sz]) noLoc
     pure (RVal out)
-  vreduceXor v = LinuxX86_64C $ JanusC $ do
+  vreduceXor v = JanusC $ do
     addHeader "string.h"
     ty <- getJanusCType (Proxy @(SIMDVector LinuxX86_64C n a))
-    RVal ev0 <- getJanusC (getLinuxX86_64C v)
+    RVal ev0 <- getJanusC v
     ev <- emitLocalVal ty ev0
     let lanes = simdLanes (Proxy @n) (Proxy @a)
         sz = simdElemBytes (Proxy @a)
@@ -2582,15 +2076,15 @@ emitX86Dp4aUWord ea eb eacc = do
   emitLocalVal (namedCType "uint32_t") sum4
 
 instance ExpSIMDDot LinuxX86_64C where
-  vdp4aS (LinuxX86_64C (JanusC ma)) (LinuxX86_64C (JanusC mb)) (LinuxX86_64C (JanusC mc)) =
-    LinuxX86_64C $ JanusC $ do
+  vdp4aS (JanusC ma) (JanusC mb) (JanusC mc) =
+    JanusC $ do
       RVal a <- ma
       RVal b <- mb
       RVal c <- mc
       RVal <$> emitX86Dp4aSWord a b c
 
-  vdp4aU (LinuxX86_64C (JanusC ma)) (LinuxX86_64C (JanusC mb)) (LinuxX86_64C (JanusC mc)) =
-    LinuxX86_64C $ JanusC $ do
+  vdp4aU (JanusC ma) (JanusC mb) (JanusC mc) =
+    JanusC $ do
       RVal a <- ma
       RVal b <- mb
       RVal c <- mc
@@ -2603,8 +2097,8 @@ instance ExpSIMDDot LinuxX86_64C where
     LinuxX86_64C (SIMDVector LinuxX86_64C m Int8) ->
     LinuxX86_64C (SIMDVector LinuxX86_64C k Int32) ->
     LinuxX86_64C (SIMDVector LinuxX86_64C k Int32)
-  vdp4aVecS (LinuxX86_64C (JanusC ma)) (LinuxX86_64C (JanusC mb)) (LinuxX86_64C (JanusC mc)) =
-    LinuxX86_64C $ JanusC $ do
+  vdp4aVecS (JanusC ma) (JanusC mb) (JanusC mc) =
+    JanusC $ do
       addHeader "string.h"
       tyA <- getJanusCType (Proxy @(SIMDVector LinuxX86_64C m Int8))
       tyK <- getJanusCType (Proxy @(SIMDVector LinuxX86_64C k Int32))
@@ -2640,8 +2134,8 @@ instance ExpSIMDDot LinuxX86_64C where
     LinuxX86_64C (SIMDVector LinuxX86_64C m Word8) ->
     LinuxX86_64C (SIMDVector LinuxX86_64C k Word32) ->
     LinuxX86_64C (SIMDVector LinuxX86_64C k Word32)
-  vdp4aVecU (LinuxX86_64C (JanusC ma)) (LinuxX86_64C (JanusC mb)) (LinuxX86_64C (JanusC mc)) =
-    LinuxX86_64C $ JanusC $ do
+  vdp4aVecU (JanusC ma) (JanusC mb) (JanusC mc) =
+    JanusC $ do
       addHeader "string.h"
       tyA <- getJanusCType (Proxy @(SIMDVector LinuxX86_64C m Word8))
       tyK <- getJanusCType (Proxy @(SIMDVector LinuxX86_64C k Word32))
@@ -2669,8 +2163,8 @@ instance ExpSIMDDot LinuxX86_64C where
       emitStmt $ Exp (Just $ cCall "memcpy" [UnOp AddrOf res noLoc, rw, signedIntConst (groups * 4)]) noLoc
       pure (RVal res)
 
-  vdp2aLoS (LinuxX86_64C (JanusC ma)) (LinuxX86_64C (JanusC mb)) (LinuxX86_64C (JanusC mc)) =
-    LinuxX86_64C $ JanusC $ do
+  vdp2aLoS (JanusC ma) (JanusC mb) (JanusC mc) =
+    JanusC $ do
       RVal ea <- ma
       RVal eb <- mb
       RVal ec <- mc
@@ -2683,8 +2177,8 @@ instance ExpSIMDDot LinuxX86_64C where
           prod = cCast "uint32_t" (BinOp Add (BinOp Mul a0 b0 noLoc) (BinOp Mul a1 b1 noLoc) noLoc)
       RVal <$> emitLocalVal (namedCType "int32_t") (cCast "int32_t" (BinOp Add (cCast "uint32_t" ec) prod noLoc))
 
-  vdp2aHiS (LinuxX86_64C (JanusC ma)) (LinuxX86_64C (JanusC mb)) (LinuxX86_64C (JanusC mc)) =
-    LinuxX86_64C $ JanusC $ do
+  vdp2aHiS (JanusC ma) (JanusC mb) (JanusC mc) =
+    JanusC $ do
       RVal ea <- ma
       RVal eb <- mb
       RVal ec <- mc
@@ -2697,8 +2191,8 @@ instance ExpSIMDDot LinuxX86_64C where
           prod = cCast "uint32_t" (BinOp Add (BinOp Mul a0 b2 noLoc) (BinOp Mul a1 b3 noLoc) noLoc)
       RVal <$> emitLocalVal (namedCType "int32_t") (cCast "int32_t" (BinOp Add (cCast "uint32_t" ec) prod noLoc))
 
-  vdp2aLoU (LinuxX86_64C (JanusC ma)) (LinuxX86_64C (JanusC mb)) (LinuxX86_64C (JanusC mc)) =
-    LinuxX86_64C $ JanusC $ do
+  vdp2aLoU (JanusC ma) (JanusC mb) (JanusC mc) =
+    JanusC $ do
       RVal ea <- ma
       RVal eb <- mb
       RVal ec <- mc
@@ -2710,8 +2204,8 @@ instance ExpSIMDDot LinuxX86_64C where
           b1 = BinOp And (BinOp Rsh b (cInt 8) noLoc) (unsignedIntConst (0xFF :: Word32)) noLoc
       RVal <$> emitLocalVal (namedCType "uint32_t") (BinOp Add ec (BinOp Add (BinOp Mul a0 b0 noLoc) (BinOp Mul a1 b1 noLoc) noLoc) noLoc)
 
-  vdp2aHiU (LinuxX86_64C (JanusC ma)) (LinuxX86_64C (JanusC mb)) (LinuxX86_64C (JanusC mc)) =
-    LinuxX86_64C $ JanusC $ do
+  vdp2aHiU (JanusC ma) (JanusC mb) (JanusC mc) =
+    JanusC $ do
       RVal ea <- ma
       RVal eb <- mb
       RVal ec <- mc
@@ -2729,8 +2223,8 @@ instance ExpSIMDDot LinuxX86_64C where
     LinuxX86_64C (SIMDVector LinuxX86_64C n Word8) ->
     LinuxX86_64C (SIMDVector LinuxX86_64C n Word8) ->
     LinuxX86_64C Word32
-  vsad8 (LinuxX86_64C (JanusC ma)) (LinuxX86_64C (JanusC mb)) =
-    LinuxX86_64C $ JanusC $ do
+  vsad8 (JanusC ma) (JanusC mb) =
+    JanusC $ do
       fs <- askX86Features
       ty <- getJanusCType (Proxy @(SIMDVector LinuxX86_64C n Word8))
       RVal ea0 <- ma
@@ -2768,7 +2262,7 @@ instance ExpSIMDCast LinuxX86_64C where
     (SIMDShape n a, SIMDShape m b) =>
     LinuxX86_64C (SIMDVector LinuxX86_64C n a) ->
     LinuxX86_64C (SIMDVector LinuxX86_64C m b)
-  vbitcast (LinuxX86_64C (JanusC mv)) = LinuxX86_64C $ JanusC $ do
+  vbitcast (JanusC mv) = JanusC $ do
     addHeader "string.h"
     let b1 = simdBytes (Proxy @n) (Proxy @a)
         b2 = simdBytes (Proxy @m) (Proxy @b)
@@ -2786,7 +2280,7 @@ instance ExpSIMDCast LinuxX86_64C where
     (SIMDShape n a, SIMDShape n b, CPUSIMDElem a, CPUSIMDElem b) =>
     LinuxX86_64C (SIMDVector LinuxX86_64C n a) ->
     LinuxX86_64C (SIMDVector LinuxX86_64C n b)
-  vcvt (LinuxX86_64C (JanusC mv)) = LinuxX86_64C $ JanusC $ do
+  vcvt (JanusC mv) = JanusC $ do
     addHeader "string.h"
     srcTy <- getJanusCType (Proxy @(SIMDVector LinuxX86_64C n a))
     dstTy <- getJanusCType (Proxy @(SIMDVector LinuxX86_64C n b))
@@ -2814,7 +2308,7 @@ instance ExpSIMDCast LinuxX86_64C where
     LinuxX86_64C (SIMDVector LinuxX86_64C n a) ->
     LinuxX86_64C (SIMDVector LinuxX86_64C n a) ->
     LinuxX86_64C (SIMDVector LinuxX86_64C m b)
-  vnarrowSat (LinuxX86_64C (JanusC mlo)) (LinuxX86_64C (JanusC mhi)) = LinuxX86_64C $ JanusC $ do
+  vnarrowSat (JanusC mlo) (JanusC mhi) = JanusC $ do
     addHeader "string.h"
     srcTy <- getJanusCType (Proxy @(SIMDVector LinuxX86_64C n a))
     dstTy <- getJanusCType (Proxy @(SIMDVector LinuxX86_64C m b))
@@ -2910,28 +2404,28 @@ emitX86Store aligned ptrExp valExp = do
       emitStmt (Exp (Just $ cCall "memcpy" [p, UnOp AddrOf v noLoc, signedIntConst b]) noLoc)
 
 instance (SIMDShape n a, Typeable a, JanusCTyped a) => CmdSIMDMem LinuxX86_64CM LinuxX86_64C n a where
-  vload (LinuxX86_64C (JanusC mp)) = LinuxX86_64CM $ do
+  vload (JanusC mp) = liftJanusCM $ do
     RVal p <- mp
     v <- emitX86Load @n @a False p
-    pure (LinuxX86_64C (JanusC (pure (RVal v))))
+    pure (JanusC (pure (RVal v)))
 
-  vloadAligned (LinuxX86_64C (JanusC mp)) = LinuxX86_64CM $ do
+  vloadAligned (JanusC mp) = liftJanusCM $ do
     RVal p <- mp
     v <- emitX86Load @n @a True p
-    pure (LinuxX86_64C (JanusC (pure (RVal v))))
+    pure (JanusC (pure (RVal v)))
 
-  vstore (LinuxX86_64C (JanusC mp)) (LinuxX86_64C (JanusC mv)) = LinuxX86_64CM $ do
+  vstore (JanusC mp) (JanusC mv) = liftJanusCM $ do
     RVal p <- mp
     RVal v <- mv
     emitX86Store @n @a False p v
 
-  vstoreAligned (LinuxX86_64C (JanusC mp)) (LinuxX86_64C (JanusC mv)) = LinuxX86_64CM $ do
+  vstoreAligned (JanusC mp) (JanusC mv) = liftJanusCM $ do
     RVal p <- mp
     RVal v <- mv
     emitX86Store @n @a True p v
 
-  vloadMasked (LinuxX86_64C (JanusC mm)) (LinuxX86_64C (JanusC mfb)) (LinuxX86_64C (JanusC mp)) =
-    LinuxX86_64CM $ do
+  vloadMasked (JanusC mm) (JanusC mfb) (JanusC mp) =
+    liftJanusCM $ do
       addHeader "string.h"
       mty <- getJanusCType (Proxy @(SIMDMask LinuxX86_64C n a))
       vty <- getJanusCType (Proxy @(SIMDVector LinuxX86_64C n a))
@@ -2956,10 +2450,10 @@ instance (SIMDShape n a, Typeable a, JanusCTyped a) => CmdSIMDMem LinuxX86_64CM 
             assignLoad = BlockStm $ Exp (Just $ Assign (Index arr (signedIntConst i) noLoc) JustAssign (Index ep (signedIntConst i) noLoc) noLoc) noLoc
         emitStmt $ If active (Block [assignLoad] noLoc) Nothing noLoc
       emitStmt $ Exp (Just $ cCall "memcpy" [UnOp AddrOf out noLoc, arr, signedIntConst bytes]) noLoc
-      pure (LinuxX86_64C (JanusC (pure (RVal out))))
+      pure (JanusC (pure (RVal out)))
 
-  vstoreMasked (LinuxX86_64C (JanusC mm)) (LinuxX86_64C (JanusC mp)) (LinuxX86_64C (JanusC mv)) =
-    LinuxX86_64CM $ do
+  vstoreMasked (JanusC mm) (JanusC mp) (JanusC mv) =
+    liftJanusCM $ do
       addHeader "string.h"
       mty <- getJanusCType (Proxy @(SIMDMask LinuxX86_64C n a))
       vty <- getJanusCType (Proxy @(SIMDVector LinuxX86_64C n a))
@@ -2983,8 +2477,8 @@ instance (SIMDShape n a, Typeable a, JanusCTyped a) => CmdSIMDMem LinuxX86_64CM 
             assignStore = BlockStm $ Exp (Just $ Assign (Index ep (signedIntConst i) noLoc) JustAssign (Index arr (signedIntConst i) noLoc) noLoc) noLoc
         emitStmt $ If active (Block [assignStore] noLoc) Nothing noLoc
 
-  vgather (LinuxX86_64C (JanusC mp)) (LinuxX86_64C (JanusC midx)) =
-    LinuxX86_64CM $ do
+  vgather (JanusC mp) (JanusC midx) =
+    liftJanusCM $ do
       addHeader "string.h"
       fs <- askX86Features
       vty <- getJanusCType (Proxy @(SIMDVector LinuxX86_64C n a))
@@ -3014,10 +2508,10 @@ instance (SIMDShape n a, Typeable a, JanusCTyped a) => CmdSIMDMem LinuxX86_64CM 
             emitStmt $ Exp (Just $ Assign (Index dstArr (signedIntConst i) noLoc) JustAssign (Index ep (Index idxArr (signedIntConst i) noLoc) noLoc) noLoc) noLoc
           emitStmt $ Exp (Just $ cCall "memcpy" [UnOp AddrOf res noLoc, dstArr, signedIntConst (lanes * sz)]) noLoc
           pure res
-      pure (LinuxX86_64C (JanusC (pure (RVal out))))
+      pure (JanusC (pure (RVal out)))
 
-  vgatherMasked (LinuxX86_64C (JanusC mm)) (LinuxX86_64C (JanusC mfb)) (LinuxX86_64C (JanusC mp)) (LinuxX86_64C (JanusC midx)) =
-    LinuxX86_64CM $ do
+  vgatherMasked (JanusC mm) (JanusC mfb) (JanusC mp) (JanusC midx) =
+    liftJanusCM $ do
       addHeader "string.h"
       mty <- getJanusCType (Proxy @(SIMDMask LinuxX86_64C n a))
       vty <- getJanusCType (Proxy @(SIMDVector LinuxX86_64C n a))
@@ -3048,4 +2542,13 @@ instance (SIMDShape n a, Typeable a, JanusCTyped a) => CmdSIMDMem LinuxX86_64CM 
             assignGather = BlockStm $ Exp (Just $ Assign (Index dstArr (signedIntConst i) noLoc) JustAssign (Index ep (Index idxArr (signedIntConst i) noLoc) noLoc) noLoc) noLoc
         emitStmt $ If active (Block [assignGather] noLoc) Nothing noLoc
       emitStmt $ Exp (Just $ cCall "memcpy" [UnOp AddrOf out noLoc, dstArr, signedIntConst bytes]) noLoc
-      pure (LinuxX86_64C (JanusC (pure (RVal out))))
+      pure (JanusC (pure (RVal out)))
+
+--------------------------------------------------------------------------------
+-- Optimal Non-Splitting Gang Dispatch for LinuxX86_64
+--------------------------------------------------------------------------------
+
+instance CmdOptimalGang LinuxX86_64CM LinuxX86_64C where
+  withOptimalGang pa k = do
+    fs <- askX86Features
+    dispatchGangInt (optimalX86GangSize fs pa) k

@@ -4,6 +4,7 @@
 {-# LANGUAGE DataKinds #-}
 {-# LANGUAGE DeriveGeneric #-}
 {-# LANGUAGE DerivingStrategies #-}
+{-# LANGUAGE DerivingVia #-}
 {-# LANGUAGE FlexibleContexts #-}
 {-# LANGUAGE FlexibleInstances #-}
 {-# LANGUAGE KindSignatures #-}
@@ -71,6 +72,22 @@ import qualified Data.Kind as K
 import Data.Proxy (Proxy (..))
 import Data.Typeable (Typeable)
 import Data.Word (Word16, Word32, Word64, Word8)
+import Foreign.C.Types
+  ( CChar,
+    CDouble,
+    CFloat,
+    CInt,
+    CLLong,
+    CLong,
+    CSChar,
+    CShort,
+    CSize,
+    CUChar,
+    CUInt,
+    CULLong,
+    CULong,
+    CUShort,
+  )
 import Foreign.Ptr (Ptr)
 import GHC.Generics
 import Janus.Alloc.Policy
@@ -82,8 +99,6 @@ import Janus.Alloc.Policy
     freeStruct,
   )
 import Janus.Backend.C
-import Janus.Backend.C.LinuxX86_64
-import Janus.Backend.C.TH
 import Janus.Command.Cond (ifThenElseM_, whenM_)
 import Janus.Command.Memory (CmdMemCopy (..), CmdStorable (..), ExpPtr (..), ExpSized (..), janusSIMDAlignment)
 import Janus.Command.Ref (letM, newRef, readRef, writeRef)
@@ -920,69 +935,14 @@ drainAppendHashMapWith alloc combine hm =
 
 type HashMapABI k v = (Typeable k, Typeable v, JanusStruct (Buf k), JanusStruct (Buf v))
 
-type instance JanusCEval (HashMap JanusC k v -> r) = HashMap Identity k v -> JanusCEval r
+type instance JanusCHost (HashMap (JanusCT _) k v) = HashMap Identity k v
 
-type instance JanusCRetType (HashMap JanusC k v -> r) = JanusCRetType r
+deriving via
+  ViaPtrHandle t (CStruct (HashMapSpine k v)) (HashMap Identity k v)
+  instance
+    (HashMapABI k v) => JanusCArg t (HashMap (JanusCT t) k v)
 
-instance (HashMapABI k v, JanusCParam r) => JanusCParam (HashMap JanusC k v -> r) where
-  jcparam = mkPtrHandleJCParam HashMap
-
-instance (HashMapABI k v, JanusCEvaluate r) => JanusCEvaluate (HashMap JanusC k v -> r) where
-  jceval = mkPtrHandleJCEval unHashMap HashMap
-
-type instance JanusCEval (JanusCM (HashMap JanusC k v)) = IO (HashMap Identity k v)
-
-type instance JanusCRetType (JanusCM (HashMap JanusC k v)) = HashMap Identity k v
-
-instance (HashMapABI k v) => JanusCParam (JanusCM (HashMap JanusC k v)) where
-  jcparam = mkPtrHandleJCRetParam unHashMap
-
-instance (HashMapABI k v) => JanusCEvaluate (JanusCM (HashMap JanusC k v)) where
-  jceval = mkPtrHandleJCRetEval HashMap
-
-type instance LinuxX86_64CEval (HashMap LinuxX86_64C k v -> r) = HashMap Identity k v -> LinuxX86_64CEval r
-
-type instance LinuxX86_64BaseRet (HashMap LinuxX86_64C k v -> r) = LinuxX86_64BaseRet r
-
-instance (HashMapABI k v, LinuxX86_64Param r) => LinuxX86_64Param (HashMap LinuxX86_64C k v -> r) where
-  x86param = mkPtrHandleX86Param HashMap
-
-instance (HashMapABI k v, X86DeferCont r, LinuxX86_64Evaluate r) => LinuxX86_64Evaluate (HashMap LinuxX86_64C k v -> r) where
-  x86eval = mkPtrHandleX86EvalParam unHashMap HashMap
-
-instance (HashMapABI k v, X86DeferCont r) => X86DeferCall (HashMap LinuxX86_64C k v -> r) where
-  x86DeferArg = mkPtrHandleX86DeferArg unHashMap HashMap
-
-instance (HashMapABI k v, X86DeferCont r) => X86DeferCont (HashMap LinuxX86_64C k v -> r) where
-  x86DeferCont = mkPtrHandleX86DeferCont unHashMap HashMap
-
-type instance LinuxX86_64CEval (LinuxX86_64CM (HashMap LinuxX86_64C k v)) = IO (HashMap Identity k v)
-
-type instance LinuxX86_64BaseRet (LinuxX86_64CM (HashMap LinuxX86_64C k v)) = HashMap Identity k v
-
-instance (HashMapABI k v) => LinuxX86_64Param (LinuxX86_64CM (HashMap LinuxX86_64C k v)) where
-  x86param = mkPtrHandleX86RetParam unHashMap
-
-instance (HashMapABI k v) => LinuxX86_64Evaluate (LinuxX86_64CM (HashMap LinuxX86_64C k v)) where
-  x86eval = mkPtrHandleX86RetEval HashMap
-
-instance (HashMapABI k v) => X86DeferCall (LinuxX86_64CM (HashMap LinuxX86_64C k v)) where
-  x86DeferArg = mkPtrHandleX86RetDeferArg HashMap
-
-instance (HashMapABI k v) => X86DeferCont (LinuxX86_64CM (HashMap LinuxX86_64C k v)) where
-  x86DeferCont = mkPtrHandleX86RetDeferCont HashMap
-
-instance (HashMapABI k v, LinuxX86_64Param r, JanusCTH r) => JanusCTH (HashMap LinuxX86_64C k v -> r) where
-  type JanusCTHEval (HashMap LinuxX86_64C k v -> r) = HashMap Identity k v -> JanusCTHEval r
-  janusCTHBackend _ = THBackendLinuxX86_64
-  janusCTHCodegen = x86param
-  janusCTHSpec _ =
-    let (ps, retSpec) = janusCTHSpec (Proxy @r)
-     in (mkPtrHandleTHParamSpec (Proxy @(HashMap Identity k v)) : ps, retSpec)
-
-instance (HashMapABI k v) => JanusCTH (LinuxX86_64CM (HashMap LinuxX86_64C k v)) where
-  type JanusCTHEval (LinuxX86_64CM (HashMap LinuxX86_64C k v)) = IO (HashMap Identity k v)
-  janusCTHBackend _ = THBackendLinuxX86_64
-  janusCTHCodegen = x86param
-  janusCTHSpec _ =
-    ([], mkPtrHandleTHRetSpec THRetIO (Proxy @(HashMap Identity k v)) (Proxy @(CStruct (HashMapSpine k v))))
+deriving via
+  ViaPtrHandle t (CStruct (HashMapSpine k v)) (HashMap Identity k v)
+  instance
+    (HashMapABI k v) => JanusCValRet t (HashMap (JanusCT t) k v)

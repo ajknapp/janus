@@ -1,12 +1,31 @@
+{-# LANGUAGE AllowAmbiguousTypes #-}
+{-# LANGUAGE DataKinds #-}
 {-# LANGUAGE DeriveGeneric #-}
 {-# LANGUAGE DerivingStrategies #-}
+{-# LANGUAGE FlexibleInstances #-}
+{-# LANGUAGE GADTs #-}
 {-# LANGUAGE GeneralizedNewtypeDeriving #-}
+{-# LANGUAGE KindSignatures #-}
 {-# LANGUAGE LambdaCase #-}
+{-# LANGUAGE MultiParamTypeClasses #-}
 {-# LANGUAGE PatternSynonyms #-}
+{-# LANGUAGE ScopedTypeVariables #-}
+{-# LANGUAGE TypeApplications #-}
+{-# LANGUAGE TypeFamilies #-}
+{-# LANGUAGE TypeOperators #-}
 
 module Janus.Backend.C.Target
   ( -- * Target Admission Exceptions
     UnsupportedTargetException (..),
+
+    -- * Open-World Dependent Target Feature Map Key
+    TargetFeatureOf,
+    TargetFeatureKey (..),
+    targetFeatureKey,
+    TargetFeatureMap,
+    portableCFeatureKey,
+    x86FeatureKey,
+    cudaFeatureKey,
 
     -- * x86-64 Target Feature Lattice
     X86Feature (..),
@@ -72,17 +91,30 @@ where
 import Control.Exception (Exception, SomeException, bracket, throwIO, try)
 import Control.Monad (unless)
 import Data.Bits (Bits (..))
+import Data.Constraint (Dict (..))
+import Data.Constraint.Compose (ComposeC)
+import Data.Constraint.Extras (Has (argDict))
+import Data.Dependent.HashMap (DHashMap)
+import Data.Functor.Identity (Identity)
+import Data.GADT.Compare (GCompare (..), GEq (..), GOrdering (..))
+import Data.GADT.Show (GShow (..), defaultGshowsPrec)
 import Data.Hashable (Hashable (..))
+import qualified Data.Kind as K
+import Data.Proxy (Proxy (..))
 import Data.Semilattice.Join (Join (..))
 import Data.Semilattice.Lower (Lower (..))
 import Data.Semilattice.Meet (Meet (..))
 import Data.Semilattice.Upper (Upper (..))
+import Data.Some (Some (..))
+import Data.Type.Equality ((:~:) (..))
+import Data.Type.Ord (OrderingI (..))
 import Data.Word (Word64)
 import Foreign.C.String (CString, peekCString)
 import Foreign.C.Types (CInt (..))
 import Foreign.Marshal.Alloc (allocaBytes, free, malloc)
 import Foreign.Storable (peek)
 import GHC.Generics (Generic)
+import GHC.TypeLits (KnownSymbol, Symbol, cmpSymbol, sameSymbol, symbolVal)
 import Janus.CBits ()
 import System.Directory (doesDirectoryExist)
 import System.Environment (lookupEnv)
@@ -444,3 +476,80 @@ observeDefaultCUDAFeatures = do
   case res :: Either SomeException CUDAFeatures of
     Right fs -> pure fs
     Left _ -> pure cudaSM80
+
+--------------------------------------------------------------------------------
+-- Open-World Dependent Target Feature Map Key
+--------------------------------------------------------------------------------
+
+type family TargetFeatureOf (tag :: Symbol) :: K.Type
+
+data TargetFeatureKey (f :: K.Type) where
+  TargetFeatureKey ::
+    (KnownSymbol tag, Eq f, Ord f, Show f, f ~ TargetFeatureOf tag) =>
+    Proxy tag ->
+    TargetFeatureKey f
+
+targetFeatureKey ::
+  forall tag f.
+  (KnownSymbol tag, Eq f, Ord f, Show f, f ~ TargetFeatureOf tag) =>
+  TargetFeatureKey f
+targetFeatureKey = TargetFeatureKey (Proxy @tag)
+
+instance Eq (TargetFeatureKey f) where
+  TargetFeatureKey p1 == TargetFeatureKey p2 = symbolVal p1 == symbolVal p2
+
+instance Ord (TargetFeatureKey f) where
+  compare (TargetFeatureKey p1) (TargetFeatureKey p2) =
+    compare (symbolVal p1) (symbolVal p2)
+
+instance Show (TargetFeatureKey f) where
+  showsPrec d (TargetFeatureKey p) =
+    showParen (d > 10) $ showString "TargetFeatureKey @" . shows (symbolVal p)
+
+instance GShow TargetFeatureKey where
+  gshowsPrec = defaultGshowsPrec
+
+instance GEq TargetFeatureKey where
+  geq (TargetFeatureKey p1) (TargetFeatureKey p2) =
+    case sameSymbol p1 p2 of
+      Just Refl -> Just Refl
+      Nothing -> Nothing
+
+instance GCompare TargetFeatureKey where
+  gcompare (TargetFeatureKey p1) (TargetFeatureKey p2) =
+    case cmpSymbol p1 p2 of
+      LTI -> GLT
+      EQI -> GEQ
+      GTI -> GGT
+
+instance Hashable (TargetFeatureKey f) where
+  hashWithSalt s (TargetFeatureKey p) = hashWithSalt s (symbolVal p)
+
+instance Hashable (Some TargetFeatureKey) where
+  hashWithSalt s (Some k) = hashWithSalt s k
+
+instance Has (ComposeC Eq Identity) TargetFeatureKey where
+  argDict (TargetFeatureKey _) = Dict
+
+instance Has (ComposeC Ord Identity) TargetFeatureKey where
+  argDict (TargetFeatureKey _) = Dict
+
+instance Has (ComposeC Show Identity) TargetFeatureKey where
+  argDict (TargetFeatureKey _) = Dict
+
+type TargetFeatureMap = DHashMap TargetFeatureKey Identity
+
+type instance TargetFeatureOf "portable-c" = ()
+
+type instance TargetFeatureOf "linux-x86_64" = X86Features
+
+type instance TargetFeatureOf "cuda" = CUDAFeatures
+
+portableCFeatureKey :: TargetFeatureKey ()
+portableCFeatureKey = targetFeatureKey @"portable-c"
+
+x86FeatureKey :: TargetFeatureKey X86Features
+x86FeatureKey = targetFeatureKey @"linux-x86_64"
+
+cudaFeatureKey :: TargetFeatureKey CUDAFeatures
+cudaFeatureKey = targetFeatureKey @"cuda"

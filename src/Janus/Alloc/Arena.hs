@@ -1,6 +1,7 @@
 {-# LANGUAGE ConstraintKinds #-}
 {-# LANGUAGE DeriveGeneric #-}
 {-# LANGUAGE DerivingStrategies #-}
+{-# LANGUAGE DerivingVia #-}
 {-# LANGUAGE FlexibleContexts #-}
 {-# LANGUAGE FlexibleInstances #-}
 {-# LANGUAGE MultiParamTypeClasses #-}
@@ -29,14 +30,11 @@ where
 
 import Data.Functor.Identity (Identity (..))
 import Data.Int (Int64)
-import Data.Proxy (Proxy (..))
 import Data.Word (Word64, Word8)
 import Foreign.Ptr (Ptr)
 import GHC.Generics (Generic)
 import Janus.Alloc.Dynamic (CmdAllocBase, alignUpWord64, isNullVoidPtr, sameVoidPtr)
 import Janus.Backend.C
-import Janus.Backend.C.LinuxX86_64
-import Janus.Backend.C.TH
 import Control.Applicative ((<|>))
 import Janus.Command.Array (CmdMemCopy (..), CmdStorable (..), ExpPtr (..), janusSIMDAlignment)
 import Janus.Command.Cond (ifThenElseM_, whenM_)
@@ -485,36 +483,15 @@ arenaDestroyImpl parentFree spineSz (Arena hdr) = do
   parentFree (toVoidPtr hdr) spineSz
 
 -- Host <-> C FFI Marshalling Instances
-type instance JanusCEval (Arena JanusC -> r) = Arena Identity -> JanusCEval r
 
-type instance JanusCRetType (Arena JanusC -> r) = JanusCRetType r
+type instance JanusCHost (Arena (JanusCT _)) = Arena Identity
 
-instance (JanusCParam r) => JanusCParam (Arena JanusC -> r) where
-  jcparam = mkPtrHandleJCParam Arena
+deriving via
+  ViaPtrHandle t (CStruct ArenaSpine) (Arena Identity)
+  instance
+    JanusCArg t (Arena (JanusCT t))
 
-instance (JanusCEvaluate r) => JanusCEvaluate (Arena JanusC -> r) where
-  jceval = mkPtrHandleJCEval unArena Arena
-
-type instance LinuxX86_64CEval (Arena LinuxX86_64C -> r) = Arena Identity -> LinuxX86_64CEval r
-
-type instance LinuxX86_64BaseRet (Arena LinuxX86_64C -> r) = LinuxX86_64BaseRet r
-
-instance (LinuxX86_64Param r) => LinuxX86_64Param (Arena LinuxX86_64C -> r) where
-  x86param = mkPtrHandleX86Param Arena
-
-instance (X86DeferCont r, LinuxX86_64Evaluate r) => LinuxX86_64Evaluate (Arena LinuxX86_64C -> r) where
-  x86eval = mkPtrHandleX86EvalParam unArena Arena
-
-instance (X86DeferCont r) => X86DeferCall (Arena LinuxX86_64C -> r) where
-  x86DeferArg = mkPtrHandleX86DeferArg unArena Arena
-
-instance (X86DeferCont r) => X86DeferCont (Arena LinuxX86_64C -> r) where
-  x86DeferCont = mkPtrHandleX86DeferCont unArena Arena
-
-instance (LinuxX86_64Param r, JanusCTH r) => JanusCTH (Arena LinuxX86_64C -> r) where
-  type JanusCTHEval (Arena LinuxX86_64C -> r) = Arena Identity -> JanusCTHEval r
-  janusCTHBackend _ = THBackendLinuxX86_64
-  janusCTHCodegen = x86param
-  janusCTHSpec _ =
-    let (ps, retSpec) = janusCTHSpec (Proxy @r)
-     in (mkPtrHandleTHParamSpec (Proxy @(Arena Identity)) : ps, retSpec)
+deriving via
+  ViaPtrHandle t (CStruct ArenaSpine) (Arena Identity)
+  instance
+    JanusCValRet t (Arena (JanusCT t))

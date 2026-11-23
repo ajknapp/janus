@@ -32,14 +32,14 @@ class (Typeable r) => JanusCFix r where
   jcfun :: String -> JanusCM [Exp] -> JanusCM [Param] -> Int -> r -> r
   jcfake :: String -> JanusCM [Exp] -> r -> r
 
-localFun :: JCFuncInfo -> JanusCM a -> JanusCM a
+localFun :: JCFuncInfo -> JanusCMT t a -> JanusCMT t a
 localFun x = local (const x)
 
-instance (JanusCTyped a) => JanusCFix (JanusCM (JanusC a)) where
+instance (Typeable t, JanusCTyped a) => JanusCFix (JanusCMT t (JanusCT t a)) where
   jcfun name args params _ body = do
     fi <- ask
     let funInfo = fi & jcfiName .~ name & jcfiIsLocal .~ True
-    params' <- localFun funInfo params
+    params' <- liftJanusCM (localFun funInfo params)
     let params'' = Params (reverse params') False noLoc
     localFun funInfo $ do
       modify $ \s -> s & ix name . jcfParams .~ params''
@@ -48,13 +48,13 @@ instance (JanusCTyped a) => JanusCFix (JanusCM (JanusC a)) where
     JCType spec dec <- getJanusCType (Proxy @a)
     let proto = InitGroup (setTypeQualifiers (jcTypeQuals funInfo) spec) [] [Init (Id name noLoc) (Proto dec params'' noLoc) Nothing Nothing [] noLoc] noLoc
     modifyFunction $ \f -> f & jcfProtos %~ Set.insert proto
-    args' <- args
+    args' <- liftJanusCM args
     pure $ JanusC $ pure $ RVal $ FnCall (Var (Id name noLoc) noLoc) (reverse args') noLoc
   jcfake name args _ = do
-    args' <- args
+    args' <- liftJanusCM args
     pure $ JanusC $ pure $ RVal $ FnCall (Var (Id name noLoc) noLoc) (reverse args') noLoc
 
-instance (JanusCTyped a) => JanusCFix (JanusC a) where
+instance (Typeable t, JanusCTyped a) => JanusCFix (JanusCT t a) where
   jcfun name args params _ body = JanusC $ do
     fi <- ask
     let funInfo = fi & jcfiName .~ name & jcfiIsLocal .~ True
@@ -72,7 +72,7 @@ instance (JanusCTyped a) => JanusCFix (JanusC a) where
     args' <- args
     pure $ RVal $ FnCall (Var (Id name noLoc) noLoc) (reverse args') noLoc
 
-instance (JanusCTyped a, JanusCFix r) => JanusCFix (JanusC a -> r) where
+instance (Typeable t, JanusCTyped a, JanusCFix r) => JanusCFix (JanusCT t a -> r) where
   jcfun name args parms n body x = jcfun name args' parms' (n + 1) (body x')
     where
       args' = do
@@ -127,5 +127,5 @@ instance ExpFix Identity r where
   fun _ _ = fix
   {-# INLINE fun #-}
 
-instance (JanusCFix r) => ExpFix JanusC r where
+instance (JanusCFix r) => ExpFix (JanusCT t) r where
   fun _ = jfix

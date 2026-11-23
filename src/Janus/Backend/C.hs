@@ -1,3 +1,4 @@
+{-# LANGUAGE AllowAmbiguousTypes #-}
 {-# LANGUAGE DataKinds #-}
 {-# LANGUAGE DeriveGeneric #-}
 {-# LANGUAGE DerivingVia #-}
@@ -7,9 +8,11 @@
 {-# LANGUAGE GADTs #-}
 {-# LANGUAGE GeneralizedNewtypeDeriving #-}
 {-# LANGUAGE ImpredicativeTypes #-}
+{-# LANGUAGE InstanceSigs #-}
 {-# LANGUAGE KindSignatures #-}
 {-# LANGUAGE LambdaCase #-}
 {-# LANGUAGE MultiParamTypeClasses #-}
+{-# LANGUAGE PatternSynonyms #-}
 {-# LANGUAGE ScopedTypeVariables #-}
 {-# LANGUAGE TemplateHaskell #-}
 {-# LANGUAGE TypeApplications #-}
@@ -29,6 +32,7 @@ import qualified Data.ByteString.Base16 as B16
 import Data.ByteString.Char8 (unpack)
 import Data.Coerce
 import Data.Complex
+import qualified Data.Dependent.HashMap as DHM
 import Data.Int
 import qualified Data.Kind as K
 import Data.List (intercalate)
@@ -49,13 +53,16 @@ import Data.Word
 import Foreign.C
 import Foreign.ForeignPtr (ForeignPtr, withForeignPtr)
 import Foreign.LibFFI
+import Foreign.Marshal.Alloc (allocaBytesAligned)
 import Foreign.Ptr
+import qualified Foreign.Storable as Storable
 import GHC.Float
 import Janus.Backend.C.Build
-import Janus.Backend.C.Target
+import Janus.Backend.C.Target (TargetFeatureKey, TargetFeatureMap, portableCFeatureKey)
 import Janus.FFI.Arg
 import Janus.FFI.Ret
 import Language.C.Quote as C
+import qualified Language.Haskell.TH as TH
 import qualified Rock
 import System.FilePath
 import System.IO
@@ -94,47 +101,79 @@ $(makeLenses ''JCFunc)
 
 type JanusCMState = Map.Map String JCFunc
 
-data JCFuncInfo
-  = JCFuncInfo
-  { _jcfiName :: String
-  , _jcfiBackend :: JanusCBackend
-  , _jcfiIsLocal :: Bool
-  , _jcfiX86Features :: X86Features
-  , _jcfiCUDAFeatures :: CUDAFeatures
-  } deriving (Eq, Ord, Show)
+data JCFuncInfo = JCFuncInfo
+  { _jcfiName :: String,
+    _jcfiBackend :: JanusCBackend,
+    _jcfiIsLocal :: Bool,
+    _jcfiTargetFeatures :: TargetFeatureMap
+  }
+  deriving (Eq, Ord, Show)
 
 $(makeLenses ''JCFuncInfo)
 
 mkJCFuncInfo :: String -> JanusCBackend -> Bool -> JCFuncInfo
 mkJCFuncInfo name backend isLocal =
   JCFuncInfo
-    { _jcfiName = name
-    , _jcfiBackend = backend
-    , _jcfiIsLocal = isLocal
-    , _jcfiX86Features = lowerBound
-    , _jcfiCUDAFeatures = lowerBound
+    { _jcfiName = name,
+      _jcfiBackend = backend,
+      _jcfiIsLocal = isLocal,
+      _jcfiTargetFeatures = DHM.empty
     }
 
-newtype JanusC a = JanusC {getJanusC :: JanusCM (RVal a)}
+setTargetFeature :: TargetFeatureKey f -> f -> JCFuncInfo -> JCFuncInfo
+setTargetFeature k f info =
+  info & jcfiTargetFeatures %~ DHM.insert k (Identity f)
 
-newtype JanusCM a = JanusCM {getJanusCM :: ReaderT JCFuncInfo (State JanusCMState) a}
+--------------------------------------------------------------------------------
+-- Target-Indexed C Expression & Monad Types
+--------------------------------------------------------------------------------
+
+-- | Target tag for portable ISO C99/C11 host targets without architecture-specific ISA extensions.
+data PortableC
+
+newtype JanusCMT (t :: K.Type) a = JanusCMT
+  { getJanusCMT :: ReaderT JCFuncInfo (State JanusCMState) a
+  }
   deriving newtype (Functor, Applicative, Monad, MonadFix, MonadState JanusCMState, MonadReader JCFuncInfo)
 
-askFuncName :: JanusCM String
+type JanusCM = JanusCMT PortableC
+
+getJanusCM :: JanusCM a -> ReaderT JCFuncInfo (State JanusCMState) a
+getJanusCM = getJanusCMT
+
+liftJanusCM :: JanusCM a -> JanusCMT t a
+liftJanusCM = coerce
+
+unJanusCMT :: JanusCMT t a -> JanusCM a
+unJanusCMT = coerce
+
+newtype JanusCT (t :: K.Type) a = JanusCT
+  { getJanusCT :: JanusCM (RVal a)
+  }
+
+pattern JanusC :: JanusCM (RVal a) -> JanusCT t a
+pattern JanusC m = JanusCT m
+
+{-# COMPLETE JanusC #-}
+
+getJanusC :: JanusCT t a -> JanusCM (RVal a)
+getJanusC = getJanusCT
+
+type JanusC = JanusCT PortableC
+
+askFuncName :: JanusCMT t String
 askFuncName = asks _jcfiName
 
-askX86Features :: JanusCM X86Features
-askX86Features = asks _jcfiX86Features
-
-askCUDAFeatures :: JanusCM CUDAFeatures
-askCUDAFeatures = asks _jcfiCUDAFeatures
+askTargetFeature :: (Lower f) => TargetFeatureKey f -> JanusCMT t f
+askTargetFeature k =
+  asks (maybe lowerBound runIdentity . DHM.lookup k . _jcfiTargetFeatures)
 
 jcTypeQuals :: JCFuncInfo -> [TypeQual]
 jcTypeQuals JCFuncInfo {_jcfiBackend = JC} = []
 jcTypeQuals JCFuncInfo {_jcfiBackend = JCUDA, _jcfiIsLocal = isLocal} =
   if isLocal then [TCUDAdevice noLoc] else [TCUDAglobal noLoc]
 
-askTypeQuals :: JanusCM [TypeQual]
+askTypeQuals :: JanusCMT t [TypeQual]
 askTypeQuals = asks jcTypeQuals
 
 defaultJanusState :: JanusCMState
@@ -238,7 +277,7 @@ renderJCProgram entryName funcs =
         <> bodies
         <> externCEnd
 
-modifyFunction :: (JCFunc -> JCFunc) -> JanusCM ()
+modifyFunction :: (JCFunc -> JCFunc) -> JanusCMT t ()
 modifyFunction f = do
   fname <- askFuncName
   modify $ \s -> s & ix fname %~ f
@@ -246,59 +285,10 @@ modifyFunction f = do
 class (Typeable a) => JanusCTyped a where
   jctype :: Proxy a -> JanusCM JCType
 
-class JanusCBackendTypes (e :: K.Type -> K.Type) (m :: K.Type -> K.Type) | e -> m, m -> e where
-  toJanusC :: e a -> JanusC a
-  fromJanusC :: JanusC a -> e a
-  toJanusCM :: m a -> JanusCM a
-  fromJanusCM :: JanusCM a -> m a
-
-instance JanusCBackendTypes JanusC JanusCM where
-  toJanusC = id
-  fromJanusC = id
-  toJanusCM = id
-  fromJanusCM = id
-
-class JanusCParamImpl (e :: K.Type -> K.Type) (m :: K.Type -> K.Type) r where
-  jcparamImplWithInfo :: Proxy e -> JCFuncInfo -> Int -> m [Param] -> r -> [JCFunc]
-
-jcparamImpl :: (JanusCParamImpl e m r) => Proxy e -> String -> Int -> m [Param] -> JanusCBackend -> r -> [JCFunc]
-jcparamImpl p name n params backend = jcparamImplWithInfo p (mkJCFuncInfo name backend False) n params
-
-instance (JanusCBackendTypes e m, JanusCTyped a) => JanusCParamImpl e m (e a) where
-  jcparamImplWithInfo _ info _ params a = Map.elems $ flip execState (Map.singleton (_jcfiName info) (defaultJCFunc (_jcfiName info) (Params [] False noLoc))) $ flip runReaderT info $ getJanusCM $ do
-    fname <- askFuncName
-    params' <- toJanusCM params
-    modify $ \s -> s & ix fname . jcfParams .~ Params (reverse params') False noLoc
-    finishFunction (toJanusC a)
-    getJanusCType (Proxy @a)
-
-instance (JanusCBackendTypes e m, JanusCTyped a) => JanusCParamImpl e m (m (e a)) where
-  jcparamImplWithInfo _ info _ params a = Map.elems $ flip execState (Map.singleton (_jcfiName info) (defaultJCFunc (_jcfiName info) (Params [] False noLoc))) $ flip runReaderT info $ getJanusCM $ do
-    fname <- askFuncName
-    params' <- toJanusCM params
-    modify $ \s -> s & ix fname . jcfParams .~ Params (reverse params') False noLoc
-    toJanusCM a >>= finishFunction . toJanusC
-    getJanusCType (Proxy @a)
-
-instance (JanusCBackendTypes e m) => JanusCParamImpl e m (m ()) where
-  jcparamImplWithInfo _ info _ params a = Map.elems $ flip execState (Map.singleton (_jcfiName info) (defaultJCFunc (_jcfiName info) (Params [] False noLoc))) $ flip runReaderT info $ getJanusCM $ do
-    fname <- askFuncName
-    params' <- toJanusCM params
-    modify $ \s -> s & ix fname . jcfParams .~ Params (reverse params') False noLoc
-    toJanusCM a >> finishFunction_
-
-instance (JanusCBackendTypes e m, JanusCTyped a, JanusCParamImpl e m r) => JanusCParamImpl e m (e a -> r) where
-  jcparamImplWithInfo p info n args f = jcparamImplWithInfo p info (n + 1) args' (f $ fromJanusC $ JanusC $ pure $ RVal $ Var (mkArgId n) noLoc)
-    where
-      args' = fromJanusCM @e $ do
-        JCType spec dec <- getJanusCType (Proxy @a)
-        args'' <- toJanusCM args
-        pure $ Param (Just (mkArgId n)) spec dec noLoc:args''
-
-finishFunction :: forall a. (JanusCTyped a) => JanusC a -> JanusCM ()
+finishFunction :: forall s t a. (JanusCTyped a) => JanusCT s a -> JanusCMT t ()
 finishFunction a = do
   JCType spec dec <- getJanusCType (Proxy @a)
-  RVal e <- getJanusC a
+  RVal e <- liftJanusCM (getJanusCT a)
   fname <- askFuncName
   tqs <- askTypeQuals
   jcs <- get
@@ -306,7 +296,7 @@ finishFunction a = do
     Just f -> put $ flip (Map.insert fname) jcs $ f & jcfExp ?~ e & jcfType ?~ JCType (setTypeQualifiers tqs spec) dec
     Nothing -> error "finishFunction: the impossible happened"
 
-finishFunction_ :: JanusCM ()
+finishFunction_ :: JanusCMT t ()
 finishFunction_ = do
   fname <- askFuncName
   tqs <- askTypeQuals
@@ -335,76 +325,349 @@ defaultJCFunc name params =
 mkArgId :: Int -> Id
 mkArgId m = Id ("arg_" <> show m) noLoc
 
-type family JanusCEval a
+runJCCodegen :: JCFuncInfo -> JanusCM () -> [JCFunc]
+runJCCodegen info action =
+  let name = _jcfiName info
+      initSt = Map.singleton name (defaultJCFunc name (Params [] False noLoc))
+   in Map.elems $ execState (runReaderT (getJanusCMT action) info) initSt
 
-type instance JanusCEval (JanusC a -> r) = a -> JanusCEval r
-type instance JanusCEval (JanusC a) = a
-type instance JanusCEval (JanusCM (JanusC a)) = IO a
-type instance JanusCEval (JanusCM ()) = IO ()
+--------------------------------------------------------------------------------
+-- Target Descriptor, Value ABI, & Unified Function Compilation / Evaluation
+--------------------------------------------------------------------------------
 
-type family JanusCRetType a
+class (Lower (CTargetFeatures t)) => JanusCTarget (t :: K.Type) where
+  type CTargetFeatures t :: K.Type
+  cTargetFeatureKey :: Proxy t -> TargetFeatureKey (CTargetFeatures t)
+  observeCTargetFeatures :: Proxy t -> IO (CTargetFeatures t)
+  ensureCTargetAdmitted :: Proxy t -> CTargetFeatures t -> IO ()
+  cTargetBanner :: Proxy t -> CTargetFeatures t -> String
+  cTargetBuildFlags :: Proxy t -> CTargetFeatures t -> [JCFunc] -> IO ([String], [String])
 
-type instance JanusCRetType (JanusCM ()) = ()
-type instance JanusCRetType (JanusC a) = a
-type instance JanusCRetType (JanusCM (JanusC a)) = a
-type instance JanusCRetType (JanusC a -> r) = JanusCRetType r
+askCTargetFeatures :: forall t s. (JanusCTarget t) => JanusCMT s (CTargetFeatures t)
+askCTargetFeatures = askTargetFeature (cTargetFeatureKey (Proxy @t))
 
-class JanusCParam r where
-  jcparam :: String -> Int -> JanusCM [Param] -> JanusCBackend -> r -> [JCFunc]
+instance JanusCTarget PortableC where
+  type CTargetFeatures PortableC = ()
+  cTargetFeatureKey _ = portableCFeatureKey
+  observeCTargetFeatures _ = pure ()
+  ensureCTargetAdmitted _ () = pure ()
+  cTargetBanner _ () = ""
+  cTargetBuildFlags _ () _ = pure ([], [])
 
-class JanusCEvaluate r where
-  jceval :: ForeignPtr () -> [Arg] -> r -> JanusCEval r
+{-# INLINE withIndirectStorableArg #-}
+withIndirectStorableArg :: (Storable.Storable a) => a -> (Ptr () -> IO b) -> IO b
+withIndirectStorableArg v k =
+  let b = Storable.sizeOf v
+      al = max 32 (Storable.alignment v)
+   in allocaBytesAligned b al $ \p -> Storable.poke p v >> k (castPtr p)
+
+{-# INLINE withIndirectStorableRet #-}
+withIndirectStorableRet :: forall a. (Storable.Storable a) => (Ptr () -> IO ()) -> IO a
+withIndirectStorableRet callOut =
+  let b = Storable.sizeOf (undefined :: a)
+      al = max 32 (Storable.alignment (undefined :: a))
+   in allocaBytesAligned b al $ \pOut -> callOut (castPtr pOut) >> Storable.peek pOut
+
+emitIndirectABIParam :: forall a. (JanusCTyped a) => Int -> Int -> (JanusCM Param, Exp)
+emitIndirectABIParam bytes n =
+  let aid = mkArgId n
+      valId = Id ("arg_val_" <> show n) noLoc
+      JCType vspec vdec = voidPtrType
+      mkP = do
+        addHeader "string.h"
+        JCType spec dec <- getJanusCType (Proxy @a)
+        let decl = BlockDecl $ InitGroup spec [] [Init valId dec Nothing Nothing [] noLoc] noLoc
+            cp = FnCall (Var (Id "memcpy" noLoc) noLoc) [UnOp AddrOf (Var valId noLoc) noLoc, Var aid noLoc, signedIntConst bytes] noLoc
+            stm = BlockStm $ Exp (Just cp) noLoc
+        modifyFunction $ \fn -> fn & jcfBlock %~ flip appendBlock [decl, stm]
+        pure (Param (Just aid) vspec vdec noLoc)
+   in (mkP, Var valId noLoc)
+
+emitIndirectABIRet :: forall t a. (JanusCTyped a) => Int -> JanusCT t a -> JanusCM [Param]
+emitIndirectABIRet bytes (JanusCT mval) = do
+  addHeader "string.h"
+  RVal e <- mval
+  ty <- getJanusCType (Proxy @a)
+  v <- emitLocalVal ty e
+  let outId = Id "janus_ret_out" noLoc
+      JCType vspec vdec = voidPtrType
+      outParam = Param (Just outId) vspec vdec noLoc
+      cp = FnCall (Var (Id "memcpy" noLoc) noLoc) [Var outId noLoc, UnOp AddrOf v noLoc, signedIntConst bytes] noLoc
+  modifyFunction $ \fn -> fn & jcfBlock %~ flip appendBlock [BlockStm $ Exp (Just cp) noLoc]
+  finishFunction_
+  pure [outParam]
+
+indirectABIParamTHSpec :: (Typeable a) => Proxy a -> THParamSpec
+indirectABIParamTHSpec p =
+  THParamSpec
+    { thParamUserType = typeRepToTHType (typeRep p),
+      thParamRawType = voidPtrTHType,
+      thParamMode = THParamIO $ \k argExp -> do
+        pName <- TH.newName "p_arg"
+        inner <- k (TH.VarE pName)
+        pure $
+          TH.AppE
+            (TH.AppE (TH.VarE 'withIndirectStorableArg) argExp)
+            (TH.LamE [TH.VarP pName] inner)
+    }
+
+indirectABIRetTHSpec :: (Typeable a) => THRetEffect -> Proxy a -> THRetSpec
+indirectABIRetTHSpec eff p =
+  THRetSpec
+    { thRetEffect = eff,
+      thRetUserBaseType = typeRepToTHType (typeRep p),
+      thRetMode = THRetOutPtr $ \callWithOut -> do
+        pOutName <- TH.newName "p_out"
+        callExp <- callWithOut (TH.VarE pOutName)
+        pure $ TH.AppE (TH.VarE 'withIndirectStorableRet) (TH.LamE [TH.VarP pOutName] callExp)
+    }
+
+scalarParamSpec :: (Typeable a, FFIArg a) => Proxy a -> THParamSpec
+scalarParamSpec = ffiTHParamSpec
+
+scalarRetSpec :: (Typeable a, FFIRet a) => THRetEffect -> Proxy a -> THRetSpec
+scalarRetSpec = ffiTHRetSpec
+
+class (JanusCTyped a) => JanusCABIParam (t :: K.Type) (a :: K.Type) where
+  jcEmitABIParam :: Proxy t -> Int -> (JanusCM Param, Exp)
+  jcWithABIArg :: Proxy t -> a -> (Arg -> IO b) -> IO b
+  jcABIParamIsIndirect :: Proxy t -> Proxy a -> Bool
+  jcABIParamIsIndirect _ _ = False
+  jcABIParamTHSpec :: Proxy t -> Proxy a -> THParamSpec
+
+class (JanusCTyped a) => JanusCABIRet (t :: K.Type) (a :: K.Type) where
+  jcFinishABIRet :: Proxy t -> JanusCT t a -> JanusCM [Param]
+  jcCallABIRet :: Proxy t -> Proxy a -> FunPtr () -> [Arg] -> IO a
+  jcABIRetIsIndirect :: Proxy t -> Proxy a -> Bool
+  jcABIRetIsIndirect _ _ = False
+  jcABIRetTHSpec :: Proxy t -> THRetEffect -> Proxy a -> THRetSpec
+
+instance {-# OVERLAPPABLE #-} (JanusCTyped a, FFIArg a) => JanusCABIParam t a where
+  jcEmitABIParam _ n =
+    let aid = mkArgId n
+        mkP = do
+          JCType spec dec <- getJanusCType (Proxy @a)
+          pure (Param (Just aid) spec dec noLoc)
+     in (mkP, Var aid noLoc)
+  jcWithABIArg _ a k = k (arg a)
+  jcABIParamTHSpec _ = ffiTHParamSpec
+
+instance {-# OVERLAPPABLE #-} (JanusCTyped a, FFIRet a) => JanusCABIRet t a where
+  jcFinishABIRet _ a = finishFunction a >> pure []
+  jcCallABIRet _ p fp args = callFFI fp (ret p) (reverse args)
+  jcABIRetTHSpec _ = ffiTHRetSpec
+
+type family JanusCHost (p :: K.Type) :: K.Type
+
+type instance JanusCHost () = ()
+type instance JanusCHost (JanusCT t a) = a
+
+type family JanusCTermEval (mres :: K.Type) :: K.Type
+type family JanusCTermRet (mres :: K.Type) :: K.Type
+
+type instance JanusCTermEval (JanusCT t a) = a
+type instance JanusCTermRet (JanusCT t a) = a
+
+type instance JanusCTermEval (JanusCMT t res) = IO (JanusCHost res)
+type instance JanusCTermRet (JanusCMT t res) = JanusCHost res
+
+type family JanusCEval (r :: K.Type) :: K.Type where
+  JanusCEval (p -> r) = JanusCHost p -> JanusCEval r
+  JanusCEval mres = JanusCTermEval mres
+
+type family JanusCRetType (r :: K.Type) :: K.Type where
+  JanusCRetType (_ -> r) = JanusCRetType r
+  JanusCRetType mres = JanusCTermRet mres
+
+class JanusCArg (t :: K.Type) (p :: K.Type) | p -> t where
+  jcEmitArg :: Int -> (Int, JanusCM [Param], p)
+  jcDummyArg :: p
+  jcWithHostArg :: Proxy p -> JanusCHost p -> [Arg] -> ([Arg] -> IO b) -> IO b
+  jcTHParamSpecs :: Proxy p -> [THParamSpec]
+
+class JanusCValRet (t :: K.Type) (res :: K.Type) where
+  jcFinishValRet :: Proxy t -> res -> JanusCM [Param]
+  jcCallValRet :: Proxy t -> Proxy res -> FunPtr () -> [Arg] -> IO (JanusCHost res)
+  jcTHValRetSpec :: Proxy t -> THRetEffect -> Proxy res -> THRetSpec
+
+instance (JanusCABIParam t a) => JanusCArg t (JanusCT t a) where
+  jcEmitArg n =
+    let (mkP, e) = jcEmitABIParam @t @a (Proxy @t) n
+     in (n + 1, pure <$> mkP, JanusCT (pure (RVal e)))
+  jcDummyArg =
+    JanusCT (pure (RVal (Var (Id "this_is_a_bug_if_you_see_this" noLoc) noLoc)))
+  jcWithHostArg _ val prevArgs k =
+    jcWithABIArg (Proxy @t) val (\a -> k (a : prevArgs))
+  jcTHParamSpecs _ = [jcABIParamTHSpec (Proxy @t) (Proxy @a)]
+
+instance JanusCValRet t () where
+  jcFinishValRet _ () = finishFunction_ >> pure []
+  jcCallValRet _ _ fp args = callFFI fp retVoid (reverse args)
+  jcTHValRetSpec _ eff _ = THRetSpec eff unitTHType (THRetDirect unitTHType)
+
+instance (JanusCABIRet t a) => JanusCValRet t (JanusCT t a) where
+  jcFinishValRet pt a = jcFinishABIRet pt a
+  jcCallValRet pt _ fp args = jcCallABIRet pt (Proxy @a) fp args
+  jcTHValRetSpec pt eff _ = jcABIRetTHSpec pt eff (Proxy @a)
+
+class (JanusCTarget t) => JanusCParam (t :: K.Type) (r :: K.Type) | r -> t where
+  jcparamWith :: CTargetFeatures t -> String -> Int -> JanusCM [Param] -> r -> [JCFunc]
+  jcTHSpec :: Proxy r -> ([THParamSpec], THRetSpec)
+
+class (JanusCTarget t) => JanusCEvaluate (t :: K.Type) (r :: K.Type) | r -> t where
+  jcevalCont :: (([Arg] -> IO (JanusCRetType r)) -> IO (JanusCRetType r)) -> ForeignPtr () -> r -> JanusCEval r
+
+jcparam :: forall t r. (JanusCParam t r) => String -> Int -> JanusCM [Param] -> r -> [JCFunc]
+jcparam = jcparamWith (lowerBound @(CTargetFeatures t))
 
 {-# NOINLINE evalPureJanusCFFI #-}
-evalPureJanusCFFI :: forall a. (FFIRet a) => ForeignPtr () -> [Arg] -> a
-evalPureJanusCFFI dlFPtr args = unsafePerformIO $
+evalPureJanusCFFI :: ForeignPtr () -> (FunPtr () -> IO a) -> a
+evalPureJanusCFFI dlFPtr k = unsafePerformIO $
   withForeignPtr dlFPtr $ \p ->
-    callFFI (castPtrToFunPtr p) (ret (Proxy @a)) (reverse args)
+    k (castPtrToFunPtr p)
 
-instance (FFIRet a, JanusCTyped a) => JanusCParam (JanusC a) where
-  jcparam = jcparamImpl (Proxy @JanusC)
+mkTargetFuncInfo :: forall t. (JanusCTarget t) => Proxy t -> CTargetFeatures t -> String -> JCFuncInfo
+mkTargetFuncInfo pt fs name =
+  setTargetFeature (cTargetFeatureKey pt) fs (mkJCFuncInfo name JC False)
 
-instance (FFIRet a, JanusCTyped a) => JanusCEvaluate (JanusC a) where
-  jceval dlFPtr args _ = evalPureJanusCFFI @a dlFPtr args
+instance (JanusCTarget t, JanusCABIRet t a) => JanusCParam t (JanusCT t a) where
+  jcparamWith fs name _ mparams a =
+    runJCCodegen (mkTargetFuncInfo (Proxy @t) fs name) $ do
+      ps <- mparams
+      extra <- jcFinishABIRet (Proxy @t) a
+      modify $ \s -> s & ix name . jcfParams .~ Params (reverse ps <> extra) False noLoc
+  jcTHSpec _ = ([], jcABIRetTHSpec (Proxy @t) THRetPure (Proxy @a))
 
-instance (FFIRet a, JanusCTyped a) => JanusCParam (JanusCM (JanusC a)) where
-  jcparam = jcparamImpl (Proxy @JanusC)
+instance (JanusCTarget t, JanusCABIRet t a) => JanusCEvaluate t (JanusCT t a) where
+  jcevalCont withArgs dlFPtr _ =
+    evalPureJanusCFFI dlFPtr $ \fp ->
+      withArgs (jcCallABIRet (Proxy @t) (Proxy @a) fp)
 
-instance (FFIRet a, JanusCTyped a) => JanusCEvaluate (JanusCM (JanusC a)) where
-  jceval dlFPtr args _ =
+instance (JanusCTarget t, JanusCValRet t res) => JanusCParam t (JanusCMT t res) where
+  jcparamWith fs name _ mparams ma =
+    runJCCodegen (mkTargetFuncInfo (Proxy @t) fs name) $ do
+      ps <- mparams
+      res <- unJanusCMT ma
+      extra <- jcFinishValRet (Proxy @t) res
+      modify $ \s -> s & ix name . jcfParams .~ Params (reverse ps <> extra) False noLoc
+  jcTHSpec _ = ([], jcTHValRetSpec (Proxy @t) THRetIO (Proxy @res))
+
+instance (JanusCTarget t, JanusCValRet t res) => JanusCEvaluate t (JanusCMT t res) where
+  jcevalCont withArgs dlFPtr _ =
     withForeignPtr dlFPtr $ \p ->
-      callFFI (castPtrToFunPtr p) (ret (Proxy @a)) (reverse args)
+      withArgs (jcCallValRet (Proxy @t) (Proxy @res) (castPtrToFunPtr p))
 
-instance JanusCParam (JanusCM ()) where
-  jcparam = jcparamImpl (Proxy @JanusC)
+instance (JanusCArg t p, JanusCParam t r) => JanusCParam t (p -> r) where
+  jcparamWith fs name n mparams f =
+    let (n', mkPs, pExpr) = jcEmitArg @t @p n
+        mparams' = do
+          ps <- mparams
+          emitted <- mkPs
+          pure (reverse emitted <> ps)
+     in jcparamWith fs name n' mparams' (f pExpr)
+  jcTHSpec _ =
+    let (ps, retSpec) = jcTHSpec @t @r (Proxy @r)
+     in (jcTHParamSpecs (Proxy @p) <> ps, retSpec)
 
-instance JanusCEvaluate (JanusCM ()) where
-  jceval dlFPtr args _ =
-    withForeignPtr dlFPtr $ \p ->
-      callFFI (castPtrToFunPtr p) (ret (Proxy @())) (reverse args)
+instance (JanusCArg t p, JanusCEvaluate t r) => JanusCEvaluate t (p -> r) where
+  jcevalCont ::
+    (([Arg] -> IO (JanusCRetType r)) -> IO (JanusCRetType r)) ->
+    ForeignPtr () ->
+    (p -> r) ->
+    JanusCHost p ->
+    JanusCEval r
+  jcevalCont withArgs dlFPtr f valHs =
+    jcevalCont @t @r
+      (\k -> withArgs (\as -> jcWithHostArg @t @p (Proxy @p) valHs as k))
+      dlFPtr
+      (f (jcDummyArg @t @p))
 
-instance (JanusCTyped a, JanusCParam r, JanusCParamImpl JanusC JanusCM r) => JanusCParam (JanusC a -> r) where
-  jcparam = jcparamImpl (Proxy @JanusC)
+--------------------------------------------------------------------------------
+-- Target-Polymorphic Compilation, Inspection & Evaluation Entrypoints
+--------------------------------------------------------------------------------
 
-instance (JanusCTyped a, FFIArg a, JanusCEvaluate r) => JanusCEvaluate (JanusC a -> r) where
-  jceval dlFPtr args f a = jceval dlFPtr (arg a : args) (f $ JanusC $ pure $ RVal $ Var (Id "this_is_a_bug_if_you_see_this" noLoc) noLoc)
+resolveCTargetFeatures :: forall t. (JanusCTarget t) => Proxy t -> CBuildConfig -> IO (CTargetFeatures t)
+resolveCTargetFeatures pt config =
+  case config ^. cBuildConfigTargetFeature (cTargetFeatureKey pt) of
+    Just fs -> pure fs
+    Nothing -> observeCTargetFeatures pt
 
-compileJanusCNamed :: forall r. (JanusCParam r, JanusCEvaluate r) => String -> JanusCBackend -> CBuildConfig -> r -> IO (JanusCEval r)
-compileJanusCNamed name backend config a = fst <$> acquireJanusCNamed name backend config a
+prepareJanusCUnit ::
+  forall t r.
+  (JanusCParam t r) =>
+  CTargetFeatures t ->
+  String ->
+  r ->
+  IO (String, [String], [String])
+prepareJanusCUnit reqFeatures name prog = do
+  let pt = Proxy @t
+      funcs = jcparamWith reqFeatures name 0 (pure []) prog
+      cSource = cTargetBanner pt reqFeatures <> renderJCProgram name funcs
+  (cflags, ldflags) <- cTargetBuildFlags pt reqFeatures funcs
+  pure (cSource, cflags, ldflags)
 
-compileJanusC :: forall r. (JanusCParam r, JanusCEvaluate r) => JanusCBackend -> CBuildConfig -> r -> IO (JanusCEval r)
-compileJanusC = compileJanusCNamed "janus_main"
+showJanusCWith :: forall t r. (JanusCParam t r) => CTargetFeatures t -> String -> r -> String
+showJanusCWith fs name a =
+  let jcs = jcparamWith fs name 0 (pure []) a
+      banner = cTargetBanner (Proxy @t) fs
+      sep = "\n" <> replicate 80 '-' <> "\n"
+   in banner <> foldMap ((<> sep) . renderJCFunc) jcs
 
--- this mostly exists for use with hedgehog withResource
-acquireJanusCNamed :: forall r. (JanusCParam r, JanusCEvaluate r) => String -> JanusCBackend -> CBuildConfig -> r -> IO (JanusCEval r, ForeignPtr ())
-acquireJanusCNamed name backend config a = do
+showJanusC :: forall t r. (JanusCParam t r) => String -> r -> IO String
+showJanusC name a = do
+  fs <- observeCTargetFeatures (Proxy @t)
+  pure (showJanusCWith fs name a)
+
+printJanusCWith :: (JanusCParam t r) => CTargetFeatures t -> r -> IO ()
+printJanusCWith fs = putStrLn . showJanusCWith fs "janus_main"
+
+printJanusC :: (JanusCParam t r) => r -> IO ()
+printJanusC a = showJanusC "janus_main" a >>= putStrLn
+
+acquireJanusCNamedWith ::
+  forall t r.
+  (JanusCParam t r, JanusCEvaluate t r) =>
+  String ->
+  CTargetFeatures t ->
+  CBuildConfig ->
+  r ->
+  IO (JanusCEval r, ForeignPtr ())
+acquireJanusCNamedWith name reqFeatures config a = do
+  let pt = Proxy @t
+  ensureCTargetAdmitted pt reqFeatures
   let dir = config ^. cBuildConfigCacheDir
-  files <- writeJanusCFiles backend dir (jcparam name 0 (pure []) backend a)
-  dlFPtr <- acquireJanusCFunPtrWithConfig config [] [] files name
-  pure (jceval dlFPtr [] a :: JanusCEval r, dlFPtr)
+      funcs = jcparamWith reqFeatures name 0 (pure []) a
+  (extraCFlags, extraLDFlags) <- cTargetBuildFlags pt reqFeatures funcs
+  files <- writeJanusCFiles JC dir funcs
+  dlFPtr <- acquireJanusCFunPtrWithConfig config extraCFlags extraLDFlags files name
+  pure (jcevalCont ($ []) dlFPtr a, dlFPtr)
 
--- this mostly exists for use with hedgehog withResource
-acquireJanusC :: forall r. (JanusCParam r, JanusCEvaluate r) => JanusCBackend -> CBuildConfig -> r -> IO (JanusCEval r, ForeignPtr ())
+acquireJanusCWith ::
+  forall t r.
+  (JanusCParam t r, JanusCEvaluate t r) =>
+  CTargetFeatures t ->
+  CBuildConfig ->
+  r ->
+  IO (JanusCEval r, ForeignPtr ())
+acquireJanusCWith = acquireJanusCNamedWith "janus_main"
+
+acquireJanusCNamed ::
+  forall t r.
+  (JanusCParam t r, JanusCEvaluate t r) =>
+  String ->
+  CBuildConfig ->
+  r ->
+  IO (JanusCEval r, ForeignPtr ())
+acquireJanusCNamed name config a = do
+  fs <- resolveCTargetFeatures (Proxy @t) config
+  acquireJanusCNamedWith name fs config a
+
+acquireJanusC ::
+  forall t r.
+  (JanusCParam t r, JanusCEvaluate t r) =>
+  CBuildConfig ->
+  r ->
+  IO (JanusCEval r, ForeignPtr ())
 acquireJanusC = acquireJanusCNamed "janus_main"
 
 -- this mostly exists for use with hedgehog withResource; the DL is closed by
@@ -412,23 +675,81 @@ acquireJanusC = acquireJanusCNamed "janus_main"
 releaseJanusC :: (a, ForeignPtr ()) -> IO ()
 releaseJanusC _ = pure ()
 
-withJanusCNamed :: forall a r. (JanusCParam r, JanusCEvaluate r, FFIRet (JanusCRetType r)) => String -> CBuildConfig -> r -> (JanusCEval r -> IO a) -> IO a
-withJanusCNamed name config a k = compileJanusCNamed name JC config a >>= k
+compileJanusCNamedWith ::
+  forall t r.
+  (JanusCParam t r, JanusCEvaluate t r) =>
+  String ->
+  CTargetFeatures t ->
+  CBuildConfig ->
+  r ->
+  IO (JanusCEval r)
+compileJanusCNamedWith name reqFeatures config a =
+  fst <$> acquireJanusCNamedWith name reqFeatures config a
 
-withJanusC :: forall a r. (JanusCParam r, JanusCEvaluate r, FFIRet (JanusCRetType r)) => CBuildConfig -> r -> (JanusCEval r -> IO a) -> IO a
+compileJanusCWith ::
+  forall t r.
+  (JanusCParam t r, JanusCEvaluate t r) =>
+  CTargetFeatures t ->
+  CBuildConfig ->
+  r ->
+  IO (JanusCEval r)
+compileJanusCWith = compileJanusCNamedWith "janus_main"
+
+compileJanusCNamed ::
+  forall t r.
+  (JanusCParam t r, JanusCEvaluate t r) =>
+  String ->
+  CBuildConfig ->
+  r ->
+  IO (JanusCEval r)
+compileJanusCNamed name config a =
+  fst <$> acquireJanusCNamed name config a
+
+compileJanusC ::
+  forall t r.
+  (JanusCParam t r, JanusCEvaluate t r) =>
+  CBuildConfig ->
+  r ->
+  IO (JanusCEval r)
+compileJanusC = compileJanusCNamed "janus_main"
+
+withJanusCNamedWith ::
+  (JanusCParam t r, JanusCEvaluate t r) =>
+  String ->
+  CTargetFeatures t ->
+  CBuildConfig ->
+  r ->
+  (JanusCEval r -> IO a) ->
+  IO a
+withJanusCNamedWith name fs config a k =
+  compileJanusCNamedWith name fs config a >>= k
+
+withJanusCWith ::
+  (JanusCParam t r, JanusCEvaluate t r) =>
+  CTargetFeatures t ->
+  CBuildConfig ->
+  r ->
+  (JanusCEval r -> IO a) ->
+  IO a
+withJanusCWith = withJanusCNamedWith "janus_main"
+
+withJanusCNamed ::
+  (JanusCParam t r, JanusCEvaluate t r) =>
+  String ->
+  CBuildConfig ->
+  r ->
+  (JanusCEval r -> IO a) ->
+  IO a
+withJanusCNamed name config a k =
+  compileJanusCNamed name config a >>= k
+
+withJanusC ::
+  (JanusCParam t r, JanusCEvaluate t r) =>
+  CBuildConfig ->
+  r ->
+  (JanusCEval r -> IO a) ->
+  IO a
 withJanusC = withJanusCNamed "janus_main"
-
-showJanusC :: forall a. (JanusCParam a) => String -> JanusCBackend -> a -> String
-showJanusC name backend a =
-  let jcs = jcparam name 0 (pure []) backend a
-      strChar 0 = '\n'
-      strChar 81 = '\n'
-      strChar _ = '-'
-      str = fmap strChar [0 .. 81 :: Int]
-   in foldMap ((<> str) . renderJCFunc) jcs
-
-printJanusC :: (JanusCParam r) => r -> IO ()
-printJanusC = putStrLn . showJanusC "janus_main" JC
 
 backendExt :: JanusCBackend -> String
 backendExt JC = ".c"
@@ -453,7 +774,7 @@ writeJanusCFiles backend dir funcs = do
           rename tmpPath path
     pure filename
 
-getFunction :: JanusCM JCFunc
+getFunction :: JanusCMT t JCFunc
 getFunction = do
   fname <- askFuncName
   jcs <- get
@@ -465,7 +786,7 @@ getFunction = do
       pure f
 
 -- NOTE the memoization here is mandatory for fixpoints to work
-getJanusCType :: (Typeable a, JanusCTyped a) => Proxy a -> JanusCM JCType
+getJanusCType :: (Typeable a, JanusCTyped a) => Proxy a -> JanusCMT t JCType
 getJanusCType p = do
   fname <- askFuncName
   f <- getFunction
@@ -473,7 +794,7 @@ getJanusCType p = do
   case Map.lookup tyrep (f ^. jcfTypeCache) of
     Just t -> pure t
     Nothing -> do
-      t@(JCType spec dec) <- jctype p
+      t@(JCType spec dec) <- liftJanusCM (jctype p)
       let isntStruct (DeclSpec _ _ (Tstruct {}) _) = False
           isntStruct _ = True
       if isntStruct spec
@@ -500,14 +821,14 @@ getJanusCType p = do
           modify $ \s -> s & at fname ?~ f'
           pure t'
 
-addHeader :: String -> JanusCM ()
+addHeader :: String -> JanusCMT t ()
 addHeader header = do
   fname <- askFuncName
   modify $ \s -> s & ix fname . jcfHeaders %~ Set.insert header
 
 -- | Bind an expression to a fresh SSA-style local variable in the current C
 -- function block and return its variable reference expression.
-emitLocalVal :: JCType -> Exp -> JanusCM Exp
+emitLocalVal :: JCType -> Exp -> JanusCMT t Exp
 emitLocalVal (JCType spec dec) rhs = do
   fn <- getFunction
   fname <- askFuncName
@@ -521,6 +842,10 @@ emitLocalVal (JCType spec dec) rhs = do
           & jcfVarCounter +~ 1
   modify $ \st -> st & ix fname .~ fn'
   pure (Var vid noLoc)
+
+--------------------------------------------------------------------------------
+-- Scalar C Type & Literal Instances
+--------------------------------------------------------------------------------
 
 instance JanusCTyped Bool where
   jctype _ = do
@@ -753,24 +1078,28 @@ instance JanusLitC (Complex Double) where
     i <- jlitc (imagPart a)
     pure $ FnCall (Var (Id "CMPLX" noLoc) noLoc) [r, i] noLoc
 
-janusCUnOp :: UnOp -> JanusC a -> JanusC a
-janusCUnOp unop (JanusC a) = JanusC $ do
+--------------------------------------------------------------------------------
+-- Portable C Operators, Math, & Semilattice Instances on JanusCT t
+--------------------------------------------------------------------------------
+
+janusCUnOp :: UnOp -> JanusCT t a -> JanusCT t a
+janusCUnOp unop (JanusCT a) = JanusCT $ do
   RVal a' <- a
   pure . RVal $ UnOp unop a' noLoc
 
 janusCBinOp ::
-  BinOp -> JanusC a -> JanusC a -> JanusC a
-janusCBinOp binop (JanusC a) (JanusC b) = JanusC $ do
+  BinOp -> JanusCT t a -> JanusCT t a -> JanusCT t a
+janusCBinOp binop (JanusCT a) (JanusCT b) = JanusCT $ do
   RVal a' <- a
   RVal b' <- b
   pure $ RVal $ BinOp binop a' b' noLoc
 
 janusCBoolBinOp ::
-  BinOp -> JanusC a -> JanusC a -> JanusC Bool
-janusCBoolBinOp = coerce janusCBinOp
+  forall t a. BinOp -> JanusCT t a -> JanusCT t a -> JanusCT t Bool
+janusCBoolBinOp = coerce (janusCBinOp @t @a)
 
-instance (Num a, JanusLitC a) => Num (JanusC a) where
-  fromInteger n = JanusC $ do
+instance (Num a, JanusLitC a) => Num (JanusCT t a) where
+  fromInteger n = JanusCT $ do
     n' <- jlitc @a (fromInteger n)
     pure $ RVal n'
   a + b = janusCBinOp Add a b
@@ -778,7 +1107,7 @@ instance (Num a, JanusLitC a) => Num (JanusC a) where
   a * b = janusCBinOp Mul a b
   negate = janusCUnOp Negate
   abs x = x * signum x
-  signum (JanusC a) = JanusC $ do
+  signum (JanusCT a) = JanusCT $ do
     RVal a' <- a
     zero <- jlitc @a 0
     pure . RVal $
@@ -788,8 +1117,12 @@ instance (Num a, JanusLitC a) => Num (JanusC a) where
         (BinOp Lt a' zero noLoc)
         noLoc
 
-instance (JanusLitC a, Fractional a) => Fractional (JanusC a) where
-  fromRational a = JanusC $ do
+instance (Bounded a, JanusLitC a) => Bounded (JanusCT t a) where
+  minBound = JanusCT (RVal <$> jlitc (minBound :: a))
+  maxBound = JanusCT (RVal <$> jlitc (maxBound :: a))
+
+instance (JanusLitC a, Fractional a) => Fractional (JanusCT t a) where
+  fromRational a = JanusCT $ do
     a' <- jlitc $ fromRational @a a
     pure $ RVal a'
   a / b = janusCBinOp Div a b
@@ -797,17 +1130,17 @@ instance (JanusLitC a, Fractional a) => Fractional (JanusC a) where
 class JanusCFFICall r where
   jcffi :: Maybe String -> String -> JanusCM [Exp] -> r
 
-instance JanusCFFICall (JanusC a) where
-  jcffi mheader name args = JanusC $ do
+instance JanusCFFICall (JanusCT t a) where
+  jcffi mheader name args = JanusCT $ do
     args' <- args
     case mheader of
       Just h -> modifyFunction $ \fn -> fn & jcfHeaders %~ Set.insert h
       Nothing -> pure ()
     pure $ RVal $ FnCall (Var (Id name noLoc) noLoc) (reverse args') noLoc
 
-instance (JanusCTyped a) => JanusCFFICall (JanusCM (JanusC a)) where
+instance (JanusCTyped a) => JanusCFFICall (JanusCMT t (JanusCT t a)) where
   jcffi mheader name args = do
-    args' <- args
+    args' <- liftJanusCM args
     case mheader of
       Just h -> modifyFunction $ \fn -> fn & jcfHeaders %~ Set.insert h
       Nothing -> pure ()
@@ -823,11 +1156,11 @@ instance (JanusCTyped a) => JanusCFFICall (JanusCM (JanusC a)) where
             & jcfBlock %~ flip appendBlock [BlockDecl $ InitGroup spec [] [ini] noLoc]
             & jcfVarCounter +~ 1
     modify $ \st -> st & ix fname .~ fn'
-    pure $ JanusC $ pure $ RVal $ Var var noLoc
+    pure $ JanusCT $ pure $ RVal $ Var var noLoc
 
-instance {-# OVERLAPS #-} JanusCFFICall (JanusCM (JanusC (Ptr ()))) where
+instance {-# OVERLAPS #-} JanusCFFICall (JanusCMT t (JanusCT t (Ptr ()))) where
   jcffi mheader name args = do
-    args' <- args
+    args' <- liftJanusCM args
     case mheader of
       Just h -> modifyFunction $ \fn -> fn & jcfHeaders %~ Set.insert h
       Nothing -> pure ()
@@ -843,36 +1176,36 @@ instance {-# OVERLAPS #-} JanusCFFICall (JanusCM (JanusC (Ptr ()))) where
             & jcfBlock %~ flip appendBlock [BlockDecl $ InitGroup spec [] [ini] noLoc]
             & jcfVarCounter +~ 1
     modify $ \st -> st & ix fname .~ fn'
-    pure $ JanusC $ pure $ RVal $ Var var noLoc
+    pure $ JanusCT $ pure $ RVal $ Var var noLoc
 
-instance JanusCFFICall (JanusCM ()) where
+instance JanusCFFICall (JanusCMT t ()) where
   jcffi mheader name args = do
-    args' <- args
+    args' <- liftJanusCM args
     case mheader of
       Just h -> modifyFunction $ \fn -> fn & jcfHeaders %~ Set.insert h
       Nothing -> pure ()
     let fncall = FnCall (Var (Id name noLoc) noLoc) (reverse args') noLoc
     modifyFunction $ \fn -> fn & jcfBlock %~ flip appendBlock [BlockStm $ Exp (Just fncall) noLoc]
 
-instance (JanusCFFICall r) => JanusCFFICall (JanusC a -> r) where
+instance (JanusCFFICall r) => JanusCFFICall (JanusCT t a -> r) where
   jcffi mheader name args a = jcffi mheader name args''
     where
       args'' = do
-        RVal arg' <- getJanusC a
+        RVal arg' <- getJanusCT a
         args' <- args
         pure (arg' : args')
 
 janusCFFICall :: (JanusCFFICall r) => Maybe String -> String -> r
 janusCFFICall header name = jcffi header name (pure [])
 
-unMathFun :: String -> JanusC a -> JanusC a
+unMathFun :: String -> JanusCT t a -> JanusCT t a
 unMathFun = janusCFFICall (Just "math.h")
 
-binMathFun :: String -> JanusC a -> JanusC a -> JanusC a
+binMathFun :: String -> JanusCT t a -> JanusCT t a -> JanusCT t a
 binMathFun = janusCFFICall (Just "math.h")
 
-instance Floating (JanusC Float) where
-  pi = JanusC $ do
+instance Floating (JanusCT t Float) where
+  pi = JanusCT $ do
     pi' <- jlitc @Float pi
     pure $ RVal pi'
   exp = unMathFun "expf"
@@ -894,8 +1227,8 @@ instance Floating (JanusC Float) where
   log1p = unMathFun "log1pf"
   expm1 = unMathFun "expm1f"
 
-instance Floating (JanusC Double) where
-  pi = JanusC $ do
+instance Floating (JanusCT t Double) where
+  pi = JanusCT $ do
     pi' <- jlitc @Double pi
     pure $ RVal pi'
   exp = unMathFun "exp"
@@ -917,8 +1250,8 @@ instance Floating (JanusC Double) where
   log1p = unMathFun "log1p"
   expm1 = unMathFun "expm1"
 
-instance Floating (JanusC (Complex Float)) where
-  pi = JanusC $ do
+instance Floating (JanusCT t (Complex Float)) where
+  pi = JanusCT $ do
     pi' <- jlitc @(Complex Float) pi
     pure $ RVal pi'
   exp = unMathFun "cexpf"
@@ -938,8 +1271,8 @@ instance Floating (JanusC (Complex Float)) where
   acosh = unMathFun "cacoshf"
   atanh = unMathFun "catanhf"
 
-instance Floating (JanusC (Complex Double)) where
-  pi = JanusC $ do
+instance Floating (JanusCT t (Complex Double)) where
+  pi = JanusCT $ do
     pi' <- jlitc @(Complex Double) pi
     pure $ RVal pi'
   exp = unMathFun "cexp"
@@ -959,18 +1292,18 @@ instance Floating (JanusC (Complex Double)) where
   acosh = unMathFun "cacosh"
   atanh = unMathFun "catanh"
 
-instance Join (JanusC Bool) where
+instance Join (JanusCT t Bool) where
   p \/ q = janusCBinOp Lor p q
 
-instance Lower (JanusC Bool) where
-  lowerBound = JanusC $ do
+instance Lower (JanusCT t Bool) where
+  lowerBound = JanusCT $ do
     addHeader "stdbool.h"
     pure . RVal $ Var (Id "false" noLoc) noLoc
 
-instance Meet (JanusC Bool) where
+instance Meet (JanusCT t Bool) where
   p /\ q = janusCBinOp Land p q
 
-instance Upper (JanusC Bool) where
-  upperBound = JanusC $ do
+instance Upper (JanusCT t Bool) where
+  upperBound = JanusCT $ do
     addHeader "stdbool.h"
     pure . RVal $ Var (Id "true" noLoc) noLoc

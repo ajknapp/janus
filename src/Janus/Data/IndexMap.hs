@@ -3,6 +3,7 @@
 {-# LANGUAGE DataKinds #-}
 {-# LANGUAGE DeriveGeneric #-}
 {-# LANGUAGE DerivingStrategies #-}
+{-# LANGUAGE DerivingVia #-}
 {-# LANGUAGE FlexibleContexts #-}
 {-# LANGUAGE FlexibleInstances #-}
 {-# LANGUAGE KindSignatures #-}
@@ -91,8 +92,6 @@ import Janus.Alloc.Policy
     freeTypedArray,
   )
 import Janus.Backend.C
-import Janus.Backend.C.LinuxX86_64
-import Janus.Backend.C.TH
 import Janus.Command.Cond (ifThenElseM_, whenM_)
 import Janus.Command.Memory
   ( CmdMemCopy (..),
@@ -1160,69 +1159,14 @@ drainAppendIndexMapWith alloc combine im =
 
 type IndexMapABI k v = (Typeable k, Typeable v, JanusStruct (Buf k), JanusStruct (Buf v))
 
-type instance JanusCEval (IndexMap JanusC k v -> r) = IndexMap Identity k v -> JanusCEval r
+type instance JanusCHost (IndexMap (JanusCT _) k v) = IndexMap Identity k v
 
-type instance JanusCRetType (IndexMap JanusC k v -> r) = JanusCRetType r
+deriving via
+  ViaPtrHandle t (CStruct (IndexMapSpine k v)) (IndexMap Identity k v)
+  instance
+    (IndexMapABI k v) => JanusCArg t (IndexMap (JanusCT t) k v)
 
-instance (IndexMapABI k v, JanusCParam r) => JanusCParam (IndexMap JanusC k v -> r) where
-  jcparam = mkPtrHandleJCParam IndexMap
-
-instance (IndexMapABI k v, JanusCEvaluate r) => JanusCEvaluate (IndexMap JanusC k v -> r) where
-  jceval = mkPtrHandleJCEval unIndexMap IndexMap
-
-type instance JanusCEval (JanusCM (IndexMap JanusC k v)) = IO (IndexMap Identity k v)
-
-type instance JanusCRetType (JanusCM (IndexMap JanusC k v)) = IndexMap Identity k v
-
-instance (IndexMapABI k v) => JanusCParam (JanusCM (IndexMap JanusC k v)) where
-  jcparam = mkPtrHandleJCRetParam unIndexMap
-
-instance (IndexMapABI k v) => JanusCEvaluate (JanusCM (IndexMap JanusC k v)) where
-  jceval = mkPtrHandleJCRetEval IndexMap
-
-type instance LinuxX86_64CEval (IndexMap LinuxX86_64C k v -> r) = IndexMap Identity k v -> LinuxX86_64CEval r
-
-type instance LinuxX86_64BaseRet (IndexMap LinuxX86_64C k v -> r) = LinuxX86_64BaseRet r
-
-instance (IndexMapABI k v, LinuxX86_64Param r) => LinuxX86_64Param (IndexMap LinuxX86_64C k v -> r) where
-  x86param = mkPtrHandleX86Param IndexMap
-
-instance (IndexMapABI k v, X86DeferCont r, LinuxX86_64Evaluate r) => LinuxX86_64Evaluate (IndexMap LinuxX86_64C k v -> r) where
-  x86eval = mkPtrHandleX86EvalParam unIndexMap IndexMap
-
-instance (IndexMapABI k v, X86DeferCont r) => X86DeferCall (IndexMap LinuxX86_64C k v -> r) where
-  x86DeferArg = mkPtrHandleX86DeferArg unIndexMap IndexMap
-
-instance (IndexMapABI k v, X86DeferCont r) => X86DeferCont (IndexMap LinuxX86_64C k v -> r) where
-  x86DeferCont = mkPtrHandleX86DeferCont unIndexMap IndexMap
-
-type instance LinuxX86_64CEval (LinuxX86_64CM (IndexMap LinuxX86_64C k v)) = IO (IndexMap Identity k v)
-
-type instance LinuxX86_64BaseRet (LinuxX86_64CM (IndexMap LinuxX86_64C k v)) = IndexMap Identity k v
-
-instance (IndexMapABI k v) => LinuxX86_64Param (LinuxX86_64CM (IndexMap LinuxX86_64C k v)) where
-  x86param = mkPtrHandleX86RetParam unIndexMap
-
-instance (IndexMapABI k v) => LinuxX86_64Evaluate (LinuxX86_64CM (IndexMap LinuxX86_64C k v)) where
-  x86eval = mkPtrHandleX86RetEval IndexMap
-
-instance (IndexMapABI k v) => X86DeferCall (LinuxX86_64CM (IndexMap LinuxX86_64C k v)) where
-  x86DeferArg = mkPtrHandleX86RetDeferArg IndexMap
-
-instance (IndexMapABI k v) => X86DeferCont (LinuxX86_64CM (IndexMap LinuxX86_64C k v)) where
-  x86DeferCont = mkPtrHandleX86RetDeferCont IndexMap
-
-instance (IndexMapABI k v, LinuxX86_64Param r, JanusCTH r) => JanusCTH (IndexMap LinuxX86_64C k v -> r) where
-  type JanusCTHEval (IndexMap LinuxX86_64C k v -> r) = IndexMap Identity k v -> JanusCTHEval r
-  janusCTHBackend _ = THBackendLinuxX86_64
-  janusCTHCodegen = x86param
-  janusCTHSpec _ =
-    let (ps, retSpec) = janusCTHSpec (Proxy @r)
-     in (mkPtrHandleTHParamSpec (Proxy @(IndexMap Identity k v)) : ps, retSpec)
-
-instance (IndexMapABI k v) => JanusCTH (LinuxX86_64CM (IndexMap LinuxX86_64C k v)) where
-  type JanusCTHEval (LinuxX86_64CM (IndexMap LinuxX86_64C k v)) = IO (IndexMap Identity k v)
-  janusCTHBackend _ = THBackendLinuxX86_64
-  janusCTHCodegen = x86param
-  janusCTHSpec _ =
-    ([], mkPtrHandleTHRetSpec THRetIO (Proxy @(IndexMap Identity k v)) (Proxy @(CStruct (IndexMapSpine k v))))
+deriving via
+  ViaPtrHandle t (CStruct (IndexMapSpine k v)) (IndexMap Identity k v)
+  instance
+    (IndexMapABI k v) => JanusCValRet t (IndexMap (JanusCT t) k v)

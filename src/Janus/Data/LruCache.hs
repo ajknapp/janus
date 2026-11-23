@@ -3,6 +3,7 @@
 {-# LANGUAGE DataKinds #-}
 {-# LANGUAGE DeriveGeneric #-}
 {-# LANGUAGE DerivingStrategies #-}
+{-# LANGUAGE DerivingVia #-}
 {-# LANGUAGE FlexibleContexts #-}
 {-# LANGUAGE FlexibleInstances #-}
 {-# LANGUAGE KindSignatures #-}
@@ -71,8 +72,6 @@ import Janus.Alloc.Policy
     freeTypedArray,
   )
 import Janus.Backend.C
-import Janus.Backend.C.LinuxX86_64
-import Janus.Backend.C.TH
 import Janus.Command.Cond (ifThenElseM_, whenM_)
 import Janus.Command.Memory
   ( CmdMemCopy (..),
@@ -887,69 +886,14 @@ drainAppendLruCache lru = drainForEach (\(kIn, vIn) -> insert lru kIn vIn)
 
 type LruCacheABI k v = (Typeable k, Typeable v, JanusStruct (Buf k), JanusStruct (Buf v))
 
-type instance JanusCEval (LruCache JanusC k v -> r) = LruCache Identity k v -> JanusCEval r
+type instance JanusCHost (LruCache (JanusCT _) k v) = LruCache Identity k v
 
-type instance JanusCRetType (LruCache JanusC k v -> r) = JanusCRetType r
+deriving via
+  ViaPtrHandle t (CStruct (LruCacheSpine k v)) (LruCache Identity k v)
+  instance
+    (LruCacheABI k v) => JanusCArg t (LruCache (JanusCT t) k v)
 
-instance (LruCacheABI k v, JanusCParam r) => JanusCParam (LruCache JanusC k v -> r) where
-  jcparam = mkPtrHandleJCParam LruCache
-
-instance (LruCacheABI k v, JanusCEvaluate r) => JanusCEvaluate (LruCache JanusC k v -> r) where
-  jceval = mkPtrHandleJCEval unLruCache LruCache
-
-type instance JanusCEval (JanusCM (LruCache JanusC k v)) = IO (LruCache Identity k v)
-
-type instance JanusCRetType (JanusCM (LruCache JanusC k v)) = LruCache Identity k v
-
-instance (LruCacheABI k v) => JanusCParam (JanusCM (LruCache JanusC k v)) where
-  jcparam = mkPtrHandleJCRetParam unLruCache
-
-instance (LruCacheABI k v) => JanusCEvaluate (JanusCM (LruCache JanusC k v)) where
-  jceval = mkPtrHandleJCRetEval LruCache
-
-type instance LinuxX86_64CEval (LruCache LinuxX86_64C k v -> r) = LruCache Identity k v -> LinuxX86_64CEval r
-
-type instance LinuxX86_64BaseRet (LruCache LinuxX86_64C k v -> r) = LinuxX86_64BaseRet r
-
-instance (LruCacheABI k v, LinuxX86_64Param r) => LinuxX86_64Param (LruCache LinuxX86_64C k v -> r) where
-  x86param = mkPtrHandleX86Param LruCache
-
-instance (LruCacheABI k v, X86DeferCont r, LinuxX86_64Evaluate r) => LinuxX86_64Evaluate (LruCache LinuxX86_64C k v -> r) where
-  x86eval = mkPtrHandleX86EvalParam unLruCache LruCache
-
-instance (LruCacheABI k v, X86DeferCont r) => X86DeferCall (LruCache LinuxX86_64C k v -> r) where
-  x86DeferArg = mkPtrHandleX86DeferArg unLruCache LruCache
-
-instance (LruCacheABI k v, X86DeferCont r) => X86DeferCont (LruCache LinuxX86_64C k v -> r) where
-  x86DeferCont = mkPtrHandleX86DeferCont unLruCache LruCache
-
-type instance LinuxX86_64CEval (LinuxX86_64CM (LruCache LinuxX86_64C k v)) = IO (LruCache Identity k v)
-
-type instance LinuxX86_64BaseRet (LinuxX86_64CM (LruCache LinuxX86_64C k v)) = LruCache Identity k v
-
-instance (LruCacheABI k v) => LinuxX86_64Param (LinuxX86_64CM (LruCache LinuxX86_64C k v)) where
-  x86param = mkPtrHandleX86RetParam unLruCache
-
-instance (LruCacheABI k v) => LinuxX86_64Evaluate (LinuxX86_64CM (LruCache LinuxX86_64C k v)) where
-  x86eval = mkPtrHandleX86RetEval LruCache
-
-instance (LruCacheABI k v) => X86DeferCall (LinuxX86_64CM (LruCache LinuxX86_64C k v)) where
-  x86DeferArg = mkPtrHandleX86RetDeferArg LruCache
-
-instance (LruCacheABI k v) => X86DeferCont (LinuxX86_64CM (LruCache LinuxX86_64C k v)) where
-  x86DeferCont = mkPtrHandleX86RetDeferCont LruCache
-
-instance (LruCacheABI k v, LinuxX86_64Param r, JanusCTH r) => JanusCTH (LruCache LinuxX86_64C k v -> r) where
-  type JanusCTHEval (LruCache LinuxX86_64C k v -> r) = LruCache Identity k v -> JanusCTHEval r
-  janusCTHBackend _ = THBackendLinuxX86_64
-  janusCTHCodegen = x86param
-  janusCTHSpec _ =
-    let (ps, retSpec) = janusCTHSpec (Proxy @r)
-     in (mkPtrHandleTHParamSpec (Proxy @(LruCache Identity k v)) : ps, retSpec)
-
-instance (LruCacheABI k v) => JanusCTH (LinuxX86_64CM (LruCache LinuxX86_64C k v)) where
-  type JanusCTHEval (LinuxX86_64CM (LruCache LinuxX86_64C k v)) = IO (LruCache Identity k v)
-  janusCTHBackend _ = THBackendLinuxX86_64
-  janusCTHCodegen = x86param
-  janusCTHSpec _ =
-    ([], mkPtrHandleTHRetSpec THRetIO (Proxy @(LruCache Identity k v)) (Proxy @(CStruct (LruCacheSpine k v))))
+deriving via
+  ViaPtrHandle t (CStruct (LruCacheSpine k v)) (LruCache Identity k v)
+  instance
+    (LruCacheABI k v) => JanusCValRet t (LruCache (JanusCT t) k v)

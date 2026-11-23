@@ -23,8 +23,9 @@ import Hedgehog (Gen, Property, assert, forAll, property, (===))
 import qualified Hedgehog.Gen as Gen
 import qualified Hedgehog.Range as Range
 import Janus.Alloc
+import Janus.Backend.C (acquireJanusC, releaseJanusC)
 import Janus.Backend.C.Build (CBuildConfig, cBuildConfigCacheDir, defaultCBuildConfig)
-import Janus.Backend.C.LinuxX86_64 (LinuxX86_64C, LinuxX86_64CM, acquireLinuxX86_64C, releaseLinuxX86_64C)
+import Janus.Backend.C.LinuxX86_64 (LinuxX86_64C, LinuxX86_64CM)
 import Janus.Command.Cond (whenM_)
 import Janus.Command.Memory (CmdStorable (peekElemOff, pokeElemOff))
 import Janus.Control.Drain (drainForEach, drainSum, runDrain)
@@ -638,8 +639,8 @@ check_graph_spatial_host_c_ffi getCFn = property $ do
 
 test_graph_and_spatial :: TestTree
 test_graph_and_spatial =
-  let acq = getGraphSpatialTestConfig >>= flip acquireLinuxX86_64C cGraphAndSpatialKernel
-   in withResource acq releaseLinuxX86_64C $ \rFn ->
+  let acq = getGraphSpatialTestConfig >>= flip acquireJanusC cGraphAndSpatialKernel
+   in withResource acq releaseJanusC $ \rFn ->
         testGroup
           "Partition, Graph, & Spatial Search Data Structures"
           [ testProperty "DisjointSet equivalence-class partition model, path-halving, & drainAppendUnions" check_disjoint_set_partition_model,

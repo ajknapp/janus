@@ -26,8 +26,9 @@ import Hedgehog (Property, assert, forAll, property, (===))
 import qualified Hedgehog.Gen as Gen
 import qualified Hedgehog.Range as Range
 import Janus.Alloc
+import Janus.Backend.C (acquireJanusC, releaseJanusC)
 import Janus.Backend.C.Build (CBuildConfig, cBuildConfigCacheDir, defaultCBuildConfig)
-import Janus.Backend.C.LinuxX86_64 (LinuxX86_64C, LinuxX86_64CM, acquireLinuxX86_64C, releaseLinuxX86_64C)
+import Janus.Backend.C.LinuxX86_64 (LinuxX86_64C, LinuxX86_64CM)
 import Janus.Command.Range (rangeM)
 import Janus.Control.Drain (drainForEach, drainSum, runDrain)
 import Janus.Control.Stream (Stream)
@@ -256,8 +257,8 @@ check_hash_host_c_ffi getCFn = property $ do
 
 test_hash_containers :: TestTree
 test_hash_containers =
-  let acq = getHashTestConfig >>= flip acquireLinuxX86_64C cMutateHashMapAndSet
-   in withResource acq releaseLinuxX86_64C $ \rFn ->
+  let acq = getHashTestConfig >>= flip acquireJanusC cMutateHashMapAndSet
+   in withResource acq releaseJanusC $ \rFn ->
         testGroup
           "SwissTable HashMap & HashSet (MurmurHash + SWAR)"
           [ testProperty "HashMap stateful trace + collisions + tombstone churn + zero leaks" check_hashmap_stateful_and_tombstone_churn,

@@ -1,3 +1,4 @@
+{-# LANGUAGE FlexibleInstances #-}
 {-# LANGUAGE FunctionalDependencies #-}
 
 module Janus.Command.Case where
@@ -22,15 +23,15 @@ instance CmdCase IO Identity where
       then c
       else switchCase_ i' cs def
 
-instance CmdCase JanusCM JanusC where
+instance CmdCase (JanusCMT t) (JanusCT t) where
   switchCase_ (JanusC tag) cases def = do
-    RVal tag' <- tag
+    RVal tag' <- liftJanusCM tag
     fn <- getFunction
     let block = fn ^. jcfBlock
     blockItems <- for cases $ \(i,m) -> do
       modifyFunction $ \f -> f & jcfBlock .~ mempty
       m
-      lit <- jlitc (fromIntegral i :: Int64)
+      lit <- liftJanusCM $ jlitc (fromIntegral i :: Int64)
       jcs'' <- getFunction
       let block' = appendBlock (jcs'' ^. jcfBlock) [BlockStm (Break noLoc)]
       pure $ BlockStm (Case lit (Block (appEndo block' []) noLoc) noLoc)

@@ -3,6 +3,7 @@
 {-# LANGUAGE DataKinds #-}
 {-# LANGUAGE DeriveGeneric #-}
 {-# LANGUAGE DerivingStrategies #-}
+{-# LANGUAGE DerivingVia #-}
 {-# LANGUAGE FlexibleContexts #-}
 {-# LANGUAGE FlexibleInstances #-}
 {-# LANGUAGE KindSignatures #-}
@@ -76,8 +77,6 @@ import Janus.Alloc.Policy
     reallocTypedArray,
   )
 import Janus.Backend.C
-import Janus.Backend.C.LinuxX86_64
-import Janus.Backend.C.TH
 import Janus.Command.Cond (ifThenElseM_, whenM_)
 import Janus.Command.Memory (CmdStorable (..), ExpPtr (..), ExpSized (..))
 import Janus.Command.Ref (letM, newRef, readRef, writeRef)
@@ -694,69 +693,14 @@ drainAppendSlotMap alloc sm = Drain $ \s -> do
 
 type SlotMapABI a = (Typeable a, JanusStruct (Buf a))
 
-type instance JanusCEval (SlotMap JanusC a -> r) = SlotMap Identity a -> JanusCEval r
+type instance JanusCHost (SlotMap (JanusCT _) a) = SlotMap Identity a
 
-type instance JanusCRetType (SlotMap JanusC a -> r) = JanusCRetType r
+deriving via
+  ViaPtrHandle t (CStruct (SlotMapSpine a)) (SlotMap Identity a)
+  instance
+    (SlotMapABI a) => JanusCArg t (SlotMap (JanusCT t) a)
 
-instance (SlotMapABI a, JanusCParam r) => JanusCParam (SlotMap JanusC a -> r) where
-  jcparam = mkPtrHandleJCParam SlotMap
-
-instance (SlotMapABI a, JanusCEvaluate r) => JanusCEvaluate (SlotMap JanusC a -> r) where
-  jceval = mkPtrHandleJCEval unSlotMap SlotMap
-
-type instance JanusCEval (JanusCM (SlotMap JanusC a)) = IO (SlotMap Identity a)
-
-type instance JanusCRetType (JanusCM (SlotMap JanusC a)) = SlotMap Identity a
-
-instance (SlotMapABI a) => JanusCParam (JanusCM (SlotMap JanusC a)) where
-  jcparam = mkPtrHandleJCRetParam unSlotMap
-
-instance (SlotMapABI a) => JanusCEvaluate (JanusCM (SlotMap JanusC a)) where
-  jceval = mkPtrHandleJCRetEval SlotMap
-
-type instance LinuxX86_64CEval (SlotMap LinuxX86_64C a -> r) = SlotMap Identity a -> LinuxX86_64CEval r
-
-type instance LinuxX86_64BaseRet (SlotMap LinuxX86_64C a -> r) = LinuxX86_64BaseRet r
-
-instance (SlotMapABI a, LinuxX86_64Param r) => LinuxX86_64Param (SlotMap LinuxX86_64C a -> r) where
-  x86param = mkPtrHandleX86Param SlotMap
-
-instance (SlotMapABI a, X86DeferCont r, LinuxX86_64Evaluate r) => LinuxX86_64Evaluate (SlotMap LinuxX86_64C a -> r) where
-  x86eval = mkPtrHandleX86EvalParam unSlotMap SlotMap
-
-instance (SlotMapABI a, X86DeferCont r) => X86DeferCall (SlotMap LinuxX86_64C a -> r) where
-  x86DeferArg = mkPtrHandleX86DeferArg unSlotMap SlotMap
-
-instance (SlotMapABI a, X86DeferCont r) => X86DeferCont (SlotMap LinuxX86_64C a -> r) where
-  x86DeferCont = mkPtrHandleX86DeferCont unSlotMap SlotMap
-
-type instance LinuxX86_64CEval (LinuxX86_64CM (SlotMap LinuxX86_64C a)) = IO (SlotMap Identity a)
-
-type instance LinuxX86_64BaseRet (LinuxX86_64CM (SlotMap LinuxX86_64C a)) = SlotMap Identity a
-
-instance (SlotMapABI a) => LinuxX86_64Param (LinuxX86_64CM (SlotMap LinuxX86_64C a)) where
-  x86param = mkPtrHandleX86RetParam unSlotMap
-
-instance (SlotMapABI a) => LinuxX86_64Evaluate (LinuxX86_64CM (SlotMap LinuxX86_64C a)) where
-  x86eval = mkPtrHandleX86RetEval SlotMap
-
-instance (SlotMapABI a) => X86DeferCall (LinuxX86_64CM (SlotMap LinuxX86_64C a)) where
-  x86DeferArg = mkPtrHandleX86RetDeferArg SlotMap
-
-instance (SlotMapABI a) => X86DeferCont (LinuxX86_64CM (SlotMap LinuxX86_64C a)) where
-  x86DeferCont = mkPtrHandleX86RetDeferCont SlotMap
-
-instance (SlotMapABI a, LinuxX86_64Param r, JanusCTH r) => JanusCTH (SlotMap LinuxX86_64C a -> r) where
-  type JanusCTHEval (SlotMap LinuxX86_64C a -> r) = SlotMap Identity a -> JanusCTHEval r
-  janusCTHBackend _ = THBackendLinuxX86_64
-  janusCTHCodegen = x86param
-  janusCTHSpec _ =
-    let (ps, retSpec) = janusCTHSpec (Proxy @r)
-     in (mkPtrHandleTHParamSpec (Proxy @(SlotMap Identity a)) : ps, retSpec)
-
-instance (SlotMapABI a) => JanusCTH (LinuxX86_64CM (SlotMap LinuxX86_64C a)) where
-  type JanusCTHEval (LinuxX86_64CM (SlotMap LinuxX86_64C a)) = IO (SlotMap Identity a)
-  janusCTHBackend _ = THBackendLinuxX86_64
-  janusCTHCodegen = x86param
-  janusCTHSpec _ =
-    ([], mkPtrHandleTHRetSpec THRetIO (Proxy @(SlotMap Identity a)) (Proxy @(CStruct (SlotMapSpine a))))
+deriving via
+  ViaPtrHandle t (CStruct (SlotMapSpine a)) (SlotMap Identity a)
+  instance
+    (SlotMapABI a) => JanusCValRet t (SlotMap (JanusCT t) a)

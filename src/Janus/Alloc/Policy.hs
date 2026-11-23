@@ -93,7 +93,7 @@ import Janus.Expression.Ord (ExpOrd (..))
 import Janus.Typed (JanusTyped)
 
 -- | Unified constraint bundle supporting all composable 'Alloc' policies across
--- @(IO, Identity)@, @(JanusCM, JanusC)@, and @(LinuxX86_64CM, LinuxX86_64C)@.
+-- @(IO, Identity)@ and @(JanusCMT t, JanusCT t)@ across any target @t@.
 type CmdAlloc m e =
   ( CmdAllocBase m e,
     ExpSized e (CStruct FixedBufSpine),

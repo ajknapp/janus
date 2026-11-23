@@ -3,6 +3,7 @@
 {-# LANGUAGE DataKinds #-}
 {-# LANGUAGE DeriveGeneric #-}
 {-# LANGUAGE DerivingStrategies #-}
+{-# LANGUAGE DerivingVia #-}
 {-# LANGUAGE FlexibleContexts #-}
 {-# LANGUAGE FlexibleInstances #-}
 {-# LANGUAGE KindSignatures #-}
@@ -71,8 +72,6 @@ import Janus.Alloc.Policy
     freeTypedArray,
   )
 import Janus.Backend.C
-import Janus.Backend.C.LinuxX86_64
-import Janus.Backend.C.TH
 import Janus.Command.Cond (ifThenElseM_, whenM_)
 import Janus.Command.Memory
   ( CmdMemCopy (..),
@@ -832,69 +831,14 @@ drainAppendClockCache cc = drainForEach (\(kIn, vIn) -> insert cc kIn vIn)
 
 type ClockCacheABI k v = (Typeable k, Typeable v, JanusStruct (Buf k), JanusStruct (Buf v))
 
-type instance JanusCEval (ClockCache JanusC k v -> r) = ClockCache Identity k v -> JanusCEval r
+type instance JanusCHost (ClockCache (JanusCT _) k v) = ClockCache Identity k v
 
-type instance JanusCRetType (ClockCache JanusC k v -> r) = JanusCRetType r
+deriving via
+  ViaPtrHandle t (CStruct (ClockCacheSpine k v)) (ClockCache Identity k v)
+  instance
+    (ClockCacheABI k v) => JanusCArg t (ClockCache (JanusCT t) k v)
 
-instance (ClockCacheABI k v, JanusCParam r) => JanusCParam (ClockCache JanusC k v -> r) where
-  jcparam = mkPtrHandleJCParam ClockCache
-
-instance (ClockCacheABI k v, JanusCEvaluate r) => JanusCEvaluate (ClockCache JanusC k v -> r) where
-  jceval = mkPtrHandleJCEval unClockCache ClockCache
-
-type instance JanusCEval (JanusCM (ClockCache JanusC k v)) = IO (ClockCache Identity k v)
-
-type instance JanusCRetType (JanusCM (ClockCache JanusC k v)) = ClockCache Identity k v
-
-instance (ClockCacheABI k v) => JanusCParam (JanusCM (ClockCache JanusC k v)) where
-  jcparam = mkPtrHandleJCRetParam unClockCache
-
-instance (ClockCacheABI k v) => JanusCEvaluate (JanusCM (ClockCache JanusC k v)) where
-  jceval = mkPtrHandleJCRetEval ClockCache
-
-type instance LinuxX86_64CEval (ClockCache LinuxX86_64C k v -> r) = ClockCache Identity k v -> LinuxX86_64CEval r
-
-type instance LinuxX86_64BaseRet (ClockCache LinuxX86_64C k v -> r) = LinuxX86_64BaseRet r
-
-instance (ClockCacheABI k v, LinuxX86_64Param r) => LinuxX86_64Param (ClockCache LinuxX86_64C k v -> r) where
-  x86param = mkPtrHandleX86Param ClockCache
-
-instance (ClockCacheABI k v, X86DeferCont r, LinuxX86_64Evaluate r) => LinuxX86_64Evaluate (ClockCache LinuxX86_64C k v -> r) where
-  x86eval = mkPtrHandleX86EvalParam unClockCache ClockCache
-
-instance (ClockCacheABI k v, X86DeferCont r) => X86DeferCall (ClockCache LinuxX86_64C k v -> r) where
-  x86DeferArg = mkPtrHandleX86DeferArg unClockCache ClockCache
-
-instance (ClockCacheABI k v, X86DeferCont r) => X86DeferCont (ClockCache LinuxX86_64C k v -> r) where
-  x86DeferCont = mkPtrHandleX86DeferCont unClockCache ClockCache
-
-type instance LinuxX86_64CEval (LinuxX86_64CM (ClockCache LinuxX86_64C k v)) = IO (ClockCache Identity k v)
-
-type instance LinuxX86_64BaseRet (LinuxX86_64CM (ClockCache LinuxX86_64C k v)) = ClockCache Identity k v
-
-instance (ClockCacheABI k v) => LinuxX86_64Param (LinuxX86_64CM (ClockCache LinuxX86_64C k v)) where
-  x86param = mkPtrHandleX86RetParam unClockCache
-
-instance (ClockCacheABI k v) => LinuxX86_64Evaluate (LinuxX86_64CM (ClockCache LinuxX86_64C k v)) where
-  x86eval = mkPtrHandleX86RetEval ClockCache
-
-instance (ClockCacheABI k v) => X86DeferCall (LinuxX86_64CM (ClockCache LinuxX86_64C k v)) where
-  x86DeferArg = mkPtrHandleX86RetDeferArg ClockCache
-
-instance (ClockCacheABI k v) => X86DeferCont (LinuxX86_64CM (ClockCache LinuxX86_64C k v)) where
-  x86DeferCont = mkPtrHandleX86RetDeferCont ClockCache
-
-instance (ClockCacheABI k v, LinuxX86_64Param r, JanusCTH r) => JanusCTH (ClockCache LinuxX86_64C k v -> r) where
-  type JanusCTHEval (ClockCache LinuxX86_64C k v -> r) = ClockCache Identity k v -> JanusCTHEval r
-  janusCTHBackend _ = THBackendLinuxX86_64
-  janusCTHCodegen = x86param
-  janusCTHSpec _ =
-    let (ps, retSpec) = janusCTHSpec (Proxy @r)
-     in (mkPtrHandleTHParamSpec (Proxy @(ClockCache Identity k v)) : ps, retSpec)
-
-instance (ClockCacheABI k v) => JanusCTH (LinuxX86_64CM (ClockCache LinuxX86_64C k v)) where
-  type JanusCTHEval (LinuxX86_64CM (ClockCache LinuxX86_64C k v)) = IO (ClockCache Identity k v)
-  janusCTHBackend _ = THBackendLinuxX86_64
-  janusCTHCodegen = x86param
-  janusCTHSpec _ =
-    ([], mkPtrHandleTHRetSpec THRetIO (Proxy @(ClockCache Identity k v)) (Proxy @(CStruct (ClockCacheSpine k v))))
+deriving via
+  ViaPtrHandle t (CStruct (ClockCacheSpine k v)) (ClockCache Identity k v)
+  instance
+    (ClockCacheABI k v) => JanusCValRet t (ClockCache (JanusCT t) k v)

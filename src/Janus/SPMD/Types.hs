@@ -10,6 +10,7 @@
 {-# LANGUAGE KindSignatures #-}
 {-# LANGUAGE MultiParamTypeClasses #-}
 {-# LANGUAGE ScopedTypeVariables #-}
+{-# LANGUAGE TemplateHaskellQuotes #-}
 {-# LANGUAGE TypeApplications #-}
 {-# LANGUAGE TypeFamilies #-}
 {-# LANGUAGE TypeOperators #-}
@@ -32,7 +33,7 @@ import qualified Data.Kind as K
 import Data.Loc (noLoc)
 import Data.Proxy (Proxy (..))
 import Data.Type.Equality ((:~:) (..))
-import Data.Typeable (eqT)
+import Data.Typeable (eqT, typeRep)
 import Data.Word (Word16, Word32, Word64, Word8)
 import Foreign.C.Types
   ( CBool,
@@ -51,15 +52,13 @@ import Foreign.C.Types
     CULong,
     CUShort,
   )
-import Foreign.LibFFI (argPtr, callFFI, retVoid)
-import Foreign.Marshal.Alloc (allocaBytesAligned)
+import Foreign.LibFFI (argPtr, callFFI, retVoid, withRetType)
 import Foreign.Ptr (Ptr, castPtr, plusPtr)
 import qualified Foreign.Storable as Storable
 import GHC.Generics (Generic)
 import GHC.TypeNats (KnownNat, Nat, SomeNat (..), natVal, someNatVal)
 import Janus.Backend.C
 import Janus.Backend.C.CUDA (CUDADejaFu (..), CUDAIO (..), CmdSync (..), JanusCUDA (..))
-import Janus.Backend.C.LinuxX86_64
 import Janus.Command.Ref (CmdRef (..))
 import Janus.Expression.Bits (ExpBits (..))
 import Janus.Expression.Bool (ExpBool (..))
@@ -67,10 +66,11 @@ import Janus.Expression.Cast (janusCReallyUnsafeCast, janusCUnsafeCast)
 import Janus.Expression.Eq (ExpEq (..))
 import Janus.Expression.Inject (defaultJanusCType)
 import Janus.Expression.SIMD
-import Janus.FFI.Arg (FFIArg)
-import Janus.FFI.Ret (FFIRet)
+import Janus.FFI.Arg (FFIArg (..), THParamMode (..), THParamSpec (..), typeRepToTHType, voidPtrTHType)
+import Janus.FFI.Ret (FFIRet (..), THRetMode (..), THRetSpec (..))
 import Janus.Typed (JanusTyped)
 import Language.C.Quote
+import qualified Language.Haskell.TH as TH
 
 --------------------------------------------------------------------------------
 -- 1. Canonical Mask Element & Execution Mask Representation
@@ -166,37 +166,74 @@ instance (Storable.Storable a, Storable.Storable b) => Storable.Storable (SIMDPa
 instance (JanusCTyped a, JanusCTyped b) => JanusCTyped (SIMDPair a b) where
   jctype = defaultJanusCType
 
-instance (JanusCTyped a, JanusCTyped b, Storable.Storable a, Storable.Storable b) => LinuxX86_64ABIParam (SIMDPair a b) where
-  x86EmitParam k = do
-    let aid = mkArgId k
-        JCType vspec vdec = voidPtrType
-        (tot, _, _) = simdPairLayout @a @b
-    loadExp <- emitMemcpyLoad @(SIMDPair a b) tot (Var aid noLoc)
-    pure (Param (Just aid) vspec vdec noLoc, loadExp)
-  x86WithArg v k =
-    let (tot, al, _) = simdPairLayout @a @b
-     in allocaBytesAligned tot (max 32 al) $ \p -> Storable.poke p v >> k (argPtr p)
-  x86ParamIsIndirect _ = True
-
-instance (JanusCTyped a, JanusCTyped b, Storable.Storable a, Storable.Storable b) => LinuxX86_64ABIRet (SIMDPair a b) where
-  x86FinishReturn =
+instance
+  (JanusCTyped a, JanusCTyped b, Storable.Storable a, Storable.Storable b) =>
+  JanusCABIParam t (SIMDPair a b)
+  where
+  jcEmitABIParam _ k =
     let (tot, _, _) = simdPairLayout @a @b
-     in emitMemcpyRet tot
-  x86CallReturn _ fp args =
-    let (tot, al, _) = simdPairLayout @a @b
-     in allocaBytesAligned tot (max 32 al) $ \pOut -> do
-          callFFI fp retVoid (reverse args <> [argPtr pOut])
-          Storable.peek pOut
-  x86RetIsIndirect _ = True
+     in emitIndirectABIParam @(SIMDPair a b) tot k
+  jcWithABIArg _ v k = withIndirectStorableArg v (k . argPtr)
+  jcABIParamIsIndirect _ _ = True
+  jcABIParamTHSpec _ = indirectABIParamTHSpec
+
+instance
+  (JanusCTyped a, JanusCTyped b, Storable.Storable a, Storable.Storable b) =>
+  JanusCABIRet t (SIMDPair a b)
+  where
+  jcFinishABIRet _ val =
+    let (tot, _, _) = simdPairLayout @a @b
+     in emitIndirectABIRet tot val
+  jcCallABIRet _ _ fp args =
+    withIndirectStorableRet $ \pOut ->
+      callFFI fp retVoid (reverse args <> [argPtr pOut])
+  jcABIRetIsIndirect _ _ = True
+  jcABIRetTHSpec _ = indirectABIRetTHSpec
 
 newtype VoidPtr = VoidPtr {getVoidPtr :: Ptr ()}
-  deriving newtype (Eq, Ord, Show, Storable.Storable, FFIArg, FFIRet)
+  deriving newtype (Eq, Ord, Show, Storable.Storable)
+
+instance FFIArg VoidPtr where
+  arg = arg . getVoidPtr
+  ffiTHParamSpec p =
+    THParamSpec
+      { thParamUserType = typeRepToTHType (typeRep p),
+        thParamRawType = voidPtrTHType,
+        thParamMode = THParamPure (TH.AppE (TH.VarE 'getVoidPtr))
+      }
+
+instance FFIRet VoidPtr where
+  ret _ = withRetType (pure . VoidPtr) (ret (Proxy @(Ptr ())))
+  ffiTHRetSpec eff p =
+    THRetSpec
+      { thRetEffect = eff,
+        thRetUserBaseType = typeRepToTHType (typeRep p),
+        thRetMode = THRetPureMap voidPtrTHType (TH.AppE (TH.ConE 'VoidPtr))
+      }
 
 instance JanusCTyped VoidPtr where
   jctype _ = pure voidPtrType
 
 newtype SPMDUnit = SPMDUnit {getSPMDUnit :: Word8}
-  deriving newtype (Eq, Ord, Show, Storable.Storable, FFIArg, FFIRet)
+  deriving newtype (Eq, Ord, Show, Storable.Storable)
+
+instance FFIArg SPMDUnit where
+  arg = arg . getSPMDUnit
+  ffiTHParamSpec p =
+    THParamSpec
+      { thParamUserType = typeRepToTHType (typeRep p),
+        thParamRawType = TH.ConT ''Word8,
+        thParamMode = THParamPure (TH.AppE (TH.VarE 'getSPMDUnit))
+      }
+
+instance FFIRet SPMDUnit where
+  ret _ = withRetType (pure . SPMDUnit) (ret (Proxy @Word8))
+  ffiTHRetSpec eff p =
+    THRetSpec
+      { thRetEffect = eff,
+        thRetUserBaseType = typeRepToTHType (typeRep p),
+        thRetMode = THRetPureMap (TH.ConT ''Word8) (TH.AppE (TH.ConE 'SPMDUnit))
+      }
 
 instance JanusCTyped SPMDUnit where
   jctype _ = jctype (Proxy @Word8)
@@ -219,8 +256,8 @@ instance ExpPair Identity where
   mkSPMDUnit = Identity (SPMDUnit 0)
   coerceExp = coerce
 
-instance ExpPair JanusC where
-  mkPair :: forall a b. (JanusCTyped a, JanusCTyped b) => JanusC a -> JanusC b -> JanusC (SIMDPair a b)
+instance ExpPair (JanusCT t) where
+  mkPair :: forall a b. (JanusCTyped a, JanusCTyped b) => JanusCT t a -> JanusCT t b -> JanusCT t (SIMDPair a b)
   mkPair (JanusC ma) (JanusC mb) = JanusC $ do
     RVal a <- ma
     RVal b <- mb
@@ -243,15 +280,6 @@ instance ExpPair JanusC where
   unVoidPtr = janusCReallyUnsafeCast
   mkSPMDUnit = JanusC (RVal <$> jlitc (0 :: Word8))
   coerceExp = janusCUnsafeCast
-
-instance ExpPair LinuxX86_64C where
-  mkPair (LinuxX86_64C a) (LinuxX86_64C b) = LinuxX86_64C (mkPair a b)
-  fstPair (LinuxX86_64C p) = LinuxX86_64C (fstPair p)
-  sndPair (LinuxX86_64C p) = LinuxX86_64C (sndPair p)
-  mkVoidPtr (LinuxX86_64C p) = LinuxX86_64C (mkVoidPtr p)
-  unVoidPtr (LinuxX86_64C p) = LinuxX86_64C (unVoidPtr p)
-  mkSPMDUnit = LinuxX86_64C mkSPMDUnit
-  coerceExp (LinuxX86_64C x) = LinuxX86_64C (coerceExp x)
 
 instance ExpPair JanusCUDA where
   mkPair (JanusCUDA a) (JanusCUDA b) = JanusCUDA (mkPair a b)

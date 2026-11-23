@@ -3,6 +3,7 @@
 {-# LANGUAGE DataKinds #-}
 {-# LANGUAGE DeriveGeneric #-}
 {-# LANGUAGE DerivingStrategies #-}
+{-# LANGUAGE DerivingVia #-}
 {-# LANGUAGE FlexibleContexts #-}
 {-# LANGUAGE FlexibleInstances #-}
 {-# LANGUAGE KindSignatures #-}
@@ -63,8 +64,6 @@ import Janus.Alloc.Policy
     freeTypedArray,
   )
 import Janus.Backend.C
-import Janus.Backend.C.LinuxX86_64
-import Janus.Backend.C.TH
 import Janus.Command.Cond (ifThenElseM_, whenM_)
 import Janus.Command.Memory (CmdStorable (..), ExpSized (..))
 import Janus.Command.Ref (letM, newRef, readRef, writeRef)
@@ -635,77 +634,14 @@ spmdCountStabbed pw fim ptGang = spmdCountOverlapping pw fim ptGang ptGang
 
 type FlatIntervalMapABI k v = (Typeable k, Typeable v, JanusStruct (Buf k), JanusStruct (Buf v))
 
-type instance JanusCEval (FlatIntervalMap JanusC k v -> r) = FlatIntervalMap Identity k v -> JanusCEval r
+type instance JanusCHost (FlatIntervalMap (JanusCT _) k v) = FlatIntervalMap Identity k v
 
-type instance JanusCRetType (FlatIntervalMap JanusC k v -> r) = JanusCRetType r
+deriving via
+  ViaPtrHandle t (CStruct (FlatIntervalMapSpine k v)) (FlatIntervalMap Identity k v)
+  instance
+    (FlatIntervalMapABI k v) => JanusCArg t (FlatIntervalMap (JanusCT t) k v)
 
-instance (FlatIntervalMapABI k v, JanusCParam r) => JanusCParam (FlatIntervalMap JanusC k v -> r) where
-  jcparam = mkPtrHandleJCParam FlatIntervalMap
-
-instance (FlatIntervalMapABI k v, JanusCEvaluate r) => JanusCEvaluate (FlatIntervalMap JanusC k v -> r) where
-  jceval = mkPtrHandleJCEval unFlatIntervalMap FlatIntervalMap
-
-type instance JanusCEval (JanusCM (FlatIntervalMap JanusC k v)) = IO (FlatIntervalMap Identity k v)
-
-type instance JanusCRetType (JanusCM (FlatIntervalMap JanusC k v)) = FlatIntervalMap Identity k v
-
-instance (FlatIntervalMapABI k v) => JanusCParam (JanusCM (FlatIntervalMap JanusC k v)) where
-  jcparam = mkPtrHandleJCRetParam unFlatIntervalMap
-
-instance (FlatIntervalMapABI k v) => JanusCEvaluate (JanusCM (FlatIntervalMap JanusC k v)) where
-  jceval = mkPtrHandleJCRetEval FlatIntervalMap
-
-type instance LinuxX86_64CEval (FlatIntervalMap LinuxX86_64C k v -> r) = FlatIntervalMap Identity k v -> LinuxX86_64CEval r
-
-type instance LinuxX86_64BaseRet (FlatIntervalMap LinuxX86_64C k v -> r) = LinuxX86_64BaseRet r
-
-instance (FlatIntervalMapABI k v, LinuxX86_64Param r) => LinuxX86_64Param (FlatIntervalMap LinuxX86_64C k v -> r) where
-  x86param = mkPtrHandleX86Param FlatIntervalMap
-
-instance
-  (FlatIntervalMapABI k v, X86DeferCont r, LinuxX86_64Evaluate r) =>
-  LinuxX86_64Evaluate (FlatIntervalMap LinuxX86_64C k v -> r)
-  where
-  x86eval = mkPtrHandleX86EvalParam unFlatIntervalMap FlatIntervalMap
-
-instance (FlatIntervalMapABI k v, X86DeferCont r) => X86DeferCall (FlatIntervalMap LinuxX86_64C k v -> r) where
-  x86DeferArg = mkPtrHandleX86DeferArg unFlatIntervalMap FlatIntervalMap
-
-instance (FlatIntervalMapABI k v, X86DeferCont r) => X86DeferCont (FlatIntervalMap LinuxX86_64C k v -> r) where
-  x86DeferCont = mkPtrHandleX86DeferCont unFlatIntervalMap FlatIntervalMap
-
-type instance LinuxX86_64CEval (LinuxX86_64CM (FlatIntervalMap LinuxX86_64C k v)) = IO (FlatIntervalMap Identity k v)
-
-type instance LinuxX86_64BaseRet (LinuxX86_64CM (FlatIntervalMap LinuxX86_64C k v)) = FlatIntervalMap Identity k v
-
-instance (FlatIntervalMapABI k v) => LinuxX86_64Param (LinuxX86_64CM (FlatIntervalMap LinuxX86_64C k v)) where
-  x86param = mkPtrHandleX86RetParam unFlatIntervalMap
-
-instance (FlatIntervalMapABI k v) => LinuxX86_64Evaluate (LinuxX86_64CM (FlatIntervalMap LinuxX86_64C k v)) where
-  x86eval = mkPtrHandleX86RetEval FlatIntervalMap
-
-instance (FlatIntervalMapABI k v) => X86DeferCall (LinuxX86_64CM (FlatIntervalMap LinuxX86_64C k v)) where
-  x86DeferArg = mkPtrHandleX86RetDeferArg FlatIntervalMap
-
-instance (FlatIntervalMapABI k v) => X86DeferCont (LinuxX86_64CM (FlatIntervalMap LinuxX86_64C k v)) where
-  x86DeferCont = mkPtrHandleX86RetDeferCont FlatIntervalMap
-
-instance
-  (FlatIntervalMapABI k v, LinuxX86_64Param r, JanusCTH r) =>
-  JanusCTH (FlatIntervalMap LinuxX86_64C k v -> r)
-  where
-  type JanusCTHEval (FlatIntervalMap LinuxX86_64C k v -> r) = FlatIntervalMap Identity k v -> JanusCTHEval r
-  janusCTHBackend _ = THBackendLinuxX86_64
-  janusCTHCodegen = x86param
-  janusCTHSpec _ =
-    let (ps, retSpec) = janusCTHSpec (Proxy @r)
-     in (mkPtrHandleTHParamSpec (Proxy @(FlatIntervalMap Identity k v)) : ps, retSpec)
-
-instance (FlatIntervalMapABI k v) => JanusCTH (LinuxX86_64CM (FlatIntervalMap LinuxX86_64C k v)) where
-  type JanusCTHEval (LinuxX86_64CM (FlatIntervalMap LinuxX86_64C k v)) = IO (FlatIntervalMap Identity k v)
-  janusCTHBackend _ = THBackendLinuxX86_64
-  janusCTHCodegen = x86param
-  janusCTHSpec _ =
-    ( [],
-      mkPtrHandleTHRetSpec THRetIO (Proxy @(FlatIntervalMap Identity k v)) (Proxy @(CStruct (FlatIntervalMapSpine k v)))
-    )
+deriving via
+  ViaPtrHandle t (CStruct (FlatIntervalMapSpine k v)) (FlatIntervalMap Identity k v)
+  instance
+    (FlatIntervalMapABI k v) => JanusCValRet t (FlatIntervalMap (JanusCT t) k v)

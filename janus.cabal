@@ -152,9 +152,13 @@ library
                     , base16-bytestring
                     , bytestring
                     , concurrency
+                    , constraints
+                    , constraints-extras
                     , containers
                     , cryptohash-sha256
                     , dejafu
+                    , dependent-hashmap
+                    , dependent-sum
                     , dependent-sum-template
                     , directory
                     , exceptions

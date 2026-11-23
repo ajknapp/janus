@@ -17,22 +17,23 @@ import Foreign.Ptr (Ptr)
 import Hedgehog (Property, assert, forAll, property, (===))
 import qualified Hedgehog.Gen as Gen
 import qualified Hedgehog.Range as Range
-import Janus.Backend.C (JanusC, JanusCBackend (JC), compileJanusCNamed, renderJCProgram, jcparam)
+import Janus.Backend.C (JanusC, compileJanusCNamed, jcparam, renderJCProgram)
 import Janus.Backend.C.Build
   ( buildCachedJanusObject,
     cBuildConfigCFlags,
     cBuildConfigCacheDir,
-    cBuildConfigX86Features,
+    cBuildConfigTargetFeature,
     defaultCBuildConfig,
     defaultTHBuildConfig,
   )
-import Janus.Backend.C.LinuxX86_64 (LinuxX86_64C, LinuxX86_64CM, compileLinuxX86_64CNamed)
+import Janus.Backend.C.LinuxX86_64 (LinuxX86_64C, LinuxX86_64CM)
 import Janus.Backend.C.TH
 import Janus.Backend.C.Target
   ( admitsX86Features,
     observeHostX86Features,
     x86AVX2,
     x86Baseline,
+    x86FeatureKey,
   )
 import Janus.Expression.SIMD
   ( HostSIMDMask (simdMaskFromBools),
@@ -90,14 +91,14 @@ $( declareJanusCWithConfig
 
 -- Explicit multi-ISA static compilation (SSE2 baseline + AVX2) in the same module
 $( declareJanusCWithConfig
-     (defaultTHBuildConfig & cBuildConfigX86Features ?~ x86Baseline)
+     (defaultTHBuildConfig & cBuildConfigTargetFeature x86FeatureKey ?~ x86Baseline)
      Unsafe
      "th_vfma8_sse2"
      x86Vfma8
  )
 
 $( declareJanusCWithConfig
-     (defaultTHBuildConfig & cBuildConfigX86Features ?~ x86AVX2)
+     (defaultTHBuildConfig & cBuildConfigTargetFeature x86FeatureKey ?~ x86AVX2)
      Unsafe
      "th_vfma8_avx2"
      x86Vfma8
@@ -277,7 +278,7 @@ unit_th_cached_object_and_named_dynamic_build = do
       cacheDir = baseDir </> "janus_th_cache_test"
       cfg1 = defaultCBuildConfig & cBuildConfigCacheDir .~ cacheDir
       cfg2 = cfg1 & cBuildConfigCFlags %~ (<> ["-fno-math-errno"])
-      cSrc = renderJCProgram "cached_fn" (jcparam "cached_fn" 0 (pure []) JC affineI64)
+      cSrc = renderJCProgram "cached_fn" (jcparam "cached_fn" 0 (pure []) affineI64)
 
   obj1 <- buildCachedJanusObject cfg1 [] cSrc
   obj1Again <- buildCachedJanusObject cfg1 [] cSrc
@@ -291,10 +292,10 @@ unit_th_cached_object_and_named_dynamic_build = do
   assertBool "distinct cflags produce distinct cached .o path" (obj1 /= obj2)
 
   -- Named dynamic compilation entrypoints
-  dynJanus <- compileJanusCNamed "custom_dyn_affine" JC cfg1 affineI64
+  dynJanus <- compileJanusCNamed "custom_dyn_affine" cfg1 affineI64
   dynJanus 4 5 6 @?= 26
 
-  dynX86 <- compileLinuxX86_64CNamed "custom_dyn_vfma8" cfg1 x86Vfma8
+  dynX86 <- compileJanusCNamed "custom_dyn_vfma8" cfg1 x86Vfma8
   let v1 = simdFromList [1 .. 8 :: Float]
   simdToList (dynX86 v1 v1 v1) @?= [x * x + x | x <- [1 .. 8 :: Float]]
 

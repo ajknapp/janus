@@ -271,11 +271,11 @@ instance CmdWhile JanusCUDAM JanusCUDA where
 
 --------------------------------------------------------------------------------
 
-instance JanusCBackendTypes JanusCUDA JanusCUDAM where
-  toJanusC = getJanusCUDA
-  fromJanusC = JanusCUDA
-  toJanusCM = runJanusCUDAM
-  fromJanusCM = JanusCUDAM . lift
+mkCUDAFuncInfo :: CUDAFeatures -> String -> JCFuncInfo
+mkCUDAFuncInfo fs name = setTargetFeature cudaFeatureKey fs (mkJCFuncInfo name JCUDA False)
+
+askCUDAFeatures :: JanusCMT t CUDAFeatures
+askCUDAFeatures = askTargetFeature cudaFeatureKey
 
 class JanusCUDAParam r where
   jcudaparamWithFeatures :: CUDAFeatures -> String -> Int -> JanusCUDAM [Param] -> r -> [JCFunc]
@@ -284,20 +284,37 @@ jcudaparam :: (JanusCUDAParam r) => String -> Int -> JanusCUDAM [Param] -> Janus
 jcudaparam name n params _ = jcudaparamWithFeatures cudaSM80 name n params
 
 instance (JanusCTyped a) => JanusCUDAParam (JanusCUDA a) where
-  jcudaparamWithFeatures fs name n params =
-    jcparamImplWithInfo (Proxy @JanusCUDA) ((mkJCFuncInfo name JCUDA False) {_jcfiCUDAFeatures = fs}) n params
+  jcudaparamWithFeatures fs name _ params (JanusCUDA a) =
+    runJCCodegen (mkCUDAFuncInfo fs name) $ do
+      ps <- runJanusCUDAM params
+      finishFunction a
+      modify $ \s -> s & ix name . jcfParams .~ Params (reverse ps) False noLoc
 
 instance (JanusCTyped a) => JanusCUDAParam (JanusCUDAM (JanusCUDA a)) where
-  jcudaparamWithFeatures fs name n params =
-    jcparamImplWithInfo (Proxy @JanusCUDA) ((mkJCFuncInfo name JCUDA False) {_jcfiCUDAFeatures = fs}) n params
+  jcudaparamWithFeatures fs name _ params ma =
+    runJCCodegen (mkCUDAFuncInfo fs name) $ do
+      ps <- runJanusCUDAM params
+      JanusCUDA a <- runJanusCUDAM ma
+      finishFunction a
+      modify $ \s -> s & ix name . jcfParams .~ Params (reverse ps) False noLoc
 
 instance JanusCUDAParam (JanusCUDAM ()) where
-  jcudaparamWithFeatures fs name n params =
-    jcparamImplWithInfo (Proxy @JanusCUDA) ((mkJCFuncInfo name JCUDA False) {_jcfiCUDAFeatures = fs}) n params
+  jcudaparamWithFeatures fs name _ params ma =
+    runJCCodegen (mkCUDAFuncInfo fs name) $ do
+      ps <- runJanusCUDAM params
+      runJanusCUDAM ma
+      finishFunction_
+      modify $ \s -> s & ix name . jcfParams .~ Params (reverse ps) False noLoc
 
-instance (JanusCTyped a, JanusCUDAParam r, JanusCParamImpl JanusCUDA JanusCUDAM r) => JanusCUDAParam (JanusCUDA a -> r) where
-  jcudaparamWithFeatures fs name n params =
-    jcparamImplWithInfo (Proxy @JanusCUDA) ((mkJCFuncInfo name JCUDA False) {_jcfiCUDAFeatures = fs}) n params
+instance (JanusCTyped a, JanusCUDAParam r) => JanusCUDAParam (JanusCUDA a -> r) where
+  jcudaparamWithFeatures fs name n params f =
+    let aid = mkArgId n
+        params' = do
+          ps <- params
+          JCType spec dec <- JanusCUDAM (lift (getJanusCType (Proxy @a)))
+          pure (Param (Just aid) spec dec noLoc : ps)
+        argExp = JanusCUDA (JanusC (pure (RVal (Var aid noLoc))))
+     in jcudaparamWithFeatures fs name (n + 1) params' (f argExp)
 
 type family JanusCUDAEval r where
   JanusCUDAEval (JanusCUDAM ()) = IO ()

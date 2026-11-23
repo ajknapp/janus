@@ -4,6 +4,8 @@
 {-# LANGUAGE ImpredicativeTypes #-}
 {-# LANGUAGE InstanceSigs #-}
 {-# LANGUAGE KindSignatures #-}
+{-# LANGUAGE MultiParamTypeClasses #-}
+{-# LANGUAGE PatternSynonyms #-}
 {-# LANGUAGE ScopedTypeVariables #-}
 {-# LANGUAGE TypeApplications #-}
 {-# LANGUAGE TypeFamilies #-}
@@ -39,9 +41,9 @@ instance CmdRef IO Identity where
   readRef ref = Identity <$> readIORef ref
   writeRef ref (Identity a) = writeIORef ref a
 
-newRefBody :: forall a. (JanusCTyped a) => String -> JanusC a -> JanusCM Exp
+newRefBody :: forall t a. (JanusCTyped a) => String -> JanusCT t a -> JanusCMT t Exp
 newRefBody name (JanusC a) = do
-  RVal a' <- a
+  RVal a' <- liftJanusCM a
   JCType spec dec <- getJanusCType (Proxy @a)
   fn <- getFunction
   fname <- askFuncName
@@ -59,16 +61,26 @@ newRefBody name (JanusC a) = do
 modifyRef :: (CmdRef m e, JanusTyped e a) => Ref m e a -> (e a -> e a) -> m ()
 modifyRef r f = readRef r >>= writeRef r . f
 
-newtype JanusCRef a = JanusCRef {getJanusCRef :: LVal a}
+newtype JanusCRefT (t :: K.Type) a = JanusCRefT {getJanusCRefT :: LVal a}
 
-instance CmdRef JanusCM JanusC where
-  type Ref JanusCM JanusC a = JanusCRef a
+pattern JanusCRef :: LVal a -> JanusCRefT t a
+pattern JanusCRef lv = JanusCRefT lv
+
+{-# COMPLETE JanusCRef #-}
+
+getJanusCRef :: JanusCRefT t a -> LVal a
+getJanusCRef = getJanusCRefT
+
+type JanusCRef = JanusCRefT PortableC
+
+instance CmdRef (JanusCMT t) (JanusCT t) where
+  type Ref (JanusCMT t) (JanusCT t) a = JanusCRefT t a
 
   letM x = JanusC . pure . RVal <$> newRefBody "x_" x
 
   newRef x = JanusCRef . LVal <$> newRefBody "ref_" x
 
-  newRef' :: forall a. (JanusTyped JanusC a) => JanusCM (Ref JanusCM JanusC a)
+  newRef' :: forall a. (JanusTyped (JanusCT t) a) => JanusCMT t (Ref (JanusCMT t) (JanusCT t) a)
   newRef' = do
     JCType spec dec <- getJanusCType (Proxy @a)
     fn <- getFunction
@@ -84,7 +96,7 @@ instance CmdRef JanusCM JanusC where
     modify $ \s -> s & ix fname .~ fn'
     pure $ JanusCRef $ LVal $ Var var1 noLoc
 
-  readRef :: forall a. (JanusTyped JanusC a) => Ref JanusCM JanusC a -> JanusCM (JanusC a)
+  readRef :: forall a. (JanusTyped (JanusCT t) a) => Ref (JanusCMT t) (JanusCT t) a -> JanusCMT t (JanusCT t a)
   readRef (JanusCRef (LVal ref)) = do
     JCType spec dec <- getJanusCType (Proxy @a)
     fn <- getFunction
@@ -98,11 +110,11 @@ instance CmdRef JanusCM JanusC where
             & jcfVarCounter +~ 1
             & jcfBlock .~ appendBlock (fn ^. jcfBlock) [ref1]
     modify $ \s -> s & ix fname .~ fn'
-    pure $ JanusC $ JanusCM $ pure $ RVal $ Var val1 noLoc
+    pure $ JanusC $ pure $ RVal $ Var val1 noLoc
 
-  writeRef :: forall a. (JanusTyped JanusC a) => Ref JanusCM JanusC a -> JanusC a -> JanusCM ()
+  writeRef :: forall a. (JanusTyped (JanusCT t) a) => Ref (JanusCMT t) (JanusCT t) a -> JanusCT t a -> JanusCMT t ()
   writeRef (JanusCRef (LVal ref)) (JanusC a) = do
-    RVal a' <- a
+    RVal a' <- liftJanusCM a
     modifyFunction $ \fn ->
       let c = fn ^. jcfVarCounter
           ref1 = BlockStm $ Exp (Just $ Assign ref JustAssign a' noLoc) noLoc
@@ -133,7 +145,7 @@ instance RefCell IO Identity (Identity a) where
     r <- newRef'
     pure (Cell (readRef r) (writeRef r))
 
-instance (JanusCTyped a) => RefCell JanusCM JanusC (JanusC a) where
+instance (JanusCTyped a) => RefCell (JanusCMT t) (JanusCT t) (JanusCT t a) where
   newCell x = do
     r <- newRef x
     pure (Cell (readRef r) (writeRef r))

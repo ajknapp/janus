@@ -17,9 +17,9 @@ instance ExpLet Identity where
   let_ x f = f x
   {-# INLINE let_ #-}
 
-instance ExpLet JanusC where
+instance ExpLet (JanusCT t) where
   let_ j@(JanusC x) f = JanusC $ do
-    let proxify :: JanusC a -> Proxy a
+    let proxify :: JanusCT s a -> Proxy a
         proxify _ = Proxy
     JCType spec dec <- getJanusCType (proxify j)
     fname <- askFuncName

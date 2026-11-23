@@ -24,8 +24,9 @@ import Hedgehog (Property, assert, forAll, property, (===))
 import qualified Hedgehog.Gen as Gen
 import qualified Hedgehog.Range as Range
 import Janus.Alloc
+import Janus.Backend.C (acquireJanusC, releaseJanusC)
 import Janus.Backend.C.Build (CBuildConfig, cBuildConfigCacheDir, defaultCBuildConfig)
-import Janus.Backend.C.LinuxX86_64 (LinuxX86_64C, LinuxX86_64CM, acquireLinuxX86_64C, releaseLinuxX86_64C)
+import Janus.Backend.C.LinuxX86_64 (LinuxX86_64C, LinuxX86_64CM)
 import Janus.Control.Drain (drainCountWhere, drainForEach, drainSum, runDrain)
 import Janus.Control.Step (Step (..))
 import Janus.Control.Stream (Stream, rangeS, statefulS, streamM)
@@ -609,10 +610,10 @@ check_bit_and_filter_host_c_ffi getMutFn getBuildXfFn = property $ do
 
 test_bit_and_filter :: TestTree
 test_bit_and_filter =
-  let acqMut = getBitFilterTestConfig >>= flip acquireLinuxX86_64C cMutateAndProbeBitFilter
-      acqBuild = getBitFilterTestConfig >>= flip acquireLinuxX86_64C cBuildXorFilterInC
-   in withResource acqMut releaseLinuxX86_64C $ \rMut ->
-        withResource acqBuild releaseLinuxX86_64C $ \rBuild ->
+  let acqMut = getBitFilterTestConfig >>= flip acquireJanusC cMutateAndProbeBitFilter
+      acqBuild = getBitFilterTestConfig >>= flip acquireJanusC cBuildXorFilterInC
+   in withResource acqMut releaseJanusC $ \rMut ->
+        withResource acqBuild releaseJanusC $ \rBuild ->
           testGroup
             "BitSet, BitTree, Split-Block BloomFilter, & Lemire-Graf XorFilter"
             [ testProperty "BitSet stateful trace, range masks, SWAR scans, & word-level streams" check_bitset_stateful_and_algebra,

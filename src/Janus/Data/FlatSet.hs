@@ -3,6 +3,7 @@
 {-# LANGUAGE DataKinds #-}
 {-# LANGUAGE DeriveGeneric #-}
 {-# LANGUAGE DerivingStrategies #-}
+{-# LANGUAGE DerivingVia #-}
 {-# LANGUAGE FlexibleContexts #-}
 {-# LANGUAGE FlexibleInstances #-}
 {-# LANGUAGE KindSignatures #-}
@@ -70,8 +71,6 @@ import Foreign.Ptr (Ptr)
 import GHC.Generics (Generic)
 import Janus.Alloc.Policy (Alloc, allocStruct, freeStruct)
 import Janus.Backend.C
-import Janus.Backend.C.LinuxX86_64
-import Janus.Backend.C.TH
 import Janus.Command.Cond (ifThenElseM_, whenM_)
 import Janus.Command.Memory (CmdStorable (..), ExpSized (..))
 import Janus.Command.Ref (RefCell, letM, newRef, readRef, writeRef)
@@ -579,69 +578,14 @@ drainAppendFlatSet alloc fs = drainForEach (\x -> insert alloc fs x >> pure ())
 
 type FlatSetABI k = (Typeable k, JanusStruct (Buf k))
 
-type instance JanusCEval (FlatSet JanusC k -> r) = FlatSet Identity k -> JanusCEval r
+type instance JanusCHost (FlatSet (JanusCT _) k) = FlatSet Identity k
 
-type instance JanusCRetType (FlatSet JanusC k -> r) = JanusCRetType r
+deriving via
+  ViaPtrHandle t (CStruct (FlatSetSpine k)) (FlatSet Identity k)
+  instance
+    (FlatSetABI k) => JanusCArg t (FlatSet (JanusCT t) k)
 
-instance (FlatSetABI k, JanusCParam r) => JanusCParam (FlatSet JanusC k -> r) where
-  jcparam = mkPtrHandleJCParam FlatSet
-
-instance (FlatSetABI k, JanusCEvaluate r) => JanusCEvaluate (FlatSet JanusC k -> r) where
-  jceval = mkPtrHandleJCEval unFlatSet FlatSet
-
-type instance JanusCEval (JanusCM (FlatSet JanusC k)) = IO (FlatSet Identity k)
-
-type instance JanusCRetType (JanusCM (FlatSet JanusC k)) = FlatSet Identity k
-
-instance (FlatSetABI k) => JanusCParam (JanusCM (FlatSet JanusC k)) where
-  jcparam = mkPtrHandleJCRetParam unFlatSet
-
-instance (FlatSetABI k) => JanusCEvaluate (JanusCM (FlatSet JanusC k)) where
-  jceval = mkPtrHandleJCRetEval FlatSet
-
-type instance LinuxX86_64CEval (FlatSet LinuxX86_64C k -> r) = FlatSet Identity k -> LinuxX86_64CEval r
-
-type instance LinuxX86_64BaseRet (FlatSet LinuxX86_64C k -> r) = LinuxX86_64BaseRet r
-
-instance (FlatSetABI k, LinuxX86_64Param r) => LinuxX86_64Param (FlatSet LinuxX86_64C k -> r) where
-  x86param = mkPtrHandleX86Param FlatSet
-
-instance (FlatSetABI k, X86DeferCont r, LinuxX86_64Evaluate r) => LinuxX86_64Evaluate (FlatSet LinuxX86_64C k -> r) where
-  x86eval = mkPtrHandleX86EvalParam unFlatSet FlatSet
-
-instance (FlatSetABI k, X86DeferCont r) => X86DeferCall (FlatSet LinuxX86_64C k -> r) where
-  x86DeferArg = mkPtrHandleX86DeferArg unFlatSet FlatSet
-
-instance (FlatSetABI k, X86DeferCont r) => X86DeferCont (FlatSet LinuxX86_64C k -> r) where
-  x86DeferCont = mkPtrHandleX86DeferCont unFlatSet FlatSet
-
-type instance LinuxX86_64CEval (LinuxX86_64CM (FlatSet LinuxX86_64C k)) = IO (FlatSet Identity k)
-
-type instance LinuxX86_64BaseRet (LinuxX86_64CM (FlatSet LinuxX86_64C k)) = FlatSet Identity k
-
-instance (FlatSetABI k) => LinuxX86_64Param (LinuxX86_64CM (FlatSet LinuxX86_64C k)) where
-  x86param = mkPtrHandleX86RetParam unFlatSet
-
-instance (FlatSetABI k) => LinuxX86_64Evaluate (LinuxX86_64CM (FlatSet LinuxX86_64C k)) where
-  x86eval = mkPtrHandleX86RetEval FlatSet
-
-instance (FlatSetABI k) => X86DeferCall (LinuxX86_64CM (FlatSet LinuxX86_64C k)) where
-  x86DeferArg = mkPtrHandleX86RetDeferArg FlatSet
-
-instance (FlatSetABI k) => X86DeferCont (LinuxX86_64CM (FlatSet LinuxX86_64C k)) where
-  x86DeferCont = mkPtrHandleX86RetDeferCont FlatSet
-
-instance (FlatSetABI k, LinuxX86_64Param r, JanusCTH r) => JanusCTH (FlatSet LinuxX86_64C k -> r) where
-  type JanusCTHEval (FlatSet LinuxX86_64C k -> r) = FlatSet Identity k -> JanusCTHEval r
-  janusCTHBackend _ = THBackendLinuxX86_64
-  janusCTHCodegen = x86param
-  janusCTHSpec _ =
-    let (ps, retSpec) = janusCTHSpec (Proxy @r)
-     in (mkPtrHandleTHParamSpec (Proxy @(FlatSet Identity k)) : ps, retSpec)
-
-instance (FlatSetABI k) => JanusCTH (LinuxX86_64CM (FlatSet LinuxX86_64C k)) where
-  type JanusCTHEval (LinuxX86_64CM (FlatSet LinuxX86_64C k)) = IO (FlatSet Identity k)
-  janusCTHBackend _ = THBackendLinuxX86_64
-  janusCTHCodegen = x86param
-  janusCTHSpec _ =
-    ([], mkPtrHandleTHRetSpec THRetIO (Proxy @(FlatSet Identity k)) (Proxy @(CStruct (FlatSetSpine k))))
+deriving via
+  ViaPtrHandle t (CStruct (FlatSetSpine k)) (FlatSet Identity k)
+  instance
+    (FlatSetABI k) => JanusCValRet t (FlatSet (JanusCT t) k)

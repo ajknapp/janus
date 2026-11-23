@@ -3,6 +3,7 @@
 {-# LANGUAGE DataKinds #-}
 {-# LANGUAGE DeriveGeneric #-}
 {-# LANGUAGE DerivingStrategies #-}
+{-# LANGUAGE DerivingVia #-}
 {-# LANGUAGE FlexibleContexts #-}
 {-# LANGUAGE FlexibleInstances #-}
 {-# LANGUAGE KindSignatures #-}
@@ -65,8 +66,6 @@ import GHC.Generics (Generic, Rep)
 import Janus.Alloc.Dynamic (CmdAllocBase)
 import Janus.Alloc.Policy (Alloc, CmdAlloc, allocStruct, freeStruct)
 import Janus.Backend.C
-import Janus.Backend.C.LinuxX86_64
-import Janus.Backend.C.TH
 import Janus.Command.Cond (ifThenElseM_, whenM_)
 import Janus.Command.Memory (CmdStorable (..), ExpPtr (..), ExpSized (..))
 import Janus.Command.Ref (newRef, readRef, writeRef)
@@ -821,69 +820,14 @@ drainAllocAppendWheel alloc wheel =
 -- Host <-> C FFI Marshalling Instances
 --------------------------------------------------------------------------------
 
-type instance JanusCEval (TimerWheel s JanusC -> r) = TimerWheel s Identity -> JanusCEval r
+type instance JanusCHost (TimerWheel s (JanusCT _)) = TimerWheel s Identity
 
-type instance JanusCRetType (TimerWheel s JanusC -> r) = JanusCRetType r
+deriving via
+  ViaPtrHandle t (CStruct TimerWheelSpine) (TimerWheel s Identity)
+  instance
+    (Typeable s) => JanusCArg t (TimerWheel s (JanusCT t))
 
-instance (Typeable s, JanusCParam r) => JanusCParam (TimerWheel s JanusC -> r) where
-  jcparam = mkPtrHandleJCParam TimerWheel
-
-instance (Typeable s, JanusCEvaluate r) => JanusCEvaluate (TimerWheel s JanusC -> r) where
-  jceval = mkPtrHandleJCEval unTimerWheel TimerWheel
-
-type instance JanusCEval (JanusCM (TimerWheel s JanusC)) = IO (TimerWheel s Identity)
-
-type instance JanusCRetType (JanusCM (TimerWheel s JanusC)) = TimerWheel s Identity
-
-instance (Typeable s) => JanusCParam (JanusCM (TimerWheel s JanusC)) where
-  jcparam = mkPtrHandleJCRetParam unTimerWheel
-
-instance (Typeable s) => JanusCEvaluate (JanusCM (TimerWheel s JanusC)) where
-  jceval = mkPtrHandleJCRetEval TimerWheel
-
-type instance LinuxX86_64CEval (TimerWheel s LinuxX86_64C -> r) = TimerWheel s Identity -> LinuxX86_64CEval r
-
-type instance LinuxX86_64BaseRet (TimerWheel s LinuxX86_64C -> r) = LinuxX86_64BaseRet r
-
-instance (Typeable s, LinuxX86_64Param r) => LinuxX86_64Param (TimerWheel s LinuxX86_64C -> r) where
-  x86param = mkPtrHandleX86Param TimerWheel
-
-instance (Typeable s, X86DeferCont r, LinuxX86_64Evaluate r) => LinuxX86_64Evaluate (TimerWheel s LinuxX86_64C -> r) where
-  x86eval = mkPtrHandleX86EvalParam unTimerWheel TimerWheel
-
-instance (Typeable s, X86DeferCont r) => X86DeferCall (TimerWheel s LinuxX86_64C -> r) where
-  x86DeferArg = mkPtrHandleX86DeferArg unTimerWheel TimerWheel
-
-instance (Typeable s, X86DeferCont r) => X86DeferCont (TimerWheel s LinuxX86_64C -> r) where
-  x86DeferCont = mkPtrHandleX86DeferCont unTimerWheel TimerWheel
-
-type instance LinuxX86_64CEval (LinuxX86_64CM (TimerWheel s LinuxX86_64C)) = IO (TimerWheel s Identity)
-
-type instance LinuxX86_64BaseRet (LinuxX86_64CM (TimerWheel s LinuxX86_64C)) = TimerWheel s Identity
-
-instance (Typeable s) => LinuxX86_64Param (LinuxX86_64CM (TimerWheel s LinuxX86_64C)) where
-  x86param = mkPtrHandleX86RetParam unTimerWheel
-
-instance (Typeable s) => LinuxX86_64Evaluate (LinuxX86_64CM (TimerWheel s LinuxX86_64C)) where
-  x86eval = mkPtrHandleX86RetEval TimerWheel
-
-instance (Typeable s) => X86DeferCall (LinuxX86_64CM (TimerWheel s LinuxX86_64C)) where
-  x86DeferArg = mkPtrHandleX86RetDeferArg TimerWheel
-
-instance (Typeable s) => X86DeferCont (LinuxX86_64CM (TimerWheel s LinuxX86_64C)) where
-  x86DeferCont = mkPtrHandleX86RetDeferCont TimerWheel
-
-instance (Typeable s, LinuxX86_64Param r, JanusCTH r) => JanusCTH (TimerWheel s LinuxX86_64C -> r) where
-  type JanusCTHEval (TimerWheel s LinuxX86_64C -> r) = TimerWheel s Identity -> JanusCTHEval r
-  janusCTHBackend _ = THBackendLinuxX86_64
-  janusCTHCodegen = x86param
-  janusCTHSpec _ =
-    let (ps, retSpec) = janusCTHSpec (Proxy @r)
-     in (mkPtrHandleTHParamSpec (Proxy @(TimerWheel s Identity)) : ps, retSpec)
-
-instance (Typeable s) => JanusCTH (LinuxX86_64CM (TimerWheel s LinuxX86_64C)) where
-  type JanusCTHEval (LinuxX86_64CM (TimerWheel s LinuxX86_64C)) = IO (TimerWheel s Identity)
-  janusCTHBackend _ = THBackendLinuxX86_64
-  janusCTHCodegen = x86param
-  janusCTHSpec _ =
-    ([], mkPtrHandleTHRetSpec THRetIO (Proxy @(TimerWheel s Identity)) (Proxy @(CStruct TimerWheelSpine)))
+deriving via
+  ViaPtrHandle t (CStruct TimerWheelSpine) (TimerWheel s Identity)
+  instance
+    (Typeable s) => JanusCValRet t (TimerWheel s (JanusCT t))

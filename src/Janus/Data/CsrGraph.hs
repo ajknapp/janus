@@ -3,6 +3,7 @@
 {-# LANGUAGE DataKinds #-}
 {-# LANGUAGE DeriveGeneric #-}
 {-# LANGUAGE DerivingStrategies #-}
+{-# LANGUAGE DerivingVia #-}
 {-# LANGUAGE FlexibleContexts #-}
 {-# LANGUAGE FlexibleInstances #-}
 {-# LANGUAGE KindSignatures #-}
@@ -62,8 +63,6 @@ import Janus.Alloc.Policy
     freeTypedArray,
   )
 import Janus.Backend.C
-import Janus.Backend.C.LinuxX86_64
-import Janus.Backend.C.TH
 import Janus.Command.Cond (ifThenElseM_, whenM_)
 import Janus.Command.Memory (CmdMemCopy (..), CmdStorable (..), ExpSized (..))
 import Janus.Command.Ref (letM, newRef, readRef, writeRef)
@@ -596,69 +595,14 @@ spmdCsrSpMVVec pw (CsrGraph hdr) xVec yVec = do
 
 type CsrGraphABI w = (Typeable w, JanusStruct (Buf w))
 
-type instance JanusCEval (CsrGraph JanusC w -> r) = CsrGraph Identity w -> JanusCEval r
+type instance JanusCHost (CsrGraph (JanusCT _) w) = CsrGraph Identity w
 
-type instance JanusCRetType (CsrGraph JanusC w -> r) = JanusCRetType r
+deriving via
+  ViaPtrHandle t (CStruct (CsrGraphSpine w)) (CsrGraph Identity w)
+  instance
+    (CsrGraphABI w) => JanusCArg t (CsrGraph (JanusCT t) w)
 
-instance (CsrGraphABI w, JanusCParam r) => JanusCParam (CsrGraph JanusC w -> r) where
-  jcparam = mkPtrHandleJCParam CsrGraph
-
-instance (CsrGraphABI w, JanusCEvaluate r) => JanusCEvaluate (CsrGraph JanusC w -> r) where
-  jceval = mkPtrHandleJCEval unCsrGraph CsrGraph
-
-type instance JanusCEval (JanusCM (CsrGraph JanusC w)) = IO (CsrGraph Identity w)
-
-type instance JanusCRetType (JanusCM (CsrGraph JanusC w)) = CsrGraph Identity w
-
-instance (CsrGraphABI w) => JanusCParam (JanusCM (CsrGraph JanusC w)) where
-  jcparam = mkPtrHandleJCRetParam unCsrGraph
-
-instance (CsrGraphABI w) => JanusCEvaluate (JanusCM (CsrGraph JanusC w)) where
-  jceval = mkPtrHandleJCRetEval CsrGraph
-
-type instance LinuxX86_64CEval (CsrGraph LinuxX86_64C w -> r) = CsrGraph Identity w -> LinuxX86_64CEval r
-
-type instance LinuxX86_64BaseRet (CsrGraph LinuxX86_64C w -> r) = LinuxX86_64BaseRet r
-
-instance (CsrGraphABI w, LinuxX86_64Param r) => LinuxX86_64Param (CsrGraph LinuxX86_64C w -> r) where
-  x86param = mkPtrHandleX86Param CsrGraph
-
-instance (CsrGraphABI w, X86DeferCont r, LinuxX86_64Evaluate r) => LinuxX86_64Evaluate (CsrGraph LinuxX86_64C w -> r) where
-  x86eval = mkPtrHandleX86EvalParam unCsrGraph CsrGraph
-
-instance (CsrGraphABI w, X86DeferCont r) => X86DeferCall (CsrGraph LinuxX86_64C w -> r) where
-  x86DeferArg = mkPtrHandleX86DeferArg unCsrGraph CsrGraph
-
-instance (CsrGraphABI w, X86DeferCont r) => X86DeferCont (CsrGraph LinuxX86_64C w -> r) where
-  x86DeferCont = mkPtrHandleX86DeferCont unCsrGraph CsrGraph
-
-type instance LinuxX86_64CEval (LinuxX86_64CM (CsrGraph LinuxX86_64C w)) = IO (CsrGraph Identity w)
-
-type instance LinuxX86_64BaseRet (LinuxX86_64CM (CsrGraph LinuxX86_64C w)) = CsrGraph Identity w
-
-instance (CsrGraphABI w) => LinuxX86_64Param (LinuxX86_64CM (CsrGraph LinuxX86_64C w)) where
-  x86param = mkPtrHandleX86RetParam unCsrGraph
-
-instance (CsrGraphABI w) => LinuxX86_64Evaluate (LinuxX86_64CM (CsrGraph LinuxX86_64C w)) where
-  x86eval = mkPtrHandleX86RetEval CsrGraph
-
-instance (CsrGraphABI w) => X86DeferCall (LinuxX86_64CM (CsrGraph LinuxX86_64C w)) where
-  x86DeferArg = mkPtrHandleX86RetDeferArg CsrGraph
-
-instance (CsrGraphABI w) => X86DeferCont (LinuxX86_64CM (CsrGraph LinuxX86_64C w)) where
-  x86DeferCont = mkPtrHandleX86RetDeferCont CsrGraph
-
-instance (CsrGraphABI w, LinuxX86_64Param r, JanusCTH r) => JanusCTH (CsrGraph LinuxX86_64C w -> r) where
-  type JanusCTHEval (CsrGraph LinuxX86_64C w -> r) = CsrGraph Identity w -> JanusCTHEval r
-  janusCTHBackend _ = THBackendLinuxX86_64
-  janusCTHCodegen = x86param
-  janusCTHSpec _ =
-    let (ps, retSpec) = janusCTHSpec (Proxy @r)
-     in (mkPtrHandleTHParamSpec (Proxy @(CsrGraph Identity w)) : ps, retSpec)
-
-instance (CsrGraphABI w) => JanusCTH (LinuxX86_64CM (CsrGraph LinuxX86_64C w)) where
-  type JanusCTHEval (LinuxX86_64CM (CsrGraph LinuxX86_64C w)) = IO (CsrGraph Identity w)
-  janusCTHBackend _ = THBackendLinuxX86_64
-  janusCTHCodegen = x86param
-  janusCTHSpec _ =
-    ([], mkPtrHandleTHRetSpec THRetIO (Proxy @(CsrGraph Identity w)) (Proxy @(CStruct (CsrGraphSpine w))))
+deriving via
+  ViaPtrHandle t (CStruct (CsrGraphSpine w)) (CsrGraph Identity w)
+  instance
+    (CsrGraphABI w) => JanusCValRet t (CsrGraph (JanusCT t) w)

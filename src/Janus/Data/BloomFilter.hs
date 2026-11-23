@@ -3,6 +3,7 @@
 {-# LANGUAGE DataKinds #-}
 {-# LANGUAGE DeriveGeneric #-}
 {-# LANGUAGE DerivingStrategies #-}
+{-# LANGUAGE DerivingVia #-}
 {-# LANGUAGE FlexibleContexts #-}
 {-# LANGUAGE FlexibleInstances #-}
 {-# LANGUAGE KindSignatures #-}
@@ -69,8 +70,6 @@ import Janus.Alloc.Policy
     freeStruct,
   )
 import Janus.Backend.C
-import Janus.Backend.C.LinuxX86_64
-import Janus.Backend.C.TH
 import Janus.Command.Cond (whenM_)
 import Janus.Command.Memory (CmdMemCopy (..), CmdStorable (..), ExpPtr (..), ExpSized (..), janusSIMDAlignment)
 import Janus.Command.Ref (letM, newRef, readRef, writeRef)
@@ -576,69 +575,14 @@ drainAppendBloomFilter bf = drainForEach (insert bf)
 
 type BloomFilterABI k = Typeable k
 
-type instance JanusCEval (BloomFilter JanusC k -> r) = BloomFilter Identity k -> JanusCEval r
+type instance JanusCHost (BloomFilter (JanusCT _) k) = BloomFilter Identity k
 
-type instance JanusCRetType (BloomFilter JanusC k -> r) = JanusCRetType r
+deriving via
+  ViaPtrHandle t (CStruct (BloomFilterSpine k)) (BloomFilter Identity k)
+  instance
+    (BloomFilterABI k) => JanusCArg t (BloomFilter (JanusCT t) k)
 
-instance (BloomFilterABI k, JanusCParam r) => JanusCParam (BloomFilter JanusC k -> r) where
-  jcparam = mkPtrHandleJCParam BloomFilter
-
-instance (BloomFilterABI k, JanusCEvaluate r) => JanusCEvaluate (BloomFilter JanusC k -> r) where
-  jceval = mkPtrHandleJCEval unBloomFilter BloomFilter
-
-type instance JanusCEval (JanusCM (BloomFilter JanusC k)) = IO (BloomFilter Identity k)
-
-type instance JanusCRetType (JanusCM (BloomFilter JanusC k)) = BloomFilter Identity k
-
-instance (BloomFilterABI k) => JanusCParam (JanusCM (BloomFilter JanusC k)) where
-  jcparam = mkPtrHandleJCRetParam unBloomFilter
-
-instance (BloomFilterABI k) => JanusCEvaluate (JanusCM (BloomFilter JanusC k)) where
-  jceval = mkPtrHandleJCRetEval BloomFilter
-
-type instance LinuxX86_64CEval (BloomFilter LinuxX86_64C k -> r) = BloomFilter Identity k -> LinuxX86_64CEval r
-
-type instance LinuxX86_64BaseRet (BloomFilter LinuxX86_64C k -> r) = LinuxX86_64BaseRet r
-
-instance (BloomFilterABI k, LinuxX86_64Param r) => LinuxX86_64Param (BloomFilter LinuxX86_64C k -> r) where
-  x86param = mkPtrHandleX86Param BloomFilter
-
-instance (BloomFilterABI k, X86DeferCont r, LinuxX86_64Evaluate r) => LinuxX86_64Evaluate (BloomFilter LinuxX86_64C k -> r) where
-  x86eval = mkPtrHandleX86EvalParam unBloomFilter BloomFilter
-
-instance (BloomFilterABI k, X86DeferCont r) => X86DeferCall (BloomFilter LinuxX86_64C k -> r) where
-  x86DeferArg = mkPtrHandleX86DeferArg unBloomFilter BloomFilter
-
-instance (BloomFilterABI k, X86DeferCont r) => X86DeferCont (BloomFilter LinuxX86_64C k -> r) where
-  x86DeferCont = mkPtrHandleX86DeferCont unBloomFilter BloomFilter
-
-type instance LinuxX86_64CEval (LinuxX86_64CM (BloomFilter LinuxX86_64C k)) = IO (BloomFilter Identity k)
-
-type instance LinuxX86_64BaseRet (LinuxX86_64CM (BloomFilter LinuxX86_64C k)) = BloomFilter Identity k
-
-instance (BloomFilterABI k) => LinuxX86_64Param (LinuxX86_64CM (BloomFilter LinuxX86_64C k)) where
-  x86param = mkPtrHandleX86RetParam unBloomFilter
-
-instance (BloomFilterABI k) => LinuxX86_64Evaluate (LinuxX86_64CM (BloomFilter LinuxX86_64C k)) where
-  x86eval = mkPtrHandleX86RetEval BloomFilter
-
-instance (BloomFilterABI k) => X86DeferCall (LinuxX86_64CM (BloomFilter LinuxX86_64C k)) where
-  x86DeferArg = mkPtrHandleX86RetDeferArg BloomFilter
-
-instance (BloomFilterABI k) => X86DeferCont (LinuxX86_64CM (BloomFilter LinuxX86_64C k)) where
-  x86DeferCont = mkPtrHandleX86RetDeferCont BloomFilter
-
-instance (BloomFilterABI k, LinuxX86_64Param r, JanusCTH r) => JanusCTH (BloomFilter LinuxX86_64C k -> r) where
-  type JanusCTHEval (BloomFilter LinuxX86_64C k -> r) = BloomFilter Identity k -> JanusCTHEval r
-  janusCTHBackend _ = THBackendLinuxX86_64
-  janusCTHCodegen = x86param
-  janusCTHSpec _ =
-    let (ps, retSpec) = janusCTHSpec (Proxy @r)
-     in (mkPtrHandleTHParamSpec (Proxy @(BloomFilter Identity k)) : ps, retSpec)
-
-instance (BloomFilterABI k) => JanusCTH (LinuxX86_64CM (BloomFilter LinuxX86_64C k)) where
-  type JanusCTHEval (LinuxX86_64CM (BloomFilter LinuxX86_64C k)) = IO (BloomFilter Identity k)
-  janusCTHBackend _ = THBackendLinuxX86_64
-  janusCTHCodegen = x86param
-  janusCTHSpec _ =
-    ([], mkPtrHandleTHRetSpec THRetIO (Proxy @(BloomFilter Identity k)) (Proxy @(CStruct (BloomFilterSpine k))))
+deriving via
+  ViaPtrHandle t (CStruct (BloomFilterSpine k)) (BloomFilter Identity k)
+  instance
+    (BloomFilterABI k) => JanusCValRet t (BloomFilter (JanusCT t) k)

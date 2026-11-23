@@ -3,6 +3,7 @@
 {-# LANGUAGE DataKinds #-}
 {-# LANGUAGE DeriveGeneric #-}
 {-# LANGUAGE DerivingStrategies #-}
+{-# LANGUAGE DerivingVia #-}
 {-# LANGUAGE FlexibleContexts #-}
 {-# LANGUAGE FlexibleInstances #-}
 {-# LANGUAGE KindSignatures #-}
@@ -67,8 +68,6 @@ import Janus.Alloc.Policy
     freeStruct,
   )
 import Janus.Backend.C
-import Janus.Backend.C.LinuxX86_64
-import Janus.Backend.C.TH
 import Janus.Command.Cond (ifThenElseM_, whenM_)
 import Janus.Command.Memory (CmdMemCopy (..), CmdStorable (..), ExpPtr (..), ExpSized (..), janusSIMDAlignment)
 import Janus.Command.Ref (letM, newRef, readRef, writeRef)
@@ -599,69 +598,14 @@ drainAppendHashSet alloc hs = drainForEach (\x -> insert alloc hs x >> pure ())
 
 type HashSetABI k = (Typeable k, JanusStruct (Buf k))
 
-type instance JanusCEval (HashSet JanusC k -> r) = HashSet Identity k -> JanusCEval r
+type instance JanusCHost (HashSet (JanusCT _) k) = HashSet Identity k
 
-type instance JanusCRetType (HashSet JanusC k -> r) = JanusCRetType r
+deriving via
+  ViaPtrHandle t (CStruct (HashSetSpine k)) (HashSet Identity k)
+  instance
+    (HashSetABI k) => JanusCArg t (HashSet (JanusCT t) k)
 
-instance (HashSetABI k, JanusCParam r) => JanusCParam (HashSet JanusC k -> r) where
-  jcparam = mkPtrHandleJCParam HashSet
-
-instance (HashSetABI k, JanusCEvaluate r) => JanusCEvaluate (HashSet JanusC k -> r) where
-  jceval = mkPtrHandleJCEval unHashSet HashSet
-
-type instance JanusCEval (JanusCM (HashSet JanusC k)) = IO (HashSet Identity k)
-
-type instance JanusCRetType (JanusCM (HashSet JanusC k)) = HashSet Identity k
-
-instance (HashSetABI k) => JanusCParam (JanusCM (HashSet JanusC k)) where
-  jcparam = mkPtrHandleJCRetParam unHashSet
-
-instance (HashSetABI k) => JanusCEvaluate (JanusCM (HashSet JanusC k)) where
-  jceval = mkPtrHandleJCRetEval HashSet
-
-type instance LinuxX86_64CEval (HashSet LinuxX86_64C k -> r) = HashSet Identity k -> LinuxX86_64CEval r
-
-type instance LinuxX86_64BaseRet (HashSet LinuxX86_64C k -> r) = LinuxX86_64BaseRet r
-
-instance (HashSetABI k, LinuxX86_64Param r) => LinuxX86_64Param (HashSet LinuxX86_64C k -> r) where
-  x86param = mkPtrHandleX86Param HashSet
-
-instance (HashSetABI k, X86DeferCont r, LinuxX86_64Evaluate r) => LinuxX86_64Evaluate (HashSet LinuxX86_64C k -> r) where
-  x86eval = mkPtrHandleX86EvalParam unHashSet HashSet
-
-instance (HashSetABI k, X86DeferCont r) => X86DeferCall (HashSet LinuxX86_64C k -> r) where
-  x86DeferArg = mkPtrHandleX86DeferArg unHashSet HashSet
-
-instance (HashSetABI k, X86DeferCont r) => X86DeferCont (HashSet LinuxX86_64C k -> r) where
-  x86DeferCont = mkPtrHandleX86DeferCont unHashSet HashSet
-
-type instance LinuxX86_64CEval (LinuxX86_64CM (HashSet LinuxX86_64C k)) = IO (HashSet Identity k)
-
-type instance LinuxX86_64BaseRet (LinuxX86_64CM (HashSet LinuxX86_64C k)) = HashSet Identity k
-
-instance (HashSetABI k) => LinuxX86_64Param (LinuxX86_64CM (HashSet LinuxX86_64C k)) where
-  x86param = mkPtrHandleX86RetParam unHashSet
-
-instance (HashSetABI k) => LinuxX86_64Evaluate (LinuxX86_64CM (HashSet LinuxX86_64C k)) where
-  x86eval = mkPtrHandleX86RetEval HashSet
-
-instance (HashSetABI k) => X86DeferCall (LinuxX86_64CM (HashSet LinuxX86_64C k)) where
-  x86DeferArg = mkPtrHandleX86RetDeferArg HashSet
-
-instance (HashSetABI k) => X86DeferCont (LinuxX86_64CM (HashSet LinuxX86_64C k)) where
-  x86DeferCont = mkPtrHandleX86RetDeferCont HashSet
-
-instance (HashSetABI k, LinuxX86_64Param r, JanusCTH r) => JanusCTH (HashSet LinuxX86_64C k -> r) where
-  type JanusCTHEval (HashSet LinuxX86_64C k -> r) = HashSet Identity k -> JanusCTHEval r
-  janusCTHBackend _ = THBackendLinuxX86_64
-  janusCTHCodegen = x86param
-  janusCTHSpec _ =
-    let (ps, retSpec) = janusCTHSpec (Proxy @r)
-     in (mkPtrHandleTHParamSpec (Proxy @(HashSet Identity k)) : ps, retSpec)
-
-instance (HashSetABI k) => JanusCTH (LinuxX86_64CM (HashSet LinuxX86_64C k)) where
-  type JanusCTHEval (LinuxX86_64CM (HashSet LinuxX86_64C k)) = IO (HashSet Identity k)
-  janusCTHBackend _ = THBackendLinuxX86_64
-  janusCTHCodegen = x86param
-  janusCTHSpec _ =
-    ([], mkPtrHandleTHRetSpec THRetIO (Proxy @(HashSet Identity k)) (Proxy @(CStruct (HashSetSpine k))))
+deriving via
+  ViaPtrHandle t (CStruct (HashSetSpine k)) (HashSet Identity k)
+  instance
+    (HashSetABI k) => JanusCValRet t (HashSet (JanusCT t) k)

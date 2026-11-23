@@ -2,6 +2,7 @@
 {-# LANGUAGE DataKinds #-}
 {-# LANGUAGE DeriveGeneric #-}
 {-# LANGUAGE DerivingStrategies #-}
+{-# LANGUAGE DerivingVia #-}
 {-# LANGUAGE FlexibleContexts #-}
 {-# LANGUAGE FlexibleInstances #-}
 {-# LANGUAGE KindSignatures #-}
@@ -63,8 +64,6 @@ import Janus.Alloc.Policy
     reallocTypedArray,
   )
 import Janus.Backend.C
-import Janus.Backend.C.LinuxX86_64
-import Janus.Backend.C.TH
 import Janus.Command.Cond (ifThenElseM_, whenM_)
 import Janus.Command.Memory (CmdStorable (..), ExpSized (..))
 import Janus.Command.Ref (letM, newRef, readRef, writeRef)
@@ -450,69 +449,14 @@ spmdCountComponents pw (DisjointSet hdr) = do
 -- Host <-> C FFI Marshalling Instances
 --------------------------------------------------------------------------------
 
-type instance JanusCEval (DisjointSet JanusC -> r) = DisjointSet Identity -> JanusCEval r
+type instance JanusCHost (DisjointSet (JanusCT _)) = DisjointSet Identity
 
-type instance JanusCRetType (DisjointSet JanusC -> r) = JanusCRetType r
+deriving via
+  ViaPtrHandle t (CStruct DisjointSetSpine) (DisjointSet Identity)
+  instance
+    JanusCArg t (DisjointSet (JanusCT t))
 
-instance (JanusCParam r) => JanusCParam (DisjointSet JanusC -> r) where
-  jcparam = mkPtrHandleJCParam DisjointSet
-
-instance (JanusCEvaluate r) => JanusCEvaluate (DisjointSet JanusC -> r) where
-  jceval = mkPtrHandleJCEval unDisjointSet DisjointSet
-
-type instance JanusCEval (JanusCM (DisjointSet JanusC)) = IO (DisjointSet Identity)
-
-type instance JanusCRetType (JanusCM (DisjointSet JanusC)) = DisjointSet Identity
-
-instance JanusCParam (JanusCM (DisjointSet JanusC)) where
-  jcparam = mkPtrHandleJCRetParam unDisjointSet
-
-instance JanusCEvaluate (JanusCM (DisjointSet JanusC)) where
-  jceval = mkPtrHandleJCRetEval DisjointSet
-
-type instance LinuxX86_64CEval (DisjointSet LinuxX86_64C -> r) = DisjointSet Identity -> LinuxX86_64CEval r
-
-type instance LinuxX86_64BaseRet (DisjointSet LinuxX86_64C -> r) = LinuxX86_64BaseRet r
-
-instance (LinuxX86_64Param r) => LinuxX86_64Param (DisjointSet LinuxX86_64C -> r) where
-  x86param = mkPtrHandleX86Param DisjointSet
-
-instance (X86DeferCont r, LinuxX86_64Evaluate r) => LinuxX86_64Evaluate (DisjointSet LinuxX86_64C -> r) where
-  x86eval = mkPtrHandleX86EvalParam unDisjointSet DisjointSet
-
-instance (X86DeferCont r) => X86DeferCall (DisjointSet LinuxX86_64C -> r) where
-  x86DeferArg = mkPtrHandleX86DeferArg unDisjointSet DisjointSet
-
-instance (X86DeferCont r) => X86DeferCont (DisjointSet LinuxX86_64C -> r) where
-  x86DeferCont = mkPtrHandleX86DeferCont unDisjointSet DisjointSet
-
-type instance LinuxX86_64CEval (LinuxX86_64CM (DisjointSet LinuxX86_64C)) = IO (DisjointSet Identity)
-
-type instance LinuxX86_64BaseRet (LinuxX86_64CM (DisjointSet LinuxX86_64C)) = DisjointSet Identity
-
-instance LinuxX86_64Param (LinuxX86_64CM (DisjointSet LinuxX86_64C)) where
-  x86param = mkPtrHandleX86RetParam unDisjointSet
-
-instance LinuxX86_64Evaluate (LinuxX86_64CM (DisjointSet LinuxX86_64C)) where
-  x86eval = mkPtrHandleX86RetEval DisjointSet
-
-instance X86DeferCall (LinuxX86_64CM (DisjointSet LinuxX86_64C)) where
-  x86DeferArg = mkPtrHandleX86RetDeferArg DisjointSet
-
-instance X86DeferCont (LinuxX86_64CM (DisjointSet LinuxX86_64C)) where
-  x86DeferCont = mkPtrHandleX86RetDeferCont DisjointSet
-
-instance (LinuxX86_64Param r, JanusCTH r) => JanusCTH (DisjointSet LinuxX86_64C -> r) where
-  type JanusCTHEval (DisjointSet LinuxX86_64C -> r) = DisjointSet Identity -> JanusCTHEval r
-  janusCTHBackend _ = THBackendLinuxX86_64
-  janusCTHCodegen = x86param
-  janusCTHSpec _ =
-    let (ps, retSpec) = janusCTHSpec (Proxy @r)
-     in (mkPtrHandleTHParamSpec (Proxy @(DisjointSet Identity)) : ps, retSpec)
-
-instance JanusCTH (LinuxX86_64CM (DisjointSet LinuxX86_64C)) where
-  type JanusCTHEval (LinuxX86_64CM (DisjointSet LinuxX86_64C)) = IO (DisjointSet Identity)
-  janusCTHBackend _ = THBackendLinuxX86_64
-  janusCTHCodegen = x86param
-  janusCTHSpec _ =
-    ([], mkPtrHandleTHRetSpec THRetIO (Proxy @(DisjointSet Identity)) (Proxy @(CStruct DisjointSetSpine)))
+deriving via
+  ViaPtrHandle t (CStruct DisjointSetSpine) (DisjointSet Identity)
+  instance
+    JanusCValRet t (DisjointSet (JanusCT t))

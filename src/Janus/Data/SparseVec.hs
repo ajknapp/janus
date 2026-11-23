@@ -3,6 +3,7 @@
 {-# LANGUAGE DataKinds #-}
 {-# LANGUAGE DeriveGeneric #-}
 {-# LANGUAGE DerivingStrategies #-}
+{-# LANGUAGE DerivingVia #-}
 {-# LANGUAGE FlexibleContexts #-}
 {-# LANGUAGE FlexibleInstances #-}
 {-# LANGUAGE KindSignatures #-}
@@ -77,8 +78,6 @@ import Janus.Alloc.Policy
     reallocTypedArray,
   )
 import Janus.Backend.C
-import Janus.Backend.C.LinuxX86_64
-import Janus.Backend.C.TH
 import Janus.Command.Cond (ifThenElseM_, whenM_)
 import Janus.Command.Memory (CmdStorable (..), ExpPtr (..), ExpSized (..))
 import Janus.Command.Ref (letM, newRef, readRef, writeRef)
@@ -644,69 +643,14 @@ drainAppendSparseVecWith alloc combine sv =
 
 type SparseVecABI a = (Typeable a, JanusStruct (Buf a))
 
-type instance JanusCEval (SparseVec JanusC a -> r) = SparseVec Identity a -> JanusCEval r
+type instance JanusCHost (SparseVec (JanusCT _) a) = SparseVec Identity a
 
-type instance JanusCRetType (SparseVec JanusC a -> r) = JanusCRetType r
+deriving via
+  ViaPtrHandle t (CStruct (SparseVecSpine a)) (SparseVec Identity a)
+  instance
+    (SparseVecABI a) => JanusCArg t (SparseVec (JanusCT t) a)
 
-instance (SparseVecABI a, JanusCParam r) => JanusCParam (SparseVec JanusC a -> r) where
-  jcparam = mkPtrHandleJCParam SparseVec
-
-instance (SparseVecABI a, JanusCEvaluate r) => JanusCEvaluate (SparseVec JanusC a -> r) where
-  jceval = mkPtrHandleJCEval unSparseVec SparseVec
-
-type instance JanusCEval (JanusCM (SparseVec JanusC a)) = IO (SparseVec Identity a)
-
-type instance JanusCRetType (JanusCM (SparseVec JanusC a)) = SparseVec Identity a
-
-instance (SparseVecABI a) => JanusCParam (JanusCM (SparseVec JanusC a)) where
-  jcparam = mkPtrHandleJCRetParam unSparseVec
-
-instance (SparseVecABI a) => JanusCEvaluate (JanusCM (SparseVec JanusC a)) where
-  jceval = mkPtrHandleJCRetEval SparseVec
-
-type instance LinuxX86_64CEval (SparseVec LinuxX86_64C a -> r) = SparseVec Identity a -> LinuxX86_64CEval r
-
-type instance LinuxX86_64BaseRet (SparseVec LinuxX86_64C a -> r) = LinuxX86_64BaseRet r
-
-instance (SparseVecABI a, LinuxX86_64Param r) => LinuxX86_64Param (SparseVec LinuxX86_64C a -> r) where
-  x86param = mkPtrHandleX86Param SparseVec
-
-instance (SparseVecABI a, X86DeferCont r, LinuxX86_64Evaluate r) => LinuxX86_64Evaluate (SparseVec LinuxX86_64C a -> r) where
-  x86eval = mkPtrHandleX86EvalParam unSparseVec SparseVec
-
-instance (SparseVecABI a, X86DeferCont r) => X86DeferCall (SparseVec LinuxX86_64C a -> r) where
-  x86DeferArg = mkPtrHandleX86DeferArg unSparseVec SparseVec
-
-instance (SparseVecABI a, X86DeferCont r) => X86DeferCont (SparseVec LinuxX86_64C a -> r) where
-  x86DeferCont = mkPtrHandleX86DeferCont unSparseVec SparseVec
-
-type instance LinuxX86_64CEval (LinuxX86_64CM (SparseVec LinuxX86_64C a)) = IO (SparseVec Identity a)
-
-type instance LinuxX86_64BaseRet (LinuxX86_64CM (SparseVec LinuxX86_64C a)) = SparseVec Identity a
-
-instance (SparseVecABI a) => LinuxX86_64Param (LinuxX86_64CM (SparseVec LinuxX86_64C a)) where
-  x86param = mkPtrHandleX86RetParam unSparseVec
-
-instance (SparseVecABI a) => LinuxX86_64Evaluate (LinuxX86_64CM (SparseVec LinuxX86_64C a)) where
-  x86eval = mkPtrHandleX86RetEval SparseVec
-
-instance (SparseVecABI a) => X86DeferCall (LinuxX86_64CM (SparseVec LinuxX86_64C a)) where
-  x86DeferArg = mkPtrHandleX86RetDeferArg SparseVec
-
-instance (SparseVecABI a) => X86DeferCont (LinuxX86_64CM (SparseVec LinuxX86_64C a)) where
-  x86DeferCont = mkPtrHandleX86RetDeferCont SparseVec
-
-instance (SparseVecABI a, LinuxX86_64Param r, JanusCTH r) => JanusCTH (SparseVec LinuxX86_64C a -> r) where
-  type JanusCTHEval (SparseVec LinuxX86_64C a -> r) = SparseVec Identity a -> JanusCTHEval r
-  janusCTHBackend _ = THBackendLinuxX86_64
-  janusCTHCodegen = x86param
-  janusCTHSpec _ =
-    let (ps, retSpec) = janusCTHSpec (Proxy @r)
-     in (mkPtrHandleTHParamSpec (Proxy @(SparseVec Identity a)) : ps, retSpec)
-
-instance (SparseVecABI a) => JanusCTH (LinuxX86_64CM (SparseVec LinuxX86_64C a)) where
-  type JanusCTHEval (LinuxX86_64CM (SparseVec LinuxX86_64C a)) = IO (SparseVec Identity a)
-  janusCTHBackend _ = THBackendLinuxX86_64
-  janusCTHCodegen = x86param
-  janusCTHSpec _ =
-    ([], mkPtrHandleTHRetSpec THRetIO (Proxy @(SparseVec Identity a)) (Proxy @(CStruct (SparseVecSpine a))))
+deriving via
+  ViaPtrHandle t (CStruct (SparseVecSpine a)) (SparseVec Identity a)
+  instance
+    (SparseVecABI a) => JanusCValRet t (SparseVec (JanusCT t) a)

@@ -28,6 +28,7 @@ import GHC.Float (expm1, log1p)
 import Hedgehog (Property, forAll, property, (===))
 import qualified Hedgehog.Gen as Gen
 import qualified Hedgehog.Range as Range
+import Janus.Backend.C (acquireJanusC, acquireJanusCWith, releaseJanusC, showJanusCWith, withJanusC, withJanusCWith)
 import Janus.Backend.C.Build (CBuildConfig (..), cBuildConfigCacheDir, defaultCBuildConfig)
 import Janus.Backend.C.CUDA
 import Janus.Backend.C.CUDA.Foreign
@@ -130,8 +131,8 @@ unit_explicit_cross_target_codegen_selection = do
         a <- vgather base idx
         pure (vfma a b c)
 
-      cSSE2 = showLinuxX86_64CWith x86Baseline "kern" x86Kern
-      cAVX2 = showLinuxX86_64CWith x86AVX2 "kern" x86Kern
+      cSSE2 = showJanusCWith x86Baseline "kern" x86Kern
+      cAVX2 = showJanusCWith x86AVX2 "kern" x86Kern
 
   assertBool "SSE2 codegen avoids __m256" (not ("__m256" `isInfixOf` cSSE2))
   assertBool "SSE2 codegen uses __m128 pair" ("__m128" `isInfixOf` cSSE2)
@@ -275,20 +276,20 @@ test_simd_differential :: TestTree
 test_simd_differential =
   let acqSSE2Int = do
         cfg <- getTestBuildConfig
-        acquireLinuxX86_64CWith x86Baseline cfg (int8x16Composite @LinuxX86_64C)
+        acquireJanusCWith x86Baseline cfg (int8x16Composite @LinuxX86_64C)
       acqHostInt = do
         cfg <- getTestBuildConfig
-        acquireLinuxX86_64C cfg (int8x16Composite @LinuxX86_64C)
+        acquireJanusC cfg (int8x16Composite @LinuxX86_64C)
       acqSSE2Flt = do
         cfg <- getTestBuildConfig
-        acquireLinuxX86_64CWith x86Baseline cfg (floatx8Composite @LinuxX86_64C)
+        acquireJanusCWith x86Baseline cfg (floatx8Composite @LinuxX86_64C)
       acqHostFlt = do
         cfg <- getTestBuildConfig
-        acquireLinuxX86_64C cfg (floatx8Composite @LinuxX86_64C)
-   in withResource acqSSE2Int releaseLinuxX86_64C $ \rSSE2I ->
-        withResource acqHostInt releaseLinuxX86_64C $ \rHostI ->
-          withResource acqSSE2Flt releaseLinuxX86_64C $ \rSSE2F ->
-            withResource acqHostFlt releaseLinuxX86_64C $ \rHostF ->
+        acquireJanusC cfg (floatx8Composite @LinuxX86_64C)
+   in withResource acqSSE2Int releaseJanusC $ \rSSE2I ->
+        withResource acqHostInt releaseJanusC $ \rHostI ->
+          withResource acqSSE2Flt releaseJanusC $ \rSSE2F ->
+            withResource acqHostFlt releaseJanusC $ \rHostF ->
               testGroup
                 "SIMD cross-tier differential properties"
                 [ testProperty "16xInt8 arith/sat/cmp/bits across FFI tiers, CPU emu, SSE2 C, & Host C" $
@@ -320,7 +321,7 @@ unit_simd_categories_exhaustive = do
       CUDAIO rShiftCPU = shiftExpr @CUDAIO (CUDAIO (simdFromList vIn)) (CUDAIO (simdFromList cIn))
 
   simdToList rShiftFFI @?= simdToList rShiftCPU
-  rShiftC <- withLinuxX86_64C cfg (shiftExpr @LinuxX86_64C) $ \f ->
+  rShiftC <- withJanusC cfg (shiftExpr @LinuxX86_64C) $ \f ->
     pure $ simdToList $ f (simdFromList vIn) (simdFromList cIn)
   rShiftC @?= simdToList rShiftCPU
 
@@ -352,7 +353,7 @@ unit_simd_categories_exhaustive = do
       CUDAIO redCPU = shufRedExpr @CUDAIO (CUDAIO (simdFromList xs4)) (CUDAIO (simdFromList ix4))
 
   redFFI @?= redCPU
-  redC <- withLinuxX86_64C cfg (shufRedExpr @LinuxX86_64C) $ \f ->
+  redC <- withJanusC cfg (shufRedExpr @LinuxX86_64C) $ \f ->
     pure $ f (simdFromList xs4) (simdFromList ix4)
   redC @?= redCPU
 
@@ -372,7 +373,7 @@ unit_simd_categories_exhaustive = do
       CUDAIO mqCPU = maskQueryExpr @CUDAIO (CUDAIO (simdFromList ma8)) (CUDAIO (simdFromList mb8))
 
   mqFFI @?= mqCPU
-  mqC <- withLinuxX86_64C cfg (maskQueryExpr @LinuxX86_64C) $ \f ->
+  mqC <- withJanusC cfg (maskQueryExpr @LinuxX86_64C) $ \f ->
     pure $ f (simdFromList ma8) (simdFromList mb8)
   mqC @?= mqCPU
 
@@ -416,7 +417,7 @@ unit_simd_categories_exhaustive = do
           (CUDAIO (simdFromList ds2))
 
   dotFFI @?= dotCPU
-  dotC <- withLinuxX86_64C cfg (dotExpr @LinuxX86_64C) $ \f ->
+  dotC <- withJanusC cfg (dotExpr @LinuxX86_64C) $ \f ->
     pure $ f (simdFromList da4) (simdFromList db4) (simdFromList dv16s) (simdFromList dv16u) (simdFromList ds2)
   dotC @?= dotCPU
 
@@ -614,7 +615,7 @@ unit_polymorphic_relu_fma_all_backends = do
 
         -- 2. LinuxX86_64C with explicit SSE2 baseline
         resetOut
-        withLinuxX86_64CWith x86Baseline cfg (cpuSimdLoop @LinuxX86_64CM @LinuxX86_64C) $ \fn ->
+        withJanusCWith x86Baseline cfg (cpuSimdLoop @LinuxX86_64CM @LinuxX86_64C) $ \fn ->
           fn (fromIntegral n) (fromIntegral chunks) alpha px py pout
         verifyOut "LinuxX86_64C (SSE2)"
 
@@ -622,12 +623,12 @@ unit_polymorphic_relu_fma_all_backends = do
         hostX86 <- observeHostX86Features
         when (admitsX86Features hostX86 x86AVX) $ do
           resetOut
-          withLinuxX86_64CWith x86AVX cfg (cpuSimdLoop @LinuxX86_64CM @LinuxX86_64C) $ \fn ->
+          withJanusCWith x86AVX cfg (cpuSimdLoop @LinuxX86_64CM @LinuxX86_64C) $ \fn ->
             fn (fromIntegral n) (fromIntegral chunks) alpha px py pout
           verifyOut "LinuxX86_64C (AVX1)"
 
         resetOut
-        withLinuxX86_64C cfg (cpuSimdLoop @LinuxX86_64CM @LinuxX86_64C) $ \fn ->
+        withJanusC cfg (cpuSimdLoop @LinuxX86_64CM @LinuxX86_64C) $ \fn ->
           fn (fromIntegral n) (fromIntegral chunks) alpha px py pout
         verifyOut "LinuxX86_64C (Host)"
 
@@ -785,11 +786,11 @@ unit_sleef_linux_floating = do
         LinuxX86_64C (SIMDVector LinuxX86_64C 4 Double)
       d4Expr = sleefTranscendentalExpr
 
-      cSSE2 = showLinuxX86_64CWith x86Baseline "sleef_f8" f8Expr
-      cSSE4 = showLinuxX86_64CWith x86SSE4_2 "sleef_f8" f8Expr
-      cAVX1 = showLinuxX86_64CWith x86AVX "sleef_f8" f8Expr
-      cAVX2 = showLinuxX86_64CWith x86AVX2 "sleef_f8" f8Expr
-      cD4AVX2 = showLinuxX86_64CWith x86AVX2 "sleef_d4" d4Expr
+      cSSE2 = showJanusCWith x86Baseline "sleef_f8" f8Expr
+      cSSE4 = showJanusCWith x86SSE4_2 "sleef_f8" f8Expr
+      cAVX1 = showJanusCWith x86AVX "sleef_f8" f8Expr
+      cAVX2 = showJanusCWith x86AVX2 "sleef_f8" f8Expr
+      cD4AVX2 = showJanusCWith x86AVX2 "sleef_d4" d4Expr
 
   assertBool "SLEEF header included" ("#include <sleef.h>" `isInfixOf` cSSE2)
   assertBool "SSE2 uses Sleef_expf4_u10sse2" ("Sleef_expf4_u10sse2" `isInfixOf` cSSE2)
@@ -821,9 +822,9 @@ unit_sleef_linux_floating = do
           (Identity (simdFromList ysF))
       ffiHost = simdToList ffiHostVec
 
-  cOutSSE2 <- withLinuxX86_64CWith x86Baseline cfg f8Expr $ \fn ->
+  cOutSSE2 <- withJanusCWith x86Baseline cfg f8Expr $ \fn ->
     pure $ fn (simdFromList xsF) (simdFromList ysF)
-  cOutHost <- withLinuxX86_64C cfg f8Expr $ \fn ->
+  cOutHost <- withJanusC cfg f8Expr $ \fn ->
     pure $ fn (simdFromList xsF) (simdFromList ysF)
 
   -- Exact tier-for-tier match between Identity FFI and LinuxX86_64C SLEEF calls
@@ -832,7 +833,7 @@ unit_sleef_linux_floating = do
 
   hostX86 <- observeHostX86Features
   when (admitsX86Features hostX86 x86AVX) $ do
-    cOutAVX <- withLinuxX86_64CWith x86AVX cfg f8Expr $ \fn ->
+    cOutAVX <- withJanusCWith x86AVX cfg f8Expr $ \fn ->
       pure $ fn (simdFromList xsF) (simdFromList ysF)
     ffiAVX <-
       withHostX86Features x86AVX $ do
@@ -854,9 +855,9 @@ unit_sleef_linux_floating = do
       ysD = [0.4, -1.1, 1.3, -0.6 :: Double]
       refD = zipWith sleefTranscendentalExpr xsD ysD
 
-  cD4SSE2 <- withLinuxX86_64CWith x86Baseline cfg d4Expr $ \fn ->
+  cD4SSE2 <- withJanusCWith x86Baseline cfg d4Expr $ \fn ->
     pure $ fn (simdFromList xsD) (simdFromList ysD)
-  cD4Host <- withLinuxX86_64C cfg d4Expr $ \fn ->
+  cD4Host <- withJanusC cfg d4Expr $ \fn ->
     pure $ fn (simdFromList xsD) (simdFromList ysD)
   let Identity ffiD4Host =
         sleefTranscendentalExpr

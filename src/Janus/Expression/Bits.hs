@@ -37,7 +37,7 @@ instance (Bits a, Integral a) => ExpBits Identity a where
 
 $( let inst t =
          [d|
-           instance ExpBits JanusC $t where
+           instance ExpBits (JanusCT target) $t where
              iand = janusCBinOp And
              ior = janusCBinOp Or
              ieor = janusCBinOp Xor

@@ -3,6 +3,7 @@
 {-# LANGUAGE DataKinds #-}
 {-# LANGUAGE DeriveGeneric #-}
 {-# LANGUAGE DerivingStrategies #-}
+{-# LANGUAGE DerivingVia #-}
 {-# LANGUAGE FlexibleContexts #-}
 {-# LANGUAGE FlexibleInstances #-}
 {-# LANGUAGE KindSignatures #-}
@@ -91,8 +92,6 @@ import GHC.Generics (Generic, Rep)
 import GHC.TypeNats (natVal)
 import Janus.Alloc.Policy (Alloc, allocStruct, freeStruct)
 import Janus.Backend.C
-import Janus.Backend.C.LinuxX86_64
-import Janus.Backend.C.TH
 import Janus.Command.Array (CmdStorable (..), ExpPtr (..), ExpSized (..))
 import Janus.Command.Cond (ifThenElseM_, whenM_)
 import Janus.Command.Ref (letM, newRef, readRef, writeRef)
@@ -749,69 +748,14 @@ foreachSOAOAVecSPMD pw v step = do
 -- Host <-> C FFI Marshalling Instances (Parameters & Return Handles)
 --------------------------------------------------------------------------------
 
-type instance JanusCEval (DynVec JanusC a -> r) = DynVec Identity a -> JanusCEval r
+type instance JanusCHost (DynVec (JanusCT _) a) = DynVec Identity a
 
-type instance JanusCRetType (DynVec JanusC a -> r) = JanusCRetType r
+deriving via
+  ViaPtrHandle t (CStruct (DynVecSpine a)) (DynVec Identity a)
+  instance
+    (Typeable a, JanusStruct (Buf a)) => JanusCArg t (DynVec (JanusCT t) a)
 
-instance (Typeable a, JanusStruct (Buf a), JanusCParam r) => JanusCParam (DynVec JanusC a -> r) where
-  jcparam = mkPtrHandleJCParam DynVec
-
-instance (Typeable a, JanusStruct (Buf a), JanusCEvaluate r) => JanusCEvaluate (DynVec JanusC a -> r) where
-  jceval = mkPtrHandleJCEval unDynVec DynVec
-
-type instance JanusCEval (JanusCM (DynVec JanusC a)) = IO (DynVec Identity a)
-
-type instance JanusCRetType (JanusCM (DynVec JanusC a)) = DynVec Identity a
-
-instance (Typeable a, JanusStruct (Buf a)) => JanusCParam (JanusCM (DynVec JanusC a)) where
-  jcparam = mkPtrHandleJCRetParam unDynVec
-
-instance (Typeable a, JanusStruct (Buf a)) => JanusCEvaluate (JanusCM (DynVec JanusC a)) where
-  jceval = mkPtrHandleJCRetEval DynVec
-
-type instance LinuxX86_64CEval (DynVec LinuxX86_64C a -> r) = DynVec Identity a -> LinuxX86_64CEval r
-
-type instance LinuxX86_64BaseRet (DynVec LinuxX86_64C a -> r) = LinuxX86_64BaseRet r
-
-instance (Typeable a, JanusStruct (Buf a), LinuxX86_64Param r) => LinuxX86_64Param (DynVec LinuxX86_64C a -> r) where
-  x86param = mkPtrHandleX86Param DynVec
-
-instance (Typeable a, JanusStruct (Buf a), X86DeferCont r, LinuxX86_64Evaluate r) => LinuxX86_64Evaluate (DynVec LinuxX86_64C a -> r) where
-  x86eval = mkPtrHandleX86EvalParam unDynVec DynVec
-
-instance (Typeable a, JanusStruct (Buf a), X86DeferCont r) => X86DeferCall (DynVec LinuxX86_64C a -> r) where
-  x86DeferArg = mkPtrHandleX86DeferArg unDynVec DynVec
-
-instance (Typeable a, JanusStruct (Buf a), X86DeferCont r) => X86DeferCont (DynVec LinuxX86_64C a -> r) where
-  x86DeferCont = mkPtrHandleX86DeferCont unDynVec DynVec
-
-type instance LinuxX86_64CEval (LinuxX86_64CM (DynVec LinuxX86_64C a)) = IO (DynVec Identity a)
-
-type instance LinuxX86_64BaseRet (LinuxX86_64CM (DynVec LinuxX86_64C a)) = DynVec Identity a
-
-instance (Typeable a, JanusStruct (Buf a)) => LinuxX86_64Param (LinuxX86_64CM (DynVec LinuxX86_64C a)) where
-  x86param = mkPtrHandleX86RetParam unDynVec
-
-instance (Typeable a, JanusStruct (Buf a)) => LinuxX86_64Evaluate (LinuxX86_64CM (DynVec LinuxX86_64C a)) where
-  x86eval = mkPtrHandleX86RetEval DynVec
-
-instance (Typeable a, JanusStruct (Buf a)) => X86DeferCall (LinuxX86_64CM (DynVec LinuxX86_64C a)) where
-  x86DeferArg = mkPtrHandleX86RetDeferArg DynVec
-
-instance (Typeable a, JanusStruct (Buf a)) => X86DeferCont (LinuxX86_64CM (DynVec LinuxX86_64C a)) where
-  x86DeferCont = mkPtrHandleX86RetDeferCont DynVec
-
-instance (Typeable a, JanusStruct (Buf a), LinuxX86_64Param r, JanusCTH r) => JanusCTH (DynVec LinuxX86_64C a -> r) where
-  type JanusCTHEval (DynVec LinuxX86_64C a -> r) = DynVec Identity a -> JanusCTHEval r
-  janusCTHBackend _ = THBackendLinuxX86_64
-  janusCTHCodegen = x86param
-  janusCTHSpec _ =
-    let (ps, retSpec) = janusCTHSpec (Proxy @r)
-     in (mkPtrHandleTHParamSpec (Proxy @(DynVec Identity a)) : ps, retSpec)
-
-instance (Typeable a, JanusStruct (Buf a)) => JanusCTH (LinuxX86_64CM (DynVec LinuxX86_64C a)) where
-  type JanusCTHEval (LinuxX86_64CM (DynVec LinuxX86_64C a)) = IO (DynVec Identity a)
-  janusCTHBackend _ = THBackendLinuxX86_64
-  janusCTHCodegen = x86param
-  janusCTHSpec _ =
-    ([], mkPtrHandleTHRetSpec THRetIO (Proxy @(DynVec Identity a)) (Proxy @(CStruct (DynVecSpine a))))
+deriving via
+  ViaPtrHandle t (CStruct (DynVecSpine a)) (DynVec Identity a)
+  instance
+    (Typeable a, JanusStruct (Buf a)) => JanusCValRet t (DynVec (JanusCT t) a)

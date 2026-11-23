@@ -23,34 +23,35 @@ class ExpExtract e a where
 instance ExpExtract Identity a where
   extract (Identity x) = x
 
-class GJanusCExtract f where
-  gjanusCExtract :: JanusC (f a) -> String -> f a
+class GJanusCExtract t f where
+  gjanusCExtract :: JanusCT t (f a) -> String -> f a
 
-instance (ExpExtract JanusC f) => GJanusCExtract (K1 i f) where
+instance (ExpExtract (JanusCT t) f) => GJanusCExtract t (K1 i f) where
   gjanusCExtract (JanusC a) s = K1 (extract f)
     where
+      f :: JanusCT t f
       f = JanusC $ do
         RVal a' <- a
         pure $ RVal $ Member a' (Id s noLoc) noLoc
 
-instance {-# OVERLAPS #-} GJanusCExtract (K1 i (JanusC a)) where
+instance {-# OVERLAPS #-} GJanusCExtract t (K1 i (JanusCT t a)) where
   gjanusCExtract (JanusC a) name = K1 f
     where
       f = JanusC $ do
         RVal a' <- a
         pure $ RVal $ Member a' (Id name noLoc) noLoc
 
-instance (GJanusCExtract f, GJanusCExtract g) => GJanusCExtract (f :*: g) where
+instance (GJanusCExtract t f, GJanusCExtract t g) => GJanusCExtract t (f :*: g) where
   gjanusCExtract fg s = gjanusCExtract (janusCReallyUnsafeCast fg) s :*: gjanusCExtract (janusCReallyUnsafeCast fg) s
 
-instance (GJanusCExtract f, KnownSymbol name) => GJanusCExtract (S1 ('MetaSel ('Just name) p s l) f) where
+instance (GJanusCExtract t f, KnownSymbol name) => GJanusCExtract t (S1 ('MetaSel ('Just name) p s l) f) where
   gjanusCExtract f _ = M1 $ gjanusCExtract (janusCReallyUnsafeCast f) (symbolVal $ Proxy @name)
 
-instance (GJanusCExtract f) => GJanusCExtract (C1 i f) where
+instance (GJanusCExtract t f) => GJanusCExtract t (C1 i f) where
   gjanusCExtract f s = M1 $ gjanusCExtract (janusCReallyUnsafeCast f) s
 
-instance (GJanusCExtract f) => GJanusCExtract (D1 i f) where
+instance (GJanusCExtract t f) => GJanusCExtract t (D1 i f) where
   gjanusCExtract f s = M1 $ gjanusCExtract (janusCReallyUnsafeCast f) s
 
-defaultJanusCExtract :: forall a. (Generic a, GJanusCExtract (Rep a)) => JanusC a -> a
-defaultJanusCExtract f = to $ gjanusCExtract (janusCReallyUnsafeCast f :: JanusC (Rep a ())) ""
+defaultJanusCExtract :: forall t a. (Generic a, GJanusCExtract t (Rep a)) => JanusCT t a -> a
+defaultJanusCExtract f = to $ gjanusCExtract (janusCReallyUnsafeCast f :: JanusCT t (Rep a ())) ""

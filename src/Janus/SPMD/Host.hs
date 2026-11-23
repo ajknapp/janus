@@ -6,6 +6,7 @@
 {-# LANGUAGE KindSignatures #-}
 {-# LANGUAGE MultiParamTypeClasses #-}
 {-# LANGUAGE ScopedTypeVariables #-}
+{-# LANGUAGE TemplateHaskellQuotes #-}
 {-# LANGUAGE TypeApplications #-}
 {-# LANGUAGE TypeFamilies #-}
 {-# LANGUAGE TypeOperators #-}
@@ -17,23 +18,21 @@ module Janus.SPMD.Host where
 import Data.Complex (Complex (..))
 import Data.Functor.Identity (Identity (..))
 import Data.Int (Int64)
-import Data.Loc (noLoc)
 import Data.Proxy (Proxy (..))
-import Foreign.ForeignPtr (withForeignPtr)
-import Foreign.LibFFI (callFFI, retVoid)
-import Foreign.Ptr (castPtrToFunPtr)
+import Data.Typeable (Typeable, typeRep)
 import GHC.TypeNats (KnownNat, Nat, natVal)
-import Janus.Backend.C (JanusC (..), RVal (..))
+import Janus.Backend.C
 import Janus.Backend.C.CUDA (CUDADejaFu (..), CUDAIO (..))
-import Janus.Backend.C.LinuxX86_64
 import Janus.Expression.Extract (ExpExtract (..))
 import Janus.Expression.SIMD
+import Janus.FFI.Arg (THParamMode (..), THParamSpec (..), natToTHType, typeRepToTHType)
+import Janus.FFI.Ret (THRetEffect (..), THRetMode (..), THRetSpec (..))
 import Janus.SPMD.Typed
 import Janus.SPMD.Types
-import Language.C.Quote (Exp (Var), Id (Id))
+import qualified Language.Haskell.TH as TH
 
 --------------------------------------------------------------------------------
--- 14. Host Conversion Helpers & Direct LinuxX86_64C Compilation Instances
+-- 14. Host Conversion Helpers & Target-Polymorphic C Compilation Instances
 --------------------------------------------------------------------------------
 
 class (KnownNat n) => HostSPMDValue (n :: Nat) e a where
@@ -154,187 +153,195 @@ instance
 instance
   ( KnownNat n,
     l ~ SPMDLayout n a,
-    HostSPMDByLayout l n LinuxX86_64C a
+    HostSPMDByLayout l n (JanusCT t) a
   ) =>
-  HostSPMDValue n LinuxX86_64C a
+  HostSPMDValue n (JanusCT t) a
   where
-  spmdRawFromList = hostRawFromL @l @n @LinuxX86_64C @a
-  spmdRawToList = hostRawToL @l @n @LinuxX86_64C @a
-  spmdHostFromList _ = error "spmdHostFromList (LinuxX86_64C): pass [a] directly to compiled LinuxX86_64C function or use spmdFromLanes"
-  spmdHostToList _ = error "spmdHostToList (LinuxX86_64C): evaluate via withLinuxX86_64C"
+  spmdRawFromList = hostRawFromL @l @n @(JanusCT t) @a
+  spmdRawToList = hostRawToL @l @n @(JanusCT t) @a
+  spmdHostFromList _ = error "spmdHostFromList (JanusCT): pass [a] directly to compiled JanusCT function or use spmdFromLanes"
+  spmdHostToList _ = error "spmdHostToList (JanusCT): evaluate via withJanusC"
 
 instance (HostSPMDValue n Identity a) => ExpExtract (SPMD n Identity) a where
   extract x = case spmdHostToList x of
     (x0 : _) -> x0
     [] -> error "extract (SPMD): empty lanes"
 
--- Direct LinuxX86_64C Compilation & Evaluation Support
-type instance LinuxX86_64CEval (SPMD n LinuxX86_64C a -> r) = [a] -> LinuxX86_64CEval r
-type instance LinuxX86_64CEval (SPMD n LinuxX86_64C a) = [a]
-type instance LinuxX86_64CEval (SPMDM n LinuxX86_64CM LinuxX86_64C (SPMD n LinuxX86_64C a)) = IO [a]
-type instance LinuxX86_64CEval (SPMDM n LinuxX86_64CM LinuxX86_64C ()) = IO ()
+{-# INLINE spmdFromListProxy #-}
+spmdFromListProxy ::
+  forall n e a.
+  (HostSPMDValue n e a) =>
+  Proxy n ->
+  Proxy e ->
+  Proxy a ->
+  [a] ->
+  SPMDRep n e a
+spmdFromListProxy _ _ _ = spmdRawFromList @n @e @a
 
-type instance LinuxX86_64BaseRet (SPMD n LinuxX86_64C a) = [a]
-type instance LinuxX86_64BaseRet (SPMDM n LinuxX86_64CM LinuxX86_64C (SPMD n LinuxX86_64C a)) = [a]
-type instance LinuxX86_64BaseRet (SPMDM n LinuxX86_64CM LinuxX86_64C ()) = ()
-type instance LinuxX86_64BaseRet (SPMD n LinuxX86_64C _ -> r) = LinuxX86_64BaseRet r
+{-# INLINE spmdToListProxy #-}
+spmdToListProxy ::
+  forall n e a.
+  (HostSPMDValue n e a) =>
+  Proxy n ->
+  Proxy e ->
+  Proxy a ->
+  SPMDRep n e a ->
+  [a]
+spmdToListProxy _ _ _ = spmdRawToList @n @e @a
+
+spmdProxyExps :: forall t n a. (Typeable t, KnownNat n, Typeable a) => (TH.Exp, TH.Exp, TH.Exp)
+spmdProxyExps =
+  let mkProxy ty = TH.SigE (TH.ConE 'Proxy) (TH.AppT (TH.ConT ''Proxy) ty)
+      pN = mkProxy (natToTHType (toInteger (natVal (Proxy @n))))
+      pE = mkProxy (typeRepToTHType (typeRep (Proxy @(JanusCT t))))
+      pA = mkProxy (typeRepToTHType (typeRep (Proxy @a)))
+   in (pN, pE, pA)
+
+spmdTHParamSpec ::
+  forall t n a.
+  ( Typeable t,
+    KnownNat n,
+    Typeable a,
+    JanusCABIParam t (SPMDRep n (JanusCT t) a),
+    HostSPMDValue n (JanusCT t) a
+  ) =>
+  THParamSpec
+spmdTHParamSpec =
+  let (pN, pE, pA) = spmdProxyExps @t @n @a
+      fromListCall = TH.AppE (TH.AppE (TH.AppE (TH.VarE 'spmdFromListProxy) pN) pE) pA
+      repSpec = jcABIParamTHSpec (Proxy @t) (Proxy @(SPMDRep n (JanusCT t) a))
+      userTy = TH.AppT TH.ListT (typeRepToTHType (typeRep (Proxy @a)))
+      mode = case thParamMode repSpec of
+        THParamDirect -> THParamPure (TH.AppE fromListCall)
+        THParamPure conv -> THParamPure (conv . TH.AppE fromListCall)
+        THParamIO withIO -> THParamIO (\k xsExp -> withIO k (TH.AppE fromListCall xsExp))
+   in THParamSpec
+        { thParamUserType = userTy,
+          thParamRawType = thParamRawType repSpec,
+          thParamMode = mode
+        }
+
+spmdTHRetSpec ::
+  forall t n a.
+  ( Typeable t,
+    KnownNat n,
+    Typeable a,
+    JanusCABIRet t (SPMDRep n (JanusCT t) a),
+    HostSPMDValue n (JanusCT t) a
+  ) =>
+  THRetEffect ->
+  THRetSpec
+spmdTHRetSpec eff =
+  let (pN, pE, pA) = spmdProxyExps @t @n @a
+      toListFn = TH.AppE (TH.AppE (TH.AppE (TH.VarE 'spmdToListProxy) pN) pE) pA
+      repSpec = jcABIRetTHSpec (Proxy @t) eff (Proxy @(SPMDRep n (JanusCT t) a))
+      userTy = TH.AppT TH.ListT (typeRepToTHType (typeRep (Proxy @a)))
+      mode = case thRetMode repSpec of
+        THRetDirect rawTy -> THRetPureMap rawTy (TH.AppE toListFn)
+        THRetPureMap rawTy conv -> THRetPureMap rawTy (TH.AppE toListFn . conv)
+        THRetOutPtr runWithOut ->
+          THRetOutPtr $ \callWithOut -> do
+            ioRepExp <- runWithOut callWithOut
+            pure $ TH.AppE (TH.AppE (TH.VarE 'fmap) toListFn) ioRepExp
+   in THRetSpec
+        { thRetEffect = eff,
+          thRetUserBaseType = userTy,
+          thRetMode = mode
+        }
+
+-- Target-Polymorphic Compilation & Evaluation Support on JanusCT t / JanusCMT t
+
+type instance JanusCHost (SPMD n (JanusCT t) a) = [a]
+
+type instance JanusCTermEval (SPMD n (JanusCT t) a) = [a]
+type instance JanusCTermRet (SPMD n (JanusCT t) a) = [a]
+
+type instance JanusCTermEval (SPMDM n (JanusCMT t) (JanusCT t) res) = IO (JanusCHost res)
+type instance JanusCTermRet (SPMDM n (JanusCMT t) (JanusCT t) res) = JanusCHost res
 
 instance
-  ( SPMDTyped n LinuxX86_64C a,
-    LinuxX86_64ABIRet (SPMDRep n LinuxX86_64C a),
-    HostSPMDValue n LinuxX86_64C a
+  ( Typeable t,
+    KnownNat n,
+    Typeable a,
+    SPMDTyped n (JanusCT t) a,
+    JanusCABIParam t (SPMDRep n (JanusCT t) a),
+    HostSPMDValue n (JanusCT t) a
   ) =>
-  LinuxX86_64Param (SPMD n LinuxX86_64C a)
+  JanusCArg t (SPMD n (JanusCT t) a)
   where
-  x86param fs name k mparams x =
-    x86param fs name k mparams (spmdMaterialize @n @LinuxX86_64C @a (runSPMD x))
+  jcEmitArg k =
+    let (mkP, e) = jcEmitABIParam @t @(SPMDRep n (JanusCT t) a) (Proxy @t) k
+        rawArg = JanusCT (pure (RVal e))
+     in (k + 1, pure <$> mkP, SPMD (pure (spmdDematerialize @n @(JanusCT t) @a rawArg)))
+  jcDummyArg =
+    SPMD
+      ( pure
+          ( spmdDematerialize @n @(JanusCT t) @a
+              (jcDummyArg @t @(JanusCT t (SPMDRep n (JanusCT t) a)))
+          )
+      )
+  jcWithHostArg _ xs prevArgs cont =
+    jcWithABIArg (Proxy @t) (spmdRawFromList @n @(JanusCT t) @a xs) (\av -> cont (av : prevArgs))
+  jcTHParamSpecs _ = [spmdTHParamSpec @t @n @a]
 
 instance
-  ( LinuxX86_64ABIRet (SPMDRep n LinuxX86_64C a),
-    HostSPMDValue n LinuxX86_64C a
+  ( Typeable t,
+    KnownNat n,
+    Typeable a,
+    SPMDTyped n (JanusCT t) a,
+    JanusCABIRet t (SPMDRep n (JanusCT t) a),
+    HostSPMDValue n (JanusCT t) a
   ) =>
-  LinuxX86_64Evaluate (SPMD n LinuxX86_64C a)
+  JanusCValRet t (SPMD n (JanusCT t) a)
   where
-  x86eval dlFPtr _ args _ =
-    evalPureLinuxX86_64FFI dlFPtr $ \fp ->
-      spmdRawToList @n @LinuxX86_64C @a <$> x86CallReturn (Proxy @(SPMDRep n LinuxX86_64C a)) fp args
+  jcFinishValRet pt x =
+    jcFinishABIRet pt (spmdMaterialize @n @(JanusCT t) @a (runSPMD x))
+  jcCallValRet pt _ fp args =
+    spmdRawToList @n @(JanusCT t) @a
+      <$> jcCallABIRet pt (Proxy @(SPMDRep n (JanusCT t) a)) fp args
+  jcTHValRetSpec _ eff _ = spmdTHRetSpec @t @n @a eff
 
 instance
-  ( SPMDTyped n LinuxX86_64C a,
-    LinuxX86_64ABIRet (SPMDRep n LinuxX86_64C a),
-    HostSPMDValue n LinuxX86_64C a
+  ( JanusCTarget t,
+    Typeable t,
+    KnownNat n,
+    Typeable a,
+    SPMDTyped n (JanusCT t) a,
+    JanusCABIRet t (SPMDRep n (JanusCT t) a),
+    HostSPMDValue n (JanusCT t) a
   ) =>
-  LinuxX86_64Param (SPMDM n LinuxX86_64CM LinuxX86_64C (SPMD n LinuxX86_64C a))
+  JanusCParam t (SPMD n (JanusCT t) a)
   where
-  x86param fs name k mparams act =
-    let lowered :: LinuxX86_64CM (LinuxX86_64C (SPMDRep n LinuxX86_64C a))
-        lowered = do
-          res <- runSPMDM act
-          pure (spmdMaterialize @n @LinuxX86_64C @a (runSPMD res))
-     in x86param fs name k mparams lowered
+  jcparamWith fs name k mparams x =
+    jcparamWith fs name k mparams (spmdMaterialize @n @(JanusCT t) @a (runSPMD x))
+  jcTHSpec _ = ([], spmdTHRetSpec @t @n @a THRetPure)
 
 instance
-  ( LinuxX86_64ABIRet (SPMDRep n LinuxX86_64C a),
-    HostSPMDValue n LinuxX86_64C a
+  ( JanusCTarget t,
+    JanusCABIRet t (SPMDRep n (JanusCT t) a),
+    HostSPMDValue n (JanusCT t) a
   ) =>
-  LinuxX86_64Evaluate (SPMDM n LinuxX86_64CM LinuxX86_64C (SPMD n LinuxX86_64C a))
+  JanusCEvaluate t (SPMD n (JanusCT t) a)
   where
-  x86eval dlFPtr _ args _ =
-    withForeignPtr dlFPtr $ \p ->
-      spmdRawToList @n @LinuxX86_64C @a <$> x86CallReturn (Proxy @(SPMDRep n LinuxX86_64C a)) (castPtrToFunPtr p) args
-
-instance LinuxX86_64Param (SPMDM n LinuxX86_64CM LinuxX86_64C ()) where
-  x86param fs name k mparams act = x86param fs name k mparams (runSPMDM act)
-
-instance LinuxX86_64Evaluate (SPMDM n LinuxX86_64CM LinuxX86_64C ()) where
-  x86eval dlFPtr _ args _ =
-    withForeignPtr dlFPtr $ \p -> callFFI (castPtrToFunPtr p) retVoid (reverse args)
+  jcevalCont withArgs dlFPtr _ =
+    evalPureJanusCFFI dlFPtr $ \fp ->
+      withArgs
+        ( \args ->
+            spmdRawToList @n @(JanusCT t) @a
+              <$> jcCallABIRet (Proxy @t) (Proxy @(SPMDRep n (JanusCT t) a)) fp args
+        )
 
 instance
-  ( SPMDTyped n LinuxX86_64C a,
-    LinuxX86_64ABIParam (SPMDRep n LinuxX86_64C a),
-    LinuxX86_64Param r
-  ) =>
-  LinuxX86_64Param (SPMD n LinuxX86_64C a -> r)
+  (JanusCTarget t, JanusCValRet t res) =>
+  JanusCParam t (SPMDM n (JanusCMT t) (JanusCT t) res)
   where
-  x86param fs name k mparams f =
-    let wrapped :: LinuxX86_64C (SPMDRep n LinuxX86_64C a) -> r
-        wrapped rawArg = f (SPMD (pure (spmdDematerialize @n @LinuxX86_64C @a rawArg)))
-     in x86param fs name k mparams wrapped
+  jcparamWith fs name k mparams act =
+    jcparamWith fs name k mparams (runSPMDM act)
+  jcTHSpec _ = ([], jcTHValRetSpec (Proxy @t) THRetIO (Proxy @res))
 
 instance
-  ( SPMDTyped n LinuxX86_64C a,
-    LinuxX86_64ABIParam (SPMDRep n LinuxX86_64C a),
-    HostSPMDValue n LinuxX86_64C a,
-    LinuxX86_64Evaluate r,
-    X86DeferCall r
-  ) =>
-  LinuxX86_64Evaluate (SPMD n LinuxX86_64C a -> r)
+  (JanusCTarget t, JanusCValRet t res) =>
+  JanusCEvaluate t (SPMDM n (JanusCMT t) (JanusCT t) res)
   where
-  x86eval dlFPtr _ args f xs =
-    let dummyRaw = LinuxX86_64C $ JanusC $ pure $ RVal $ Var (Id "this_is_a_bug_if_you_see_this" noLoc) noLoc
-        dummy = SPMD (pure (spmdDematerialize @n @LinuxX86_64C @a dummyRaw))
-     in x86DeferArg (spmdRawFromList @n @LinuxX86_64C @a xs) dlFPtr args (f dummy)
-
-instance
-  ( LinuxX86_64ABIRet (SPMDRep n LinuxX86_64C b),
-    HostSPMDValue n LinuxX86_64C b
-  ) =>
-  X86DeferCall (SPMD n LinuxX86_64C b)
-  where
-  x86DeferArg x dlFPtr args _ =
-    evalPureLinuxX86_64FFI dlFPtr $ \fp ->
-      x86WithArg x $ \a ->
-        spmdRawToList @n @LinuxX86_64C @b <$> x86CallReturn (Proxy @(SPMDRep n LinuxX86_64C b)) fp (a : args)
-
-instance
-  ( LinuxX86_64ABIRet (SPMDRep n LinuxX86_64C b),
-    HostSPMDValue n LinuxX86_64C b
-  ) =>
-  X86DeferCall (SPMDM n LinuxX86_64CM LinuxX86_64C (SPMD n LinuxX86_64C b))
-  where
-  x86DeferArg x dlFPtr args _ =
-    withForeignPtr dlFPtr $ \p ->
-      x86WithArg x $ \a ->
-        spmdRawToList @n @LinuxX86_64C @b <$> x86CallReturn (Proxy @(SPMDRep n LinuxX86_64C b)) (castPtrToFunPtr p) (a : args)
-
-instance X86DeferCall (SPMDM n LinuxX86_64CM LinuxX86_64C ()) where
-  x86DeferArg x dlFPtr args _ =
-    withForeignPtr dlFPtr $ \p ->
-      x86WithArg x $ \a ->
-        callFFI (castPtrToFunPtr p) retVoid (reverse (a : args))
-
-instance
-  ( SPMDTyped n LinuxX86_64C b,
-    LinuxX86_64ABIParam (SPMDRep n LinuxX86_64C b),
-    HostSPMDValue n LinuxX86_64C b,
-    X86DeferCall r,
-    X86DeferCont r,
-    LinuxX86_64Evaluate r
-  ) =>
-  X86DeferCall (SPMD n LinuxX86_64C b -> r)
-  where
-  x86DeferArg x dlFPtr args f ys =
-    let dummyRaw = LinuxX86_64C $ JanusC $ pure $ RVal $ Var (Id "this_is_a_bug_if_you_see_this" noLoc) noLoc
-        dummy = SPMD (pure (spmdDematerialize @n @LinuxX86_64C @b dummyRaw))
-        yRaw = spmdRawFromList @n @LinuxX86_64C @b ys
-     in x86DeferCont (\k -> x86WithArg x $ \ax -> x86WithArg yRaw $ \ay -> k (ay : ax : args)) dlFPtr (f dummy)
-
-instance
-  ( LinuxX86_64ABIRet (SPMDRep n LinuxX86_64C a),
-    HostSPMDValue n LinuxX86_64C a
-  ) =>
-  X86DeferCont (SPMD n LinuxX86_64C a)
-  where
-  x86DeferCont withArgs dlFPtr _ =
-    evalPureLinuxX86_64FFI dlFPtr $ \fp ->
-      withArgs (\args -> spmdRawToList @n @LinuxX86_64C @a <$> x86CallReturn (Proxy @(SPMDRep n LinuxX86_64C a)) fp args)
-
-instance
-  ( LinuxX86_64ABIRet (SPMDRep n LinuxX86_64C a),
-    HostSPMDValue n LinuxX86_64C a
-  ) =>
-  X86DeferCont (SPMDM n LinuxX86_64CM LinuxX86_64C (SPMD n LinuxX86_64C a))
-  where
-  x86DeferCont withArgs dlFPtr _ =
-    withForeignPtr dlFPtr $ \p ->
-      withArgs (\args -> spmdRawToList @n @LinuxX86_64C @a <$> x86CallReturn (Proxy @(SPMDRep n LinuxX86_64C a)) (castPtrToFunPtr p) args)
-
-instance X86DeferCont (SPMDM n LinuxX86_64CM LinuxX86_64C ()) where
-  x86DeferCont withArgs dlFPtr _ =
-    withForeignPtr dlFPtr $ \p ->
-      withArgs (callFFI (castPtrToFunPtr p) retVoid . reverse)
-
-instance
-  ( SPMDTyped n LinuxX86_64C a,
-    LinuxX86_64ABIParam (SPMDRep n LinuxX86_64C a),
-    HostSPMDValue n LinuxX86_64C a,
-    X86DeferCont r
-  ) =>
-  X86DeferCont (SPMD n LinuxX86_64C a -> r)
-  where
-  x86DeferCont withArgs dlFPtr f xs =
-    let dummyRaw = LinuxX86_64C $ JanusC $ pure $ RVal $ Var (Id "this_is_a_bug_if_you_see_this" noLoc) noLoc
-        dummy = SPMD (pure (spmdDematerialize @n @LinuxX86_64C @a dummyRaw))
-        xRaw = spmdRawFromList @n @LinuxX86_64C @a xs
-     in x86DeferCont (\k -> withArgs $ \as -> x86WithArg xRaw $ \av -> k (av : as)) dlFPtr (f dummy)
+  jcevalCont withArgs dlFPtr act =
+    jcevalCont @t @(JanusCMT t res) withArgs dlFPtr (runSPMDM act)

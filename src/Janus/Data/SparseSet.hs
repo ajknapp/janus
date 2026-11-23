@@ -2,6 +2,7 @@
 {-# LANGUAGE DataKinds #-}
 {-# LANGUAGE DeriveGeneric #-}
 {-# LANGUAGE DerivingStrategies #-}
+{-# LANGUAGE DerivingVia #-}
 {-# LANGUAGE FlexibleContexts #-}
 {-# LANGUAGE FlexibleInstances #-}
 {-# LANGUAGE KindSignatures #-}
@@ -69,8 +70,6 @@ import Janus.Alloc.Policy
     reallocTypedArray,
   )
 import Janus.Backend.C
-import Janus.Backend.C.LinuxX86_64
-import Janus.Backend.C.TH
 import Janus.Command.Cond (whenM_)
 import Janus.Command.Memory (CmdStorable (..), ExpPtr (..), ExpSized (..))
 import Janus.Command.Ref (newRef, readRef, writeRef)
@@ -434,69 +433,14 @@ memberSPMD (SparseSet hdr) xs = do
 -- Host <-> C FFI Marshalling Instances
 --------------------------------------------------------------------------------
 
-type instance JanusCEval (SparseSet JanusC -> r) = SparseSet Identity -> JanusCEval r
+type instance JanusCHost (SparseSet (JanusCT _)) = SparseSet Identity
 
-type instance JanusCRetType (SparseSet JanusC -> r) = JanusCRetType r
+deriving via
+  ViaPtrHandle t (CStruct SparseSetSpine) (SparseSet Identity)
+  instance
+    JanusCArg t (SparseSet (JanusCT t))
 
-instance (JanusCParam r) => JanusCParam (SparseSet JanusC -> r) where
-  jcparam = mkPtrHandleJCParam SparseSet
-
-instance (JanusCEvaluate r) => JanusCEvaluate (SparseSet JanusC -> r) where
-  jceval = mkPtrHandleJCEval unSparseSet SparseSet
-
-type instance JanusCEval (JanusCM (SparseSet JanusC)) = IO (SparseSet Identity)
-
-type instance JanusCRetType (JanusCM (SparseSet JanusC)) = SparseSet Identity
-
-instance JanusCParam (JanusCM (SparseSet JanusC)) where
-  jcparam = mkPtrHandleJCRetParam unSparseSet
-
-instance JanusCEvaluate (JanusCM (SparseSet JanusC)) where
-  jceval = mkPtrHandleJCRetEval SparseSet
-
-type instance LinuxX86_64CEval (SparseSet LinuxX86_64C -> r) = SparseSet Identity -> LinuxX86_64CEval r
-
-type instance LinuxX86_64BaseRet (SparseSet LinuxX86_64C -> r) = LinuxX86_64BaseRet r
-
-instance (LinuxX86_64Param r) => LinuxX86_64Param (SparseSet LinuxX86_64C -> r) where
-  x86param = mkPtrHandleX86Param SparseSet
-
-instance (X86DeferCont r, LinuxX86_64Evaluate r) => LinuxX86_64Evaluate (SparseSet LinuxX86_64C -> r) where
-  x86eval = mkPtrHandleX86EvalParam unSparseSet SparseSet
-
-instance (X86DeferCont r) => X86DeferCall (SparseSet LinuxX86_64C -> r) where
-  x86DeferArg = mkPtrHandleX86DeferArg unSparseSet SparseSet
-
-instance (X86DeferCont r) => X86DeferCont (SparseSet LinuxX86_64C -> r) where
-  x86DeferCont = mkPtrHandleX86DeferCont unSparseSet SparseSet
-
-type instance LinuxX86_64CEval (LinuxX86_64CM (SparseSet LinuxX86_64C)) = IO (SparseSet Identity)
-
-type instance LinuxX86_64BaseRet (LinuxX86_64CM (SparseSet LinuxX86_64C)) = SparseSet Identity
-
-instance LinuxX86_64Param (LinuxX86_64CM (SparseSet LinuxX86_64C)) where
-  x86param = mkPtrHandleX86RetParam unSparseSet
-
-instance LinuxX86_64Evaluate (LinuxX86_64CM (SparseSet LinuxX86_64C)) where
-  x86eval = mkPtrHandleX86RetEval SparseSet
-
-instance X86DeferCall (LinuxX86_64CM (SparseSet LinuxX86_64C)) where
-  x86DeferArg = mkPtrHandleX86RetDeferArg SparseSet
-
-instance X86DeferCont (LinuxX86_64CM (SparseSet LinuxX86_64C)) where
-  x86DeferCont = mkPtrHandleX86RetDeferCont SparseSet
-
-instance (LinuxX86_64Param r, JanusCTH r) => JanusCTH (SparseSet LinuxX86_64C -> r) where
-  type JanusCTHEval (SparseSet LinuxX86_64C -> r) = SparseSet Identity -> JanusCTHEval r
-  janusCTHBackend _ = THBackendLinuxX86_64
-  janusCTHCodegen = x86param
-  janusCTHSpec _ =
-    let (ps, retSpec) = janusCTHSpec (Proxy @r)
-     in (mkPtrHandleTHParamSpec (Proxy @(SparseSet Identity)) : ps, retSpec)
-
-instance JanusCTH (LinuxX86_64CM (SparseSet LinuxX86_64C)) where
-  type JanusCTHEval (LinuxX86_64CM (SparseSet LinuxX86_64C)) = IO (SparseSet Identity)
-  janusCTHBackend _ = THBackendLinuxX86_64
-  janusCTHCodegen = x86param
-  janusCTHSpec _ =
-    ([], mkPtrHandleTHRetSpec THRetIO (Proxy @(SparseSet Identity)) (Proxy @(CStruct SparseSetSpine)))
+deriving via
+  ViaPtrHandle t (CStruct SparseSetSpine) (SparseSet Identity)
+  instance
+    JanusCValRet t (SparseSet (JanusCT t))

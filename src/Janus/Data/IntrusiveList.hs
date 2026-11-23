@@ -3,6 +3,7 @@
 {-# LANGUAGE DataKinds #-}
 {-# LANGUAGE DeriveGeneric #-}
 {-# LANGUAGE DerivingStrategies #-}
+{-# LANGUAGE DerivingVia #-}
 {-# LANGUAGE FlexibleContexts #-}
 {-# LANGUAGE FlexibleInstances #-}
 {-# LANGUAGE KindSignatures #-}
@@ -68,7 +69,6 @@ import Control.Monad.Cont (ContT (..))
 import Data.Functor.Identity (Identity (..))
 import Data.Int (Int64)
 import qualified Data.Kind as K
-import Data.Proxy (Proxy (..))
 import Data.Typeable (Typeable)
 import Data.Word (Word8)
 import Foreign.Ptr (Ptr)
@@ -76,8 +76,6 @@ import GHC.Generics (Generic, Rep)
 import Janus.Alloc.Dynamic (CmdAllocBase)
 import Janus.Alloc.Policy (Alloc, CmdAlloc, allocStruct, freeStruct)
 import Janus.Backend.C
-import Janus.Backend.C.LinuxX86_64
-import Janus.Backend.C.TH
 import Janus.Command.Array (CmdStorable (..), ExpPtr (..), ExpSized (..))
 import Janus.Command.Cond (ifThenElseM_, whenM_)
 import Janus.Command.Ref (newRef, readRef, writeRef)
@@ -694,69 +692,14 @@ drainAllocAppendList alloc lst =
 -- Host <-> C FFI Marshalling Instances
 --------------------------------------------------------------------------------
 
-type instance JanusCEval (IntrusiveList s JanusC -> r) = IntrusiveList s Identity -> JanusCEval r
+type instance JanusCHost (IntrusiveList s (JanusCT _)) = IntrusiveList s Identity
 
-type instance JanusCRetType (IntrusiveList s JanusC -> r) = JanusCRetType r
+deriving via
+  ViaPtrHandle t (CStruct IntrusiveListSpine) (IntrusiveList s Identity)
+  instance
+    (Typeable s) => JanusCArg t (IntrusiveList s (JanusCT t))
 
-instance (Typeable s, JanusCParam r) => JanusCParam (IntrusiveList s JanusC -> r) where
-  jcparam = mkPtrHandleJCParam IntrusiveList
-
-instance (Typeable s, JanusCEvaluate r) => JanusCEvaluate (IntrusiveList s JanusC -> r) where
-  jceval = mkPtrHandleJCEval unIntrusiveList IntrusiveList
-
-type instance JanusCEval (JanusCM (IntrusiveList s JanusC)) = IO (IntrusiveList s Identity)
-
-type instance JanusCRetType (JanusCM (IntrusiveList s JanusC)) = IntrusiveList s Identity
-
-instance (Typeable s) => JanusCParam (JanusCM (IntrusiveList s JanusC)) where
-  jcparam = mkPtrHandleJCRetParam unIntrusiveList
-
-instance (Typeable s) => JanusCEvaluate (JanusCM (IntrusiveList s JanusC)) where
-  jceval = mkPtrHandleJCRetEval IntrusiveList
-
-type instance LinuxX86_64CEval (IntrusiveList s LinuxX86_64C -> r) = IntrusiveList s Identity -> LinuxX86_64CEval r
-
-type instance LinuxX86_64BaseRet (IntrusiveList s LinuxX86_64C -> r) = LinuxX86_64BaseRet r
-
-instance (Typeable s, LinuxX86_64Param r) => LinuxX86_64Param (IntrusiveList s LinuxX86_64C -> r) where
-  x86param = mkPtrHandleX86Param IntrusiveList
-
-instance (Typeable s, X86DeferCont r, LinuxX86_64Evaluate r) => LinuxX86_64Evaluate (IntrusiveList s LinuxX86_64C -> r) where
-  x86eval = mkPtrHandleX86EvalParam unIntrusiveList IntrusiveList
-
-instance (Typeable s, X86DeferCont r) => X86DeferCall (IntrusiveList s LinuxX86_64C -> r) where
-  x86DeferArg = mkPtrHandleX86DeferArg unIntrusiveList IntrusiveList
-
-instance (Typeable s, X86DeferCont r) => X86DeferCont (IntrusiveList s LinuxX86_64C -> r) where
-  x86DeferCont = mkPtrHandleX86DeferCont unIntrusiveList IntrusiveList
-
-type instance LinuxX86_64CEval (LinuxX86_64CM (IntrusiveList s LinuxX86_64C)) = IO (IntrusiveList s Identity)
-
-type instance LinuxX86_64BaseRet (LinuxX86_64CM (IntrusiveList s LinuxX86_64C)) = IntrusiveList s Identity
-
-instance (Typeable s) => LinuxX86_64Param (LinuxX86_64CM (IntrusiveList s LinuxX86_64C)) where
-  x86param = mkPtrHandleX86RetParam unIntrusiveList
-
-instance (Typeable s) => LinuxX86_64Evaluate (LinuxX86_64CM (IntrusiveList s LinuxX86_64C)) where
-  x86eval = mkPtrHandleX86RetEval IntrusiveList
-
-instance (Typeable s) => X86DeferCall (LinuxX86_64CM (IntrusiveList s LinuxX86_64C)) where
-  x86DeferArg = mkPtrHandleX86RetDeferArg IntrusiveList
-
-instance (Typeable s) => X86DeferCont (LinuxX86_64CM (IntrusiveList s LinuxX86_64C)) where
-  x86DeferCont = mkPtrHandleX86RetDeferCont IntrusiveList
-
-instance (Typeable s, LinuxX86_64Param r, JanusCTH r) => JanusCTH (IntrusiveList s LinuxX86_64C -> r) where
-  type JanusCTHEval (IntrusiveList s LinuxX86_64C -> r) = IntrusiveList s Identity -> JanusCTHEval r
-  janusCTHBackend _ = THBackendLinuxX86_64
-  janusCTHCodegen = x86param
-  janusCTHSpec _ =
-    let (ps, retSpec) = janusCTHSpec (Proxy @r)
-     in (mkPtrHandleTHParamSpec (Proxy @(IntrusiveList s Identity)) : ps, retSpec)
-
-instance (Typeable s) => JanusCTH (LinuxX86_64CM (IntrusiveList s LinuxX86_64C)) where
-  type JanusCTHEval (LinuxX86_64CM (IntrusiveList s LinuxX86_64C)) = IO (IntrusiveList s Identity)
-  janusCTHBackend _ = THBackendLinuxX86_64
-  janusCTHCodegen = x86param
-  janusCTHSpec _ =
-    ([], mkPtrHandleTHRetSpec THRetIO (Proxy @(IntrusiveList s Identity)) (Proxy @(CStruct IntrusiveListSpine)))
+deriving via
+  ViaPtrHandle t (CStruct IntrusiveListSpine) (IntrusiveList s Identity)
+  instance
+    (Typeable s) => JanusCValRet t (IntrusiveList s (JanusCT t))

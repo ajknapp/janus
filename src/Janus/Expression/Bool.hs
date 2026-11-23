@@ -28,7 +28,7 @@ instance ExpBool Identity where
   lor (Identity a) (Identity b) = Identity $ a || b
   lnot (Identity a) = Identity (not a)
 
-instance ExpBool JanusC where
+instance ExpBool (JanusCT t) where
   false = lowerBound
   true = upperBound
   land = (/\)

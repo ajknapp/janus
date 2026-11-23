@@ -3,6 +3,7 @@
 {-# LANGUAGE DataKinds #-}
 {-# LANGUAGE DeriveGeneric #-}
 {-# LANGUAGE DerivingStrategies #-}
+{-# LANGUAGE DerivingVia #-}
 {-# LANGUAGE FlexibleContexts #-}
 {-# LANGUAGE FlexibleInstances #-}
 {-# LANGUAGE KindSignatures #-}
@@ -57,7 +58,6 @@ import Control.Monad.Cont (ContT (..))
 import Data.Functor.Identity (Identity (..))
 import Data.Int (Int64)
 import qualified Data.Kind as K
-import Data.Proxy (Proxy (..))
 import Data.Word (Word64)
 import Foreign.Ptr (Ptr)
 import GHC.Generics (Generic)
@@ -70,8 +70,6 @@ import Janus.Alloc.Policy
     freeStruct,
   )
 import Janus.Backend.C
-import Janus.Backend.C.LinuxX86_64
-import Janus.Backend.C.TH
 import Janus.Command.Cond (ifThenElseM_, whenM_)
 import Janus.Command.Memory (CmdMemCopy (..), CmdStorable (..), ExpPtr (..), ExpSized (..), janusSIMDAlignment)
 import Janus.Command.Ref (letM, newRef, readRef, writeRef)
@@ -526,69 +524,14 @@ drainAppendBitTree bt = drainForEach (\x -> insert bt x >> pure ())
 -- Host <-> C FFI Marshalling Instances
 --------------------------------------------------------------------------------
 
-type instance JanusCEval (BitTree JanusC -> r) = BitTree Identity -> JanusCEval r
+type instance JanusCHost (BitTree (JanusCT _)) = BitTree Identity
 
-type instance JanusCRetType (BitTree JanusC -> r) = JanusCRetType r
+deriving via
+  ViaPtrHandle t (CStruct BitTreeSpine) (BitTree Identity)
+  instance
+    JanusCArg t (BitTree (JanusCT t))
 
-instance (JanusCParam r) => JanusCParam (BitTree JanusC -> r) where
-  jcparam = mkPtrHandleJCParam BitTree
-
-instance (JanusCEvaluate r) => JanusCEvaluate (BitTree JanusC -> r) where
-  jceval = mkPtrHandleJCEval unBitTree BitTree
-
-type instance JanusCEval (JanusCM (BitTree JanusC)) = IO (BitTree Identity)
-
-type instance JanusCRetType (JanusCM (BitTree JanusC)) = BitTree Identity
-
-instance JanusCParam (JanusCM (BitTree JanusC)) where
-  jcparam = mkPtrHandleJCRetParam unBitTree
-
-instance JanusCEvaluate (JanusCM (BitTree JanusC)) where
-  jceval = mkPtrHandleJCRetEval BitTree
-
-type instance LinuxX86_64CEval (BitTree LinuxX86_64C -> r) = BitTree Identity -> LinuxX86_64CEval r
-
-type instance LinuxX86_64BaseRet (BitTree LinuxX86_64C -> r) = LinuxX86_64BaseRet r
-
-instance (LinuxX86_64Param r) => LinuxX86_64Param (BitTree LinuxX86_64C -> r) where
-  x86param = mkPtrHandleX86Param BitTree
-
-instance (X86DeferCont r, LinuxX86_64Evaluate r) => LinuxX86_64Evaluate (BitTree LinuxX86_64C -> r) where
-  x86eval = mkPtrHandleX86EvalParam unBitTree BitTree
-
-instance (X86DeferCont r) => X86DeferCall (BitTree LinuxX86_64C -> r) where
-  x86DeferArg = mkPtrHandleX86DeferArg unBitTree BitTree
-
-instance (X86DeferCont r) => X86DeferCont (BitTree LinuxX86_64C -> r) where
-  x86DeferCont = mkPtrHandleX86DeferCont unBitTree BitTree
-
-type instance LinuxX86_64CEval (LinuxX86_64CM (BitTree LinuxX86_64C)) = IO (BitTree Identity)
-
-type instance LinuxX86_64BaseRet (LinuxX86_64CM (BitTree LinuxX86_64C)) = BitTree Identity
-
-instance LinuxX86_64Param (LinuxX86_64CM (BitTree LinuxX86_64C)) where
-  x86param = mkPtrHandleX86RetParam unBitTree
-
-instance LinuxX86_64Evaluate (LinuxX86_64CM (BitTree LinuxX86_64C)) where
-  x86eval = mkPtrHandleX86RetEval BitTree
-
-instance X86DeferCall (LinuxX86_64CM (BitTree LinuxX86_64C)) where
-  x86DeferArg = mkPtrHandleX86RetDeferArg BitTree
-
-instance X86DeferCont (LinuxX86_64CM (BitTree LinuxX86_64C)) where
-  x86DeferCont = mkPtrHandleX86RetDeferCont BitTree
-
-instance (LinuxX86_64Param r, JanusCTH r) => JanusCTH (BitTree LinuxX86_64C -> r) where
-  type JanusCTHEval (BitTree LinuxX86_64C -> r) = BitTree Identity -> JanusCTHEval r
-  janusCTHBackend _ = THBackendLinuxX86_64
-  janusCTHCodegen = x86param
-  janusCTHSpec _ =
-    let (ps, retSpec) = janusCTHSpec (Proxy @r)
-     in (mkPtrHandleTHParamSpec (Proxy @(BitTree Identity)) : ps, retSpec)
-
-instance JanusCTH (LinuxX86_64CM (BitTree LinuxX86_64C)) where
-  type JanusCTHEval (LinuxX86_64CM (BitTree LinuxX86_64C)) = IO (BitTree Identity)
-  janusCTHBackend _ = THBackendLinuxX86_64
-  janusCTHCodegen = x86param
-  janusCTHSpec _ =
-    ([], mkPtrHandleTHRetSpec THRetIO (Proxy @(BitTree Identity)) (Proxy @(CStruct BitTreeSpine)))
+deriving via
+  ViaPtrHandle t (CStruct BitTreeSpine) (BitTree Identity)
+  instance
+    JanusCValRet t (BitTree (JanusCT t))

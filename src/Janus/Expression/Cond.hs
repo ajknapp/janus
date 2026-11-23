@@ -22,7 +22,7 @@ class (ExpBool e) => ExpCond e where
 instance ExpCond Identity where
   ifThenElse (Identity p) (Identity a) (Identity b) = Identity $ if p then a else b
 
-instance ExpCond JanusC where
+instance ExpCond (JanusCT t) where
   ifThenElse (JanusC c) (JanusC t) (JanusC f) = JanusC $ do
     RVal c' <- c
     let proxify :: JanusCM (RVal a) -> Proxy a

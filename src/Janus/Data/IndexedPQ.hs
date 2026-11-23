@@ -3,6 +3,7 @@
 {-# LANGUAGE DataKinds #-}
 {-# LANGUAGE DeriveGeneric #-}
 {-# LANGUAGE DerivingStrategies #-}
+{-# LANGUAGE DerivingVia #-}
 {-# LANGUAGE FlexibleContexts #-}
 {-# LANGUAGE FlexibleInstances #-}
 {-# LANGUAGE KindSignatures #-}
@@ -76,8 +77,6 @@ import Janus.Alloc.Policy
     reallocTypedArray,
   )
 import Janus.Backend.C
-import Janus.Backend.C.LinuxX86_64
-import Janus.Backend.C.TH
 import Janus.Command.Cond (ifThenElseM_, whenM_)
 import Janus.Command.Memory (CmdStorable (..), ExpPtr (..), ExpSized (..))
 import Janus.Command.Ref (newRef, readRef, writeRef)
@@ -745,69 +744,14 @@ containsIdsSPMD (IndexedPQ hdr) ids = do
 
 type IndexedPQABI p v = (Typeable p, Typeable v, JanusStruct (Buf p), JanusStruct (Buf v))
 
-type instance JanusCEval (IndexedPQ JanusC p v -> r) = IndexedPQ Identity p v -> JanusCEval r
+type instance JanusCHost (IndexedPQ (JanusCT _) p v) = IndexedPQ Identity p v
 
-type instance JanusCRetType (IndexedPQ JanusC p v -> r) = JanusCRetType r
+deriving via
+  ViaPtrHandle t (CStruct (IndexedPQSpine p v)) (IndexedPQ Identity p v)
+  instance
+    (IndexedPQABI p v) => JanusCArg t (IndexedPQ (JanusCT t) p v)
 
-instance (IndexedPQABI p v, JanusCParam r) => JanusCParam (IndexedPQ JanusC p v -> r) where
-  jcparam = mkPtrHandleJCParam IndexedPQ
-
-instance (IndexedPQABI p v, JanusCEvaluate r) => JanusCEvaluate (IndexedPQ JanusC p v -> r) where
-  jceval = mkPtrHandleJCEval unIndexedPQ IndexedPQ
-
-type instance JanusCEval (JanusCM (IndexedPQ JanusC p v)) = IO (IndexedPQ Identity p v)
-
-type instance JanusCRetType (JanusCM (IndexedPQ JanusC p v)) = IndexedPQ Identity p v
-
-instance (IndexedPQABI p v) => JanusCParam (JanusCM (IndexedPQ JanusC p v)) where
-  jcparam = mkPtrHandleJCRetParam unIndexedPQ
-
-instance (IndexedPQABI p v) => JanusCEvaluate (JanusCM (IndexedPQ JanusC p v)) where
-  jceval = mkPtrHandleJCRetEval IndexedPQ
-
-type instance LinuxX86_64CEval (IndexedPQ LinuxX86_64C p v -> r) = IndexedPQ Identity p v -> LinuxX86_64CEval r
-
-type instance LinuxX86_64BaseRet (IndexedPQ LinuxX86_64C p v -> r) = LinuxX86_64BaseRet r
-
-instance (IndexedPQABI p v, LinuxX86_64Param r) => LinuxX86_64Param (IndexedPQ LinuxX86_64C p v -> r) where
-  x86param = mkPtrHandleX86Param IndexedPQ
-
-instance (IndexedPQABI p v, X86DeferCont r, LinuxX86_64Evaluate r) => LinuxX86_64Evaluate (IndexedPQ LinuxX86_64C p v -> r) where
-  x86eval = mkPtrHandleX86EvalParam unIndexedPQ IndexedPQ
-
-instance (IndexedPQABI p v, X86DeferCont r) => X86DeferCall (IndexedPQ LinuxX86_64C p v -> r) where
-  x86DeferArg = mkPtrHandleX86DeferArg unIndexedPQ IndexedPQ
-
-instance (IndexedPQABI p v, X86DeferCont r) => X86DeferCont (IndexedPQ LinuxX86_64C p v -> r) where
-  x86DeferCont = mkPtrHandleX86DeferCont unIndexedPQ IndexedPQ
-
-type instance LinuxX86_64CEval (LinuxX86_64CM (IndexedPQ LinuxX86_64C p v)) = IO (IndexedPQ Identity p v)
-
-type instance LinuxX86_64BaseRet (LinuxX86_64CM (IndexedPQ LinuxX86_64C p v)) = IndexedPQ Identity p v
-
-instance (IndexedPQABI p v) => LinuxX86_64Param (LinuxX86_64CM (IndexedPQ LinuxX86_64C p v)) where
-  x86param = mkPtrHandleX86RetParam unIndexedPQ
-
-instance (IndexedPQABI p v) => LinuxX86_64Evaluate (LinuxX86_64CM (IndexedPQ LinuxX86_64C p v)) where
-  x86eval = mkPtrHandleX86RetEval IndexedPQ
-
-instance (IndexedPQABI p v) => X86DeferCall (LinuxX86_64CM (IndexedPQ LinuxX86_64C p v)) where
-  x86DeferArg = mkPtrHandleX86RetDeferArg IndexedPQ
-
-instance (IndexedPQABI p v) => X86DeferCont (LinuxX86_64CM (IndexedPQ LinuxX86_64C p v)) where
-  x86DeferCont = mkPtrHandleX86RetDeferCont IndexedPQ
-
-instance (IndexedPQABI p v, LinuxX86_64Param r, JanusCTH r) => JanusCTH (IndexedPQ LinuxX86_64C p v -> r) where
-  type JanusCTHEval (IndexedPQ LinuxX86_64C p v -> r) = IndexedPQ Identity p v -> JanusCTHEval r
-  janusCTHBackend _ = THBackendLinuxX86_64
-  janusCTHCodegen = x86param
-  janusCTHSpec _ =
-    let (ps, retSpec) = janusCTHSpec (Proxy @r)
-     in (mkPtrHandleTHParamSpec (Proxy @(IndexedPQ Identity p v)) : ps, retSpec)
-
-instance (IndexedPQABI p v) => JanusCTH (LinuxX86_64CM (IndexedPQ LinuxX86_64C p v)) where
-  type JanusCTHEval (LinuxX86_64CM (IndexedPQ LinuxX86_64C p v)) = IO (IndexedPQ Identity p v)
-  janusCTHBackend _ = THBackendLinuxX86_64
-  janusCTHCodegen = x86param
-  janusCTHSpec _ =
-    ([], mkPtrHandleTHRetSpec THRetIO (Proxy @(IndexedPQ Identity p v)) (Proxy @(CStruct (IndexedPQSpine p v))))
+deriving via
+  ViaPtrHandle t (CStruct (IndexedPQSpine p v)) (IndexedPQ Identity p v)
+  instance
+    (IndexedPQABI p v) => JanusCValRet t (IndexedPQ (JanusCT t) p v)

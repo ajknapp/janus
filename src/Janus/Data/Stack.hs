@@ -3,6 +3,7 @@
 {-# LANGUAGE DataKinds #-}
 {-# LANGUAGE DeriveGeneric #-}
 {-# LANGUAGE DerivingStrategies #-}
+{-# LANGUAGE DerivingVia #-}
 {-# LANGUAGE FlexibleContexts #-}
 {-# LANGUAGE FlexibleInstances #-}
 {-# LANGUAGE KindSignatures #-}
@@ -68,8 +69,6 @@ import Foreign.Ptr (Ptr)
 import GHC.Generics (Generic)
 import Janus.Alloc.Policy (Alloc, allocStruct, freeStruct)
 import Janus.Backend.C
-import Janus.Backend.C.LinuxX86_64
-import Janus.Backend.C.TH
 import Janus.Command.Cond (ifThenElseM_, whenM_)
 import Janus.Command.Memory (CmdStorable (..), ExpSized (..))
 import Janus.Command.Ref (letM, newRef, readRef, writeRef)
@@ -428,69 +427,14 @@ foldSPMD pw st s0 step = do
 
 type StackABI a = (Typeable a, JanusStruct (Buf a))
 
-type instance JanusCEval (Stack JanusC a -> r) = Stack Identity a -> JanusCEval r
+type instance JanusCHost (Stack (JanusCT _) a) = Stack Identity a
 
-type instance JanusCRetType (Stack JanusC a -> r) = JanusCRetType r
+deriving via
+  ViaPtrHandle t (CStruct (StackSpine a)) (Stack Identity a)
+  instance
+    (StackABI a) => JanusCArg t (Stack (JanusCT t) a)
 
-instance (StackABI a, JanusCParam r) => JanusCParam (Stack JanusC a -> r) where
-  jcparam = mkPtrHandleJCParam Stack
-
-instance (StackABI a, JanusCEvaluate r) => JanusCEvaluate (Stack JanusC a -> r) where
-  jceval = mkPtrHandleJCEval unStack Stack
-
-type instance JanusCEval (JanusCM (Stack JanusC a)) = IO (Stack Identity a)
-
-type instance JanusCRetType (JanusCM (Stack JanusC a)) = Stack Identity a
-
-instance (StackABI a) => JanusCParam (JanusCM (Stack JanusC a)) where
-  jcparam = mkPtrHandleJCRetParam unStack
-
-instance (StackABI a) => JanusCEvaluate (JanusCM (Stack JanusC a)) where
-  jceval = mkPtrHandleJCRetEval Stack
-
-type instance LinuxX86_64CEval (Stack LinuxX86_64C a -> r) = Stack Identity a -> LinuxX86_64CEval r
-
-type instance LinuxX86_64BaseRet (Stack LinuxX86_64C a -> r) = LinuxX86_64BaseRet r
-
-instance (StackABI a, LinuxX86_64Param r) => LinuxX86_64Param (Stack LinuxX86_64C a -> r) where
-  x86param = mkPtrHandleX86Param Stack
-
-instance (StackABI a, X86DeferCont r, LinuxX86_64Evaluate r) => LinuxX86_64Evaluate (Stack LinuxX86_64C a -> r) where
-  x86eval = mkPtrHandleX86EvalParam unStack Stack
-
-instance (StackABI a, X86DeferCont r) => X86DeferCall (Stack LinuxX86_64C a -> r) where
-  x86DeferArg = mkPtrHandleX86DeferArg unStack Stack
-
-instance (StackABI a, X86DeferCont r) => X86DeferCont (Stack LinuxX86_64C a -> r) where
-  x86DeferCont = mkPtrHandleX86DeferCont unStack Stack
-
-type instance LinuxX86_64CEval (LinuxX86_64CM (Stack LinuxX86_64C a)) = IO (Stack Identity a)
-
-type instance LinuxX86_64BaseRet (LinuxX86_64CM (Stack LinuxX86_64C a)) = Stack Identity a
-
-instance (StackABI a) => LinuxX86_64Param (LinuxX86_64CM (Stack LinuxX86_64C a)) where
-  x86param = mkPtrHandleX86RetParam unStack
-
-instance (StackABI a) => LinuxX86_64Evaluate (LinuxX86_64CM (Stack LinuxX86_64C a)) where
-  x86eval = mkPtrHandleX86RetEval Stack
-
-instance (StackABI a) => X86DeferCall (LinuxX86_64CM (Stack LinuxX86_64C a)) where
-  x86DeferArg = mkPtrHandleX86RetDeferArg Stack
-
-instance (StackABI a) => X86DeferCont (LinuxX86_64CM (Stack LinuxX86_64C a)) where
-  x86DeferCont = mkPtrHandleX86RetDeferCont Stack
-
-instance (StackABI a, LinuxX86_64Param r, JanusCTH r) => JanusCTH (Stack LinuxX86_64C a -> r) where
-  type JanusCTHEval (Stack LinuxX86_64C a -> r) = Stack Identity a -> JanusCTHEval r
-  janusCTHBackend _ = THBackendLinuxX86_64
-  janusCTHCodegen = x86param
-  janusCTHSpec _ =
-    let (ps, retSpec) = janusCTHSpec (Proxy @r)
-     in (mkPtrHandleTHParamSpec (Proxy @(Stack Identity a)) : ps, retSpec)
-
-instance (StackABI a) => JanusCTH (LinuxX86_64CM (Stack LinuxX86_64C a)) where
-  type JanusCTHEval (LinuxX86_64CM (Stack LinuxX86_64C a)) = IO (Stack Identity a)
-  janusCTHBackend _ = THBackendLinuxX86_64
-  janusCTHCodegen = x86param
-  janusCTHSpec _ =
-    ([], mkPtrHandleTHRetSpec THRetIO (Proxy @(Stack Identity a)) (Proxy @(CStruct (StackSpine a))))
+deriving via
+  ViaPtrHandle t (CStruct (StackSpine a)) (Stack Identity a)
+  instance
+    (StackABI a) => JanusCValRet t (Stack (JanusCT t) a)

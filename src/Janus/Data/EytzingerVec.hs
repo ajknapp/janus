@@ -3,6 +3,7 @@
 {-# LANGUAGE DataKinds #-}
 {-# LANGUAGE DeriveGeneric #-}
 {-# LANGUAGE DerivingStrategies #-}
+{-# LANGUAGE DerivingVia #-}
 {-# LANGUAGE FlexibleContexts #-}
 {-# LANGUAGE FlexibleInstances #-}
 {-# LANGUAGE KindSignatures #-}
@@ -55,8 +56,6 @@ import Foreign.Ptr (Ptr)
 import GHC.Generics (Generic)
 import Janus.Alloc.Policy (Alloc, CmdAlloc, allocStruct, freeStruct)
 import Janus.Backend.C
-import Janus.Backend.C.LinuxX86_64
-import Janus.Backend.C.TH
 import Janus.Command.Cond (ifThenElseM_, whenM_)
 import Janus.Command.Memory (CmdStorable (..), ExpSized (..))
 import Janus.Command.Ref (newRef, readRef, writeRef)
@@ -463,69 +462,14 @@ foldSPMD pw (EytzingerVec hdr) s0 step = do
 
 type EytzingerVecABI k = (Typeable k, JanusStruct (Buf k))
 
-type instance JanusCEval (EytzingerVec JanusC k -> r) = EytzingerVec Identity k -> JanusCEval r
+type instance JanusCHost (EytzingerVec (JanusCT _) k) = EytzingerVec Identity k
 
-type instance JanusCRetType (EytzingerVec JanusC k -> r) = JanusCRetType r
+deriving via
+  ViaPtrHandle t (CStruct (EytzingerVecSpine k)) (EytzingerVec Identity k)
+  instance
+    (EytzingerVecABI k) => JanusCArg t (EytzingerVec (JanusCT t) k)
 
-instance (EytzingerVecABI k, JanusCParam r) => JanusCParam (EytzingerVec JanusC k -> r) where
-  jcparam = mkPtrHandleJCParam EytzingerVec
-
-instance (EytzingerVecABI k, JanusCEvaluate r) => JanusCEvaluate (EytzingerVec JanusC k -> r) where
-  jceval = mkPtrHandleJCEval unEytzingerVec EytzingerVec
-
-type instance JanusCEval (JanusCM (EytzingerVec JanusC k)) = IO (EytzingerVec Identity k)
-
-type instance JanusCRetType (JanusCM (EytzingerVec JanusC k)) = EytzingerVec Identity k
-
-instance (EytzingerVecABI k) => JanusCParam (JanusCM (EytzingerVec JanusC k)) where
-  jcparam = mkPtrHandleJCRetParam unEytzingerVec
-
-instance (EytzingerVecABI k) => JanusCEvaluate (JanusCM (EytzingerVec JanusC k)) where
-  jceval = mkPtrHandleJCRetEval EytzingerVec
-
-type instance LinuxX86_64CEval (EytzingerVec LinuxX86_64C k -> r) = EytzingerVec Identity k -> LinuxX86_64CEval r
-
-type instance LinuxX86_64BaseRet (EytzingerVec LinuxX86_64C k -> r) = LinuxX86_64BaseRet r
-
-instance (EytzingerVecABI k, LinuxX86_64Param r) => LinuxX86_64Param (EytzingerVec LinuxX86_64C k -> r) where
-  x86param = mkPtrHandleX86Param EytzingerVec
-
-instance (EytzingerVecABI k, X86DeferCont r, LinuxX86_64Evaluate r) => LinuxX86_64Evaluate (EytzingerVec LinuxX86_64C k -> r) where
-  x86eval = mkPtrHandleX86EvalParam unEytzingerVec EytzingerVec
-
-instance (EytzingerVecABI k, X86DeferCont r) => X86DeferCall (EytzingerVec LinuxX86_64C k -> r) where
-  x86DeferArg = mkPtrHandleX86DeferArg unEytzingerVec EytzingerVec
-
-instance (EytzingerVecABI k, X86DeferCont r) => X86DeferCont (EytzingerVec LinuxX86_64C k -> r) where
-  x86DeferCont = mkPtrHandleX86DeferCont unEytzingerVec EytzingerVec
-
-type instance LinuxX86_64CEval (LinuxX86_64CM (EytzingerVec LinuxX86_64C k)) = IO (EytzingerVec Identity k)
-
-type instance LinuxX86_64BaseRet (LinuxX86_64CM (EytzingerVec LinuxX86_64C k)) = EytzingerVec Identity k
-
-instance (EytzingerVecABI k) => LinuxX86_64Param (LinuxX86_64CM (EytzingerVec LinuxX86_64C k)) where
-  x86param = mkPtrHandleX86RetParam unEytzingerVec
-
-instance (EytzingerVecABI k) => LinuxX86_64Evaluate (LinuxX86_64CM (EytzingerVec LinuxX86_64C k)) where
-  x86eval = mkPtrHandleX86RetEval EytzingerVec
-
-instance (EytzingerVecABI k) => X86DeferCall (LinuxX86_64CM (EytzingerVec LinuxX86_64C k)) where
-  x86DeferArg = mkPtrHandleX86RetDeferArg EytzingerVec
-
-instance (EytzingerVecABI k) => X86DeferCont (LinuxX86_64CM (EytzingerVec LinuxX86_64C k)) where
-  x86DeferCont = mkPtrHandleX86RetDeferCont EytzingerVec
-
-instance (EytzingerVecABI k, LinuxX86_64Param r, JanusCTH r) => JanusCTH (EytzingerVec LinuxX86_64C k -> r) where
-  type JanusCTHEval (EytzingerVec LinuxX86_64C k -> r) = EytzingerVec Identity k -> JanusCTHEval r
-  janusCTHBackend _ = THBackendLinuxX86_64
-  janusCTHCodegen = x86param
-  janusCTHSpec _ =
-    let (ps, retSpec) = janusCTHSpec (Proxy @r)
-     in (mkPtrHandleTHParamSpec (Proxy @(EytzingerVec Identity k)) : ps, retSpec)
-
-instance (EytzingerVecABI k) => JanusCTH (LinuxX86_64CM (EytzingerVec LinuxX86_64C k)) where
-  type JanusCTHEval (LinuxX86_64CM (EytzingerVec LinuxX86_64C k)) = IO (EytzingerVec Identity k)
-  janusCTHBackend _ = THBackendLinuxX86_64
-  janusCTHCodegen = x86param
-  janusCTHSpec _ =
-    ([], mkPtrHandleTHRetSpec THRetIO (Proxy @(EytzingerVec Identity k)) (Proxy @(CStruct (EytzingerVecSpine k))))
+deriving via
+  ViaPtrHandle t (CStruct (EytzingerVecSpine k)) (EytzingerVec Identity k)
+  instance
+    (EytzingerVecABI k) => JanusCValRet t (EytzingerVec (JanusCT t) k)

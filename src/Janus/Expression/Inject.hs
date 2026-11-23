@@ -24,7 +24,7 @@ class ExpInject e a where
 instance ExpInject Identity a where
   inject = pure
 
-instance (JanusLitC a) => ExpInject JanusC a where
+instance (JanusLitC a) => ExpInject (JanusCT t) a where
   inject a = JanusC $ do
     a' <- jlitc @a a
     pure $ RVal a'
@@ -39,7 +39,7 @@ instance (JanusCTyped f, Generic f, GJanusCInject (Rep f)) => GJanusCInject (K1 
     let e = CompoundLit (Type spec dec noLoc) ini noLoc
     pure [(Just (Designation [MemberDesignator (Id s noLoc) noLoc] noLoc), ExpInitializer e noLoc)]
 
-instance {-# OVERLAPS #-} GJanusCInject (K1 i (JanusC a)) where
+instance {-# OVERLAPS #-} GJanusCInject (K1 i (JanusCT t a)) where
   gjcinject (K1 (JanusC a)) s = do
     RVal a' <- a
     pure [(Just (Designation [MemberDesignator (Id s noLoc) noLoc] noLoc), ExpInitializer a' noLoc)]
@@ -59,7 +59,7 @@ instance (GJanusCInject f) => GJanusCInject (D1 i f) where
 class GJanusCFields f where
   gjcfields :: Proxy (f a) -> String -> JanusCM [FieldGroup]
 
-instance {-# OVERLAPS #-} (JanusCTyped f) => GJanusCFields (K1 i (JanusC f)) where
+instance {-# OVERLAPS #-} (JanusCTyped f) => GJanusCFields (K1 i (JanusCT t f)) where
   gjcfields _ s = do
     JCType spec dec <- getJanusCType (Proxy @f)
     pure [FieldGroup spec [Field (Just $ Id s noLoc) (Just dec) Nothing noLoc] noLoc]
@@ -90,7 +90,7 @@ defaultJanusCType _ = do
   fgs <- gjcfields (Proxy @(Rep f ())) ""
   pure $ JCType (DeclSpec [] [] (Tstruct Nothing (Just fgs) [] noLoc) noLoc) (DeclRoot noLoc)
 
-defaultJanusCInject :: forall f. (Generic f, GJanusCInject (Rep f), JanusCTyped f) => f -> JanusC f
+defaultJanusCInject :: forall t f. (Generic f, GJanusCInject (Rep f), JanusCTyped f) => f -> JanusCT t f
 defaultJanusCInject a = JanusC $ do
   ini <- gjcinject (GHC.Generics.from a) ""
   JCType spec dec <- getJanusCType (Proxy @f)

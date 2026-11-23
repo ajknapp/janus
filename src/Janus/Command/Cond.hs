@@ -19,9 +19,9 @@ class (ExpBool e, Monad m) => CmdCond m e | e -> m, m -> e where
 instance CmdCond IO Identity where
   ifThenElseM_ (Identity p) a b = if p then a else b
 
-instance CmdCond JanusCM JanusC where
+instance CmdCond (JanusCMT t) (JanusCT t) where
   ifThenElseM_ (JanusC c) t f = do
-    RVal c' <- c
+    RVal c' <- liftJanusCM c
     fn <- getFunction
     modifyFunction $ \jfn -> jfn & jcfBlock .~ mempty
     t

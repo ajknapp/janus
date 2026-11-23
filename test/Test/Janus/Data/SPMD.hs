@@ -30,8 +30,9 @@ import Hedgehog (Property, assert, forAll, property, (===))
 import qualified Hedgehog.Gen as Gen
 import qualified Hedgehog.Range as Range
 import Janus.Alloc
+import Janus.Backend.C (acquireJanusC, releaseJanusC)
 import Janus.Backend.C.Build (CBuildConfig, cBuildConfigCacheDir, defaultCBuildConfig)
-import Janus.Backend.C.LinuxX86_64 (LinuxX86_64C, LinuxX86_64CM, acquireLinuxX86_64C, releaseLinuxX86_64C)
+import Janus.Backend.C.LinuxX86_64 (LinuxX86_64C, LinuxX86_64CM)
 import Janus.Command.Memory (withAlignedArray)
 import Janus.Control.Drain (drainForEach, drainSum, runDrain)
 import Janus.Control.Step (Step (..))
@@ -718,8 +719,8 @@ check_spmd_containers_compiled_c_ffi getCFn = property $ do
 
 test_data_spmd :: TestTree
 test_data_spmd =
-  let acq = getSPMDDataTestConfig >>= flip acquireLinuxX86_64C cMultiContainerSPMDKernel
-   in withResource acq releaseLinuxX86_64C $ \rFn ->
+  let acq = getSPMDDataTestConfig >>= flip acquireJanusC cMultiContainerSPMDKernel
+   in withResource acq releaseJanusC $ \rFn ->
         testGroup
           "First-Class SPMD / SIMD Support Across Janus Data Structures"
           [ testProperty "BitSet, BitTree, BloomFilter (@8 cache-line), & XorFilter SPMD" check_spmd_bitwise_and_filters,

@@ -26,6 +26,7 @@ import qualified Data.ByteString as BS
 import qualified Data.ByteString.Unsafe as BS
 import qualified Data.ByteString.Base16 as B16
 import Data.ByteString.Char8 (unpack)
+import qualified Data.Dependent.HashMap as DHM
 import Data.Foldable
 import Data.GADT.Compare
 import Data.GADT.Compare.TH (deriveGEq)
@@ -66,11 +67,18 @@ data CBuildConfig = CBuildConfig
     _cBuildConfigCFlags :: [String],
     _cBuildConfigSharedCFlags :: [String],
     _cBuildConfigLDFlags :: [String],
-    _cBuildConfigX86Features :: Maybe X86Features
+    _cBuildConfigTargetFeatures :: TargetFeatureMap
   }
   deriving (Eq, Ord, Show, Generic)
 
 $(makeLenses ''CBuildConfig)
+
+cBuildConfigTargetFeature :: TargetFeatureKey f -> Lens' CBuildConfig (Maybe f)
+cBuildConfigTargetFeature k =
+  cBuildConfigTargetFeatures
+    . lens
+      (fmap runIdentity . DHM.lookup k)
+      (\m mv -> DHM.alter (const (Identity <$> mv)) k m)
 
 defaultCBuildConfig :: CBuildConfig
 defaultCBuildConfig =
@@ -81,7 +89,7 @@ defaultCBuildConfig =
       _cBuildConfigCFlags = ["-O3", "-fPIC"],
       _cBuildConfigSharedCFlags = ["-flto"],
       _cBuildConfigLDFlags = ["-shared"],
-      _cBuildConfigX86Features = Nothing
+      _cBuildConfigTargetFeatures = DHM.empty
     }
 
 defaultTHBuildConfig :: CBuildConfig

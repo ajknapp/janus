@@ -3,6 +3,7 @@
 {-# LANGUAGE DataKinds #-}
 {-# LANGUAGE DeriveGeneric #-}
 {-# LANGUAGE DerivingStrategies #-}
+{-# LANGUAGE DerivingVia #-}
 {-# LANGUAGE FlexibleContexts #-}
 {-# LANGUAGE FlexibleInstances #-}
 {-# LANGUAGE KindSignatures #-}
@@ -76,8 +77,6 @@ import Janus.Alloc.Policy
     freeStruct,
   )
 import Janus.Backend.C
-import Janus.Backend.C.LinuxX86_64
-import Janus.Backend.C.TH
 import Janus.Command.Cond (ifThenElseM_, whenM_)
 import Janus.Command.Memory (CmdStorable (..), ExpPtr (..), ExpSized (..))
 import Janus.Command.Ref (RefCell, newRef, readRef, writeRef)
@@ -1274,69 +1273,14 @@ drainAppendBTreeSet alloc bs = drainForEach (\x -> insert alloc bs x >> pure ())
 -- Host <-> C FFI Marshalling Instances
 --------------------------------------------------------------------------------
 
-type instance JanusCEval (BTreeSet JanusC k -> r) = BTreeSet Identity k -> JanusCEval r
+type instance JanusCHost (BTreeSet (JanusCT _) k) = BTreeSet Identity k
 
-type instance JanusCRetType (BTreeSet JanusC k -> r) = JanusCRetType r
+deriving via
+  ViaPtrHandle t (CStruct (BTreeSetSpine k)) (BTreeSet Identity k)
+  instance
+    (Typeable k) => JanusCArg t (BTreeSet (JanusCT t) k)
 
-instance (Typeable k, JanusCParam r) => JanusCParam (BTreeSet JanusC k -> r) where
-  jcparam = mkPtrHandleJCParam BTreeSet
-
-instance (Typeable k, JanusCEvaluate r) => JanusCEvaluate (BTreeSet JanusC k -> r) where
-  jceval = mkPtrHandleJCEval unBTreeSet BTreeSet
-
-type instance JanusCEval (JanusCM (BTreeSet JanusC k)) = IO (BTreeSet Identity k)
-
-type instance JanusCRetType (JanusCM (BTreeSet JanusC k)) = BTreeSet Identity k
-
-instance (Typeable k) => JanusCParam (JanusCM (BTreeSet JanusC k)) where
-  jcparam = mkPtrHandleJCRetParam unBTreeSet
-
-instance (Typeable k) => JanusCEvaluate (JanusCM (BTreeSet JanusC k)) where
-  jceval = mkPtrHandleJCRetEval BTreeSet
-
-type instance LinuxX86_64CEval (BTreeSet LinuxX86_64C k -> r) = BTreeSet Identity k -> LinuxX86_64CEval r
-
-type instance LinuxX86_64BaseRet (BTreeSet LinuxX86_64C k -> r) = LinuxX86_64BaseRet r
-
-instance (Typeable k, LinuxX86_64Param r) => LinuxX86_64Param (BTreeSet LinuxX86_64C k -> r) where
-  x86param = mkPtrHandleX86Param BTreeSet
-
-instance (Typeable k, X86DeferCont r, LinuxX86_64Evaluate r) => LinuxX86_64Evaluate (BTreeSet LinuxX86_64C k -> r) where
-  x86eval = mkPtrHandleX86EvalParam unBTreeSet BTreeSet
-
-instance (Typeable k, X86DeferCont r) => X86DeferCall (BTreeSet LinuxX86_64C k -> r) where
-  x86DeferArg = mkPtrHandleX86DeferArg unBTreeSet BTreeSet
-
-instance (Typeable k, X86DeferCont r) => X86DeferCont (BTreeSet LinuxX86_64C k -> r) where
-  x86DeferCont = mkPtrHandleX86DeferCont unBTreeSet BTreeSet
-
-type instance LinuxX86_64CEval (LinuxX86_64CM (BTreeSet LinuxX86_64C k)) = IO (BTreeSet Identity k)
-
-type instance LinuxX86_64BaseRet (LinuxX86_64CM (BTreeSet LinuxX86_64C k)) = BTreeSet Identity k
-
-instance (Typeable k) => LinuxX86_64Param (LinuxX86_64CM (BTreeSet LinuxX86_64C k)) where
-  x86param = mkPtrHandleX86RetParam unBTreeSet
-
-instance (Typeable k) => LinuxX86_64Evaluate (LinuxX86_64CM (BTreeSet LinuxX86_64C k)) where
-  x86eval = mkPtrHandleX86RetEval BTreeSet
-
-instance (Typeable k) => X86DeferCall (LinuxX86_64CM (BTreeSet LinuxX86_64C k)) where
-  x86DeferArg = mkPtrHandleX86RetDeferArg BTreeSet
-
-instance (Typeable k) => X86DeferCont (LinuxX86_64CM (BTreeSet LinuxX86_64C k)) where
-  x86DeferCont = mkPtrHandleX86RetDeferCont BTreeSet
-
-instance (Typeable k, LinuxX86_64Param r, JanusCTH r) => JanusCTH (BTreeSet LinuxX86_64C k -> r) where
-  type JanusCTHEval (BTreeSet LinuxX86_64C k -> r) = BTreeSet Identity k -> JanusCTHEval r
-  janusCTHBackend _ = THBackendLinuxX86_64
-  janusCTHCodegen = x86param
-  janusCTHSpec _ =
-    let (ps, retSpec) = janusCTHSpec (Proxy @r)
-     in (mkPtrHandleTHParamSpec (Proxy @(BTreeSet Identity k)) : ps, retSpec)
-
-instance (Typeable k) => JanusCTH (LinuxX86_64CM (BTreeSet LinuxX86_64C k)) where
-  type JanusCTHEval (LinuxX86_64CM (BTreeSet LinuxX86_64C k)) = IO (BTreeSet Identity k)
-  janusCTHBackend _ = THBackendLinuxX86_64
-  janusCTHCodegen = x86param
-  janusCTHSpec _ =
-    ([], mkPtrHandleTHRetSpec THRetIO (Proxy @(BTreeSet Identity k)) (Proxy @(CStruct (BTreeSetSpine k))))
+deriving via
+  ViaPtrHandle t (CStruct (BTreeSetSpine k)) (BTreeSet Identity k)
+  instance
+    (Typeable k) => JanusCValRet t (BTreeSet (JanusCT t) k)

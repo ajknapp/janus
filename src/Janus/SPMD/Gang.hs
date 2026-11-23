@@ -29,7 +29,6 @@ import Data.Proxy (Proxy (..))
 import Data.Word (Word16, Word32, Word64, Word8)
 import Foreign.Ptr (Ptr)
 import GHC.TypeNats (KnownNat, Nat, natVal)
-import Janus.Backend.C (askCUDAFeatures, askX86Features)
 import Janus.Backend.C.CUDA
   ( CUDADejaFu,
     CUDADejaFuM,
@@ -38,9 +37,9 @@ import Janus.Backend.C.CUDA
     JanusCUDA,
     JanusCUDAM (..),
     askCUDADejaFuFeatures,
+    askCUDAFeatures,
     askCUDAIOFeatures,
   )
-import Janus.Backend.C.LinuxX86_64 (LinuxX86_64C, LinuxX86_64CM (..))
 import Janus.Backend.C.Target
   ( CUDAFeatures,
     X86Feature (..),
@@ -311,11 +310,6 @@ class (Monad m) => CmdOptimalGang m e | m -> e, e -> m where
 instance CmdOptimalGang IO Identity where
   withOptimalGang pa k = do
     fs <- getActiveHostX86Features
-    dispatchGangInt (optimalX86GangSize fs pa) k
-
-instance CmdOptimalGang LinuxX86_64CM LinuxX86_64C where
-  withOptimalGang pa k = do
-    fs <- LinuxX86_64CM askX86Features
     dispatchGangInt (optimalX86GangSize fs pa) k
 
 instance CmdOptimalGang JanusCUDAM JanusCUDA where

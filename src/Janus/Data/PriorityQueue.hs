@@ -3,6 +3,7 @@
 {-# LANGUAGE DataKinds #-}
 {-# LANGUAGE DeriveGeneric #-}
 {-# LANGUAGE DerivingStrategies #-}
+{-# LANGUAGE DerivingVia #-}
 {-# LANGUAGE FlexibleContexts #-}
 {-# LANGUAGE FlexibleInstances #-}
 {-# LANGUAGE KindSignatures #-}
@@ -82,8 +83,6 @@ import Foreign.Ptr (Ptr)
 import GHC.Generics (Generic)
 import Janus.Alloc.Policy (Alloc, allocStruct, freeStruct)
 import Janus.Backend.C
-import Janus.Backend.C.LinuxX86_64
-import Janus.Backend.C.TH
 import Janus.Command.Cond (ifThenElseM_, whenM_)
 import Janus.Command.Memory (CmdStorable (..), ExpSized (..))
 import Janus.Command.Ref (letM, newRef, readRef, writeRef)
@@ -945,138 +944,28 @@ mapKeysAndRebuildSPMD pw (PriorityQueue hdr) step = do
 
 type PriorityQueueABI k v = (Typeable k, Typeable v, JanusStruct (Buf k), JanusStruct (Buf v))
 
-type instance JanusCEval (PriorityQueue JanusC k v -> r) = PriorityQueue Identity k v -> JanusCEval r
-
-type instance JanusCRetType (PriorityQueue JanusC k v -> r) = JanusCRetType r
-
-instance (PriorityQueueABI k v, JanusCParam r) => JanusCParam (PriorityQueue JanusC k v -> r) where
-  jcparam = mkPtrHandleJCParam PriorityQueue
-
-instance (PriorityQueueABI k v, JanusCEvaluate r) => JanusCEvaluate (PriorityQueue JanusC k v -> r) where
-  jceval = mkPtrHandleJCEval unPriorityQueue PriorityQueue
-
-type instance JanusCEval (JanusCM (PriorityQueue JanusC k v)) = IO (PriorityQueue Identity k v)
-
-type instance JanusCRetType (JanusCM (PriorityQueue JanusC k v)) = PriorityQueue Identity k v
-
-instance (PriorityQueueABI k v) => JanusCParam (JanusCM (PriorityQueue JanusC k v)) where
-  jcparam = mkPtrHandleJCRetParam unPriorityQueue
-
-instance (PriorityQueueABI k v) => JanusCEvaluate (JanusCM (PriorityQueue JanusC k v)) where
-  jceval = mkPtrHandleJCRetEval PriorityQueue
-
-type instance LinuxX86_64CEval (PriorityQueue LinuxX86_64C k v -> r) = PriorityQueue Identity k v -> LinuxX86_64CEval r
-
-type instance LinuxX86_64BaseRet (PriorityQueue LinuxX86_64C k v -> r) = LinuxX86_64BaseRet r
-
-instance (PriorityQueueABI k v, LinuxX86_64Param r) => LinuxX86_64Param (PriorityQueue LinuxX86_64C k v -> r) where
-  x86param = mkPtrHandleX86Param PriorityQueue
-
-instance (PriorityQueueABI k v, X86DeferCont r, LinuxX86_64Evaluate r) => LinuxX86_64Evaluate (PriorityQueue LinuxX86_64C k v -> r) where
-  x86eval = mkPtrHandleX86EvalParam unPriorityQueue PriorityQueue
-
-instance (PriorityQueueABI k v, X86DeferCont r) => X86DeferCall (PriorityQueue LinuxX86_64C k v -> r) where
-  x86DeferArg = mkPtrHandleX86DeferArg unPriorityQueue PriorityQueue
-
-instance (PriorityQueueABI k v, X86DeferCont r) => X86DeferCont (PriorityQueue LinuxX86_64C k v -> r) where
-  x86DeferCont = mkPtrHandleX86DeferCont unPriorityQueue PriorityQueue
-
-type instance LinuxX86_64CEval (LinuxX86_64CM (PriorityQueue LinuxX86_64C k v)) = IO (PriorityQueue Identity k v)
-
-type instance LinuxX86_64BaseRet (LinuxX86_64CM (PriorityQueue LinuxX86_64C k v)) = PriorityQueue Identity k v
-
-instance (PriorityQueueABI k v) => LinuxX86_64Param (LinuxX86_64CM (PriorityQueue LinuxX86_64C k v)) where
-  x86param = mkPtrHandleX86RetParam unPriorityQueue
-
-instance (PriorityQueueABI k v) => LinuxX86_64Evaluate (LinuxX86_64CM (PriorityQueue LinuxX86_64C k v)) where
-  x86eval = mkPtrHandleX86RetEval PriorityQueue
-
-instance (PriorityQueueABI k v) => X86DeferCall (LinuxX86_64CM (PriorityQueue LinuxX86_64C k v)) where
-  x86DeferArg = mkPtrHandleX86RetDeferArg PriorityQueue
-
-instance (PriorityQueueABI k v) => X86DeferCont (LinuxX86_64CM (PriorityQueue LinuxX86_64C k v)) where
-  x86DeferCont = mkPtrHandleX86RetDeferCont PriorityQueue
-
-instance (PriorityQueueABI k v, LinuxX86_64Param r, JanusCTH r) => JanusCTH (PriorityQueue LinuxX86_64C k v -> r) where
-  type JanusCTHEval (PriorityQueue LinuxX86_64C k v -> r) = PriorityQueue Identity k v -> JanusCTHEval r
-  janusCTHBackend _ = THBackendLinuxX86_64
-  janusCTHCodegen = x86param
-  janusCTHSpec _ =
-    let (ps, retSpec) = janusCTHSpec (Proxy @r)
-     in (mkPtrHandleTHParamSpec (Proxy @(PriorityQueue Identity k v)) : ps, retSpec)
-
-instance (PriorityQueueABI k v) => JanusCTH (LinuxX86_64CM (PriorityQueue LinuxX86_64C k v)) where
-  type JanusCTHEval (LinuxX86_64CM (PriorityQueue LinuxX86_64C k v)) = IO (PriorityQueue Identity k v)
-  janusCTHBackend _ = THBackendLinuxX86_64
-  janusCTHCodegen = x86param
-  janusCTHSpec _ =
-    ([], mkPtrHandleTHRetSpec THRetIO (Proxy @(PriorityQueue Identity k v)) (Proxy @(CStruct (PriorityQueueSpine k v))))
-
 type MinHeapABI k = (Typeable k, JanusStruct (Buf k))
 
-type instance JanusCEval (MinHeap JanusC k -> r) = MinHeap Identity k -> JanusCEval r
+type instance JanusCHost (PriorityQueue (JanusCT _) k v) = PriorityQueue Identity k v
 
-type instance JanusCRetType (MinHeap JanusC k -> r) = JanusCRetType r
+deriving via
+  ViaPtrHandle t (CStruct (PriorityQueueSpine k v)) (PriorityQueue Identity k v)
+  instance
+    (PriorityQueueABI k v) => JanusCArg t (PriorityQueue (JanusCT t) k v)
 
-instance (MinHeapABI k, JanusCParam r) => JanusCParam (MinHeap JanusC k -> r) where
-  jcparam = mkPtrHandleJCParam MinHeap
+deriving via
+  ViaPtrHandle t (CStruct (PriorityQueueSpine k v)) (PriorityQueue Identity k v)
+  instance
+    (PriorityQueueABI k v) => JanusCValRet t (PriorityQueue (JanusCT t) k v)
 
-instance (MinHeapABI k, JanusCEvaluate r) => JanusCEvaluate (MinHeap JanusC k -> r) where
-  jceval = mkPtrHandleJCEval unMinHeap MinHeap
+type instance JanusCHost (MinHeap (JanusCT _) k) = MinHeap Identity k
 
-type instance JanusCEval (JanusCM (MinHeap JanusC k)) = IO (MinHeap Identity k)
+deriving via
+  ViaPtrHandle t (CStruct (MinHeapSpine k)) (MinHeap Identity k)
+  instance
+    (MinHeapABI k) => JanusCArg t (MinHeap (JanusCT t) k)
 
-type instance JanusCRetType (JanusCM (MinHeap JanusC k)) = MinHeap Identity k
-
-instance (MinHeapABI k) => JanusCParam (JanusCM (MinHeap JanusC k)) where
-  jcparam = mkPtrHandleJCRetParam unMinHeap
-
-instance (MinHeapABI k) => JanusCEvaluate (JanusCM (MinHeap JanusC k)) where
-  jceval = mkPtrHandleJCRetEval MinHeap
-
-type instance LinuxX86_64CEval (MinHeap LinuxX86_64C k -> r) = MinHeap Identity k -> LinuxX86_64CEval r
-
-type instance LinuxX86_64BaseRet (MinHeap LinuxX86_64C k -> r) = LinuxX86_64BaseRet r
-
-instance (MinHeapABI k, LinuxX86_64Param r) => LinuxX86_64Param (MinHeap LinuxX86_64C k -> r) where
-  x86param = mkPtrHandleX86Param MinHeap
-
-instance (MinHeapABI k, X86DeferCont r, LinuxX86_64Evaluate r) => LinuxX86_64Evaluate (MinHeap LinuxX86_64C k -> r) where
-  x86eval = mkPtrHandleX86EvalParam unMinHeap MinHeap
-
-instance (MinHeapABI k, X86DeferCont r) => X86DeferCall (MinHeap LinuxX86_64C k -> r) where
-  x86DeferArg = mkPtrHandleX86DeferArg unMinHeap MinHeap
-
-instance (MinHeapABI k, X86DeferCont r) => X86DeferCont (MinHeap LinuxX86_64C k -> r) where
-  x86DeferCont = mkPtrHandleX86DeferCont unMinHeap MinHeap
-
-type instance LinuxX86_64CEval (LinuxX86_64CM (MinHeap LinuxX86_64C k)) = IO (MinHeap Identity k)
-
-type instance LinuxX86_64BaseRet (LinuxX86_64CM (MinHeap LinuxX86_64C k)) = MinHeap Identity k
-
-instance (MinHeapABI k) => LinuxX86_64Param (LinuxX86_64CM (MinHeap LinuxX86_64C k)) where
-  x86param = mkPtrHandleX86RetParam unMinHeap
-
-instance (MinHeapABI k) => LinuxX86_64Evaluate (LinuxX86_64CM (MinHeap LinuxX86_64C k)) where
-  x86eval = mkPtrHandleX86RetEval MinHeap
-
-instance (MinHeapABI k) => X86DeferCall (LinuxX86_64CM (MinHeap LinuxX86_64C k)) where
-  x86DeferArg = mkPtrHandleX86RetDeferArg MinHeap
-
-instance (MinHeapABI k) => X86DeferCont (LinuxX86_64CM (MinHeap LinuxX86_64C k)) where
-  x86DeferCont = mkPtrHandleX86RetDeferCont MinHeap
-
-instance (MinHeapABI k, LinuxX86_64Param r, JanusCTH r) => JanusCTH (MinHeap LinuxX86_64C k -> r) where
-  type JanusCTHEval (MinHeap LinuxX86_64C k -> r) = MinHeap Identity k -> JanusCTHEval r
-  janusCTHBackend _ = THBackendLinuxX86_64
-  janusCTHCodegen = x86param
-  janusCTHSpec _ =
-    let (ps, retSpec) = janusCTHSpec (Proxy @r)
-     in (mkPtrHandleTHParamSpec (Proxy @(MinHeap Identity k)) : ps, retSpec)
-
-instance (MinHeapABI k) => JanusCTH (LinuxX86_64CM (MinHeap LinuxX86_64C k)) where
-  type JanusCTHEval (LinuxX86_64CM (MinHeap LinuxX86_64C k)) = IO (MinHeap Identity k)
-  janusCTHBackend _ = THBackendLinuxX86_64
-  janusCTHCodegen = x86param
-  janusCTHSpec _ =
-    ([], mkPtrHandleTHRetSpec THRetIO (Proxy @(MinHeap Identity k)) (Proxy @(CStruct (MinHeapSpine k))))
+deriving via
+  ViaPtrHandle t (CStruct (MinHeapSpine k)) (MinHeap Identity k)
+  instance
+    (MinHeapABI k) => JanusCValRet t (MinHeap (JanusCT t) k)

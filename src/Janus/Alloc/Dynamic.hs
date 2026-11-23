@@ -48,7 +48,7 @@ import Janus.Expression.Ord (ExpOrd (..))
 import Janus.Typed (JanusTyped)
 
 -- | Core constraint bundle satisfied by all CPU Janus backends:
--- @(IO, Identity)@, @(JanusCM, JanusC)@, and @(LinuxX86_64CM, LinuxX86_64C)@.
+-- @(IO, Identity)@ and @(JanusCMT t, JanusCT t)@ across any target @t@.
 type CmdAllocBase m e =
   ( Monad m,
     CmdMem m e,

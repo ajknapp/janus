@@ -52,24 +52,15 @@ module Janus.Data.HKD
     newHKDCell,
     newHKDCell',
 
-    -- * Zero-Overhead Host (Identity) <-> Janus (e) HKD FFI Marshalling
+    -- * Zero-Overhead Host (Identity) <-> Janus (e) HKD & Handle FFI Marshalling
+    ViaPtrHandle (..),
+    coerceToVoidPtr,
+    coerceFromVoidPtr,
+    mkPtrHandleTHParamSpec,
+    mkPtrHandleTHRetSpec,
     JanusHKD (..),
     GHKDLeaves (..),
     HKD (..),
-    mkPtrHandleJCParam,
-    mkPtrHandleJCEval,
-    mkPtrHandleJCRetParam,
-    mkPtrHandleJCRetEval,
-    mkPtrHandleX86Param,
-    mkPtrHandleX86EvalParam,
-    mkPtrHandleX86DeferArg,
-    mkPtrHandleX86DeferCont,
-    mkPtrHandleX86RetParam,
-    mkPtrHandleX86RetEval,
-    mkPtrHandleX86RetDeferArg,
-    mkPtrHandleX86RetDeferCont,
-    mkPtrHandleTHParamSpec,
-    mkPtrHandleTHRetSpec,
   )
 where
 
@@ -84,22 +75,19 @@ import Data.Proxy (Proxy (..))
 import Data.Typeable (Typeable, typeRep)
 import qualified Data.Vector as V
 import Data.Word (Word64, Word8)
-import Foreign.ForeignPtr (ForeignPtr, withForeignPtr)
 import Foreign.LibFFI (Arg, argPtr, callFFI, retPtr, retVoid)
-import Foreign.Ptr (Ptr, castPtr, castPtrToFunPtr, intPtrToPtr, plusPtr, ptrToIntPtr, ptrToWordPtr, wordPtrToPtr)
+import Foreign.Ptr (Ptr, castPtr, intPtrToPtr, plusPtr, ptrToIntPtr, ptrToWordPtr, wordPtrToPtr)
 import qualified Foreign.Storable as Storable
 import GHC.Generics
 import GHC.TypeLits (KnownSymbol, symbolVal)
 import GHC.TypeNats (KnownNat, Nat, natVal)
 import Janus.Backend.C
-import Janus.Backend.C.LinuxX86_64
-import Janus.Backend.C.TH
-import Janus.Backend.C.Target (X86Features)
 import Janus.Command.Array (CmdStorable (..), ExpPtr (..))
 import Janus.Command.Ref (Cell (..), CmdRef, RefCell (..))
 import Janus.Expression.Bits (ExpBits (..))
 import Janus.Expression.Cast (ExpPtrCast (..))
-import Janus.FFI.Arg (FFIArg (..))
+import Janus.FFI.Arg (FFIArg (..), THParamMode (..), THParamSpec (..), typeRepToTHType)
+import Janus.FFI.Ret (THRetEffect (..), THRetMode (..), THRetSpec (..))
 import Janus.Typed (JanusTyped)
 import Language.C.Quote
   ( ArraySize (ArraySize),
@@ -138,24 +126,20 @@ instance ExpPtrWord Identity where
   ptrToWord64Expr (Identity p) = Identity (fromIntegral (ptrToWordPtr p))
   word64ToPtrExpr (Identity w) = Identity (wordPtrToPtr (fromIntegral w))
 
-instance ExpPtrWord JanusC where
+instance ExpPtrWord (JanusCT t) where
   ptrToWord64Expr (JanusC mp) = JanusC $ do
     addHeader "stdint.h"
     RVal p <- mp
     let uptrTy = Type (DeclSpec [] [] (Tnamed (Id "uintptr_t" noLoc) [] noLoc) noLoc) (DeclRoot noLoc) noLoc
         u64Ty = Type (DeclSpec [] [] (Tnamed (Id "uint64_t" noLoc) [] noLoc) noLoc) (DeclRoot noLoc) noLoc
     pure $ RVal $ Cast u64Ty (Cast uptrTy p noLoc) noLoc
-  word64ToPtrExpr :: forall a. (JanusCTyped a) => JanusC Word64 -> JanusC (Ptr a)
+  word64ToPtrExpr :: forall a. (JanusCTyped a) => JanusCT t Word64 -> JanusCT t (Ptr a)
   word64ToPtrExpr (JanusC mw) = JanusC $ do
     addHeader "stdint.h"
     RVal w <- mw
     JCType spec dec <- getJanusCType (Proxy @(Ptr a))
     let uptrTy = Type (DeclSpec [] [] (Tnamed (Id "uintptr_t" noLoc) [] noLoc) noLoc) (DeclRoot noLoc) noLoc
     pure $ RVal $ Cast (Type spec dec noLoc) (Cast uptrTy w noLoc) noLoc
-
-instance ExpPtrWord LinuxX86_64C where
-  ptrToWord64Expr (LinuxX86_64C p) = LinuxX86_64C (ptrToWord64Expr p)
-  word64ToPtrExpr (LinuxX86_64C w) = LinuxX86_64C (word64ToPtrExpr w)
 
 --------------------------------------------------------------------------------
 -- FixedArray (w :: Nat) a — ISO C Fixed-Length Array `a field[w]`
@@ -231,13 +215,10 @@ cPtrMemberLVal :: Exp -> String -> Exp
 cPtrMemberLVal (UnOp AddrOf lval _) fname = Member lval (Id fname noLoc) noLoc
 cPtrMemberLVal p fname = PtrMember p (Id fname noLoc) noLoc
 
-instance ExpStructPtr JanusC where
+instance ExpStructPtr (JanusCT t) where
   structFieldPtr (JanusC mp) _ fname = JanusC $ do
     RVal p <- mp
     pure $ RVal $ UnOp AddrOf (cPtrMemberLVal p fname) noLoc
-
-instance ExpStructPtr LinuxX86_64C where
-  structFieldPtr (LinuxX86_64C p) off fname = LinuxX86_64C (structFieldPtr p off fname)
 
 --------------------------------------------------------------------------------
 -- Generic C-ABI Struct Layout, Storable, C Typedef, & Pointer Projection
@@ -839,184 +820,16 @@ newHKDCell' = do
   pure (Cell (to <$> readCell c) (writeCell c . from))
 
 --------------------------------------------------------------------------------
--- Reusable Single-Pointer Handle FFI Helpers (Zero-Copy Identity <-> C)
+-- Reusable Single-Pointer Handle DerivingVia Wrapper (ViaPtrHandle)
 --------------------------------------------------------------------------------
 
-mkPtrHandleJCParam ::
-  forall p h r.
-  (JanusCTyped p, JanusCParam r) =>
-  (JanusC (Ptr p) -> h) ->
-  String ->
-  Int ->
-  JanusCM [Param] ->
-  JanusCBackend ->
-  (h -> r) ->
-  [JCFunc]
-mkPtrHandleJCParam wrap name n params backend f =
-  let params' = do
-        JCType spec dec <- getJanusCType (Proxy @(Ptr p))
-        ps <- params
-        pure (Param (Just (mkArgId n)) spec dec noLoc : ps)
-      argExp = wrap (JanusC (pure (RVal (Var (mkArgId n) noLoc))))
-   in jcparam name (n + 1) params' backend (f argExp)
+{-# INLINE coerceToVoidPtr #-}
+coerceToVoidPtr :: forall a p. (Coercible a (Ptr p)) => a -> Ptr ()
+coerceToVoidPtr x = castPtr (coerce x :: Ptr p)
 
-mkPtrHandleJCEval ::
-  forall p hHs hC r.
-  (JanusCEvaluate r) =>
-  (hHs -> Identity (Ptr p)) ->
-  (JanusC (Ptr p) -> hC) ->
-  ForeignPtr () ->
-  [Arg] ->
-  (hC -> r) ->
-  hHs ->
-  JanusCEval r
-mkPtrHandleJCEval unwrapHs wrapC dlFPtr args f valHs =
-  let Identity rawPtr = unwrapHs valHs
-      dummy = wrapC (JanusC (pure (RVal (Var (Id "this_is_a_bug_if_you_see_this" noLoc) noLoc))))
-   in jceval dlFPtr (argPtr rawPtr : args) (f dummy)
-
-mkPtrHandleJCRetParam ::
-  forall p hC.
-  (JanusCTyped p) =>
-  (hC -> JanusC (Ptr p)) ->
-  String ->
-  Int ->
-  JanusCM [Param] ->
-  JanusCBackend ->
-  JanusCM hC ->
-  [JCFunc]
-mkPtrHandleJCRetParam unwrapC name n params backend ma =
-  let maW8 :: JanusCM (JanusC (Ptr Word8))
-      maW8 = fromVoidPtr . toVoidPtr . unwrapC <$> ma
-   in jcparamImpl (Proxy @JanusC) name n params backend maW8
-
-mkPtrHandleJCRetEval ::
-  forall p hHs hC.
-  (Identity (Ptr p) -> hHs) ->
-  ForeignPtr () ->
-  [Arg] ->
-  JanusCM hC ->
-  IO hHs
-mkPtrHandleJCRetEval wrapHs dlFPtr args _ =
-  withForeignPtr dlFPtr $ \fp -> do
-    raw <- callFFI (castPtrToFunPtr fp) (retPtr retVoid) (reverse args)
-    pure (wrapHs (Identity (castPtr raw)))
-
-mkPtrHandleX86Param ::
-  forall p h r.
-  (JanusCTyped p, LinuxX86_64Param r) =>
-  (LinuxX86_64C (Ptr p) -> h) ->
-  X86Features ->
-  String ->
-  Int ->
-  JanusCM [Param] ->
-  (h -> r) ->
-  [JCFunc]
-mkPtrHandleX86Param wrap fs name n mparams f =
-  x86param fs name n mparams (\(pArg :: LinuxX86_64C (Ptr p)) -> f (wrap pArg))
-
-mkPtrHandleX86EvalParam ::
-  forall p hHs hC r b.
-  (JanusCTyped p, X86DeferCont r) =>
-  (hHs -> Identity (Ptr p)) ->
-  (LinuxX86_64C (Ptr p) -> hC) ->
-  ForeignPtr () ->
-  (([Arg] -> IO b) -> [Arg] -> IO b) ->
-  [Arg] ->
-  (hC -> r) ->
-  hHs ->
-  LinuxX86_64CEval r
-mkPtrHandleX86EvalParam unwrapHs wrapC dlFPtr _ args f valHs =
-  let Identity rawPtr = unwrapHs valHs
-      dummy = wrapC (LinuxX86_64C (JanusC (pure (RVal (Var (Id "this_is_a_bug_if_you_see_this" noLoc) noLoc)))))
-   in x86DeferCont (\k -> k (argPtr rawPtr : args)) dlFPtr (f dummy)
-
-mkPtrHandleX86DeferArg ::
-  forall p b hHs hC r.
-  (LinuxX86_64ABIParam b, X86DeferCont r) =>
-  (hHs -> Identity (Ptr p)) ->
-  (LinuxX86_64C (Ptr p) -> hC) ->
-  b ->
-  ForeignPtr () ->
-  [Arg] ->
-  (hC -> r) ->
-  hHs ->
-  LinuxX86_64CEval r
-mkPtrHandleX86DeferArg unwrapHs wrapC prevVal dlFPtr args f valHs =
-  let Identity rawPtr = unwrapHs valHs
-      dummy = wrapC (LinuxX86_64C (JanusC (pure (RVal (Var (Id "this_is_a_bug_if_you_see_this" noLoc) noLoc)))))
-   in x86DeferCont (\k -> x86WithArg prevVal (\ap -> k (argPtr rawPtr : ap : args))) dlFPtr (f dummy)
-
-mkPtrHandleX86DeferCont ::
-  forall p hHs hC r.
-  (X86DeferCont r) =>
-  (hHs -> Identity (Ptr p)) ->
-  (LinuxX86_64C (Ptr p) -> hC) ->
-  (([Arg] -> IO (LinuxX86_64BaseRet r)) -> IO (LinuxX86_64BaseRet r)) ->
-  ForeignPtr () ->
-  (hC -> r) ->
-  hHs ->
-  LinuxX86_64CEval r
-mkPtrHandleX86DeferCont unwrapHs wrapC withArgs dlFPtr f valHs =
-  let Identity rawPtr = unwrapHs valHs
-      dummy = wrapC (LinuxX86_64C (JanusC (pure (RVal (Var (Id "this_is_a_bug_if_you_see_this" noLoc) noLoc)))))
-   in x86DeferCont (\k -> withArgs (\as -> k (argPtr rawPtr : as))) dlFPtr (f dummy)
-
-mkPtrHandleX86RetParam ::
-  forall p hC.
-  (JanusCTyped p) =>
-  (hC -> LinuxX86_64C (Ptr p)) ->
-  X86Features ->
-  String ->
-  Int ->
-  JanusCM [Param] ->
-  LinuxX86_64CM hC ->
-  [JCFunc]
-mkPtrHandleX86RetParam unwrapC fs name n mparams ma =
-  let maPtr :: LinuxX86_64CM (LinuxX86_64C (Ptr Word8))
-      maPtr = fromVoidPtr . toVoidPtr . unwrapC <$> ma
-   in x86param fs name n mparams maPtr
-
-mkPtrHandleX86RetEval ::
-  forall p hHs hC b.
-  (Identity (Ptr p) -> hHs) ->
-  ForeignPtr () ->
-  (([Arg] -> IO b) -> [Arg] -> IO b) ->
-  [Arg] ->
-  LinuxX86_64CM hC ->
-  IO hHs
-mkPtrHandleX86RetEval wrapHs dlFPtr _ args _ =
-  withForeignPtr dlFPtr $ \fp -> do
-    raw <- callFFI (castPtrToFunPtr fp) (retPtr retVoid) (reverse args)
-    pure (wrapHs (Identity (castPtr raw)))
-
-mkPtrHandleX86RetDeferArg ::
-  forall p a hHs hC.
-  (LinuxX86_64ABIParam a) =>
-  (Identity (Ptr p) -> hHs) ->
-  a ->
-  ForeignPtr () ->
-  [Arg] ->
-  LinuxX86_64CM hC ->
-  IO hHs
-mkPtrHandleX86RetDeferArg wrapHs x dlFPtr args _ =
-  withForeignPtr dlFPtr $ \fp ->
-    x86WithArg x $ \ax -> do
-      raw <- callFFI (castPtrToFunPtr fp) (retPtr retVoid) (reverse (ax : args))
-      pure (wrapHs (Identity (castPtr raw)))
-
-mkPtrHandleX86RetDeferCont ::
-  forall p hHs hC.
-  (Identity (Ptr p) -> hHs) ->
-  (([Arg] -> IO hHs) -> IO hHs) ->
-  ForeignPtr () ->
-  LinuxX86_64CM hC ->
-  IO hHs
-mkPtrHandleX86RetDeferCont wrapHs withArgs dlFPtr _ =
-  withForeignPtr dlFPtr $ \fp ->
-    withArgs $ \as -> do
-      raw <- callFFI (castPtrToFunPtr fp) (retPtr retVoid) (reverse as)
-      pure (wrapHs (Identity (castPtr raw)))
+{-# INLINE coerceFromVoidPtr #-}
+coerceFromVoidPtr :: forall a p. (Coercible (Ptr p) a) => Ptr () -> a
+coerceFromVoidPtr p = coerce (castPtr p :: Ptr p)
 
 mkPtrHandleTHParamSpec ::
   forall p hHs.
@@ -1047,13 +860,44 @@ mkPtrHandleTHRetSpec eff ph _ =
           (\e -> TH.AppE (TH.VarE 'coerceFromVoidPtr) e)
     }
 
-{-# INLINE coerceToVoidPtr #-}
-coerceToVoidPtr :: forall a p. (Coercible a (Ptr p)) => a -> Ptr ()
-coerceToVoidPtr x = castPtr (coerce x :: Ptr p)
+-- | @DerivingVia@ adapter for single-pointer container and allocator handles
+-- (@newtype Handle e ... = Handle (e (Ptr pointee))@), providing target-polymorphic
+-- 'JanusCArg' and 'JanusCValRet' instances (including Template Haskell specs)
+-- across every @JanusCT t@ target with zero per-architecture boilerplate.
+newtype ViaPtrHandle (t :: K.Type) pointee hHs = ViaPtrHandle
+  { unViaPtrHandle :: JanusCT t (Ptr pointee)
+  }
 
-{-# INLINE coerceFromVoidPtr #-}
-coerceFromVoidPtr :: forall a p. (Coercible (Ptr p) a) => Ptr () -> a
-coerceFromVoidPtr p = coerce (castPtr p :: Ptr p)
+type instance JanusCHost (ViaPtrHandle _ _ hHs) = hHs
+
+instance
+  (JanusCTyped pointee, Typeable hHs, Coercible hHs (Ptr pointee)) =>
+  JanusCArg t (ViaPtrHandle t pointee hHs)
+  where
+  jcEmitArg n =
+    let aid = mkArgId n
+        mkP = do
+          JCType spec dec <- getJanusCType (Proxy @(Ptr pointee))
+          pure [Param (Just aid) spec dec noLoc]
+     in (n + 1, mkP, ViaPtrHandle (JanusCT (pure (RVal (Var aid noLoc)))))
+  jcDummyArg =
+    ViaPtrHandle (JanusCT (pure (RVal (Var (Id "this_is_a_bug_if_you_see_this" noLoc) noLoc))))
+  jcWithHostArg _ valHs prevArgs k =
+    k (argPtr (coerceToVoidPtr @hHs @pointee valHs) : prevArgs)
+  jcTHParamSpecs _ =
+    [mkPtrHandleTHParamSpec @pointee @hHs (Proxy @hHs)]
+
+instance
+  (JanusCTyped pointee, Typeable hHs, Coercible (Ptr pointee) hHs) =>
+  JanusCValRet t (ViaPtrHandle t pointee hHs)
+  where
+  jcFinishValRet _ (ViaPtrHandle ptrExp) =
+    finishFunction ptrExp >> pure []
+  jcCallValRet _ _ fp args = do
+    raw <- callFFI fp (retPtr retVoid) (reverse args)
+    pure (coerceFromVoidPtr @hHs @pointee raw)
+  jcTHValRetSpec _ eff _ =
+    mkPtrHandleTHRetSpec @pointee @hHs eff (Proxy @hHs) (Proxy @pointee)
 
 --------------------------------------------------------------------------------
 -- Generic Multi-Field HKD Wrapper (`HKD d e`) for Arbitrary HKD Records
@@ -1064,135 +908,79 @@ newtype HKD (d :: (K.Type -> K.Type) -> K.Type) (e :: K.Type -> K.Type) = HKD
   }
 
 class JanusHKD (d :: (K.Type -> K.Type) -> K.Type) where
-  hkdEmitParamsJC :: Int -> JanusCM [Param] -> (d JanusC, Int, JanusCM [Param])
-  hkdEmitParamsX86 :: Int -> JanusCM [Param] -> (d LinuxX86_64C, Int, JanusCM [Param])
+  hkdEmitArg :: forall t. Proxy t -> Int -> (Int, JanusCM [Param], d (JanusCT t))
   hkdPackArgs :: d Identity -> [Arg] -> [Arg]
-  hkdDummyJC :: d JanusC
-  hkdDummyX86 :: d LinuxX86_64C
+  hkdDummy :: forall t. d (JanusCT t)
 
-  default hkdEmitParamsJC ::
-    (Generic (d JanusC), GHKDLeaves (Rep (d Identity)) (Rep (d JanusC)) (Rep (d LinuxX86_64C))) =>
+  default hkdEmitArg ::
+    forall t.
+    (Generic (d (JanusCT t)), GHKDLeaves t (Rep (d Identity)) (Rep (d (JanusCT t)))) =>
+    Proxy t ->
     Int ->
-    JanusCM [Param] ->
-    (d JanusC, Int, JanusCM [Param])
-  hkdEmitParamsJC n mp =
-    let (repJC, n', mp') = gEmitParamsJC @(Rep (d Identity)) @(Rep (d JanusC)) @(Rep (d LinuxX86_64C)) n mp
-     in (to repJC, n', mp')
-
-  default hkdEmitParamsX86 ::
-    (Generic (d LinuxX86_64C), GHKDLeaves (Rep (d Identity)) (Rep (d JanusC)) (Rep (d LinuxX86_64C))) =>
-    Int ->
-    JanusCM [Param] ->
-    (d LinuxX86_64C, Int, JanusCM [Param])
-  hkdEmitParamsX86 n mp =
-    let (repX, n', mp') = gEmitParamsX86 @(Rep (d Identity)) @(Rep (d JanusC)) @(Rep (d LinuxX86_64C)) n mp
-     in (to repX, n', mp')
+    (Int, JanusCM [Param], d (JanusCT t))
+  hkdEmitArg _ n =
+    let (n', mkPs, repCT) = gEmitArg @t @(Rep (d Identity)) @(Rep (d (JanusCT t))) n
+     in (n', mkPs, to repCT)
 
   default hkdPackArgs ::
-    (Generic (d Identity), GHKDLeaves (Rep (d Identity)) (Rep (d JanusC)) (Rep (d LinuxX86_64C))) =>
+    (Generic (d Identity), GHKDLeaves PortableC (Rep (d Identity)) (Rep (d JanusC))) =>
     d Identity ->
     [Arg] ->
     [Arg]
-  hkdPackArgs v acc = gPackArgs @(Rep (d Identity)) @(Rep (d JanusC)) @(Rep (d LinuxX86_64C)) (from v) acc
+  hkdPackArgs v acc = gPackArgs @PortableC @(Rep (d Identity)) @(Rep (d JanusC)) (from v) acc
 
-  default hkdDummyJC ::
-    (Generic (d JanusC), GHKDLeaves (Rep (d Identity)) (Rep (d JanusC)) (Rep (d LinuxX86_64C))) =>
-    d JanusC
-  hkdDummyJC = to (gDummyJC @(Rep (d Identity)) @(Rep (d JanusC)) @(Rep (d LinuxX86_64C)))
+  default hkdDummy ::
+    forall t.
+    (Generic (d (JanusCT t)), GHKDLeaves t (Rep (d Identity)) (Rep (d (JanusCT t)))) =>
+    d (JanusCT t)
+  hkdDummy = to (gDummy @t @(Rep (d Identity)) @(Rep (d (JanusCT t))))
 
-  default hkdDummyX86 ::
-    (Generic (d LinuxX86_64C), GHKDLeaves (Rep (d Identity)) (Rep (d JanusC)) (Rep (d LinuxX86_64C))) =>
-    d LinuxX86_64C
-  hkdDummyX86 = to (gDummyX86 @(Rep (d Identity)) @(Rep (d JanusC)) @(Rep (d LinuxX86_64C)))
-
-class GHKDLeaves (rId :: K.Type -> K.Type) (rJC :: K.Type -> K.Type) (rX86 :: K.Type -> K.Type) where
-  gEmitParamsJC :: Int -> JanusCM [Param] -> (rJC p, Int, JanusCM [Param])
-  gEmitParamsX86 :: Int -> JanusCM [Param] -> (rX86 p, Int, JanusCM [Param])
+class GHKDLeaves (t :: K.Type) (rId :: K.Type -> K.Type) (rCT :: K.Type -> K.Type) where
+  gEmitArg :: Int -> (Int, JanusCM [Param], rCT p)
   gPackArgs :: rId p -> [Arg] -> [Arg]
-  gDummyJC :: rJC p
-  gDummyX86 :: rX86 p
+  gDummy :: rCT p
 
-instance (GHKDLeaves fId fJC fX86) => GHKDLeaves (M1 i c fId) (M1 i c fJC) (M1 i c fX86) where
-  gEmitParamsJC n mp = let (r, n', mp') = gEmitParamsJC @fId @fJC @fX86 n mp in (M1 r, n', mp')
-  gEmitParamsX86 n mp = let (r, n', mp') = gEmitParamsX86 @fId @fJC @fX86 n mp in (M1 r, n', mp')
-  gPackArgs (M1 x) acc = gPackArgs @fId @fJC @fX86 x acc
-  gDummyJC = M1 (gDummyJC @fId @fJC @fX86)
-  gDummyX86 = M1 (gDummyX86 @fId @fJC @fX86)
+instance (GHKDLeaves t fId fCT) => GHKDLeaves t (M1 i c fId) (M1 i c fCT) where
+  gEmitArg n = let (n', mp, r) = gEmitArg @t @fId @fCT n in (n', mp, M1 r)
+  gPackArgs (M1 x) acc = gPackArgs @t @fId @fCT x acc
+  gDummy = M1 (gDummy @t @fId @fCT)
 
 instance
-  (GHKDLeaves fId fJC fX86, GHKDLeaves gId gJC gX86) =>
-  GHKDLeaves (fId :*: gId) (fJC :*: gJC) (fX86 :*: gX86)
+  (GHKDLeaves t fId fCT, GHKDLeaves t gId gCT) =>
+  GHKDLeaves t (fId :*: gId) (fCT :*: gCT)
   where
-  gEmitParamsJC n0 mp0 =
-    let (rf, n1, mp1) = gEmitParamsJC @fId @fJC @fX86 n0 mp0
-        (rg, n2, mp2) = gEmitParamsJC @gId @gJC @gX86 n1 mp1
-     in (rf :*: rg, n2, mp2)
-  gEmitParamsX86 n0 mp0 =
-    let (rf, n1, mp1) = gEmitParamsX86 @fId @fJC @fX86 n0 mp0
-        (rg, n2, mp2) = gEmitParamsX86 @gId @gJC @gX86 n1 mp1
-     in (rf :*: rg, n2, mp2)
+  gEmitArg n0 =
+    let (n1, mp1, rf) = gEmitArg @t @fId @fCT n0
+        (n2, mp2, rg) = gEmitArg @t @gId @gCT n1
+     in (n2, (<>) <$> mp1 <*> mp2, rf :*: rg)
   gPackArgs (fx :*: gx) acc =
-    let acc1 = gPackArgs @fId @fJC @fX86 fx acc
-     in gPackArgs @gId @gJC @gX86 gx acc1
-  gDummyJC = gDummyJC @fId @fJC @fX86 :*: gDummyJC @gId @gJC @gX86
-  gDummyX86 = gDummyX86 @fId @fJC @fX86 :*: gDummyX86 @gId @gJC @gX86
+    let acc1 = gPackArgs @t @fId @fCT fx acc
+     in gPackArgs @t @gId @gCT gx acc1
+  gDummy = gDummy @t @fId @fCT :*: gDummy @t @gId @gCT
 
-instance (JanusCTyped a, FFIArg a) => GHKDLeaves (K1 i (Identity a)) (K1 i (JanusC a)) (K1 i (LinuxX86_64C a)) where
-  gEmitParamsJC n mp =
-    let mp' = do
+instance (JanusCTyped a, FFIArg a) => GHKDLeaves t (K1 i (Identity a)) (K1 i (JanusCT t a)) where
+  gEmitArg n =
+    let aid = mkArgId n
+        mp = do
           JCType spec dec <- getJanusCType (Proxy @a)
-          ps <- mp
-          pure (Param (Just (mkArgId n)) spec dec noLoc : ps)
-        v = JanusC (pure (RVal (Var (mkArgId n) noLoc)))
-     in (K1 v, n + 1, mp')
-  gEmitParamsX86 n mp =
-    let mp' = do
-          JCType spec dec <- getJanusCType (Proxy @a)
-          ps <- mp
-          pure (Param (Just (mkArgId n)) spec dec noLoc : ps)
-        v = LinuxX86_64C (JanusC (pure (RVal (Var (mkArgId n) noLoc))))
-     in (K1 v, n + 1, mp')
+          pure [Param (Just aid) spec dec noLoc]
+        v = JanusCT (pure (RVal (Var aid noLoc)))
+     in (n + 1, mp, K1 v)
   gPackArgs (K1 (Identity x)) acc = arg x : acc
-  gDummyJC = K1 (JanusC (pure (RVal (Var (Id "this_is_a_bug_if_you_see_this" noLoc) noLoc))))
-  gDummyX86 = K1 (LinuxX86_64C (JanusC (pure (RVal (Var (Id "this_is_a_bug_if_you_see_this" noLoc) noLoc)))))
+  gDummy = K1 (JanusCT (pure (RVal (Var (Id "this_is_a_bug_if_you_see_this" noLoc) noLoc))))
 
-instance (JanusHKD sub) => GHKDLeaves (K1 i (sub Identity)) (K1 i (sub JanusC)) (K1 i (sub LinuxX86_64C)) where
-  gEmitParamsJC n mp = let (s, n', mp') = hkdEmitParamsJC @sub n mp in (K1 s, n', mp')
-  gEmitParamsX86 n mp = let (s, n', mp') = hkdEmitParamsX86 @sub n mp in (K1 s, n', mp')
+instance (JanusHKD sub) => GHKDLeaves t (K1 i (sub Identity)) (K1 i (sub (JanusCT t))) where
+  gEmitArg n = let (n', mp, s) = hkdEmitArg @sub (Proxy @t) n in (n', mp, K1 s)
   gPackArgs (K1 s) acc = hkdPackArgs s acc
-  gDummyJC = K1 (hkdDummyJC @sub)
-  gDummyX86 = K1 (hkdDummyX86 @sub)
+  gDummy = K1 (hkdDummy @sub @t)
 
-type instance JanusCEval (HKD d JanusC -> r) = d Identity -> JanusCEval r
+type instance JanusCHost (HKD d (JanusCT _)) = d Identity
 
-type instance JanusCRetType (HKD d JanusC -> r) = JanusCRetType r
-
-instance (JanusHKD d, JanusCParam r) => JanusCParam (HKD d JanusC -> r) where
-  jcparam name n params backend f =
-    let (valJC, n', params') = hkdEmitParamsJC @d n params
-     in jcparam name n' params' backend (f (HKD valJC))
-
-instance (JanusHKD d, JanusCEvaluate r) => JanusCEvaluate (HKD d JanusC -> r) where
-  jceval dlFPtr args f valHs =
-    jceval dlFPtr (hkdPackArgs valHs args) (f (HKD (hkdDummyJC @d)))
-
-type instance LinuxX86_64CEval (HKD d LinuxX86_64C -> r) = d Identity -> LinuxX86_64CEval r
-
-type instance LinuxX86_64BaseRet (HKD d LinuxX86_64C -> r) = LinuxX86_64BaseRet r
-
-instance (JanusHKD d, LinuxX86_64Param r) => LinuxX86_64Param (HKD d LinuxX86_64C -> r) where
-  x86param fs name n mparams f =
-    let (valX86, n', mparams') = hkdEmitParamsX86 @d n mparams
-     in x86param fs name n' mparams' (f (HKD valX86))
-
-instance (JanusHKD d, X86DeferCont r, LinuxX86_64Evaluate r) => LinuxX86_64Evaluate (HKD d LinuxX86_64C -> r) where
-  x86eval dlFPtr _ args f valHs =
-    x86DeferCont (\k -> k (hkdPackArgs valHs args)) dlFPtr (f (HKD (hkdDummyX86 @d)))
-
-instance (JanusHKD b, X86DeferCont r) => X86DeferCall (HKD b LinuxX86_64C -> r) where
-  x86DeferArg x dlFPtr args f valHs =
-    x86DeferCont (\k -> x86WithArg x (\ax -> k (hkdPackArgs valHs (ax : args)))) dlFPtr (f (HKD (hkdDummyX86 @b)))
-
-instance (JanusHKD d, X86DeferCont r) => X86DeferCont (HKD d LinuxX86_64C -> r) where
-  x86DeferCont withArgs dlFPtr f valHs =
-    x86DeferCont (\k -> withArgs (\as -> k (hkdPackArgs valHs as))) dlFPtr (f (HKD (hkdDummyX86 @d)))
+instance (JanusHKD d) => JanusCArg t (HKD d (JanusCT t)) where
+  jcEmitArg n =
+    let (n', mkPs, valCT) = hkdEmitArg @d (Proxy @t) n
+     in (n', mkPs, HKD valCT)
+  jcDummyArg = HKD (hkdDummy @d @t)
+  jcWithHostArg _ valHs prevArgs k = k (hkdPackArgs valHs prevArgs)
+  jcTHParamSpecs _ =
+    error "Janus.Backend.C.TH: multi-parameter by-value HKD records are not supported in TH splices; pass Ptr (CStruct d) or a container handle"
