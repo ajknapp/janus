@@ -20,7 +20,6 @@
 module Janus.SPMD.Gang where
 
 import Control.Monad (when)
-import Control.Monad.Trans.Class (lift)
 import Data.Complex (Complex)
 import Data.Functor.Identity (Identity)
 import Data.Int (Int16, Int32, Int64, Int8)
@@ -29,17 +28,6 @@ import Data.Proxy (Proxy (..))
 import Data.Word (Word16, Word32, Word64, Word8)
 import Foreign.Ptr (Ptr)
 import GHC.TypeNats (KnownNat, Nat, natVal)
-import Janus.Backend.C.CUDA
-  ( CUDADejaFu,
-    CUDADejaFuM,
-    CUDAIO,
-    CUDAIOM,
-    JanusCUDA,
-    JanusCUDAM (..),
-    askCUDADejaFuFeatures,
-    askCUDAFeatures,
-    askCUDAIOFeatures,
-  )
 import Janus.Backend.C.Target
   ( CUDAFeatures,
     X86Feature (..),
@@ -311,21 +299,6 @@ instance CmdOptimalGang IO Identity where
   withOptimalGang pa k = do
     fs <- getActiveHostX86Features
     dispatchGangInt (optimalX86GangSize fs pa) k
-
-instance CmdOptimalGang JanusCUDAM JanusCUDA where
-  withOptimalGang pa k = do
-    fs <- JanusCUDAM (lift askCUDAFeatures)
-    dispatchGangInt (optimalCUDAGangSize fs pa) k
-
-instance CmdOptimalGang CUDAIOM CUDAIO where
-  withOptimalGang pa k = do
-    fs <- askCUDAIOFeatures
-    dispatchGangInt (optimalCUDAGangSize fs pa) k
-
-instance CmdOptimalGang CUDADejaFuM CUDADejaFu where
-  withOptimalGang pa k = do
-    fs <- askCUDADejaFuFeatures
-    dispatchGangInt (optimalCUDAGangSize fs pa) k
 
 -- Strip-Mining Combinators Over Unlifted Ranges & Tensors
 foreachImpl ::

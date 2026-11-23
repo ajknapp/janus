@@ -131,7 +131,33 @@ library
                       Janus.SPMD
                       Janus.Typed
     -- Modules included in this library but not exported.
-    other-modules:    Janus.Expression.SIMD.Types
+    other-modules:    Janus.Backend.C.CUDA.CPU
+                      Janus.Backend.C.CUDA.CPUSIMD
+                      Janus.Backend.C.CUDA.Gang
+                      Janus.Backend.C.CUDA.Kernel
+                      Janus.Backend.C.CUDA.Runtime
+                      Janus.Backend.C.CUDA.SIMD.Arith
+                      Janus.Backend.C.CUDA.SIMD.Base
+                      Janus.Backend.C.CUDA.SIMD.Bits
+                      Janus.Backend.C.CUDA.SIMD.Cast
+                      Janus.Backend.C.CUDA.SIMD.Float
+                      Janus.Backend.C.CUDA.SIMD.MaskCmp
+                      Janus.Backend.C.CUDA.SIMD.Mem
+                      Janus.Backend.C.CUDA.SIMD.ReduceDot
+                      Janus.Backend.C.CUDA.SIMD.Shuffle
+                      Janus.Backend.C.CUDA.Types
+                      Janus.Backend.C.LinuxX86_64.Gang
+                      Janus.Backend.C.LinuxX86_64.SIMD.Arith
+                      Janus.Backend.C.LinuxX86_64.SIMD.Base
+                      Janus.Backend.C.LinuxX86_64.SIMD.Bits
+                      Janus.Backend.C.LinuxX86_64.SIMD.Cast
+                      Janus.Backend.C.LinuxX86_64.SIMD.Float
+                      Janus.Backend.C.LinuxX86_64.SIMD.MaskCmp
+                      Janus.Backend.C.LinuxX86_64.SIMD.Mem
+                      Janus.Backend.C.LinuxX86_64.SIMD.ReduceDot
+                      Janus.Backend.C.LinuxX86_64.SIMD.Shuffle
+                      Janus.Backend.C.LinuxX86_64.Types
+                      Janus.Expression.SIMD.Types
                       Janus.Expression.SIMD.FFI
                       Janus.Expression.SIMD.CPU
                       Janus.SPMD.Cast

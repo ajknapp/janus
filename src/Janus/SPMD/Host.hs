@@ -22,7 +22,7 @@ import Data.Proxy (Proxy (..))
 import Data.Typeable (Typeable, typeRep)
 import GHC.TypeNats (KnownNat, Nat, natVal)
 import Janus.Backend.C
-import Janus.Backend.C.CUDA (CUDADejaFu (..), CUDAIO (..))
+import Janus.Backend.C.CUDA.Types (CUDADejaFu (..), CUDAIO (..))
 import Janus.Expression.Extract (ExpExtract (..))
 import Janus.Expression.SIMD
 import Janus.FFI.Arg (THParamMode (..), THParamSpec (..), natToTHType, typeRepToTHType)

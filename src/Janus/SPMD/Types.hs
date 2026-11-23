@@ -58,7 +58,7 @@ import qualified Foreign.Storable as Storable
 import GHC.Generics (Generic)
 import GHC.TypeNats (KnownNat, Nat, SomeNat (..), natVal, someNatVal)
 import Janus.Backend.C
-import Janus.Backend.C.CUDA (CUDADejaFu (..), CUDAIO (..), CmdSync (..), JanusCUDA (..))
+import Janus.Backend.C.CUDA.Types (CUDADejaFu (..), CUDAIO (..), CmdSync (..), JanusCUDA (..))
 import Janus.Command.Ref (CmdRef (..))
 import Janus.Expression.Bits (ExpBits (..))
 import Janus.Expression.Bool (ExpBool (..))

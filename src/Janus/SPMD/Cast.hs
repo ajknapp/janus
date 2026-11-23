@@ -26,7 +26,7 @@ import Data.Word (Word32, Word64)
 import Foreign.C.Types (CDouble, CFloat)
 import Foreign.Ptr (Ptr)
 import GHC.TypeNats (KnownNat, Nat, natVal)
-import Janus.Backend.C.CUDA (CUDADejaFu, CUDAIO)
+import Janus.Backend.C.CUDA.Types (CUDADejaFu, CUDAIO)
 import qualified Janus.Command.Array as A
 import Janus.Expression.Cast
   ( ExpBoolCast (..),
