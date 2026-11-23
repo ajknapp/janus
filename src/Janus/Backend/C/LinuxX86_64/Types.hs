@@ -53,8 +53,8 @@ instance JanusCTarget LinuxX86_64 where
 --------------------------------------------------------------------------------
 
 ticTocAsmBlock ::
-  (LinuxX86_64C a -> b) -> String -> LinuxX86_64CM b
-ticTocAsmBlock newty str = do
+  (LinuxX86_64C a -> b) -> String -> [String] -> LinuxX86_64CM b
+ticTocAsmBlock newty str clobbers = do
   fname <- askFuncName
   JCType spec dec <- getJanusCType (Proxy @Word64)
   jcs <- get
@@ -63,7 +63,7 @@ ticTocAsmBlock newty str = do
       let c = f ^. jcfVarCounter
           vid = Id ("x_" <> show c) noLoc
           ini = Init vid dec Nothing Nothing [] noLoc
-          asm = Asm True [] (StringLit [show str] "" noLoc) [AsmOut Nothing "\"=a\"" vid] [] ["\"rdx\""] noLoc
+          asm = Asm True [] (StringLit [show str] "" noLoc) [AsmOut Nothing "\"=a\"" vid] [] clobbers noLoc
           block = appendBlock (f ^. jcfBlock) [BlockDecl (InitGroup spec [] [ini] noLoc), BlockStm asm]
       put $
         jcs
@@ -73,5 +73,5 @@ ticTocAsmBlock newty str = do
     Nothing -> error "tic: the impossible happened"
 
 instance CmdTicToc LinuxX86_64CM LinuxX86_64C where
-  tic = ticTocAsmBlock Tic "rdtsc\n\tlfence\n\tshl $32, %%rdx\n\tor %%rdx, %0"
-  toc = ticTocAsmBlock Toc "rdtscp\n\tshl $32, %%rdx\n\tor %%rdx, %0"
+  tic = ticTocAsmBlock Tic "rdtsc\n\tlfence\n\tshl $32, %%rdx\n\tor %%rdx, %0" ["\"rdx\"", "\"cc\"", "\"memory\""]
+  toc = ticTocAsmBlock Toc "rdtscp\n\tshl $32, %%rdx\n\tor %%rdx, %0" ["\"rdx\"", "\"rcx\"", "\"cc\"", "\"memory\""]

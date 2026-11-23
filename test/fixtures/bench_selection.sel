@@ -1,0 +1,4 @@
+[
+  ("algo_piece", "fast_spmd"),
+  ("unroll_piece", "wide_4")
+]

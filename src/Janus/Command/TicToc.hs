@@ -4,6 +4,7 @@ module Janus.Command.TicToc where
 
 import Data.Functor.Identity
 import Data.Word
+import Janus.CBits ()
 
 foreign import ccall janus_tic :: IO Word64
 

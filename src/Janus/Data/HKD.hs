@@ -33,8 +33,7 @@ module Janus.Data.HKD
     fixedArrayElemPtr,
     alignUpInt,
     alignUpExpr,
-    ptrToWord64Expr,
-    word64ToPtrExpr,
+    ExpPtrWord (..),
 
     -- * Generic C-ABI Struct Layout, Storable, Codegen & Field Addressing
     ExpStructPtr (..),

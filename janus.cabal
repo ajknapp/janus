@@ -34,12 +34,12 @@ library janus-cbits
                     , lens
     hs-source-dirs:   cbits-hs
     c-sources:        cbits/janus_simd.c
+                      cbits/janus.c
     include-dirs:     cbits/
     default-language: Haskell2010
 
 library
     import:           warnings
-    c-sources:        cbits/janus.c
     exposed-modules:  Janus
                       Janus.Alloc
                       Janus.Alloc.Arena
@@ -56,9 +56,12 @@ library
                       Janus.Backend.C.LinuxX86_64
                       Janus.Backend.C.TH
                       Janus.Backend.C.Target
+                      Janus.Bench
+                      Janus.Control.CSV
                       Janus.Control.Drain
                       Janus.Control.Fold
                       Janus.Control.Pipe
+                      Janus.Control.Reader
                       Janus.Control.Step
                       Janus.Control.Stream
                       Janus.Control.Unfold
@@ -132,6 +135,15 @@ library
                       Janus.Typed
     -- Modules included in this library but not exported.
     other-modules:    Janus.Backend.C.CUDA.CPU
+                      Janus.Bench.Choice
+                      Janus.Bench.Gang
+                      Janus.Bench.Instances
+                      Janus.Bench.Runner
+                      Janus.Bench.Stats
+                      Janus.Bench.Types
+                      Janus.Control.Reader.Base
+                      Janus.Control.Reader.Gang
+                      Janus.Control.Reader.TH
                       Janus.Backend.C.CUDA.CPUSIMD
                       Janus.Backend.C.CUDA.Gang
                       Janus.Backend.C.CUDA.Kernel
@@ -224,6 +236,8 @@ test-suite janus-test
 
     -- Modules included in this executable, other than Main.
     other-modules:    Test.Janus.Fix
+                      Test.Janus.Bench
+                      Test.Janus.BenchDefs
                       Test.Janus.Backend.C.CUDA
                       Test.Janus.Backend.C.TH
                       Test.Janus.Backend.C.THDefs

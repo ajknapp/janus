@@ -69,7 +69,7 @@ uint64_t janus_tic()
                 "or %%rdx, %0"
                 : "=a" (start_time)
                 :
-                : "rdx");
+                : "rdx", "cc", "memory");
   return start_time;
 }
 
@@ -81,7 +81,7 @@ uint64_t janus_toc()
                 "or %%rdx, %0"
                 : "=a" (stop_time)
                 :
-                : "rdx");
+                : "rdx", "rcx", "cc", "memory");
   return stop_time;
 }
 #elif defined(__aarch64__)

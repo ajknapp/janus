@@ -11,6 +11,7 @@
 module Janus.Fix where
 
 import Control.Lens
+import Control.Monad (unless)
 import Control.Monad.Reader
 import Control.Monad.State
 import qualified Crypto.Hash.SHA256 as SHA256
@@ -20,6 +21,8 @@ import Data.Char (isAlphaNum)
 import Data.Function
 import Data.Kind as K
 import Data.Loc
+import qualified Data.Map as Map
+import Data.Maybe (isJust)
 import Data.Proxy
 import qualified Data.Set as Set
 import qualified Data.Text as Text
@@ -39,12 +42,14 @@ instance (Typeable t, JanusCTyped a) => JanusCFix (JanusCMT t (JanusCT t a)) whe
   jcfun name args params _ body = do
     fi <- ask
     let funInfo = fi & jcfiName .~ name & jcfiIsLocal .~ True
+    alreadyDefined <- gets (maybe False (isJust . _jcfType) . Map.lookup name)
     params' <- liftJanusCM (localFun funInfo params)
     let params'' = Params (reverse params') False noLoc
-    localFun funInfo $ do
-      modify $ \s -> s & ix name . jcfParams .~ params''
-      body' <- body
-      finishFunction body'
+    unless alreadyDefined $
+      localFun funInfo $ do
+        modify $ \s -> s & ix name . jcfParams .~ params''
+        body' <- body
+        finishFunction body'
     JCType spec dec <- getJanusCType (Proxy @a)
     let proto = InitGroup (setTypeQualifiers (jcTypeQuals funInfo) spec) [] [Init (Id name noLoc) (Proto dec params'' noLoc) Nothing Nothing [] noLoc] noLoc
     modifyFunction $ \f -> f & jcfProtos %~ Set.insert proto
@@ -58,11 +63,13 @@ instance (Typeable t, JanusCTyped a) => JanusCFix (JanusCT t a) where
   jcfun name args params _ body = JanusC $ do
     fi <- ask
     let funInfo = fi & jcfiName .~ name & jcfiIsLocal .~ True
+    alreadyDefined <- gets (maybe False (isJust . _jcfType) . Map.lookup name)
     params' <- localFun funInfo params
     let params'' = Params (reverse params') False noLoc
-    localFun funInfo $ do
-      modify $ \s -> s & ix name . jcfParams .~ params''
-      finishFunction body
+    unless alreadyDefined $
+      localFun funInfo $ do
+        modify $ \s -> s & ix name . jcfParams .~ params''
+        finishFunction body
     JCType spec dec <- getJanusCType (Proxy @a)
     let proto = InitGroup (setTypeQualifiers (jcTypeQuals funInfo) spec) [] [Init (Id name noLoc) (Proto dec params'' noLoc) Nothing Nothing [] noLoc] noLoc
     modifyFunction $ \f -> f & jcfProtos %~ Set.insert proto

@@ -8,6 +8,7 @@ import Data.Loc
 import Foreign.C
 import Foreign.Ptr
 import Janus.Backend.C
+import Janus.CBits ()
 import Language.C.Quote
 
 class CmdIO m e | m -> e, e -> m where
