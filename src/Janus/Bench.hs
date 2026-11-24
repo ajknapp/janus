@@ -119,6 +119,7 @@ module Janus.Bench
     readScopedBuf,
     writeScopedBuf,
     reallocScopedBuf,
+    freeScopedBuf,
 
     -- * Re-exported Associated SIMD Wrappers
     SIMDVector (..),
@@ -150,6 +151,7 @@ import Janus.Bench.Stats
 import Janus.Bench.Types
 import Janus.Data.Layout
   ( ScopedBuf (..),
+    freeScopedBuf,
     readScopedBuf,
     reallocScopedBuf,
     scopedBuf,

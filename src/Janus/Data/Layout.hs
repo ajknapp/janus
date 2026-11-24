@@ -49,6 +49,7 @@ module Janus.Data.Layout
     readScopedBuf,
     writeScopedBuf,
     reallocScopedBuf,
+    freeScopedBuf,
     LayoutCtx,
     InlineLayoutCtx,
     peekBufStruct,
@@ -151,7 +152,7 @@ import Janus.Control.Stream (Stream, rangeS, reverseRangeS, streamM)
 import Janus.Data.HKD
 import Janus.Expression.Bits (ExpBits (..))
 import Janus.Expression.Bool (ExpBool (..))
-import Janus.Expression.Cast (ExpPtrCast (..))
+import Janus.Expression.Cast (ExpIntegralCast (..), ExpPtrCast (..))
 import Janus.Expression.Cond (ExpCond (..))
 import Janus.Expression.Eq (ExpEq (..))
 import Janus.Expression.Integral (ExpIntegral (..))
@@ -365,12 +366,27 @@ class StorageLayout a where
     e (Ptr (CStruct (InlineBuf n a))) ->
     m (Buf a e)
 
+-- | Branchlessly zero out @rawCap@ whenever @vp@ is @NULL@ (and clamp negative
+-- capacities to @0@), preserving the invariant @(isNullVoidPtr vp) ==> (cap == 0)@
+-- without introducing C control-flow branches on pointer nullness.
+ownedCapForVoidPtr ::
+  forall m e.
+  (CmdAlloc m e) =>
+  e (Ptr ()) ->
+  e Int64 ->
+  m (e Int64)
+ownedCapForVoidPtr vp rawCap = do
+  clamped <- letM (ifThenElse (rawCap `le` 0) 0 rawCap)
+  let w = ptrToWord64Expr (fromVoidPtr vp :: e (Ptr Word8))
+      nz = (w `ior` (0 - w)) `rshift` 63
+  letM (toIntegral nz * clamped)
+
 -- | Scoped mutable buffer handle managed by 'withBuf'.
 --
 -- Tracks both the live 'Buf' pointer(s) and current capacity in mutable Janus
--- references across any 'reallocScopedBuf' calls inside the continuation so
--- 'withBuf' always frees the latest buffer with its latest capacity in the
--- owning 'Alloc' policy.
+-- references across any 'reallocScopedBuf' or 'freeScopedBuf' calls inside the
+-- continuation so 'withBuf' always frees the latest buffer with its latest
+-- capacity in the owning 'Alloc' policy.
 data ScopedBuf (m :: K.Type -> K.Type) (e :: K.Type -> K.Type) a = ScopedBuf
   { sbAlloc :: !(Alloc e),
     sbReadState :: !(m (Buf a e, e Int64)),
@@ -381,7 +397,8 @@ data ScopedBuf (m :: K.Type -> K.Type) (e :: K.Type -> K.Type) a = ScopedBuf
 scopedBuf :: (Monad m) => ScopedBuf m e a -> m (Buf a e)
 scopedBuf sb = fst <$> sbReadState sb
 
--- | Read the current live element capacity from a 'ScopedBuf'.
+-- | Read the current live element capacity from a 'ScopedBuf' (@0@ whenever
+-- the buffer is 'nullBuf').
 scopedBufCap :: (Monad m) => ScopedBuf m e a -> m (e Int64)
 scopedBufCap sb = snd <$> sbReadState sb
 
@@ -408,12 +425,13 @@ writeScopedBuf sb i v = do
   b <- scopedBuf sb
   writeBuf @a b i v
 
--- | Resize a 'ScopedBuf' to @newCap@ elements (preserving @min liveLen newCap@
--- elements) in its owning 'Alloc' policy, updating the tracked buffer and
--- capacity in place.
+-- | Resize a 'ScopedBuf' to @newCap@ elements (preserving
+-- @clamp liveLen 0 (min oldCap newCap)@ elements) in its owning 'Alloc' policy,
+-- updating the tracked buffer and capacity in place.
 --
--- * If @newCap <= 0@, the current buffer is freed and the tracked state becomes
---   @(nullBuf, 0)@ so exit cleanup does not double-free.
+-- * If @newCap <= 0@, any live buffer is freed and the tracked state becomes
+--   @(nullBuf, 0)@ so exit cleanup does not double-free (and subsequent
+--   'reallocScopedBuf' calls can allocate fresh storage again).
 -- * If @newCap > 0@ and reallocation succeeds, the tracked state becomes
 --   @(newBuf, newCap)@ so exit cleanup frees the new buffer with @newCap@.
 -- * If @newCap > 0@ and reallocation fails (returns 'nullBuf'), the previous
@@ -437,10 +455,26 @@ reallocScopedBuf sb newCap liveLen = do
     )
   pure newB
 
+-- | Explicitly free the current live buffer of a 'ScopedBuf' early and reset
+-- its tracked state to @(nullBuf, 0)@.
+--
+-- Idempotent: calling 'freeScopedBuf' multiple times or letting 'withBuf' exit
+-- afterwards will not double-free, and 'reallocScopedBuf' may still be called
+-- afterwards to allocate fresh storage within the same scope.
+freeScopedBuf ::
+  forall a m e.
+  (CmdAlloc m e, StorageLayout a, LayoutElemCtx m e a) =>
+  ScopedBuf m e a ->
+  m ()
+freeScopedBuf sb = do
+  (b, cap) <- sbReadState sb
+  freeBuf @a (sbAlloc sb) b cap
+  sbWriteState sb (nullBuf @a (Proxy @m)) 0
+
 -- | Allocate a scoped buffer of @initCap@ elements of layout @a@ under
 -- allocation policy @alloc@, run @k@ with a 'ScopedBuf' handle (supporting
--- 'reallocScopedBuf' within @k@), and automatically 'freeBuf' the latest live
--- buffer and capacity upon completion.
+-- 'reallocScopedBuf' and 'freeScopedBuf' within @k@), and automatically
+-- 'freeBuf' the latest live buffer and capacity upon completion.
 withBuf ::
   forall a m e r.
   (CmdAlloc m e, StorageLayout a, LayoutElemCtx m e a) =>
@@ -552,16 +586,21 @@ scalarIsNullBuf :: (CmdAlloc m e, ScalarElemCtx m e a) => ScalarBuf a e -> e Boo
 scalarIsNullBuf (ScalarBuf p) = isNullVoidPtr (toVoidPtr p)
 
 scalarNewBufStateRefs ::
+  forall a m e.
   (CmdAlloc m e, ScalarElemCtx m e a) =>
   ScalarBuf a e ->
   e Int64 ->
   m (m (ScalarBuf a e, e Int64), ScalarBuf a e -> e Int64 -> m ())
 scalarNewBufStateRefs (ScalarBuf p0) cap0 = do
+  effCap0 <- ownedCapForVoidPtr @m @e (toVoidPtr p0) cap0
   pRef <- newRef p0
-  cRef <- newRef cap0
+  cRef <- newRef effCap0
   pure
     ( (,) <$> (ScalarBuf <$> readRef pRef) <*> readRef cRef,
-      \(ScalarBuf p) c -> writeRef pRef p >> writeRef cRef c
+      \(ScalarBuf p) c -> do
+        effC <- ownedCapForVoidPtr @m @e (toVoidPtr p) c
+        writeRef pRef p
+        writeRef cRef effC
     )
 
 scalarAllocBuf :: forall a m e. (CmdAlloc m e, ScalarElemCtx m e a) => Alloc e -> e Int64 -> m (ScalarBuf a e)
@@ -740,12 +779,22 @@ instance StorageLayout (AoS s) where
 
   nullBuf _ = AoSBuf nullPtr
   isNullBuf _ (AoSBuf p) = isNullVoidPtr (toVoidPtr p)
+  newBufStateRefs ::
+    forall m e.
+    (CmdAlloc m e, AoSElemCtx m e s) =>
+    AoSBuf s e ->
+    e Int64 ->
+    m (m (AoSBuf s e, e Int64), AoSBuf s e -> e Int64 -> m ())
   newBufStateRefs (AoSBuf p0) cap0 = do
+    effCap0 <- ownedCapForVoidPtr @m @e (toVoidPtr p0) cap0
     pRef <- newRef p0
-    cRef <- newRef cap0
+    cRef <- newRef effCap0
     pure
       ( (,) <$> (AoSBuf <$> readRef pRef) <*> readRef cRef,
-        \(AoSBuf p) c -> writeRef pRef p >> writeRef cRef c
+        \(AoSBuf p) c -> do
+          effC <- ownedCapForVoidPtr @m @e (toVoidPtr p) c
+          writeRef pRef p
+          writeRef cRef effC
       )
   allocBuf alloc cap = AoSBuf . unScalarBuf <$> scalarAllocBuf @(CStruct s) alloc cap
   reallocBuf alloc (AoSBuf oldP) oldCap newCap len =
@@ -919,33 +968,35 @@ instance StorageLayout (SoA s) where
     e Int64 ->
     m (m (PtrStruct s e, e Int64), PtrStruct s e -> e Int64 -> m ())
   newBufStateRefs (PtrStruct ptrs0) cap0 = do
-    let base0 =
-          fromVoidPtr (gSoAFirstVoidPtr @m @e @(Rep (s (PtrOf e))) @(Rep (s e)) (from ptrs0)) :: e (Ptr Word8)
+    let base0Vp = gSoAFirstVoidPtr @m @e @(Rep (s (PtrOf e))) @(Rep (s e)) (from ptrs0)
+        base0 = fromVoidPtr base0Vp :: e (Ptr Word8)
+    effCap0 <- ownedCapForVoidPtr @m @e base0Vp cap0
     baseRef <- newRef base0
-    capRef <- newRef cap0
+    capRef <- newRef effCap0
     let rd = do
           b <- readRef baseRef
           c <- readRef capRef
-          let effCap = ifThenElse (isNullVoidPtr (toVoidPtr b)) 0 c
-              (repPtrs, _) = gSoACarve @m @e @(Rep (s (PtrOf e))) @(Rep (s e)) b 0 effCap
+          let (repPtrs, _) = gSoACarve @m @e @(Rep (s (PtrOf e))) @(Rep (s e)) b 0 c
           pure (PtrStruct (to repPtrs), c)
         wr (PtrStruct ptrs) c = do
-          let b =
-                fromVoidPtr (gSoAFirstVoidPtr @m @e @(Rep (s (PtrOf e))) @(Rep (s e)) (from ptrs)) :: e (Ptr Word8)
+          let bVp = gSoAFirstVoidPtr @m @e @(Rep (s (PtrOf e))) @(Rep (s e)) (from ptrs)
+              b = fromVoidPtr bVp :: e (Ptr Word8)
+          effC <- ownedCapForVoidPtr @m @e bVp c
           writeRef baseRef b
-          writeRef capRef c
+          writeRef capRef effC
     pure (rd, wr)
 
   allocBuf :: forall m e. (CmdAlloc m e, SoAElemCtx m e s) => Alloc e -> e Int64 -> m (PtrStruct s e)
   allocBuf alloc cap = do
-    let totBytes = gSoATotalBytes @m @e (Proxy @(Rep (s (PtrOf e)))) (Proxy @(Rep (s e))) cap
+    clampedCap <- letM (ifThenElse (cap `le` 0) 0 cap)
+    let totBytes = gSoATotalBytes @m @e (Proxy @(Rep (s (PtrOf e)))) (Proxy @(Rep (s e))) clampedCap
     vp <-
       ifThenElseM_WithRef
-        (cap `le` 0)
+        (clampedCap `le` 0)
         (pure (toVoidPtr (nullPtr @e @Word8)))
         (allocBytesAligned alloc totBytes (fromIntegral janusSIMDAlignment))
-    let (repPtrs, _) = gSoACarve @m @e @(Rep (s (PtrOf e))) @(Rep (s e)) (fromVoidPtr vp) 0 cap
-        -- When cap <= 0, vp is NULL and off0 starts at 0 with colBytes = 0, so every carved column pointer is NULL!
+    effCap <- ownedCapForVoidPtr @m @e vp clampedCap
+    let (repPtrs, _) = gSoACarve @m @e @(Rep (s (PtrOf e))) @(Rep (s e)) (fromVoidPtr vp) 0 effCap
     pure (PtrStruct (to repPtrs))
 
   reallocBuf ::
@@ -958,20 +1009,37 @@ instance StorageLayout (SoA s) where
     e Int64 ->
     m (PtrStruct s e)
   reallocBuf alloc oldBuf oldCap newCap liveLen = do
-    newBuf <- allocBuf @(SoA s) alloc newCap
     let oldBase = gSoAFirstVoidPtr @m @e @(Rep (s (PtrOf e))) @(Rep (s e)) (from (unPtrStruct oldBuf))
-        newBase = gSoAFirstVoidPtr @m @e @(Rep (s (PtrOf e))) @(Rep (s e)) (from (unPtrStruct newBuf))
-        copyCnt = ifThenElse (liveLen `lt` newCap) liveLen newCap
-    whenM_ (lnot (isNullVoidPtr oldBase) `land` (oldCap `gt` 0)) $
-      ifThenElseM_
-        (newCap `le` 0)
-        (freeBuf @(SoA s) alloc oldBuf oldCap)
-        ( whenM_ (lnot (isNullVoidPtr newBase)) $ do
-            whenM_ (copyCnt `gt` 0) $
-              copyBuf @(SoA s) newBuf 0 oldBuf 0 copyCnt
-            freeBuf @(SoA s) alloc oldBuf oldCap
-        )
-    pure newBuf
+        oldValid = lnot (isNullVoidPtr oldBase) `land` (oldCap `gt` 0)
+        oldTotBytes = gSoATotalBytes @m @e (Proxy @(Rep (s (PtrOf e)))) (Proxy @(Rep (s e))) oldCap
+        newTotBytes = gSoATotalBytes @m @e (Proxy @(Rep (s (PtrOf e)))) (Proxy @(Rep (s e))) newCap
+    (rdOut, wrOut) <- newBufStateRefs @(SoA s) (nullBuf @(SoA s) (Proxy @m)) 0
+    ifThenElseM_
+      (newCap `le` 0)
+      (whenM_ oldValid $ freeBuf @(SoA s) alloc oldBuf oldCap)
+      ( ifThenElseM_
+          (lnot oldValid)
+          ( do
+              nb <- allocBuf @(SoA s) alloc newCap
+              wrOut nb newCap
+          )
+          ( ifThenElseM_
+              (oldTotBytes `eq` newTotBytes)
+              (wrOut oldBuf newCap)
+              ( do
+                  newBuf <- allocBuf @(SoA s) alloc newCap
+                  let newBase = gSoAFirstVoidPtr @m @e @(Rep (s (PtrOf e))) @(Rep (s e)) (from (unPtrStruct newBuf))
+                      maxCap = ifThenElse (oldCap `lt` newCap) oldCap newCap
+                      copyCnt = ifThenElse (liveLen `lt` maxCap) liveLen maxCap
+                  whenM_ (lnot (isNullVoidPtr newBase)) $ do
+                    whenM_ (copyCnt `gt` 0) $
+                      copyBuf @(SoA s) newBuf 0 oldBuf 0 copyCnt
+                    freeBuf @(SoA s) alloc oldBuf oldCap
+                    wrOut newBuf newCap
+              )
+          )
+      )
+    fst <$> rdOut
 
   freeBuf :: forall m e. (CmdAlloc m e, SoAElemCtx m e s) => Alloc e -> PtrStruct s e -> e Int64 -> m ()
   freeBuf alloc (PtrStruct ptrs) cap = do
@@ -1133,12 +1201,22 @@ instance StorageLayout (AoSoA w s) where
 
   nullBuf _ = AoSoABuf nullPtr
   isNullBuf _ (AoSoABuf p) = isNullVoidPtr (toVoidPtr p)
+  newBufStateRefs ::
+    forall m e.
+    (CmdAlloc m e, AoSoAElemCtx w m e s) =>
+    AoSoABuf w s e ->
+    e Int64 ->
+    m (m (AoSoABuf w s e, e Int64), AoSoABuf w s e -> e Int64 -> m ())
   newBufStateRefs (AoSoABuf p0) cap0 = do
+    effCap0 <- ownedCapForVoidPtr @m @e (toVoidPtr p0) cap0
     pRef <- newRef p0
-    cRef <- newRef cap0
+    cRef <- newRef effCap0
     pure
       ( (,) <$> (AoSoABuf <$> readRef pRef) <*> readRef cRef,
-        \(AoSoABuf p) c -> writeRef pRef p >> writeRef cRef c
+        \(AoSoABuf p) c -> do
+          effC <- ownedCapForVoidPtr @m @e (toVoidPtr p) c
+          writeRef pRef p
+          writeRef cRef effC
       )
   allocBuf alloc cap =
     AoSoABuf . unScalarBuf <$> scalarAllocBuf @(CStruct (TileStruct w s)) alloc (tileCountExpr (Proxy @w) cap)
@@ -1334,12 +1412,22 @@ instance StorageLayout (SOAOA w outer) where
 
   nullBuf _ = SOAOABuf nullPtr
   isNullBuf _ (SOAOABuf arr) = isNullVoidPtr (toVoidPtr arr)
+  newBufStateRefs ::
+    forall m e.
+    (CmdAlloc m e, SOAOAElemCtx w m e outer) =>
+    SOAOABuf w outer e ->
+    e Int64 ->
+    m (m (SOAOABuf w outer e, e Int64), SOAOABuf w outer e -> e Int64 -> m ())
   newBufStateRefs (SOAOABuf arr0) cap0 = do
+    effCap0 <- ownedCapForVoidPtr @m @e (toVoidPtr arr0) cap0
     pRef <- newRef arr0
-    cRef <- newRef cap0
+    cRef <- newRef effCap0
     pure
       ( (,) <$> (SOAOABuf <$> readRef pRef) <*> readRef cRef,
-        \(SOAOABuf arr) c -> writeRef pRef arr >> writeRef cRef c
+        \(SOAOABuf arr) c -> do
+          effC <- ownedCapForVoidPtr @m @e (toVoidPtr arr) c
+          writeRef pRef arr
+          writeRef cRef effC
       )
 
   allocBuf :: forall m e. (CmdAlloc m e, SOAOAElemCtx w m e outer) => Alloc e -> e Int64 -> m (SOAOABuf w outer e)
@@ -1367,26 +1455,43 @@ instance StorageLayout (SOAOA w outer) where
     e Int64 ->
     m (SOAOABuf w outer e)
   reallocBuf alloc oldB@(SOAOABuf oldArr) oldCap newCap liveLen = do
-    newB@(SOAOABuf newArr) <- allocBuf @(SOAOA w outer) alloc newCap
-    whenM_ (lnot (isNullVoidPtr (toVoidPtr oldArr)) `land` (oldCap `gt` 0)) $
-      ifThenElseM_
-        (newCap `le` 0)
-        (freeBuf @(SOAOA w outer) alloc oldB oldCap)
-        ( whenM_ (lnot (isNullVoidPtr (toVoidPtr newArr))) $ do
-            let copyCnt = ifThenElse (liveLen `lt` newCap) liveLen newCap
-            whenM_ (copyCnt `gt` 0) $ do
-              _ <-
-                gSOAOACopyFast @w @m @e
-                  (Proxy @(Rep (outer Identity)))
-                  (Proxy @(Rep (outer e)))
-                  newArr
-                  oldArr
-                  0
-                  (tileCountExpr (Proxy @w) copyCnt)
-              pure ()
-            freeBuf @(SOAOA w outer) alloc oldB oldCap
-        )
-    pure newB
+    let oldValid = lnot (isNullVoidPtr (toVoidPtr oldArr)) `land` (oldCap `gt` 0)
+        oldTiles = tileCountExpr (Proxy @w) oldCap
+        newTiles = tileCountExpr (Proxy @w) newCap
+    outRef <- newRef (nullPtr @e @(Ptr Word8))
+    ifThenElseM_
+      (newCap `le` 0)
+      (whenM_ oldValid $ freeBuf @(SOAOA w outer) alloc oldB oldCap)
+      ( ifThenElseM_
+          (lnot oldValid)
+          ( do
+              SOAOABuf na <- allocBuf @(SOAOA w outer) alloc newCap
+              writeRef outRef na
+          )
+          ( ifThenElseM_
+              (oldTiles `eq` newTiles)
+              (writeRef outRef oldArr)
+              ( do
+                  SOAOABuf newArr <- allocBuf @(SOAOA w outer) alloc newCap
+                  whenM_ (lnot (isNullVoidPtr (toVoidPtr newArr))) $ do
+                    let maxCap = ifThenElse (oldCap `lt` newCap) oldCap newCap
+                        copyCnt = ifThenElse (liveLen `lt` maxCap) liveLen maxCap
+                    whenM_ (copyCnt `gt` 0) $ do
+                      _ <-
+                        gSOAOACopyFast @w @m @e
+                          (Proxy @(Rep (outer Identity)))
+                          (Proxy @(Rep (outer e)))
+                          newArr
+                          oldArr
+                          0
+                          (tileCountExpr (Proxy @w) copyCnt)
+                      pure ()
+                    freeBuf @(SOAOA w outer) alloc oldB oldCap
+                    writeRef outRef newArr
+              )
+          )
+      )
+    SOAOABuf <$> readRef outRef
 
   freeBuf ::
     forall m e.

@@ -89,6 +89,7 @@ import Janus.Data.HKD (CStruct, FixedArray, getPtrOf, projectPtrs)
 import Janus.Expression.Bool (ExpBool (..))
 import Janus.Expression.Cast (ExpPtrCast (..))
 import Janus.Expression.Cond (ExpCond (..))
+import Janus.Expression.Eq (ExpEq (..))
 import Janus.Expression.Ord (ExpOrd (..))
 import Janus.Typed (JanusTyped)
 
@@ -484,11 +485,27 @@ reallocTypedArray ::
   e Int64 ->
   m (e (Ptr a))
 reallocTypedArray alloc oldP oldN newN = do
-  let sz = sizeOf (Proxy @a)
-      elemAlign = alignOf (Proxy @a)
-      simdAl = fromIntegral janusSIMDAlignment
-      effAl = ifThenElse (elemAlign `gt` simdAl) elemAlign simdAl
-  fromVoidPtr <$> reallocBytesAligned alloc (toVoidPtr oldP) (oldN * sz) (newN * sz) effAl
+  outRef <- newRef (nullPtr @e @Word8)
+  ifThenElseM_
+    (newN `le` 0)
+    (freeTypedArray @a alloc oldP oldN)
+    ( ifThenElseM_
+        (isNullVoidPtr (toVoidPtr oldP) `lor` (oldN `le` 0))
+        (allocTypedArray @a alloc newN >>= writeRef outRef . fromVoidPtr . toVoidPtr)
+        ( ifThenElseM_
+            (oldN `eq` newN)
+            (writeRef outRef (fromVoidPtr (toVoidPtr oldP)))
+            ( do
+                let sz = sizeOf (Proxy @a)
+                    elemAlign = alignOf (Proxy @a)
+                    simdAl = fromIntegral janusSIMDAlignment
+                    effAl = ifThenElse (elemAlign `gt` simdAl) elemAlign simdAl
+                vp <- reallocBytesAligned alloc (toVoidPtr oldP) (oldN * sz) (newN * sz) effAl
+                writeRef outRef (fromVoidPtr vp)
+            )
+        )
+    )
+  fromVoidPtr . toVoidPtr <$> readRef outRef
 
 freeTypedArray ::
   forall a m e.
