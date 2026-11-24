@@ -1,13 +1,14 @@
 -- | Polymorphic Janus benchmarking monad transformer ('BenchT' / 'BenchM'),
--- expression wrapper ('Bench'), implementation choice framework ('HasChoices',
--- 'choose', 'ChoiceKey', 'ChoiceSpace', 'ChoiceSelection'), named @tic@/@toc@
--- timers, pure-Janus Bayesian statistical engine, ascending CSV report
--- generation, and zero-overhead library deployment helpers.
+-- expression wrapper ('Bench'), higher-kinded choice records ('HasChoices',
+-- 'HasChoiceDescriptions', 'choose', 'chooseDescription', 'ChoiceColumns',
+-- 'ChoiceSpace', 'ChoiceSelection'), named @tic@/@toc@ timers, pure-Janus
+-- Bayesian statistical engine, ascending CSV report generation, and
+-- zero-overhead library deployment helpers.
 --
 -- All EDSL typeclasses on @('BenchT' c m e, 'Bench' c e)@ are derived from the
 -- general @('Control.Monad.Reader.ReaderT', 'Janus.Control.Reader.ReaderExp')@
--- instances in "Janus.Control.Reader", and 'choose' is a function built on
--- 'Control.Monad.Reader.ask'.
+-- instances in "Janus.Control.Reader", and 'choose' / 'chooseDescription' are
+-- plain functions built on 'Control.Monad.Reader.ask' and lenses.
 module Janus.Bench
   ( -- * Benchmarking Monad Transformer & Expression Wrapper
     Bench (..),
@@ -22,34 +23,46 @@ module Janus.Bench
     liftBenchM,
     MonadReader (..),
 
-    -- * Implementation Choice Combinators & Choice Spaces
+    -- * Higher-Kinded Choice Combinators, Lenses, & Spaces
     HasChoices (..),
+    HasChoiceDescriptions (..),
     choose,
-    askChoiceImpl,
+    chooseDescription,
     Impl (..),
     impl,
     implWithId,
     Candidates (..),
     candidates,
-    DSum ((:=>)),
-    Some (..),
-    GEq (..),
-    Hashable (..),
-    ChoiceKey (..),
-    ChoiceSelection,
+    ChoiceColumns (..),
     ChoiceSpace,
-    choiceSpace,
-    choiceSelection,
+    ChoiceSelection (..),
+    fromChoiceImpl,
+    NoChoice (..),
+    SimpleChoice (..),
+    simpleImpl,
+    elementL,
     emptyChoiceSpace,
     emptyChoiceSelection,
     simpleChoiceSpace,
-    NoChoice,
-    SimpleChoice (..),
+    enumerateChoiceImpls,
     enumerateChoices,
     choiceHeaderColumns,
     choiceDescriptionFields,
-    camelToSnake,
-    deriveChoiceKey,
+
+    -- * Re-exported "Data.HKD" & Functor Wrappers
+    Identity (..),
+    Const (..),
+    Element (..),
+    FFunctor (..),
+    FFoldable (..),
+    FTraversable (..),
+    FZip (..),
+    FRepeat (..),
+    ffmapDefault,
+    ffoldMapDefault,
+    gftraverse,
+    gfzipWith,
+    gfrepeat,
 
     -- * Named @tic@ / @toc@ Timers
     CmdNamedTimer,
@@ -67,6 +80,7 @@ module Janus.Bench
     loadSelectionSpec,
     loadSelection,
     loadSelectionTH,
+    runWithDescriptions,
     runWithChoices,
     runProduction,
 
@@ -97,6 +111,15 @@ module Janus.Bench
     benchmarkCandidatesIO,
     benchmarkSimpleIO,
 
+    -- * Scoped Buffer Management (Re-exported from "Janus.Data.Layout")
+    ScopedBuf (..),
+    withBuf,
+    scopedBuf,
+    scopedBufCap,
+    readScopedBuf,
+    writeScopedBuf,
+    reallocScopedBuf,
+
     -- * Re-exported Associated SIMD Wrappers
     SIMDVector (..),
     SIMDMask (..),
@@ -104,12 +127,33 @@ module Janus.Bench
 where
 
 import Control.Monad.Reader (MonadReader (..))
-import Data.GADT.Compare (GEq (..))
-import Data.Hashable (Hashable (..))
-import Data.Some (Some (..))
+import Data.Functor.Const (Const (..))
+import Data.Functor.Identity (Identity (..))
+import Data.HKD
+  ( Element (..),
+    FFoldable (..),
+    FFunctor (..),
+    FRepeat (..),
+    FTraversable (..),
+    FZip (..),
+    ffmapDefault,
+    ffoldMapDefault,
+    gfrepeat,
+    gftraverse,
+    gfzipWith,
+  )
 import Janus.Bench.Choice
 import Janus.Bench.Gang ()
 import Janus.Bench.Instances
 import Janus.Bench.Runner
 import Janus.Bench.Stats
 import Janus.Bench.Types
+import Janus.Data.Layout
+  ( ScopedBuf (..),
+    readScopedBuf,
+    reallocScopedBuf,
+    scopedBuf,
+    scopedBufCap,
+    withBuf,
+    writeScopedBuf,
+  )

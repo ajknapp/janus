@@ -31,22 +31,29 @@ module Janus.Bench.Stats
 where
 
 import Data.Int (Int64)
-import Data.Word (Word64)
+import Data.Word (Word64, Word8)
 import Foreign.Ptr (Ptr)
 import Janus.Alloc.Policy (CmdAlloc, dynamicAlloc)
 import Janus.Bench.Types (CmdNamedTimer)
 import Janus.Command.Cond (ifThenElseM_, whenM_)
 import Janus.Command.Format (CmdFormat)
-import Janus.Command.Memory (CmdMem (..), CmdStorable (..))
+import Janus.Command.Memory (CmdStorable (..))
 import Janus.Command.Range (rangeM)
 import Janus.Command.Ref (Ref, letM, newRef, readRef, writeRef)
 import Janus.Command.TicToc (CmdTicToc (..), Tic (..), Toc (..))
 import Janus.Command.While (whileM)
-import Janus.Data.Layout (LayoutElemCtx, ScalarBuf (..), allocBuf, freeBuf, readBuf, writeBuf)
+import Janus.Data.Layout
+  ( LayoutElemCtx,
+    ScalarBuf (..),
+    readBuf,
+    scopedBuf,
+    withBuf,
+    writeBuf,
+  )
 import Janus.Data.Sort (sortBuf)
 import Janus.Expression.Bits (ExpBits (..))
 import Janus.Expression.Bool (ExpBool (..))
-import Janus.Expression.Cast (ExpFloatingCast (..), ExpPtrCast (..))
+import Janus.Expression.Cast (ExpFloatingCast (..))
 import Janus.Expression.Cond (ExpCond (..))
 import Janus.Expression.Eq (ExpEq (..))
 import Janus.Expression.Integral (ExpIntegral (..))
@@ -117,6 +124,8 @@ type CmdBenchStats m e =
     CmdFormat m e Double,
     LayoutElemCtx m e Double,
     LayoutElemCtx m e Int64,
+    LayoutElemCtx m e Word64,
+    LayoutElemCtx m e Word8,
     CmdStorable m e (Ptr Word64),
     ExpFloatingCast e Int64 Double,
     ExpFloatingCast e Word64 Double,
@@ -180,27 +189,25 @@ calibrateTimerOverhead cfg = do
   let nCal = max 16 (benchCalibrationIters cfg)
       nCalE = fromIntegral nCal :: e Int64
       p10Idx = fromIntegral (max 0 (min (nCal - 1) ((nCal * 10) `div` 100))) :: e Int64
-  calBuf <- allocBuf @Double dynamicAlloc nCalE
-  rawScratch <- calloc 1 8
-  let scratchPtr = fromVoidPtr rawScratch :: e (Ptr Word64)
-  -- Brief warmup of the hardware cycle counter
-  rangeM 0 16 $ \_ -> do
-    Tic t0 <- tic
-    poke scratchPtr t0
-    Toc _ <- toc
-    pure ()
-  rangeM 0 nCalE $ \i -> do
-    Tic t0 <- tic
-    poke scratchPtr t0
-    Toc t1 <- toc
-    t0Loaded <- peek scratchPtr
-    let delta = ifThenElse (t1 `ge` t0Loaded) (t1 - t0Loaded) 0
-    writeBuf calBuf i (toFloating delta)
-  sortBuf calBuf nCalE
-  overhead <- readBuf calBuf p10Idx
-  free rawScratch
-  freeBuf @Double dynamicAlloc calBuf nCalE
-  pure overhead
+  withBuf @Double dynamicAlloc nCalE $ \calSB ->
+    withBuf @Word64 dynamicAlloc 1 $ \scratchSB -> do
+      calBuf <- scopedBuf calSB
+      ScalarBuf scratchPtr <- scopedBuf scratchSB
+      -- Brief warmup of the hardware cycle counter
+      rangeM 0 16 $ \_ -> do
+        Tic t0 <- tic
+        poke scratchPtr t0
+        Toc _ <- toc
+        pure ()
+      rangeM 0 nCalE $ \i -> do
+        Tic t0 <- tic
+        poke scratchPtr t0
+        Toc t1 <- toc
+        t0Loaded <- peek scratchPtr
+        let delta = ifThenElse (t1 `ge` t0Loaded) (t1 - t0Loaded) 0
+        writeBuf calBuf i (toFloating delta)
+      sortBuf calBuf nCalE
+      readBuf calBuf p10Idx
 
 -- | Determine the per-sample batch size @B >= 1@ so each measured batch spans
 -- at least 'benchMinBatchTicks' ticks (or return 'benchFixedBatchSize' when set).
@@ -278,127 +285,126 @@ estimateTimingPosterior cfg rngRef rawBuf nSamples = do
       hiIdx1 = max 0 (min (bDraws - 1) (hiIdx0 + 1)) :: Int
       fracHi = doubleLit (posHi - fromIntegral hiIdx0)
 
-  sortedBuf <- allocBuf @Double dynamicAlloc nClamped
-  devBuf <- allocBuf @Double dynamicAlloc nClamped
-  weightsBuf <- allocBuf @Double dynamicAlloc nClamped
-  drawsBuf <- allocBuf @Double dynamicAlloc bDrawsE
+  withBuf @Double dynamicAlloc nClamped $ \sortedSB ->
+    withBuf @Double dynamicAlloc nClamped $ \devSB ->
+      withBuf @Double dynamicAlloc nClamped $ \weightsSB ->
+        withBuf @Double dynamicAlloc bDrawsE $ \drawsSB -> do
+          sortedBuf <- scopedBuf sortedSB
+          devBuf <- scopedBuf devSB
+          weightsBuf <- scopedBuf weightsSB
+          drawsBuf <- scopedBuf drawsSB
 
-  -- 1. Copy and sort raw per-call tick samples ascending.
-  rangeM 0 nClamped $ \i -> do
-    v <- readBuf rawBuf i
-    writeBuf sortedBuf i v
-  sortBuf sortedBuf nClamped
+          -- 1. Copy and sort raw per-call tick samples ascending.
+          rangeM 0 nClamped $ \i -> do
+            v <- readBuf rawBuf i
+            writeBuf sortedBuf i v
+          sortBuf sortedBuf nClamped
 
-  -- 2. Compute sample median and normalized MAD (1.4826 * MAD).
-  loMid <- letM ((nClamped - 1) `rshift` 1)
-  hiMid <- letM (nClamped `rshift` 1)
-  medLo <- readBuf sortedBuf loMid
-  medHi <- readBuf sortedBuf hiMid
-  med <- letM (0.5 * (medLo + medHi))
+          -- 2. Compute sample median and normalized MAD (1.4826 * MAD).
+          loMid <- letM ((nClamped - 1) `rshift` 1)
+          hiMid <- letM (nClamped `rshift` 1)
+          medLo <- readBuf sortedBuf loMid
+          medHi <- readBuf sortedBuf hiMid
+          med <- letM (0.5 * (medLo + medHi))
 
-  rangeM 0 nClamped $ \i -> do
-    xi <- readBuf sortedBuf i
-    writeBuf devBuf i (abs (xi - med))
-  sortBuf devBuf nClamped
-  madLo <- readBuf devBuf loMid
-  madHi <- readBuf devBuf hiMid
-  sigmaMad <- letM (doubleLit 1.4826 * 0.5 * (madLo + madHi))
-  scaleFloor <- letM (max' (doubleLit 1.0e-9) (doubleLit 1.0e-4 * abs med))
-  robustScale <- letM (max' sigmaMad scaleFloor)
-  upperFence <- letM (med + madMult * robustScale)
+          rangeM 0 nClamped $ \i -> do
+            xi <- readBuf sortedBuf i
+            writeBuf devBuf i (abs (xi - med))
+          sortBuf devBuf nClamped
+          madLo <- readBuf devBuf loMid
+          madHi <- readBuf devBuf hiMid
+          sigmaMad <- letM (doubleLit 1.4826 * 0.5 * (madLo + madHi))
+          scaleFloor <- letM (max' (doubleLit 1.0e-9) (doubleLit 1.0e-4 * abs med))
+          robustScale <- letM (max' sigmaMad scaleFloor)
+          upperFence <- letM (med + madMult * robustScale)
 
-  -- 3. Gate extreme right-tail OS interrupt spikes while retaining >= ceil(0.8 * N) samples.
-  keptCountRef <- newRef (0 :: e Int64)
-  rangeM 0 nClamped $ \i -> do
-    xi <- readBuf sortedBuf i
-    whenM_ (xi `le` upperFence) $ do
-      k <- readRef keptCountRef
-      writeRef keptCountRef (k + 1)
-  rawKept <- readRef keptCountRef
-  minRetained <- letM (max' 1 ((nClamped * 8 + 9) `quotient` 10))
-  mClean <- letM (min' nClamped (max' minRetained rawKept))
-  cHuber <- letM (doubleLit 1.345 * robustScale)
+          -- 3. Gate extreme right-tail OS interrupt spikes while retaining >= ceil(0.8 * N) samples.
+          keptCountRef <- newRef (0 :: e Int64)
+          rangeM 0 nClamped $ \i -> do
+            xi <- readBuf sortedBuf i
+            whenM_ (xi `le` upperFence) $ do
+              k <- readRef keptCountRef
+              writeRef keptCountRef (k + 1)
+          rawKept <- readRef keptCountRef
+          minRetained <- letM (max' 1 ((nClamped * 8 + 9) `quotient` 10))
+          mClean <- letM (min' nClamped (max' minRetained rawKept))
+          cHuber <- letM (doubleLit 1.345 * robustScale)
 
-  -- 4. Rubin (1981) Bayesian Bootstrap draws with Dirichlet(1,...,1) weights.
-  rangeM 0 bDrawsE $ \b -> do
-    wSumRef <- newRef (0.0 :: e Double)
-    rangeM 0 mClean $ \i -> do
-      u <- nextUniform01 rngRef
-      eVal <- letM (negate (log u))
-      writeBuf weightsBuf i eVal
-      ws <- readRef wSumRef
-      writeRef wSumRef (ws + eVal)
-    wSum <- readRef wSumRef
-    invWSum <- letM (1.0 / wSum)
-    rangeM 0 mClean $ \i -> do
-      ei <- readBuf weightsBuf i
-      writeBuf weightsBuf i (ei * invWSum)
+          -- 4. Rubin (1981) Bayesian Bootstrap draws with Dirichlet(1,...,1) weights.
+          rangeM 0 bDrawsE $ \b -> do
+            wSumRef <- newRef (0.0 :: e Double)
+            rangeM 0 mClean $ \i -> do
+              u <- nextUniform01 rngRef
+              eVal <- letM (negate (log u))
+              writeBuf weightsBuf i eVal
+              ws <- readRef wSumRef
+              writeRef wSumRef (ws + eVal)
+            wSum <- readRef wSumRef
+            invWSum <- letM (1.0 / wSum)
+            rangeM 0 mClean $ \i -> do
+              ei <- readBuf weightsBuf i
+              writeBuf weightsBuf i (ei * invWSum)
 
-    -- Exact O(M) Dirichlet-weighted median on sorted clean prefix
-    cumWRef <- newRef (0.0 :: e Double)
-    foundMedRef <- newRef false
-    thetaRef <- newRef med
-    rangeM 0 mClean $ \i -> do
-      wi <- readBuf weightsBuf i
-      cw <- readRef cumWRef
-      cw' <- letM (cw + wi)
-      writeRef cumWRef cw'
-      already <- readRef foundMedRef
-      whenM_ (lnot already `land` (cw' `ge` 0.5)) $ do
-        xi <- readBuf sortedBuf i
-        writeRef thetaRef xi
-        writeRef foundMedRef true
+            -- Exact O(M) Dirichlet-weighted median on sorted clean prefix
+            cumWRef <- newRef (0.0 :: e Double)
+            foundMedRef <- newRef false
+            thetaRef <- newRef med
+            rangeM 0 mClean $ \i -> do
+              wi <- readBuf weightsBuf i
+              cw <- readRef cumWRef
+              cw' <- letM (cw + wi)
+              writeRef cumWRef cw'
+              already <- readRef foundMedRef
+              whenM_ (lnot already `land` (cw' `ge` 0.5)) $ do
+                xi <- readBuf sortedBuf i
+                writeRef thetaRef xi
+                writeRef foundMedRef true
 
-    -- 3-step IRLS refinement for the Dirichlet-weighted Huber M-estimator
-    rangeM 0 3 $ \_ -> do
-      curTheta <- readRef thetaRef
-      numRef <- newRef (0.0 :: e Double)
-      denRef <- newRef (0.0 :: e Double)
-      rangeM 0 mClean $ \i -> do
-        xi <- readBuf sortedBuf i
-        wi <- readBuf weightsBuf i
-        r <- letM (abs (xi - curTheta))
-        let huberW = ifThenElse (r `le` cHuber) 1.0 (cHuber / r)
-        effW <- letM (wi * huberW)
-        num <- readRef numRef
-        den <- readRef denRef
-        writeRef numRef (num + effW * xi)
-        writeRef denRef (den + effW)
-      numFinal <- readRef numRef
-      denFinal <- readRef denRef
-      whenM_ (denFinal `gt` 0.0) $
-        writeRef thetaRef (numFinal / denFinal)
+            -- 3-step IRLS refinement for the Dirichlet-weighted Huber M-estimator
+            rangeM 0 3 $ \_ -> do
+              curTheta <- readRef thetaRef
+              numRef <- newRef (0.0 :: e Double)
+              denRef <- newRef (0.0 :: e Double)
+              rangeM 0 mClean $ \i -> do
+                xi <- readBuf sortedBuf i
+                wi <- readBuf weightsBuf i
+                r <- letM (abs (xi - curTheta))
+                let huberW = ifThenElse (r `le` cHuber) 1.0 (cHuber / r)
+                effW <- letM (wi * huberW)
+                num <- readRef numRef
+                den <- readRef denRef
+                writeRef numRef (num + effW * xi)
+                writeRef denRef (den + effW)
+              numFinal <- readRef numRef
+              denFinal <- readRef denRef
+              whenM_ (denFinal `gt` 0.0) $
+                writeRef thetaRef (numFinal / denFinal)
 
-    thetaDraw <- readRef thetaRef
-    writeBuf drawsBuf b thetaDraw
+            thetaDraw <- readRef thetaRef
+            writeBuf drawsBuf b thetaDraw
 
-  -- 5. Sort posterior draws and extract posterior mean + equal-tailed CI.
-  sortBuf drawsBuf bDrawsE
-  drawSumRef <- newRef (0.0 :: e Double)
-  rangeM 0 bDrawsE $ \b -> do
-    db <- readBuf drawsBuf b
-    s <- readRef drawSumRef
-    writeRef drawSumRef (s + db)
-  drawSum <- readRef drawSumRef
-  postMean <- letM (drawSum / toFloating bDrawsE)
+          -- 5. Sort posterior draws and extract posterior mean + equal-tailed CI.
+          sortBuf drawsBuf bDrawsE
+          drawSumRef <- newRef (0.0 :: e Double)
+          rangeM 0 bDrawsE $ \b -> do
+            db <- readBuf drawsBuf b
+            s <- readRef drawSumRef
+            writeRef drawSumRef (s + db)
+          drawSum <- readRef drawSumRef
+          postMean <- letM (drawSum / toFloating bDrawsE)
 
-  dLo0 <- readBuf drawsBuf (fromIntegral loIdx0)
-  dLo1 <- readBuf drawsBuf (fromIntegral loIdx1)
-  dHi0 <- readBuf drawsBuf (fromIntegral hiIdx0)
-  dHi1 <- readBuf drawsBuf (fromIntegral hiIdx1)
-  rawCiLo <- letM (dLo0 + fracLo * (dLo1 - dLo0))
-  rawCiHi <- letM (dHi0 + fracHi * (dHi1 - dHi0))
-  ciLo <- letM (min' rawCiLo postMean)
-  ciHi <- letM (max' rawCiHi postMean)
+          dLo0 <- readBuf drawsBuf (fromIntegral loIdx0)
+          dLo1 <- readBuf drawsBuf (fromIntegral loIdx1)
+          dHi0 <- readBuf drawsBuf (fromIntegral hiIdx0)
+          dHi1 <- readBuf drawsBuf (fromIntegral hiIdx1)
+          rawCiLo <- letM (dLo0 + fracLo * (dLo1 - dLo0))
+          rawCiHi <- letM (dHi0 + fracHi * (dHi1 - dHi0))
+          ciLo <- letM (min' rawCiLo postMean)
+          ciHi <- letM (max' rawCiHi postMean)
 
-  freeBuf @Double dynamicAlloc sortedBuf nClamped
-  freeBuf @Double dynamicAlloc devBuf nClamped
-  freeBuf @Double dynamicAlloc weightsBuf nClamped
-  freeBuf @Double dynamicAlloc drawsBuf bDrawsE
-
-  pure
-    TimingEstimate
-      { estTiming = postMean,
-        estCiLower = ciLo,
-        estCiUpper = ciHi
-      }
+          pure
+            TimingEstimate
+              { estTiming = postMean,
+                estCiLower = ciLo,
+                estCiUpper = ciHi
+              }

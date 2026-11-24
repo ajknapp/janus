@@ -13,7 +13,6 @@ import Control.Exception (bracket)
 import Control.Lens ((&), (.~))
 import Control.Monad (forM_)
 import Control.Monad.Reader (ReaderT (..))
-import Data.Functor.Identity (Identity (..))
 import Data.Int (Int64)
 import Data.List (isInfixOf)
 import Data.Proxy (Proxy (..))
@@ -23,11 +22,31 @@ import Foreign.C (CChar)
 import Hedgehog (Property, forAll, property, (===))
 import qualified Hedgehog.Gen as Gen
 import qualified Hedgehog.Range as Range
-import Janus.Alloc.Policy (CmdAlloc, dynamicAlloc)
-import Janus.Backend.C (JanusC, JanusCM, PortableC, showJanusC, withJanusC)
+import Janus.Alloc.Policy
+  ( CmdAlloc,
+    destroyFixedBuf,
+    destroyRecycler,
+    dynamicAlloc,
+    fallbackAlloc,
+    fixedAlloc,
+    newFixedBuf,
+    newRecycler,
+    recyclingAlloc,
+    segregateAlloc,
+    statsAlloc,
+  )
+import Janus.Alloc.Stats
+  ( AllocSnapshot (..),
+    AllocTrackerSpine,
+    freeAllocTracker,
+    newAllocTracker,
+    readAllocSnapshot,
+  )
+import Janus.Backend.C (JanusC, JanusCM, JanusCTyped, PortableC, showJanusC, withJanusC)
 import Janus.Backend.C.Build (CBuildConfig, cBuildConfigCacheDir, defaultCBuildConfig)
 import Janus.Backend.C.LinuxX86_64 (LinuxX86_64, LinuxX86_64C, LinuxX86_64CM)
 import Janus.Bench
+import Janus.Command.Cond (whenM_)
 import Janus.Command.Format (CmdFormat, CmdPutString, CmdString (..))
 import Janus.Command.Memory (CmdStorable (..))
 import Janus.Command.Range (CmdRange (..))
@@ -42,7 +61,8 @@ import Janus.Control.Drain (drainSum, runDrain)
 import Janus.Control.Reader (ReaderExp (..))
 import Janus.Control.Stream (Stream)
 import qualified Janus.Data.DynVec as DV
-import Janus.Data.Layout (ScalarBuf (..), allocBuf, freeBuf, readBuf, writeBuf)
+import Janus.Data.HKD (CStruct)
+import Janus.Data.Layout (ScalarBuf (..), allocBuf, freeBuf, isNullBuf, readBuf, writeBuf)
 import Janus.Expression.Bits (ExpBits (..))
 import Janus.Expression.Bool (ExpBool (..))
 import Janus.Expression.Cond (ExpCond (..))
@@ -233,19 +253,19 @@ syntheticPosteriorKernel = do
             benchCredibleMass = 0.95,
             benchSeed = 0x123456789abcdef0
           }
-  buf <- allocBuf @Double dynamicAlloc n
-  -- 90 clean samples tightly clustered around 500.0 ticks (499.0 .. 501.0)
-  -- plus 10 extreme 100x OS-interrupt spikes at 50000.0 ticks!
-  rangeM 0 90 $ \i -> do
-    let offset = ifThenElse ((i `iand` 1) `eq` 0) (-1.0) 1.0
-    writeBuf buf i (500.0 + offset)
-  rangeM 90 100 $ \i ->
-    writeBuf buf i 50000.0
+  withBuf @Double dynamicAlloc n $ \bufSB -> do
+    buf <- scopedBuf bufSB
+    -- 90 clean samples tightly clustered around 500.0 ticks (499.0 .. 501.0)
+    -- plus 10 extreme 100x OS-interrupt spikes at 50000.0 ticks!
+    rangeM 0 90 $ \i -> do
+      let offset = ifThenElse ((i `iand` 1) `eq` 0) (-1.0) 1.0
+      writeBuf buf i (500.0 + offset)
+    rangeM 90 100 $ \i ->
+      writeBuf buf i 50000.0
 
-  rngRef <- newRef (fromIntegral (benchSeed cfg) :: e Word64)
-  est <- estimateTimingPosterior cfg rngRef buf n
-  freeBuf @Double dynamicAlloc buf n
-  pure (estTiming est, estCiLower est, estCiUpper est)
+    rngRef <- newRef (fromIntegral (benchSeed cfg) :: e Word64)
+    est <- estimateTimingPosterior cfg rngRef buf n
+    pure (estTiming est, estCiLower est, estCiUpper est)
 
 unit_bayesian_bootstrap_outlier_immunity :: Assertion
 unit_bayesian_bootstrap_outlier_immunity = do
@@ -275,21 +295,21 @@ unit_bayesian_bootstrap_outlier_immunity = do
 
 kernelChoiceSpace :: ChoiceSpace KernelChoice
 kernelChoiceSpace =
-  choiceSpace
-    [ AlgoPiece
-        :=> candidates
+  KernelChoice
+    { _algoPiece =
+        candidates
           [ implWithId "fast_spmd" "SIMD gang reduction (fast)" AlgoFastSPMD,
             implWithId "slow_redundant" "Redundant multi-pass scalar, \"baseline\"" AlgoSlowRedundant
           ],
-      UnrollPiece
-        :=> candidates
+      _unrollPiece =
+        candidates
           [ implWithId "wide_4" "Optimal SIMD gang, \"vectorized\"" UnrollWide4,
             implWithId "scalar_1" "1-lane scalar" UnrollScalar1
           ]
-    ]
+    }
 
 -- | Polymorphic benchmarked algorithm exercising:
---   * 'choose' over multiple GADT constructors ('AlgoPiece', 'UnrollPiece')
+--   * 'choose' & 'chooseDescription' over HKD lenses ('algoPiece', 'unrollPiece')
 --   * 'namedTic' / 'namedToc' and 'withNamedTimer'
 --   * Inner 'foldForeachOptimal0M' ('CmdOptimalGang') SIMD execution inside '(BenchT c m e, Bench c e)'
 --   * 'DynVec' & 'dynamicAlloc' inside 'BenchT'
@@ -306,8 +326,8 @@ polymorphicBenchKernel ::
   Bench KernelChoice e Int64 ->
   BenchT KernelChoice m e (Bench KernelChoice e Int64)
 polymorphicBenchKernel (inputBuf@(ScalarBuf rawPtr), sinkBuf) len = do
-  algo <- choose AlgoPiece
-  unroll <- choose UnrollPiece
+  algo <- choose algoPiece
+  unroll <- choose unrollPiece
 
   -- Exercise recursive `fun` over `Bench c e`
   let mixStep :: Bench KernelChoice e Int64 -> Bench KernelChoice e Int64
@@ -568,67 +588,184 @@ unit_multi_choice_benchmark_c_io_and_library_promotion =
       other -> fail ("unexpected simple loop.csv: " <> show other)
 
 --------------------------------------------------------------------------------
--- 4. Direct `(ReaderT r m, ReaderExp r e)` & `choose` via `ask` Tests
+-- 4. Direct `(ReaderT r m, ReaderExp r e)` & HKD Lenses (`choose` / `chooseDescription`)
 --------------------------------------------------------------------------------
 
 rawReaderKernel ::
   forall r m e.
-  ( r ~ ChoiceSelection KernelChoice,
+  ( HasChoices KernelChoice r,
     Monad m,
     DV.DynVecCtx (ReaderT r m) (ReaderExp r e) Int64,
     CmdOptimalGang (ReaderT r m) (ReaderExp r e)
   ) =>
   ReaderT r m (ReaderExp r e Int64)
 rawReaderKernel = do
-  algo <- choose AlgoPiece
-  unroll <- choose UnrollPiece
+  algo <- choose algoPiece
+  unroll <- choose unrollPiece
   let len = 64 :: ReaderExp r e Int64
-  buf@(ScalarBuf rawPtr) <- allocBuf @Int64 dynamicAlloc len
-  rangeM 0 len $ \i -> writeBuf buf i (i + 1)
-  bodySum <- case (algo, unroll) of
-    (AlgoFastSPMD, UnrollWide4) ->
-      foldForeachOptimal0M
-        (Proxy @Int64)
-        len
-        0
-        ( \acc laneIdx -> do
-            v <- peekElemOff (uniformAlignedPtr rawPtr) laneIdx
-            pure (acc + v)
-        )
-        gangReduceAdd
-    _ -> do
-      accRef <- newRef (1000 :: ReaderExp r e Int64)
-      rangeM 0 len $ \i -> do
-        v <- readBuf buf i
-        cur <- readRef accRef
-        writeRef accRef (cur + v)
-      readRef accRef
-  freeBuf @Int64 dynamicAlloc buf len
-  pure bodySum
+  withBuf @Int64 dynamicAlloc len $ \bufSB -> do
+    buf@(ScalarBuf rawPtr) <- scopedBuf bufSB
+    rangeM 0 len $ \i -> writeBuf buf i (i + 1)
+    case (algo, unroll) of
+      (AlgoFastSPMD, UnrollWide4) ->
+        foldForeachOptimal0M
+          (Proxy @Int64)
+          len
+          0
+          ( \acc laneIdx -> do
+              v <- peekElemOff (uniformAlignedPtr rawPtr) laneIdx
+              pure (acc + v)
+          )
+          gangReduceAdd
+      _ -> do
+        accRef <- newRef (1000 :: ReaderExp r e Int64)
+        rangeM 0 len $ \i -> do
+          v <- readBuf buf i
+          cur <- readRef accRef
+          writeRef accRef (cur + v)
+        readRef accRef
 
 unit_reader_t_direct_and_choose_via_ask :: Assertion
 unit_reader_t_direct_and_choose_via_ask = do
   buildCfg <- getBenchTestBuildConfig
   let fastSel = resolveSelectionOrFail kernelChoiceSpace fixtureCompiledSpec
-      slowSel =
-        choiceSelection
-          [ AlgoPiece :=> impl "slow" AlgoSlowRedundant,
-            UnrollPiece :=> impl "scalar" UnrollScalar1
-          ]
-  Identity ioFast <- runReaderT (getReaderExp <$> rawReaderKernel @((ChoiceSelection KernelChoice)) @IO @Identity) fastSel
-  Identity ioSlow <- runReaderT (getReaderExp <$> rawReaderKernel @((ChoiceSelection KernelChoice)) @IO @Identity) slowSel
+      slowChoices :: KernelChoice Identity
+      slowChoices =
+        KernelChoice
+          { _algoPiece = Identity AlgoSlowRedundant,
+            _unrollPiece = Identity UnrollScalar1
+          }
+      slowDescriptions :: KernelChoice (Const String)
+      slowDescriptions =
+        KernelChoice
+          { _algoPiece = Const "slow-desc",
+            _unrollPiece = Const "scalar-desc"
+          }
+      slowPair = (slowChoices, slowDescriptions)
+
+  -- Verify both `c Identity` and `c (Const String)` in `ReaderT` using the same lenses
+  (algoDesc, unrollDesc, Identity ioSlow) <-
+    flip runReaderT slowPair $ do
+      d1 <- chooseDescription algoPiece
+      d2 <- chooseDescription unrollPiece
+      v <- getReaderExp <$> rawReaderKernel @(KernelChoice Identity, KernelChoice (Const String)) @IO @Identity
+      pure (d1, d2, v)
+  algoDesc @?= "slow-desc"
+  unrollDesc @?= "scalar-desc"
+
+  -- Also verify `ChoiceSelection KernelChoice` and bare `KernelChoice Identity` directly in `ReaderT`
+  Identity ioFast <-
+    runReaderT (getReaderExp <$> rawReaderKernel @(ChoiceSelection KernelChoice) @IO @Identity) fastSel
   cFast <-
     withJanusC @LinuxX86_64
       buildCfg
-      (runReaderT (getReaderExp <$> rawReaderKernel @(ChoiceSelection KernelChoice) @LinuxX86_64CM @LinuxX86_64C) fastSel)
+      (runReaderT (getReaderExp <$> rawReaderKernel @(KernelChoice Identity) @LinuxX86_64CM @LinuxX86_64C) (selChoices fastSel))
       id
   cSlow <-
     withJanusC @LinuxX86_64
       buildCfg
-      (runReaderT (getReaderExp <$> rawReaderKernel @(ChoiceSelection KernelChoice) @LinuxX86_64CM @LinuxX86_64C) slowSel)
+      (runReaderT (getReaderExp <$> rawReaderKernel @(KernelChoice Identity, KernelChoice (Const String)) @LinuxX86_64CM @LinuxX86_64C) slowPair)
       id
+
   -- sum(1..64) = 2080; slow branch starts at 1000 -> 3080
   ioFast @?= 2080
   cFast @?= 2080
   ioSlow @?= 3080
   cSlow @?= 3080
+
+--------------------------------------------------------------------------------
+-- 5. `withBuf` + `reallocScopedBuf` Across Composite Allocation Policies
+--------------------------------------------------------------------------------
+
+withBufReallocKernel ::
+  forall m e.
+  ( CmdBenchStats m e,
+    JanusCTyped (CStruct AllocTrackerSpine)
+  ) =>
+  m (e Int64)
+withBufReallocKernel = do
+  tracker <- newAllocTracker
+  fb <- newFixedBuf dynamicAlloc 192
+  rec <- newRecycler dynamicAlloc 8
+  let composite =
+        statsAlloc
+          tracker
+          ( segregateAlloc
+              256
+              (fallbackAlloc (fixedAlloc fb) (recyclingAlloc rec dynamicAlloc))
+              dynamicAlloc
+          )
+
+  -- 1. Multi-stage `reallocScopedBuf`:
+  --    cap 8 (64B, FixedBuf) -> 16 (128B, FixedBuf in-place)
+  --    -> 32 (256B, spills to Recycling) -> 128 (1024B, crosses Segregate to largeA)
+  --    -> 256 (2048B inside rangeM conditional)
+  sumVal <-
+    withBuf @Int64 composite 8 $ \sb -> do
+      rangeM 0 8 $ \i -> writeScopedBuf sb i (i + 1)
+      _ <- reallocScopedBuf sb 16 8
+      rangeM 8 16 $ \i -> writeScopedBuf sb i (i + 1)
+      _ <- reallocScopedBuf sb 32 16
+      rangeM 16 32 $ \i -> writeScopedBuf sb i (i + 1)
+      _ <- reallocScopedBuf sb 128 32
+      rangeM 32 128 $ \i -> writeScopedBuf sb i (i + 1)
+      rangeM 128 256 $ \i -> do
+        curCap <- scopedBufCap sb
+        whenM_ (i `ge` curCap) $ do
+          _ <- reallocScopedBuf sb 256 128
+          pure ()
+        writeScopedBuf sb i (i + 1)
+      accRef <- newRef (0 :: e Int64)
+      rangeM 0 256 $ \i -> do
+        v <- readScopedBuf sb i
+        cur <- readRef accRef
+        writeRef accRef (cur + v)
+      readRef accRef
+
+  -- 2. Shrink-to-zero (`reallocScopedBuf sb 0 0`) inside `withBuf` must not double-free
+  withBuf @Int64 composite 16 $ \sb2 -> do
+    writeScopedBuf sb2 0 42
+    _ <- reallocScopedBuf sb2 0 0
+    pure ()
+
+  snap1 <- readAllocSnapshot tracker
+  destroyRecycler dynamicAlloc rec
+  destroyFixedBuf dynamicAlloc fb
+  freeAllocTracker tracker
+
+  -- 3. Failed `reallocScopedBuf` (exhausted FixedBuf without fallback) must
+  --    preserve original `(oldBuf, oldCap)` and still free it on `withBuf` exit
+  tracker2 <- newAllocTracker
+  tinyFb <- newFixedBuf dynamicAlloc 128
+  let tinyPolicy = statsAlloc tracker2 (fixedAlloc tinyFb)
+  oomCheckVal <-
+    withBuf @Int64 tinyPolicy 4 $ \sb3 -> do
+      writeScopedBuf sb3 0 777
+      failedBuf <- reallocScopedBuf sb3 10000 4
+      v0 <- readScopedBuf sb3 0
+      capAfterFail <- scopedBufCap sb3
+      pure $
+        ifThenElse
+          (isNullBuf @Int64 (Proxy @m) failedBuf `land` (capAfterFail `eq` 4))
+          v0
+          (-999999)
+  snap2 <- readAllocSnapshot tracker2
+  destroyFixedBuf dynamicAlloc tinyFb
+  freeAllocTracker tracker2
+
+  pure $
+    sumVal
+      + oomCheckVal
+      + snapLiveBlocks snap1 * 1000000
+      + snapLiveBytes snap1 * 1000
+      + snapLiveBlocks snap2 * 1000000
+      + snapLiveBytes snap2 * 1000
+
+unit_with_buf_realloc_across_policies_io_and_c :: Assertion
+unit_with_buf_realloc_across_policies_io_and_c = do
+  buildCfg <- getBenchTestBuildConfig
+  Identity ioRes <- withBufReallocKernel @IO @Identity
+  cRes <- withJanusC @LinuxX86_64 buildCfg (withBufReallocKernel @LinuxX86_64CM @LinuxX86_64C) id
+  -- sum(1..256) = 32896, oomCheckVal = 777, all liveBlocks == 0 and liveBytes == 0 -> 33673
+  ioRes @?= 33673
+  cRes @?= 33673

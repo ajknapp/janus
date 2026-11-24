@@ -73,22 +73,23 @@ import Janus.Bench.Stats
 import Janus.Bench.Types
   ( BenchEnv (..),
     BenchT,
-    ChoiceKey (..),
-    ChoiceSelection,
+    ChoiceColumns,
+    ChoiceSelection (..),
     ChoiceSpace,
     Impl,
     NoChoice,
-    SimpleChoice (..),
+    SimpleChoice,
     TimerCollector (..),
     choose,
     resetTimerIterAccumulators,
     runBenchT,
+    simpleImpl,
     withTimerCollector,
   )
 import Janus.Command.Case (CmdCase (..))
 import Janus.Command.Cond (ifThenElseM_, whenM_)
 import Janus.Command.Format (CmdPutString (..), CmdString (..))
-import Janus.Command.Memory (CmdMem (..), CmdMemCopy (..), CmdStorable (..), ExpPtr (..))
+import Janus.Command.Memory (CmdMemCopy (..), CmdStorable (..), ExpPtr (..))
 import Janus.Command.Range (rangeM)
 import Janus.Command.Ref (letM, newRef, readRef, writeRef)
 import Janus.Command.TicToc (CmdTicToc (..), Tic (..), Toc (..))
@@ -96,7 +97,7 @@ import Janus.Command.While (whileM)
 import Janus.Control.CSV (CSVRow (..), csvEscapeString, csvField, drainCSVFileCString)
 import Janus.Control.Drain (runDrain)
 import Janus.Control.Stream (rangeS)
-import Janus.Data.Layout (ScalarBuf (..), allocBuf, freeBuf, readBuf, writeBuf)
+import Janus.Data.Layout (ScalarBuf (..), readBuf, scopedBuf, withBuf, writeBuf)
 import Janus.Data.Sort (sortKeyValBufs)
 import Janus.Expression.Bool (ExpBool (..))
 import Janus.Expression.Cast (ExpFloatingCast (..), ExpPtrCast (..))
@@ -151,29 +152,26 @@ withTimerCSVPathCString outDir timerNameCStr k = do
 
     prefLen <- readRef prefLenRef
     nameLen <- readRef nameLenRef
-    rawPath <- calloc (prefLen + nameLen + 6) 1
-    let dst8 :: e (Ptr Word8)
-        dst8 = fromVoidPtr rawPath
-    whenM_ (prefLen `gt` 0) $
-      cmdMemcpy rawPath (toVoidPtr prefixCStr) prefLen
-    rangeM 0 nameLen $ \i -> do
-      b <- peekElemOff name8 i
-      let isDigitB = (b `ge` 48) `land` (b `le` 57)
-          isUpperB = (b `ge` 65) `land` (b `le` 90)
-          isLowerB = (b `ge` 97) `land` (b `le` 122)
-          isSafePunct = (b `eq` 95) `lor` (b `eq` 45)
-          cleanB = ifThenElse (isDigitB `lor` isUpperB `lor` isLowerB `lor` isSafePunct) b 95
-      pokeElemOff dst8 cleanB (prefLen + i)
-    let extBase = prefLen + nameLen
-    pokeElemOff dst8 46 extBase
-    pokeElemOff dst8 99 (extBase + 1)
-    pokeElemOff dst8 115 (extBase + 2)
-    pokeElemOff dst8 118 (extBase + 3)
-    pokeElemOff dst8 0 (extBase + 4)
+    withBuf @Word8 dynamicAlloc (prefLen + nameLen + 6) $ \pathSB -> do
+      ScalarBuf dst8 <- scopedBuf pathSB
+      whenM_ (prefLen `gt` 0) $
+        cmdMemcpy (toVoidPtr dst8) (toVoidPtr prefixCStr) prefLen
+      rangeM 0 nameLen $ \i -> do
+        b <- peekElemOff name8 i
+        let isDigitB = (b `ge` 48) `land` (b `le` 57)
+            isUpperB = (b `ge` 65) `land` (b `le` 90)
+            isLowerB = (b `ge` 97) `land` (b `le` 122)
+            isSafePunct = (b `eq` 95) `lor` (b `eq` 45)
+            cleanB = ifThenElse (isDigitB `lor` isUpperB `lor` isLowerB `lor` isSafePunct) b 95
+        pokeElemOff dst8 cleanB (prefLen + i)
+      let extBase = prefLen + nameLen
+      pokeElemOff dst8 46 extBase
+      pokeElemOff dst8 99 (extBase + 1)
+      pokeElemOff dst8 115 (extBase + 2)
+      pokeElemOff dst8 118 (extBase + 3)
+      pokeElemOff dst8 0 (extBase + 4)
 
-    res <- k (fromVoidPtr rawPath)
-    free rawPath
-    pure res
+      k (ptrCast dst8)
 
 --------------------------------------------------------------------------------
 -- Pure-Janus Multi-Implementation Benchmark Kernel
@@ -188,7 +186,7 @@ withTimerCSVPathCString outDir timerNameCStr k = do
 -- implementation in @'enumerateChoices' space@.
 benchmarkChoicesJanusWithSetup ::
   forall c m e res b.
-  (ChoiceKey c, CmdBenchRunner m e) =>
+  (ChoiceColumns c, CmdBenchRunner m e) =>
   BenchConfig ->
   FilePath ->
   ChoiceSpace c ->
@@ -215,172 +213,168 @@ benchmarkChoicesJanusWithSetup cfg outDir space setup teardown benchBody = do
           hasChoiceCols = not (null choiceCols)
           headerCols = choiceCols <> ["timing", "ci_lower", "ci_upper"]
           rowPrefixes =
-            [ intercalate "," (map csvEscapeString (choiceDescriptionFields sel))
+            [ intercalate "," (map csvEscapeString (choiceDescriptionFields (selDescriptions sel)))
             | sel <- selections
             ]
 
       rngRef <- newRef (fromIntegral (benchSeed cfg) :: e Word64)
       timerOverhead <- calibrateTimerOverhead cfg
 
-      rawStartScratch <- calloc 1 8
-      let startScratchPtr = fromVoidPtr rawStartScratch :: e (Ptr Word64)
+      withBuf @Word64 dynamicAlloc 1 $ \startScratchSB ->
+        withBuf @Double dynamicAlloc curSamplesCapE $ \curSamplesSB ->
+          withBuf @Int64 dynamicAlloc maxSlotsE $ \slotSampleCountsSB ->
+            withBuf @Double dynamicAlloc totalCellsE $ \estTimingsSB ->
+              withBuf @Double dynamicAlloc totalCellsE $ \estLowersSB ->
+                withBuf @Double dynamicAlloc totalCellsE $ \estUppersSB ->
+                  withBuf @Int64 dynamicAlloc totalCellsE $ \slotRecordedSB ->
+                    withBuf @Double dynamicAlloc numImplsE $ \sortKeysSB ->
+                      withBuf @Int64 dynamicAlloc numImplsE $ \sortIdxsSB -> do
+                        ScalarBuf startScratchPtr <- scopedBuf startScratchSB
+                        curSamplesBuf@(ScalarBuf curSamplesPtr) <- scopedBuf curSamplesSB
+                        slotSampleCounts <- scopedBuf slotSampleCountsSB
+                        estTimings <- scopedBuf estTimingsSB
+                        estLowers <- scopedBuf estLowersSB
+                        estUppers <- scopedBuf estUppersSB
+                        slotRecorded <- scopedBuf slotRecordedSB
+                        sortKeys <- scopedBuf sortKeysSB
+                        sortIdxs <- scopedBuf sortIdxsSB
 
-      curSamplesBuf@(ScalarBuf curSamplesPtr) <- allocBuf @Double dynamicAlloc curSamplesCapE
-      slotSampleCounts <- allocBuf @Int64 dynamicAlloc maxSlotsE
-      estTimings <- allocBuf @Double dynamicAlloc totalCellsE
-      estLowers <- allocBuf @Double dynamicAlloc totalCellsE
-      estUppers <- allocBuf @Double dynamicAlloc totalCellsE
-      slotRecorded <- allocBuf @Int64 dynamicAlloc totalCellsE
+                        rangeM 0 totalCellsE $ \idx -> do
+                          writeBuf estTimings idx 0.0
+                          writeBuf estLowers idx 0.0
+                          writeBuf estUppers idx 0.0
+                          writeBuf slotRecorded idx 0
 
-      rangeM 0 totalCellsE $ \idx -> do
-        writeBuf estTimings idx 0.0
-        writeBuf estLowers idx 0.0
-        writeBuf estUppers idx 0.0
-        writeBuf slotRecorded idx 0
+                        -- Execute warmup, batched timing, and Bayesian bootstrap for each combination k
+                        let runOneImpl :: Int -> ChoiceSelection c -> m ()
+                            runOneImpl kIdx sel = do
+                              let kE = fromIntegral kIdx :: e Int64
+                                  env =
+                                    BenchEnv
+                                      { _benchChoices = selChoices sel,
+                                        _benchDescriptions = selDescriptions sel,
+                                        _benchTimers = Just tc
+                                      }
+                              res <- runBenchT env setup
+                              let stepOnce = void (runBenchT env (benchBody res))
 
-      -- Execute warmup, batched timing, and Bayesian bootstrap for each combination k
-      let runOneImpl :: Int -> ChoiceSelection c -> m ()
-          runOneImpl kIdx sel = do
-            let kE = fromIntegral kIdx :: e Int64
-                env =
-                  BenchEnv
-                    { _benchChoices = sel,
-                      _benchTimers = Just tc
-                    }
-            res <- runBenchT env setup
-            let stepOnce = void (runBenchT env (benchBody res))
+                              batchB <- calibrateBatchSize cfg stepOnce
+                              batchBF <- letM (toFloating batchB :: e Double)
 
-            batchB <- calibrateBatchSize cfg stepOnce
-            batchBF <- letM (toFloating batchB :: e Double)
+                              -- Warmup batches (populates named timer slots and warms caches/predictors)
+                              rangeM 0 nWarmupE $ \_ -> do
+                                resetTimerIterAccumulators tc
+                                rangeM 0 batchB $ \_ -> stepOnce
 
-            -- Warmup batches (populates named timer slots and warms caches/predictors)
-            rangeM 0 nWarmupE $ \_ -> do
-              resetTimerIterAccumulators tc
-              rangeM 0 batchB $ \_ -> stepOnce
+                              rangeM 0 maxSlotsE $ \s ->
+                                writeBuf slotSampleCounts s 0
 
-            rangeM 0 maxSlotsE $ \s ->
-              writeBuf slotSampleCounts s 0
+                              -- Sample collection batches
+                              rangeM 0 nSamplesE $ \sIdx -> do
+                                resetTimerIterAccumulators tc
+                                Tic t0 <- tic
+                                poke startScratchPtr t0
+                                rangeM 0 batchB $ \_ -> stepOnce
+                                Toc t1 <- toc
+                                t0Loaded <- peek startScratchPtr
+                                let rawDelta = ifThenElse (t1 `ge` t0Loaded) (t1 - t0Loaded) 0
+                                    netOverall = max' 0.0 (toFloating rawDelta - timerOverhead)
+                                    perCallOverall = netOverall / batchBF
+                                writeBuf curSamplesBuf sIdx perCallOverall
+                                c0 <- readBuf slotSampleCounts 0
+                                writeBuf slotSampleCounts 0 (c0 + 1)
 
-            -- Sample collection batches
-            rangeM 0 nSamplesE $ \sIdx -> do
-              resetTimerIterAccumulators tc
-              Tic t0 <- tic
-              poke startScratchPtr t0
-              rangeM 0 batchB $ \_ -> stepOnce
-              Toc t1 <- toc
-              t0Loaded <- peek startScratchPtr
-              let rawDelta = ifThenElse (t1 `ge` t0Loaded) (t1 - t0Loaded) 0
-                  netOverall = max' 0.0 (toFloating rawDelta - timerOverhead)
-                  perCallOverall = netOverall / batchBF
-              writeBuf curSamplesBuf sIdx perCallOverall
-              c0 <- readBuf slotSampleCounts 0
-              writeBuf slotSampleCounts 0 (c0 + 1)
+                                numUsed <- peek (tcCountPtr tc)
+                                rangeM 1 numUsed $ \slot -> do
+                                  cnt <- peekElemOff (tcIterCounts tc) slot
+                                  whenM_ (cnt `gt` 0) $ do
+                                    del <- peekElemOff (tcIterDeltas tc) slot
+                                    let netSlot =
+                                          max'
+                                            0.0
+                                            (toFloating del - toFloating cnt * timerOverhead)
+                                        perCallSlot = netSlot / batchBF
+                                    curCnt <- readBuf slotSampleCounts slot
+                                    writeBuf curSamplesBuf (slot * nSamplesE + curCnt) perCallSlot
+                                    writeBuf slotSampleCounts slot (curCnt + 1)
 
-              numUsed <- peek (tcCountPtr tc)
-              rangeM 1 numUsed $ \slot -> do
-                cnt <- peekElemOff (tcIterCounts tc) slot
-                whenM_ (cnt `gt` 0) $ do
-                  del <- peekElemOff (tcIterDeltas tc) slot
-                  let netSlot =
-                        max'
-                          0.0
-                          (toFloating del - toFloating cnt * timerOverhead)
-                      perCallSlot = netSlot / batchBF
-                  curCnt <- readBuf slotSampleCounts slot
-                  writeBuf curSamplesBuf (slot * nSamplesE + curCnt) perCallSlot
-                  writeBuf slotSampleCounts slot (curCnt + 1)
+                              -- Compute Bayesian posterior summaries for "overall" and active named timers
+                              numUsedAfter <- peek (tcCountPtr tc)
+                              rangeM 0 numUsedAfter $ \slot -> do
+                                cnt <- readBuf slotSampleCounts slot
+                                whenM_ (cnt `gt` 0) $ do
+                                  let slotSubBuf = ScalarBuf (ptrIndex curSamplesPtr (slot * nSamplesE))
+                                      cellIdx = kE * maxSlotsE + slot
+                                  est <- estimateTimingPosterior cfg rngRef slotSubBuf cnt
+                                  writeBuf estTimings cellIdx (estTiming est)
+                                  writeBuf estLowers cellIdx (estCiLower est)
+                                  writeBuf estUppers cellIdx (estCiUpper est)
+                                  writeBuf slotRecorded cellIdx 1
 
-            -- Compute Bayesian posterior summaries for "overall" and active named timers
-            numUsedAfter <- peek (tcCountPtr tc)
-            rangeM 0 numUsedAfter $ \slot -> do
-              cnt <- readBuf slotSampleCounts slot
-              whenM_ (cnt `gt` 0) $ do
-                let slotSubBuf = ScalarBuf (ptrIndex curSamplesPtr (slot * nSamplesE))
-                    cellIdx = kE * maxSlotsE + slot
-                est <- estimateTimingPosterior cfg rngRef slotSubBuf cnt
-                writeBuf estTimings cellIdx (estTiming est)
-                writeBuf estLowers cellIdx (estCiLower est)
-                writeBuf estUppers cellIdx (estCiUpper est)
-                writeBuf slotRecorded cellIdx 1
+                              runBenchT env (teardown res)
 
-            runBenchT env (teardown res)
+                        sequence_ [runOneImpl k sel | (k, sel) <- zip [0 ..] selections]
 
-      sequence_ [runOneImpl k sel | (k, sel) <- zip [0 ..] selections]
+                        -- Sort active implementations ascending (fastest first) and emit CSV per timer
+                        bestOverallIdxRef <- newRef (0 :: e Int64)
 
-      -- Sort active implementations ascending (fastest first) and emit CSV per timer
-      sortKeys <- allocBuf @Double dynamicAlloc numImplsE
-      sortIdxs <- allocBuf @Int64 dynamicAlloc numImplsE
-      bestOverallIdxRef <- newRef (0 :: e Int64)
+                        totalSlots <- peek (tcCountPtr tc)
+                        rangeM 0 totalSlots $ \slot -> do
+                          activeCountRef <- newRef (0 :: e Int64)
+                          rangeM 0 numImplsE $ \kE -> do
+                            let cellIdx = kE * maxSlotsE + slot
+                            recFlag <- readBuf slotRecorded cellIdx
+                            whenM_ (recFlag `eq` 1) $ do
+                              ac <- readRef activeCountRef
+                              tVal <- readBuf estTimings cellIdx
+                              writeBuf sortKeys ac tVal
+                              writeBuf sortIdxs ac kE
+                              writeRef activeCountRef (ac + 1)
 
-      totalSlots <- peek (tcCountPtr tc)
-      rangeM 0 totalSlots $ \slot -> do
-        activeCountRef <- newRef (0 :: e Int64)
-        rangeM 0 numImplsE $ \kE -> do
-          let cellIdx = kE * maxSlotsE + slot
-          recFlag <- readBuf slotRecorded cellIdx
-          whenM_ (recFlag `eq` 1) $ do
-            ac <- readRef activeCountRef
-            tVal <- readBuf estTimings cellIdx
-            writeBuf sortKeys ac tVal
-            writeBuf sortIdxs ac kE
-            writeRef activeCountRef (ac + 1)
+                          activeCount <- readRef activeCountRef
+                          whenM_ (activeCount `gt` 0) $ do
+                            sortKeyValBufs sortKeys sortIdxs activeCount
+                            whenM_ (slot `eq` 0) $ do
+                              fastest <- readBuf sortIdxs 0
+                              writeRef bestOverallIdxRef fastest
 
-        activeCount <- readRef activeCountRef
-        whenM_ (activeCount `gt` 0) $ do
-          sortKeyValBufs sortKeys sortIdxs activeCount
-          whenM_ (slot `eq` 0) $ do
-            fastest <- readBuf sortIdxs 0
-            writeRef bestOverallIdxRef fastest
+                            timerNameCStr <- peekElemOff (tcSlotNames tc) slot
+                            withTimerCSVPathCString outDir timerNameCStr $ \csvPathCStr -> do
+                              let choicePrefixRow :: e Int64 -> CSVRow m e
+                                  choicePrefixRow implIdx =
+                                    CSVRow $ \h ->
+                                      switchCase_
+                                        implIdx
+                                        [ (k, withString pref (hputString h))
+                                        | (k, pref) <- zip [0 ..] rowPrefixes
+                                        ]
+                                        (pure ())
+                                  rowStream =
+                                    fmap
+                                      ( \pos ->
+                                          CSVRow $ \h -> do
+                                            implIdx <- readBuf sortIdxs pos
+                                            let cellIdx = implIdx * maxSlotsE + slot
+                                            tVal <- readBuf estTimings cellIdx
+                                            loVal <- readBuf estLowers cellIdx
+                                            hiVal <- readBuf estUppers cellIdx
+                                            let statsCols =
+                                                  csvField tVal <> csvField loVal <> csvField hiVal
+                                                fullRow =
+                                                  if hasChoiceCols
+                                                    then choicePrefixRow implIdx <> statsCols
+                                                    else statsCols
+                                            emitCSVRow fullRow h
+                                      )
+                                      (rangeS 0 activeCount)
+                              runDrain (drainCSVFileCString csvPathCStr (Just headerCols)) rowStream
 
-          timerNameCStr <- peekElemOff (tcSlotNames tc) slot
-          withTimerCSVPathCString outDir timerNameCStr $ \csvPathCStr -> do
-            let choicePrefixRow :: e Int64 -> CSVRow m e
-                choicePrefixRow implIdx =
-                  CSVRow $ \h ->
-                    switchCase_
-                      implIdx
-                      [ (k, withString pref (hputString h))
-                      | (k, pref) <- zip [0 ..] rowPrefixes
-                      ]
-                      (pure ())
-                rowStream =
-                  fmap
-                    ( \pos ->
-                        CSVRow $ \h -> do
-                          implIdx <- readBuf sortIdxs pos
-                          let cellIdx = implIdx * maxSlotsE + slot
-                          tVal <- readBuf estTimings cellIdx
-                          loVal <- readBuf estLowers cellIdx
-                          hiVal <- readBuf estUppers cellIdx
-                          let statsCols =
-                                csvField tVal <> csvField loVal <> csvField hiVal
-                              fullRow =
-                                if hasChoiceCols
-                                  then choicePrefixRow implIdx <> statsCols
-                                  else statsCols
-                          emitCSVRow fullRow h
-                    )
-                    (rangeS 0 activeCount)
-            runDrain (drainCSVFileCString csvPathCStr (Just headerCols)) rowStream
-
-      bestIdx <- readRef bestOverallIdxRef
-
-      free rawStartScratch
-      freeBuf @Double dynamicAlloc curSamplesBuf curSamplesCapE
-      freeBuf @Int64 dynamicAlloc slotSampleCounts maxSlotsE
-      freeBuf @Double dynamicAlloc estTimings totalCellsE
-      freeBuf @Double dynamicAlloc estLowers totalCellsE
-      freeBuf @Double dynamicAlloc estUppers totalCellsE
-      freeBuf @Int64 dynamicAlloc slotRecorded totalCellsE
-      freeBuf @Double dynamicAlloc sortKeys numImplsE
-      freeBuf @Int64 dynamicAlloc sortIdxs numImplsE
-
-      pure bestIdx
+                        readRef bestOverallIdxRef
 
 -- | Benchmark every combination in a 'ChoiceSpace' purely inside Janus @(m, e)@
 -- without separate setup/teardown actions.
 benchmarkChoicesJanus ::
-  (ChoiceKey c, CmdBenchRunner m e) =>
+  (ChoiceColumns c, CmdBenchRunner m e) =>
   BenchConfig ->
   FilePath ->
   ChoiceSpace c ->
@@ -400,11 +394,8 @@ benchmarkCandidatesJanus ::
   m (e Int64)
 benchmarkCandidatesJanus cfg outDir cands fn =
   benchmarkChoicesJanus cfg outDir (simpleChoiceSpace cands) $ do
-    chosen <- runSimpleChoose
+    chosen <- choose simpleImpl
     fn chosen
-  where
-    runSimpleChoose =
-      choose SimpleImpl
 
 -- | Benchmark a single implementation (with optional named @tic@/@toc@ pairs)
 -- purely inside Janus @(m, e)@, emitting @overall.csv@ and per-timer CSV files.
@@ -433,7 +424,7 @@ ensureOutDir outDir =
 benchmarkAndSelectCWithSetup ::
   forall t c res a.
   ( JanusCTarget t,
-    ChoiceKey c,
+    ChoiceColumns c,
     CmdBenchRunner (JanusCMT t) (JanusCT t),
     JanusCParam t (JanusCMT t (JanusCT t Int64)),
     JanusCEvaluate t (JanusCMT t (JanusCT t Int64)),
@@ -467,7 +458,7 @@ benchmarkAndSelectCWithSetup buildCfg benchCfg outDir space setup teardown body 
 benchmarkAndSelectCWith ::
   forall t c a.
   ( JanusCTarget t,
-    ChoiceKey c,
+    ChoiceColumns c,
     CmdBenchRunner (JanusCMT t) (JanusCT t),
     JanusCParam t (JanusCMT t (JanusCT t Int64)),
     JanusCEvaluate t (JanusCMT t (JanusCT t Int64)),
@@ -496,7 +487,7 @@ benchmarkAndSelectCWith buildCfg benchCfg outDir space body =
 benchmarkAndSelectC ::
   forall t c a.
   ( JanusCTarget t,
-    ChoiceKey c,
+    ChoiceColumns c,
     CmdBenchRunner (JanusCMT t) (JanusCT t),
     JanusCParam t (JanusCMT t (JanusCT t Int64)),
     JanusCEvaluate t (JanusCMT t (JanusCT t Int64)),
@@ -563,7 +554,7 @@ benchmarkSimpleC benchCfg outDir body = do
 -- the @(IO, Identity)@ interpreter, writing ascending-sorted CSV reports to
 -- @outDir@ and returning the fastest 'ChoiceSelection' and 'SelectionSpec'.
 benchmarkAndSelectIOWithSetup ::
-  (ChoiceKey c) =>
+  (ChoiceColumns c) =>
   BenchConfig ->
   FilePath ->
   ChoiceSpace c ->
@@ -585,7 +576,7 @@ benchmarkAndSelectIOWithSetup benchCfg outDir space setup teardown body = do
 
 -- | Run a multi-choice Janus benchmark in @(IO, Identity)@.
 benchmarkAndSelectIO ::
-  (ChoiceKey c) =>
+  (ChoiceColumns c) =>
   BenchConfig ->
   FilePath ->
   ChoiceSpace c ->

@@ -60,6 +60,7 @@
           , exceptions
           , gcc
           , hashable
+          , hkd
           , lens
           , language-c-quote
           , libffi
@@ -97,6 +98,7 @@
                 dependent-sum-template
                 exceptions
                 hashable
+                hkd
                 lens
                 language-c-quote
                 libffi
@@ -114,7 +116,7 @@ substituteInPlace $dev/share/pkgconfig/nvjitlink.pc --replace "-lnvjitlink" "-ln
 substituteInPlace $dev/share/pkgconfig/nvjitlink-12.9.pc --replace "-lnvjitlink" "-lnvJitLink"'';
             })) ];
             librarySystemDepends = [ cudaPackages.cudatoolkit gcc linuxPackages.nvidia_x11 sleef ];
-            testHaskellDepends = [ concurrency dejafu semilattices tasty-dejafu tasty-discover tasty-hedgehog tasty-hunit ];
+            testHaskellDepends = [ concurrency dejafu hkd semilattices tasty-dejafu tasty-discover tasty-hedgehog tasty-hunit ];
             description = "An extensible EDSL for high-performance computing.";
             license = "unknown";
             hydraPlatforms = lib.platforms.none;
@@ -123,6 +125,7 @@ substituteInPlace $dev/share/pkgconfig/nvjitlink-12.9.pc --replace "-lnvjitlink"
         pkg = pkgs.haskell.lib.overrideCabal ((haskellPackages.override {
           overrides = self: super: rec {
             dependent-hashmap = pkgs.haskell.lib.dontCheck (super.dependent-hashmap.overrideAttrs (a : { meta = { broken = false; }; patches = (a.patches or []) ++ [./foldl.patch]; }));
+            hkd = jailbreakUnbreak super.hkd;
             rock = jailbreakUnbreak super.rock;
             semilattices = jailbreakUnbreak super.semilattices;
           };

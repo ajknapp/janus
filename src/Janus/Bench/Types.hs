@@ -3,36 +3,39 @@
 {-# LANGUAGE DeriveFunctor #-}
 {-# LANGUAGE DeriveTraversable #-}
 {-# LANGUAGE DerivingStrategies #-}
-{-# LANGUAGE EmptyCase #-}
 {-# LANGUAGE FlexibleContexts #-}
 {-# LANGUAGE FlexibleInstances #-}
-{-# LANGUAGE FunctionalDependencies #-}
-{-# LANGUAGE GADTs #-}
 {-# LANGUAGE GeneralizedNewtypeDeriving #-}
 {-# LANGUAGE KindSignatures #-}
 {-# LANGUAGE MultiParamTypeClasses #-}
+{-# LANGUAGE PolyKinds #-}
 {-# LANGUAGE ScopedTypeVariables #-}
+{-# LANGUAGE StandaloneDeriving #-}
 {-# LANGUAGE TemplateHaskellQuotes #-}
 {-# LANGUAGE TypeApplications #-}
 {-# LANGUAGE TypeFamilies #-}
 {-# LANGUAGE UndecidableInstances #-}
 
 -- | Core types for the Janus benchmarking monad transformer ('BenchT'),
--- expression wrapper ('Bench'), implementation choice environment, and
--- zero-contamination named @tic@/@toc@ timer collector.
+-- expression wrapper ('Bench'), higher-kinded choice records (@c :: (Type -> Type) -> Type@),
+-- and zero-contamination named @tic@/@toc@ timer collector.
 --
 -- 'BenchT' and 'Bench' wrap @('ReaderT' ('BenchEnv' c e) m, 'ReaderExp' ('BenchEnv' c e) e)@
--- and derive their Janus EDSL instances from "Janus.Control.Reader", while
--- 'choose' is a plain function built directly on 'ask'.
+-- where 'BenchEnv' stores both the implementation choices (@c 'Identity'@) and
+-- their human-readable descriptions (@c ('Const' 'String')@). All Janus EDSL
+-- instances are derived from "Janus.Control.Reader", and 'choose' /
+-- 'chooseDescription' are plain functions built on 'ask'.
 module Janus.Bench.Types
-  ( -- * Implementation Pieces & Dependent Choice Maps
+  ( -- * Implementation Pieces & Higher-Kinded Choice Records
     Impl (..),
     Candidates (..),
-    ChoiceSelection,
     ChoiceSpace,
-    ChoiceKey (..),
-    NoChoice,
+    ChoiceSelection (..),
+    ChoiceColumns (..),
+    NoChoice (..),
     SimpleChoice (..),
+    simpleImpl,
+    elementL,
 
     -- * Pure-Janus Named Timer Collector
     CmdNamedTimer,
@@ -59,10 +62,11 @@ module Janus.Bench.Types
     liftBenchM,
     benchReaderSpec,
 
-    -- * Reader-Based Choice Functions (`choose` via `ask`)
+    -- * Reader-Based Choice Lenses & Functions (`choose` via `ask`)
     HasChoices (..),
-    askChoiceImpl,
+    HasChoiceDescriptions (..),
     choose,
+    chooseDescription,
 
     -- * Named Timer Operations
     namedTic,
@@ -71,6 +75,7 @@ module Janus.Bench.Types
   )
 where
 
+import Control.Lens (Getting, Lens', _1, _2, lens, view)
 import qualified Control.Monad.Catch as Catch
 import Control.Monad.Fix (MonadFix)
 import Control.Monad.IO.Class (MonadIO)
@@ -80,16 +85,22 @@ import qualified Crypto.Hash.SHA256 as SHA256
 import Data.Bits (Bits (..))
 import qualified Data.ByteString as BS
 import Data.Char (isAlphaNum)
-import Data.Dependent.HashMap (DHashMap)
-import qualified Data.Dependent.HashMap as DHM
-import Data.GADT.Compare (GCompare (..), GEq (..), GOrdering (..))
-import Data.Hashable (Hashable (..))
+import Data.Functor.Const (Const (..))
+import Data.Functor.Identity (Identity (..))
+import Data.Functor.Product (Product (..))
+import Data.HKD
+  ( Element (..),
+    FFoldable (..),
+    FFunctor (..),
+    FRepeat (..),
+    FTraversable (..),
+    FZip (..),
+  )
 import Data.Int (Int64)
 import qualified Data.Kind as K
-import Data.Some (Some (..))
+import Data.Proxy (Proxy (..))
 import qualified Data.Text as Text
 import qualified Data.Text.Encoding as Text
-import Data.Type.Equality ((:~:) (..))
 import Data.Typeable (Typeable)
 import Data.Word (Word64, Word8)
 import Foreign.C (CChar, CString)
@@ -116,13 +127,13 @@ import Janus.Typed (JanusTyped)
 import qualified Language.Haskell.TH as TH
 
 --------------------------------------------------------------------------------
--- Implementation Pieces & Dependent Choice Maps
+-- Implementation Pieces & Higher-Kinded Choice Records
 --------------------------------------------------------------------------------
 
 -- | An instantiation of a single implementation piece @a@, paired with a
 -- stable programmatic identifier ('implId', used for library persistence) and
 -- a human-readable description ('implDescription', emitted in CSV reports).
-data Impl a = Impl
+data Impl (a :: K.Type) = Impl
   { implId :: !String,
     implDescription :: !String,
     implValue :: a
@@ -137,59 +148,105 @@ instance Show (Impl a) where
         . showChar ' '
         . shows (implDescription i)
 
--- | Ordered candidate list for a single choice key @c a@.
-newtype Candidates a = Candidates {getCandidates :: [Impl a]}
+-- | Ordered candidate list for a single field of a choice HKD record.
+newtype Candidates (a :: K.Type) = Candidates {getCandidates :: [Impl a]}
   deriving stock (Functor)
   deriving newtype (Semigroup, Monoid)
 
--- | Concrete instantiation of every choice key in @c@.
-type ChoiceSelection c = DHashMap c Impl
+-- | Search space mapping each field of a higher-kinded choice record
+-- @c :: (Type -> Type) -> Type@ to its candidate implementations.
+type ChoiceSpace (c :: (K.Type -> K.Type) -> K.Type) = c Candidates
 
--- | Search space mapping each choice key in @c@ to its candidate implementations.
-type ChoiceSpace c = DHashMap c Candidates
+-- | Concrete instantiation of a higher-kinded choice record @c@, bundling the
+-- active implementation pieces (@c 'Identity'@), their human-readable CSV
+-- descriptions (@c ('Const' 'String')@), and their persistent identifiers
+-- (@c ('Const' 'String')@).
+data ChoiceSelection (c :: (K.Type -> K.Type) -> K.Type) = ChoiceSelection
+  { selChoices :: !(c Identity),
+    selDescriptions :: !(c (Const String)),
+    selIds :: !(c (Const String))
+  }
 
--- | Class characterizing a choice GADT @c :: Type -> Type@ whose constructors
--- correspond to configurable pieces of an algorithm (data layout, unroll
--- factor, sub-algorithm, SIMD strategy, etc.).
-class (GEq c, Hashable (Some c)) => ChoiceKey (c :: K.Type -> K.Type) where
-  -- | Ordered list of choice axes, defining the CSV column order.
-  choiceColumns :: [Some c]
+deriving stock instance
+  (Eq (c Identity), Eq (c (Const String))) =>
+  Eq (ChoiceSelection c)
 
-  -- | CSV header column name for a given choice constructor.
-  choiceColumnName :: c a -> String
+deriving stock instance
+  (Ord (c Identity), Ord (c (Const String))) =>
+  Ord (ChoiceSelection c)
 
--- | Empty choice key for simple single-implementation benchmarks.
-data NoChoice a
+deriving stock instance
+  (Show (c Identity), Show (c (Const String))) =>
+  Show (ChoiceSelection c)
 
-instance GEq NoChoice where
-  geq x _ = case x of {}
+-- | Higher-kinded choice records @c :: (Type -> Type) -> Type@ equipped with
+-- explicit CSV header column names via @c ('Const' 'String')@.
+class (FTraversable c, FZip c) => ChoiceColumns (c :: (K.Type -> K.Type) -> K.Type) where
+  -- | CSV header column name for each field of @c@.
+  choiceColumns :: c (Const String)
 
-instance GCompare NoChoice where
-  gcompare x _ = case x of {}
+-- | Zero-field HKD choice record for single-implementation benchmarks.
+data NoChoice (f :: K.Type -> K.Type) = NoChoice
+  deriving stock (Eq, Ord, Show)
 
-instance Hashable (Some NoChoice) where
-  hashWithSalt _ (Some x) = case x of {}
+instance FFunctor NoChoice where
+  ffmap _ NoChoice = NoChoice
 
-instance ChoiceKey NoChoice where
-  choiceColumns = []
-  choiceColumnName x = case x of {}
+instance FFoldable NoChoice where
+  ffoldMap _ NoChoice = mempty
 
--- | Single-axis choice key for flat multi-candidate benchmarks without a custom GADT.
-data SimpleChoice implTy a where
-  SimpleImpl :: SimpleChoice implTy implTy
+instance FTraversable NoChoice where
+  ftraverse _ NoChoice = pure NoChoice
 
-instance GEq (SimpleChoice implTy) where
-  geq SimpleImpl SimpleImpl = Just Refl
+instance FZip NoChoice where
+  fzipWith _ NoChoice NoChoice = NoChoice
 
-instance GCompare (SimpleChoice implTy) where
-  gcompare SimpleImpl SimpleImpl = GEQ
+instance FRepeat NoChoice where
+  frepeat _ = NoChoice
 
-instance Hashable (Some (SimpleChoice implTy)) where
-  hashWithSalt s (Some SimpleImpl) = hashWithSalt s (0 :: Int)
+instance ChoiceColumns NoChoice where
+  choiceColumns = NoChoice
 
-instance ChoiceKey (SimpleChoice implTy) where
-  choiceColumns = [Some SimpleImpl]
-  choiceColumnName SimpleImpl = "implementation"
+instance ChoiceColumns Proxy where
+  choiceColumns = Proxy
+
+-- | Single-field HKD choice record for flat candidate-list benchmarks without
+-- a custom HKD record.
+newtype SimpleChoice (implTy :: K.Type) (f :: K.Type -> K.Type) = SimpleChoice
+  { _simpleImpl :: f implTy
+  }
+  deriving stock (Eq, Ord, Show)
+
+-- | Polymorphic lens into the single field of 'SimpleChoice', usable with both
+-- 'choose' and 'chooseDescription'.
+simpleImpl :: Lens' (SimpleChoice implTy f) (f implTy)
+simpleImpl k (SimpleChoice x) = SimpleChoice <$> k x
+
+instance FFunctor (SimpleChoice implTy) where
+  ffmap f (SimpleChoice x) = SimpleChoice (f x)
+
+instance FFoldable (SimpleChoice implTy) where
+  ffoldMap f (SimpleChoice x) = f x
+
+instance FTraversable (SimpleChoice implTy) where
+  ftraverse f (SimpleChoice x) = SimpleChoice <$> f x
+
+instance FZip (SimpleChoice implTy) where
+  fzipWith f (SimpleChoice x) (SimpleChoice y) = SimpleChoice (f x y)
+
+instance ChoiceColumns (SimpleChoice implTy) where
+  choiceColumns = SimpleChoice (Const "implementation")
+
+-- | Polymorphic lens into 'Data.HKD.Element', usable with both 'choose' and
+-- 'chooseDescription'.
+elementL :: Lens' (Element (a :: K.Type) f) (f a)
+elementL k (Element x) = Element <$> k x
+
+instance ChoiceColumns (Element (a :: K.Type)) where
+  choiceColumns = Element (Const "implementation")
+
+instance (ChoiceColumns f, ChoiceColumns g) => ChoiceColumns (Product f g) where
+  choiceColumns = Pair choiceColumns choiceColumns
 
 --------------------------------------------------------------------------------
 -- Pure-Janus Named Timer Collector
@@ -262,7 +319,7 @@ type CmdNamedTimer m e =
 -- Slot @0@ is reserved for @\"overall\"@; slots @1 .. numSlots - 1@ are
 -- allocated on demand via an open-addressed power-of-2 hash table keyed by
 -- compile-time 64-bit hashes of timer names.
-data TimerCollector e = TimerCollector
+data TimerCollector (e :: K.Type -> K.Type) = TimerCollector
   { tcMaxSlots :: !Int,
     tcTableCap :: !Int,
     tcRawCount :: !(e (Ptr ())),
@@ -381,7 +438,7 @@ freeTimerCollector tc = do
   free (tcRawCounts tc)
 
 -- | Bracketed allocation and cleanup of a 'TimerCollector'.
-withTimerCollector :: (CmdNamedTimer m e) => Int -> (TimerCollector e -> m a) -> m a
+withTimerCollector :: (CmdNamedTimer m e) => Int -> (TimerCollector e -> m (a :: K.Type)) -> m a
 withTimerCollector maxNamed k = do
   tc <- newTimerCollector maxNamed
   res <- k tc
@@ -461,17 +518,20 @@ resolveTimerSlot tc rawName = do
 -- Benchmarking Environment, Expression, Reference, & Monad Transformer
 --------------------------------------------------------------------------------
 
--- | Reader environment carried by 'BenchT'.
+-- | Reader environment carried by 'BenchT', holding both the active
+-- implementation pieces (@c 'Identity'@) and their human-readable descriptions
+-- (@c ('Const' 'String')@).
 --
 -- When '_benchTimers' is 'Nothing' (production mode via 'runWithChoices'),
 -- 'namedTic' and 'namedToc' compile to @pure ()@ with zero runtime overhead.
-data BenchEnv (c :: K.Type -> K.Type) (e :: K.Type -> K.Type) = BenchEnv
-  { _benchChoices :: !(ChoiceSelection c),
+data BenchEnv (c :: (K.Type -> K.Type) -> K.Type) (e :: K.Type -> K.Type) = BenchEnv
+  { _benchChoices :: !(c Identity),
+    _benchDescriptions :: !(c (Const String)),
     _benchTimers :: !(Maybe (TimerCollector e))
   }
 
 -- | Zero-cost Janus expression wrapper backed by @'ReaderExp' ('BenchEnv' c e) e@.
-newtype Bench (c :: K.Type -> K.Type) (e :: K.Type -> K.Type) a = Bench
+newtype Bench (c :: (K.Type -> K.Type) -> K.Type) (e :: K.Type -> K.Type) (a :: K.Type) = Bench
   { unBench :: ReaderExp (BenchEnv c e) e a
   }
   deriving stock (Eq, Ord, Show, Functor, Foldable, Traversable)
@@ -499,7 +559,7 @@ liftBench :: e a -> Bench c e a
 liftBench = Bench . ReaderExp
 
 -- | Mutable reference wrapper for 'BenchT', backed by 'ReaderRef'.
-newtype BenchRef (c :: K.Type -> K.Type) (m :: K.Type -> K.Type) (e :: K.Type -> K.Type) a = BenchRef
+newtype BenchRef (c :: (K.Type -> K.Type) -> K.Type) (m :: K.Type -> K.Type) (e :: K.Type -> K.Type) (a :: K.Type) = BenchRef
   { unBenchRef :: ReaderRef (BenchEnv c e) m e a
   }
 
@@ -507,10 +567,11 @@ newtype BenchRef (c :: K.Type -> K.Type) (m :: K.Type -> K.Type) (e :: K.Type ->
 getBenchRef :: BenchRef c m e a -> Ref m e a
 getBenchRef = getReaderRef . unBenchRef
 
--- | Polymorphic Janus benchmarking monad transformer parameterized by choice
--- GADT @c@, base monad @m@, and base expression type @e@, deriving its effects
--- and Janus typeclasses from @'ReaderT' ('BenchEnv' c e) m@.
-newtype BenchT (c :: K.Type -> K.Type) (m :: K.Type -> K.Type) (e :: K.Type -> K.Type) a = BenchT
+-- | Polymorphic Janus benchmarking monad transformer parameterized by
+-- higher-kinded choice record @c :: (Type -> Type) -> Type@, base monad @m@,
+-- and base expression type @e@, deriving its effects and Janus typeclasses
+-- from @'ReaderT' ('BenchEnv' c e) m@.
+newtype BenchT (c :: (K.Type -> K.Type) -> K.Type) (m :: K.Type -> K.Type) (e :: K.Type -> K.Type) (a :: K.Type) = BenchT
   { unBenchT :: ReaderT (BenchEnv c e) m a
   }
   deriving newtype
@@ -562,40 +623,67 @@ benchReaderSpec =
     }
 
 --------------------------------------------------------------------------------
--- Reader-Based Choice Functions (`choose` via `ask`)
+-- Reader-Based Choice Lenses & Functions (`choose` via `ask`)
 --------------------------------------------------------------------------------
 
--- | Environments that carry a 'ChoiceSelection' for @c@, enabling 'choose' and
--- 'askChoiceImpl' to operate over any @'MonadReader' r m@ (including 'BenchT',
--- @'ReaderT' ('BenchEnv' c e) m@, and @'ReaderT' ('ChoiceSelection' c) m@).
-class HasChoices (c :: K.Type -> K.Type) r | r -> c where
-  getChoiceSelection :: r -> ChoiceSelection c
+-- | Environments that carry a choice record @c 'Identity'@, enabling 'choose'
+-- to operate over any @'MonadReader' r m@ (including 'BenchT',
+-- @'ReaderT' (c 'Identity') m@, @'ReaderT' (c 'Identity', c ('Const' 'String')) m@,
+-- and @'ReaderT' ('ChoiceSelection' c) m@).
+class HasChoices (c :: (K.Type -> K.Type) -> K.Type) (r :: K.Type) where
+  choicesL :: Lens' r (c Identity)
+
+instance HasChoices c (c Identity) where
+  choicesL = id
+
+instance HasChoices c (c Identity, d) where
+  choicesL = _1
 
 instance HasChoices c (ChoiceSelection c) where
-  getChoiceSelection = id
+  choicesL = lens selChoices (\s cs -> s {selChoices = cs})
 
 instance HasChoices c (BenchEnv c e) where
-  getChoiceSelection = _benchChoices
+  choicesL = lens _benchChoices (\env cs -> env {_benchChoices = cs})
 
--- | Retrieve the full 'Impl' metadata (identifier, description, and value) for
--- a choice constructor @c a@ via 'ask'.
-askChoiceImpl ::
-  (GEq c, Hashable (Some c), HasChoices c r, MonadReader r m) =>
-  c a ->
-  m (Impl a)
-askChoiceImpl key = do
-  env <- ask
-  case DHM.lookup key (getChoiceSelection env) of
-    Just i -> pure i
-    Nothing ->
-      error "Janus.Bench.choose: ChoiceSelection is missing an entry for the requested choice key"
+-- | Environments that carry human-readable choice descriptions
+-- @c ('Const' 'String')@, enabling 'chooseDescription' to operate over any
+-- @'MonadReader' r m@ (including 'BenchT',
+-- @'ReaderT' (c 'Identity', c ('Const' 'String')) m@, and
+-- @'ReaderT' ('ChoiceSelection' c) m@).
+class HasChoiceDescriptions (c :: (K.Type -> K.Type) -> K.Type) (r :: K.Type) where
+  choiceDescriptionsL :: Lens' r (c (Const String))
 
--- | Select the active implementation piece for constructor @c a@ via 'ask'.
+instance HasChoiceDescriptions c (c (Const String)) where
+  choiceDescriptionsL = id
+
+instance HasChoiceDescriptions c (a, c (Const String)) where
+  choiceDescriptionsL = _2
+
+instance HasChoiceDescriptions c (ChoiceSelection c) where
+  choiceDescriptionsL = lens selDescriptions (\s ds -> s {selDescriptions = ds})
+
+instance HasChoiceDescriptions c (BenchEnv c e) where
+  choiceDescriptionsL = lens _benchDescriptions (\env ds -> env {_benchDescriptions = ds})
+
+-- | Select the active implementation piece for a field of @c@ via 'ask' and a
+-- polymorphic HKD field lens.
 choose ::
-  (GEq c, Hashable (Some c), HasChoices c r, MonadReader r m) =>
-  c a ->
+  (HasChoices c r, MonadReader r m) =>
+  Getting (Identity a) (c Identity) (Identity a) ->
   m a
-choose key = implValue <$> askChoiceImpl key
+choose fieldLens = do
+  env <- ask
+  pure (runIdentity (view (choicesL . fieldLens) env))
+
+-- | Read the human-readable description for a field of @c@ via 'ask' and the
+-- same polymorphic HKD field lens used with 'choose'.
+chooseDescription ::
+  (HasChoiceDescriptions c r, MonadReader r m) =>
+  Getting (Const String a) (c (Const String)) (Const String a) ->
+  m String
+chooseDescription fieldLens = do
+  env <- ask
+  pure (getConst (view (choiceDescriptionsL . fieldLens) env))
 
 --------------------------------------------------------------------------------
 -- Named Timer Operations (Lookup Strictly Outside Measurement Window)
@@ -639,7 +727,7 @@ namedToc name = do
         pokeElemOff (tcIterCounts tc) (prevCount + 1) slot
 
 -- | Measure an action under named timer pair @name@ (@namedTic name *> act <* namedToc name@).
-withNamedTimer :: (CmdNamedTimer m e) => String -> BenchT c m e a -> BenchT c m e a
+withNamedTimer :: (CmdNamedTimer m e) => String -> BenchT c m e (a :: K.Type) -> BenchT c m e a
 withNamedTimer name act = do
   namedTic name
   res <- act

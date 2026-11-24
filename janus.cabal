@@ -201,6 +201,7 @@ library
                     , directory
                     , exceptions
                     , hashable
+                    , hkd
                     , filepath
                     , kan-extensions
                     , language-c-quote
@@ -281,6 +282,7 @@ test-suite janus-test
                     , directory
                     , filepath
                     , hedgehog
+                    , hkd
                     , janus
                     , janus-cbits
                     , lens

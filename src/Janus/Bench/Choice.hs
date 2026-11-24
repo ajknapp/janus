@@ -1,33 +1,29 @@
 {-# LANGUAGE AllowAmbiguousTypes #-}
 {-# LANGUAGE FlexibleContexts #-}
 {-# LANGUAGE FlexibleInstances #-}
-{-# LANGUAGE GADTs #-}
-{-# LANGUAGE LambdaCase #-}
 {-# LANGUAGE RankNTypes #-}
 {-# LANGUAGE ScopedTypeVariables #-}
 {-# LANGUAGE TemplateHaskellQuotes #-}
 {-# LANGUAGE TypeApplications #-}
 
--- | Implementation choice spaces, Cartesian enumeration, Template Haskell
--- derivation, and zero-overhead library promotion helpers.
+-- | Higher-kinded choice spaces, Cartesian enumeration via "Data.HKD"
+-- ('FFunctor', 'FFoldable', 'FTraversable', 'FZip'), CSV column/description
+-- extraction, and zero-overhead library promotion helpers.
 module Janus.Bench.Choice
   ( -- * Constructing Implementation Pieces & Choice Spaces
     impl,
     implWithId,
     candidates,
-    DSum ((:=>)),
-    choiceSpace,
-    choiceSelection,
     emptyChoiceSpace,
     emptyChoiceSelection,
     simpleChoiceSpace,
 
-    -- * Choice Enumeration & CSV Metadata
+    -- * HKD Enumeration & CSV Metadata
+    fromChoiceImpl,
+    enumerateChoiceImpls,
     enumerateChoices,
     choiceHeaderColumns,
     choiceDescriptionFields,
-    camelToSnake,
-    deriveChoiceKey,
 
     -- * Zero-Overhead Library Execution & Selection Persistence
     SelectionSpec,
@@ -38,20 +34,19 @@ module Janus.Bench.Choice
     loadSelectionSpec,
     loadSelection,
     loadSelectionTH,
+    runWithDescriptions,
     runWithChoices,
     runProduction,
   )
 where
 
-import Data.Char (isLower, isUpper, toLower)
-import qualified Data.Dependent.HashMap as DHM
-import Data.Dependent.Sum (DSum ((:=>)))
-import Data.GADT.Compare (GEq)
-import Data.GADT.Compare.TH (deriveGEq)
-import Data.Hashable (Hashable (..))
+import Control.Lens (view)
+import Data.Functor.Const (Const (..))
+import Data.Functor.Identity (Identity (..))
+import Data.Functor.Product (Product (..))
+import Data.HKD (FFoldable (..), FFunctor (..), FTraversable (..), FZip (..))
 import Data.List (intercalate)
 import qualified Data.Map.Strict as Map
-import Data.Some (Some (..))
 import Janus.Bench.Types
 import qualified Language.Haskell.TH as TH
 import qualified Language.Haskell.TH.Syntax as THS
@@ -84,182 +79,95 @@ implWithId ident desc val =
       implValue = val
     }
 
--- | Wrap a non-empty list of candidate implementations for a choice key.
+-- | Wrap a non-empty list of candidate implementations for a choice field.
 candidates :: [Impl a] -> Candidates a
 candidates = Candidates
 
--- | Build a 'ChoiceSpace' from @key :=> candidates [...]@ entries.
-choiceSpace :: (GEq c, Hashable (Some c)) => [DSum c Candidates] -> ChoiceSpace c
-choiceSpace = DHM.fromList
-
--- | Build a concrete 'ChoiceSelection' from @key :=> impl ...@ entries.
-choiceSelection :: (GEq c, Hashable (Some c)) => [DSum c Impl] -> ChoiceSelection c
-choiceSelection = DHM.fromList
-
 -- | Empty 'ChoiceSpace' for zero-choice ('NoChoice') benchmarks.
 emptyChoiceSpace :: ChoiceSpace NoChoice
-emptyChoiceSpace = DHM.empty
+emptyChoiceSpace = NoChoice
 
 -- | Empty 'ChoiceSelection' for zero-choice ('NoChoice') benchmarks.
 emptyChoiceSelection :: ChoiceSelection NoChoice
-emptyChoiceSelection = DHM.empty
+emptyChoiceSelection =
+  ChoiceSelection
+    { selChoices = NoChoice,
+      selDescriptions = NoChoice,
+      selIds = NoChoice
+    }
 
 -- | Single-axis 'ChoiceSpace' over 'SimpleChoice' for flat candidate lists.
 simpleChoiceSpace :: [Impl a] -> ChoiceSpace (SimpleChoice a)
-simpleChoiceSpace xs = DHM.singleton SimpleImpl (Candidates xs)
+simpleChoiceSpace xs = SimpleChoice (Candidates xs)
 
 --------------------------------------------------------------------------------
--- Choice Enumeration & CSV Metadata
+-- HKD Enumeration & CSV Metadata
 --------------------------------------------------------------------------------
+
+-- | Split a concrete @c 'Impl'@ record into its @c 'Identity'@ implementation
+-- pieces, @c ('Const' 'String')@ human-readable descriptions, and
+-- @c ('Const' 'String')@ persistent identifiers via 'ffmap'.
+fromChoiceImpl :: (FFunctor c) => c Impl -> ChoiceSelection c
+fromChoiceImpl recImpl =
+  ChoiceSelection
+    { selChoices = ffmap (Identity . implValue) recImpl,
+      selDescriptions = ffmap (Const . implDescription) recImpl,
+      selIds = ffmap (Const . implId) recImpl
+    }
 
 -- | Enumerate the deterministic Cartesian product of all candidate
--- implementations across @'choiceColumns' \@c@.
-enumerateChoices :: forall c. (ChoiceKey c) => ChoiceSpace c -> [ChoiceSelection c]
-enumerateChoices space = go (choiceColumns @c)
-  where
-    go :: [Some c] -> [ChoiceSelection c]
-    go [] = [DHM.empty]
-    go (Some k : rest) =
-      case DHM.lookup k space of
-        Nothing ->
-          error $
-            "Janus.Bench.enumerateChoices: ChoiceSpace is missing candidates for column "
-              <> show (choiceColumnName k)
-        Just (Candidates cs) ->
-          [ DHM.insert k cand tailSel
-          | cand <- cs,
-            tailSel <- go rest
-          ]
+-- implementations across @c@ using 'ftraverse' in @[]@.
+enumerateChoiceImpls :: (FTraversable c) => ChoiceSpace c -> [c Impl]
+enumerateChoiceImpls = ftraverse getCandidates
 
--- | Ordered CSV column names corresponding to each constructor of @c@.
-choiceHeaderColumns :: forall c. (ChoiceKey c) => [String]
-choiceHeaderColumns = [choiceColumnName k | Some k <- choiceColumns @c]
+-- | Enumerate all 'ChoiceSelection' combinations in a 'ChoiceSpace'.
+enumerateChoices :: (FTraversable c) => ChoiceSpace c -> [ChoiceSelection c]
+enumerateChoices = map fromChoiceImpl . enumerateChoiceImpls
 
--- | Ordered human-readable 'implDescription' cells for a concrete 'ChoiceSelection'.
-choiceDescriptionFields :: forall c. (ChoiceKey c) => ChoiceSelection c -> [String]
-choiceDescriptionFields sel =
-  [ maybe "" implDescription (DHM.lookup k sel)
-  | Some k <- choiceColumns @c
-  ]
+-- | Ordered CSV header column names extracted from @'choiceColumns' \@c@ via
+-- 'ffoldMap'.
+choiceHeaderColumns :: forall c. (ChoiceColumns c) => [String]
+choiceHeaderColumns = ffoldMap (\(Const col) -> [col]) (choiceColumns @c)
 
--- | Convert a Haskell constructor name (e.g., @\"SIMDWidth\"@ or @\"DataLayout\"@)
--- into @snake_case@ (@\"simd_width\"@, @\"data_layout\"@) suitable for CSV headers.
-camelToSnake :: String -> String
-camelToSnake = go Nothing
-  where
-    go _ [] = []
-    go mPrev (c : cs)
-      | isUpper c =
-          let nextIsLower = case cs of
-                (n : _) -> isLower n
-                [] -> False
-              needsSep = case mPrev of
-                Nothing -> False
-                Just p -> isLower p || (isUpper p && nextIsLower)
-           in (if needsSep then ['_', toLower c] else [toLower c]) <> go (Just c) cs
-      | otherwise = c : go (Just c) cs
-
-extractZeroArgConNames :: TH.Con -> [TH.Name]
-extractZeroArgConNames = \case
-  TH.NormalC nm [] -> [nm]
-  TH.GadtC nms [] _ -> nms
-  TH.ForallC _ _ inner -> extractZeroArgConNames inner
-  other ->
-    error $
-      "Janus.Bench.deriveChoiceKey: expected zero-argument GADT constructors, got "
-        <> show other
-
--- | Derive 'GEq', @'Hashable' ('Some' c)@, and 'ChoiceKey' instances for a
--- choice GADT @c :: Type -> Type@ whose constructors represent implementation
--- axes.
-deriveChoiceKey :: TH.Name -> TH.Q [TH.Dec]
-deriveChoiceKey tyName = do
-  geqDecs <- deriveGEq tyName
-  info <- TH.reify tyName
-  cons <- case info of
-    TH.TyConI (TH.DataD _ _ _ _ cs _) -> pure (concatMap extractZeroArgConNames cs)
-    TH.TyConI (TH.NewtypeD _ _ _ _ c _) -> pure (extractZeroArgConNames c)
-    _ -> fail $ "Janus.Bench.deriveChoiceKey: " <> show tyName <> " is not a data/newtype GADT"
-  let tyCon = TH.ConT tyName
-      colExprs = [TH.AppE (TH.ConE 'Some) (TH.ConE nm) | nm <- cons]
-      xVar = TH.mkName "k"
-      matches =
-        [ TH.Match
-            (TH.ConP nm [] [])
-            (TH.NormalB (TH.LitE (TH.StringL (camelToSnake (TH.nameBase nm)))))
-            []
-        | nm <- cons
-        ]
-      colNameBody =
-        if null matches
-          then TH.CaseE (TH.VarE xVar) []
-          else TH.CaseE (TH.VarE xVar) matches
-      choiceKeyInst =
-        TH.InstanceD
-          Nothing
-          []
-          (TH.AppT (TH.ConT ''ChoiceKey) tyCon)
-          [ TH.ValD (TH.VarP 'choiceColumns) (TH.NormalB (TH.ListE colExprs)) [],
-            TH.FunD 'choiceColumnName [TH.Clause [TH.VarP xVar] (TH.NormalB colNameBody) []]
-          ]
-      sVar = TH.mkName "s"
-      someArg = TH.mkName "cKey"
-      hashBody =
-        TH.AppE
-          (TH.AppE (TH.VarE 'hashWithSalt) (TH.VarE sVar))
-          (TH.AppE (TH.VarE 'choiceColumnName) (TH.VarE someArg))
-      hashInst =
-        TH.InstanceD
-          Nothing
-          []
-          (TH.AppT (TH.ConT ''Hashable) (TH.AppT (TH.ConT ''Some) tyCon))
-          [ TH.FunD
-              'hashWithSalt
-              [ TH.Clause
-                  [TH.VarP sVar, TH.ConP 'Some [] [TH.VarP someArg]]
-                  (TH.NormalB hashBody)
-                  []
-              ]
-          ]
-  pure (geqDecs <> [choiceKeyInst, hashInst])
+-- | Ordered human-readable description cells extracted from @c ('Const' 'String')@
+-- via 'ffoldMap' in the exact same field order as 'choiceHeaderColumns'.
+choiceDescriptionFields :: (FFoldable c) => c (Const String) -> [String]
+choiceDescriptionFields = ffoldMap (\(Const desc) -> [desc])
 
 --------------------------------------------------------------------------------
 -- Zero-Overhead Library Execution & Selection Persistence
 --------------------------------------------------------------------------------
 
--- | Serializable mapping from 'choiceColumnName' to winning 'implId'.
+-- | Serializable mapping from CSV column name to winning 'implId'.
 type SelectionSpec = Map.Map String String
 
--- | Extract a serializable 'SelectionSpec' from a concrete 'ChoiceSelection'.
-extractSelectionSpec :: forall c. (ChoiceKey c) => ChoiceSelection c -> SelectionSpec
+-- | Extract a serializable 'SelectionSpec' from a 'ChoiceSelection' using
+-- 'fzipWith' and 'ffoldMap'.
+extractSelectionSpec :: forall c. (ChoiceColumns c) => ChoiceSelection c -> SelectionSpec
 extractSelectionSpec sel =
-  Map.fromList
-    [ (choiceColumnName k, implId i)
-    | Some k <- choiceColumns @c,
-      Just i <- [DHM.lookup k sel]
-    ]
+  Map.fromList $
+    ffoldMap
+      (\(Const pair) -> [pair])
+      (fzipWith (\(Const col) (Const ident) -> Const (col, ident)) (choiceColumns @c) (selIds sel))
 
 -- | Reconstruct a typed 'ChoiceSelection' from a 'ChoiceSpace' and a saved
--- 'SelectionSpec'.
+-- 'SelectionSpec' using 'fzipWith' and 'ftraverse'.
 resolveSelection ::
   forall c.
-  (ChoiceKey c) =>
+  (ChoiceColumns c) =>
   ChoiceSpace c ->
   SelectionSpec ->
   Either String (ChoiceSelection c)
-resolveSelection space spec = go (choiceColumns @c) DHM.empty
+resolveSelection space spec =
+  fromChoiceImpl <$> ftraverse resolveField (fzipWith Pair (choiceColumns @c) space)
   where
-    go [] acc = Right acc
-    go (Some k : rest) acc = do
-      let col = choiceColumnName k
+    resolveField :: Product (Const String) Candidates a -> Either String (Impl a)
+    resolveField (Pair (Const col) (Candidates cands)) = do
       chosenId <- case Map.lookup col spec of
         Just ident -> Right ident
         Nothing -> Left $ "resolveSelection: missing choice column " <> show col <> " in SelectionSpec"
-      Candidates cands <- case DHM.lookup k space of
-        Just cs -> Right cs
-        Nothing -> Left $ "resolveSelection: missing choice column " <> show col <> " in ChoiceSpace"
-      case filter (\c -> implId c == chosenId) cands of
-        (winner : _) -> go rest (DHM.insert k winner acc)
+      case filter (\i -> implId i == chosenId) cands of
+        (winner : _) -> Right winner
         [] ->
           Left $
             "resolveSelection: unknown implId "
@@ -273,8 +181,7 @@ resolveSelection space spec = go (choiceColumns @c) DHM.empty
 -- | Total wrapper around 'resolveSelection' suitable for top-level library
 -- bindings paired with 'loadSelectionTH'.
 resolveSelectionOrFail ::
-  forall c.
-  (ChoiceKey c) =>
+  (ChoiceColumns c) =>
   ChoiceSpace c ->
   SelectionSpec ->
   ChoiceSelection c
@@ -300,7 +207,7 @@ parseSelectionSpec path raw =
 -- | Persist a winning 'ChoiceSelection' to @path@ so it can be reloaded at
 -- runtime ('loadSelection') or embedded at compile time ('loadSelectionTH') in
 -- a production library.
-saveSelection :: forall c. (ChoiceKey c) => FilePath -> ChoiceSelection c -> IO ()
+saveSelection :: (ChoiceColumns c) => FilePath -> ChoiceSelection c -> IO ()
 saveSelection path sel = do
   let dir = takeDirectory path
   if null dir || dir == "."
@@ -317,7 +224,7 @@ loadSelectionSpec path = do
     Left err -> ioError (userError err)
 
 -- | Load and resolve a saved 'ChoiceSelection' against a 'ChoiceSpace'.
-loadSelection :: forall c. (ChoiceKey c) => ChoiceSpace c -> FilePath -> IO (ChoiceSelection c)
+loadSelection :: (ChoiceColumns c) => ChoiceSpace c -> FilePath -> IO (ChoiceSelection c)
 loadSelection space path = do
   spec <- loadSelectionSpec path
   case resolveSelection space spec of
@@ -351,21 +258,30 @@ loadSelectionTH path = do
         ]
   pure (TH.AppE (TH.VarE 'Map.fromList) (TH.ListE pairExps))
 
--- | Execute a 'BenchT' computation in production/library mode using a fixed
--- 'ChoiceSelection'.
+-- | Execute a 'BenchT' computation in production/library mode with explicit
+-- @c 'Identity'@ choices and @c ('Const' 'String')@ descriptions.
 --
 -- In this mode '_benchTimers' is 'Nothing', so all 'namedTic', 'namedToc', and
 -- 'withNamedTimer' calls disappear completely at staging/compile time with
 -- zero runtime or instruction overhead.
-runWithChoices :: (Monad m) => ChoiceSelection c -> BenchT c m e a -> m a
-runWithChoices sel =
+runWithDescriptions :: (Monad m) => c Identity -> c (Const String) -> BenchT c m e a -> m a
+runWithDescriptions cs ds =
   runBenchT
     BenchEnv
-      { _benchChoices = sel,
+      { _benchChoices = cs,
+        _benchDescriptions = ds,
         _benchTimers = Nothing
       }
 
+-- | Execute a 'BenchT' computation in production/library mode using any @r@
+-- carrying @c 'Identity'@ (such as @c 'Identity'@ directly or a
+-- @'ChoiceSelection' c@).
+runWithChoices :: (FFunctor c, HasChoices c r, Monad m) => r -> BenchT c m e a -> m a
+runWithChoices r =
+  let cs = view choicesL r
+   in runWithDescriptions cs (ffmap (const (Const "")) cs)
+
 -- | Convenience wrapper around 'runWithChoices' that also unwraps a returned
 -- @'Bench' c e a@ expression into @e a@ for direct use in library code.
-runProduction :: (Monad m) => ChoiceSelection c -> BenchT c m e (Bench c e a) -> m (e a)
-runProduction sel act = getBench <$> runWithChoices sel act
+runProduction :: (FFunctor c, HasChoices c r, Monad m) => r -> BenchT c m e (Bench c e a) -> m (e a)
+runProduction r act = getBench <$> runWithChoices r act
