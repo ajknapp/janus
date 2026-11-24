@@ -19,23 +19,32 @@ import Janus.Backend.C.CUDA.SIMD.Mem ()
 import Janus.Backend.C.CUDA.SIMD.ReduceDot ()
 import Janus.Backend.C.CUDA.SIMD.Shuffle ()
 import Janus.Backend.C.CUDA.Types
-import Janus.SPMD.Gang (CmdOptimalGang (..), dispatchGangInt, optimalCUDAGangSize)
+import Janus.SPMD.Gang
+  ( CmdOptimalGang (..),
+    JanusTypedChain (..),
+    OptimalGangCaps (..),
+    dispatchOptimalGang,
+    optimalCUDAGangSize,
+  )
 
 --------------------------------------------------------------------------------
 -- Optimal Non-Splitting Gang Dispatch for CUDA Backends
 --------------------------------------------------------------------------------
 
 instance CmdOptimalGang JanusCUDAM JanusCUDA where
+  optimalGangCaps = OptimalGangCaps JTChainC
   withOptimalGang pa k = do
     fs <- JanusCUDAM (lift askCUDAFeatures)
-    dispatchGangInt (optimalCUDAGangSize fs pa) k
+    dispatchOptimalGang optimalGangCaps (optimalCUDAGangSize fs pa) pa k
 
 instance CmdOptimalGang CUDAIOM CUDAIO where
+  optimalGangCaps = OptimalGangCaps JTChainId
   withOptimalGang pa k = do
     fs <- askCUDAIOFeatures
-    dispatchGangInt (optimalCUDAGangSize fs pa) k
+    dispatchOptimalGang optimalGangCaps (optimalCUDAGangSize fs pa) pa k
 
 instance CmdOptimalGang CUDADejaFuM CUDADejaFu where
+  optimalGangCaps = OptimalGangCaps JTChainId
   withOptimalGang pa k = do
     fs <- askCUDADejaFuFeatures
-    dispatchGangInt (optimalCUDAGangSize fs pa) k
+    dispatchOptimalGang optimalGangCaps (optimalCUDAGangSize fs pa) pa k

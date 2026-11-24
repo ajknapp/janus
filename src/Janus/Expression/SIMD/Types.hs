@@ -24,6 +24,7 @@ module Janus.Expression.SIMD.Types
     pokeByteBufBytes,
 
     -- * Scalar Lane Element Metadata
+    SIMDElemProof (..),
     SIMDElem (..),
     JanusElemTag (..),
 
@@ -159,7 +160,22 @@ data JanusElemTag
   | JanusElemDouble
   deriving stock (Eq, Ord, Show, Bounded, Enum, Generic)
 
+-- | Closed GADT proof identifying which of the 10 hardware 'SIMDElem' scalar
+-- types @a@ is.
+data SIMDElemProof (a :: K.Type) where
+  SIMDElemInt8 :: SIMDElemProof Int8
+  SIMDElemWord8 :: SIMDElemProof Word8
+  SIMDElemInt16 :: SIMDElemProof Int16
+  SIMDElemWord16 :: SIMDElemProof Word16
+  SIMDElemInt32 :: SIMDElemProof Int32
+  SIMDElemWord32 :: SIMDElemProof Word32
+  SIMDElemInt64 :: SIMDElemProof Int64
+  SIMDElemWord64 :: SIMDElemProof Word64
+  SIMDElemFloat :: SIMDElemProof Float
+  SIMDElemDouble :: SIMDElemProof Double
+
 class (Storable a, Eq a, Show a, Typeable a) => SIMDElem a where
+  simdElemProof :: SIMDElemProof a
   simdElemTag :: Proxy a -> JanusElemTag
   simdElemBytes :: Proxy a -> Int
   simdElemSigned :: Proxy a -> Bool
@@ -167,6 +183,7 @@ class (Storable a, Eq a, Show a, Typeable a) => SIMDElem a where
   simdElemCTypeName :: Proxy a -> String
 
 instance SIMDElem Int8 where
+  simdElemProof = SIMDElemInt8
   simdElemTag _ = JanusElemInt8
   simdElemBytes _ = 1
   simdElemSigned _ = True
@@ -174,6 +191,7 @@ instance SIMDElem Int8 where
   simdElemCTypeName _ = "int8_t"
 
 instance SIMDElem Word8 where
+  simdElemProof = SIMDElemWord8
   simdElemTag _ = JanusElemWord8
   simdElemBytes _ = 1
   simdElemSigned _ = False
@@ -181,6 +199,7 @@ instance SIMDElem Word8 where
   simdElemCTypeName _ = "uint8_t"
 
 instance SIMDElem Int16 where
+  simdElemProof = SIMDElemInt16
   simdElemTag _ = JanusElemInt16
   simdElemBytes _ = 2
   simdElemSigned _ = True
@@ -188,6 +207,7 @@ instance SIMDElem Int16 where
   simdElemCTypeName _ = "int16_t"
 
 instance SIMDElem Word16 where
+  simdElemProof = SIMDElemWord16
   simdElemTag _ = JanusElemWord16
   simdElemBytes _ = 2
   simdElemSigned _ = False
@@ -195,6 +215,7 @@ instance SIMDElem Word16 where
   simdElemCTypeName _ = "uint16_t"
 
 instance SIMDElem Int32 where
+  simdElemProof = SIMDElemInt32
   simdElemTag _ = JanusElemInt32
   simdElemBytes _ = 4
   simdElemSigned _ = True
@@ -202,6 +223,7 @@ instance SIMDElem Int32 where
   simdElemCTypeName _ = "int32_t"
 
 instance SIMDElem Word32 where
+  simdElemProof = SIMDElemWord32
   simdElemTag _ = JanusElemWord32
   simdElemBytes _ = 4
   simdElemSigned _ = False
@@ -209,6 +231,7 @@ instance SIMDElem Word32 where
   simdElemCTypeName _ = "uint32_t"
 
 instance SIMDElem Int64 where
+  simdElemProof = SIMDElemInt64
   simdElemTag _ = JanusElemInt64
   simdElemBytes _ = 8
   simdElemSigned _ = True
@@ -216,6 +239,7 @@ instance SIMDElem Int64 where
   simdElemCTypeName _ = "int64_t"
 
 instance SIMDElem Word64 where
+  simdElemProof = SIMDElemWord64
   simdElemTag _ = JanusElemWord64
   simdElemBytes _ = 8
   simdElemSigned _ = False
@@ -223,6 +247,7 @@ instance SIMDElem Word64 where
   simdElemCTypeName _ = "uint64_t"
 
 instance SIMDElem Float where
+  simdElemProof = SIMDElemFloat
   simdElemTag _ = JanusElemFloat
   simdElemBytes _ = 4
   simdElemSigned _ = True
@@ -230,6 +255,7 @@ instance SIMDElem Float where
   simdElemCTypeName _ = "float"
 
 instance SIMDElem Double where
+  simdElemProof = SIMDElemDouble
   simdElemTag _ = JanusElemDouble
   simdElemBytes _ = 8
   simdElemSigned _ = True

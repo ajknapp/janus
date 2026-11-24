@@ -1,6 +1,7 @@
 {-# LANGUAGE DataKinds #-}
 {-# LANGUAGE FlexibleContexts #-}
 {-# LANGUAGE FlexibleInstances #-}
+{-# LANGUAGE GADTs #-}
 {-# LANGUAGE MonoLocalBinds #-}
 {-# LANGUAGE MultiParamTypeClasses #-}
 {-# LANGUAGE ScopedTypeVariables #-}
@@ -13,23 +14,32 @@
 module Janus.Control.Reader.Gang () where
 
 import Control.Monad.Reader (ReaderT (..))
+import Data.Typeable (Typeable)
 import GHC.TypeNats (natVal)
 import Janus.Control.Reader.Base (ReaderExp)
-import Janus.SPMD.Gang (CmdOptimalGang (..), SPMDGang, dispatchGangInt)
+import Janus.SPMD.Gang
+  ( CmdOptimalGang (..),
+    OptimalGangCaps (..),
+    dispatchOptimalGang,
+    liftWrapperTypedChain,
+  )
 
 instance
-  ( CmdOptimalGang m e,
-    SPMDGang 2 (ReaderT r m) (ReaderExp r e),
-    SPMDGang 4 (ReaderT r m) (ReaderExp r e),
-    SPMDGang 8 (ReaderT r m) (ReaderExp r e),
-    SPMDGang 16 (ReaderT r m) (ReaderExp r e),
-    SPMDGang 32 (ReaderT r m) (ReaderExp r e)
-  ) =>
+  (Typeable r, CmdOptimalGang m e) =>
   CmdOptimalGang (ReaderT r m) (ReaderExp r e)
   where
+  optimalGangCaps =
+    case optimalGangCaps @m @e of
+      OptimalGangCaps ch ->
+        OptimalGangCaps (liftWrapperTypedChain @(ReaderExp r e) @e ch)
   withOptimalGang pa k =
     ReaderT $ \env ->
-      withOptimalGang pa $ \pn ->
+      withOptimalGang @m @e pa $ \pn ->
         runReaderT
-          (dispatchGangInt @(ReaderT r m) @(ReaderExp r e) (fromIntegral (natVal pn)) k)
+          ( dispatchOptimalGang
+              (optimalGangCaps @(ReaderT r m) @(ReaderExp r e))
+              (fromIntegral (natVal pn))
+              pa
+              k
+          )
           env

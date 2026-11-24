@@ -2,6 +2,7 @@
 {-# LANGUAGE DerivingStrategies #-}
 {-# LANGUAGE FlexibleContexts #-}
 {-# LANGUAGE FlexibleInstances #-}
+{-# LANGUAGE GADTs #-}
 {-# LANGUAGE GeneralizedNewtypeDeriving #-}
 {-# LANGUAGE MultiParamTypeClasses #-}
 {-# LANGUAGE ScopedTypeVariables #-}
@@ -68,7 +69,12 @@ import Janus.Expression.MurmurHash (ExpMurmurHash (..))
 import Janus.Expression.Ord (ExpOrd (..))
 import Janus.Expression.SIMD
 import Janus.Fix (ExpFix (..), JanusCFix (..), jfix)
-import Janus.SPMD.Gang (CmdOptimalGang (..), SPMDGang, dispatchGangInt)
+import Janus.SPMD.Gang
+  ( CmdOptimalGang (..),
+    OptimalGangCaps (..),
+    dispatchOptimalGang,
+    liftWrapperTypedChain,
+  )
 import Janus.Typed (JanusTyped)
 import qualified Language.Haskell.TH as TH
 
@@ -716,23 +722,26 @@ deriveJanusReaderGang spec = do
   eVar <- TH.newName "e"
   let mQ = TH.varT mVar
       eQ = TH.varT eVar
-  (_, mTy, eTy, _, _) <- jrsInstantiate spec mQ eQ
+  (_, mTy, eTy, _, extraTypeables) <- jrsInstantiate spec mQ eQ
   let mTyQ = pure mTy
       eTyQ = pure eTy
-  [d|
-    instance
-      ( CmdOptimalGang $mQ $eQ,
-        SPMDGang 2 $mTyQ $eTyQ,
-        SPMDGang 4 $mTyQ $eTyQ,
-        SPMDGang 8 $mTyQ $eTyQ,
-        SPMDGang 16 $mTyQ $eTyQ,
-        SPMDGang 32 $mTyQ $eTyQ
-      ) =>
-      CmdOptimalGang $mTyQ $eTyQ
-      where
-      withOptimalGang pa k =
-        $mkM $
-          ReaderT $ \env ->
-            withOptimalGang @($mQ) @($eQ) pa $ \pn ->
-              runReaderT ($unM (dispatchGangInt @($mTyQ) @($eTyQ) (fromIntegral (natVal pn)) k)) env
-    |]
+  basePred <- [t|CmdOptimalGang $mQ $eQ|]
+  decs <-
+    [d|
+      instance CmdOptimalGang $mTyQ $eTyQ where
+        optimalGangCaps =
+          case optimalGangCaps @($mQ) @($eQ) of
+            OptimalGangCaps ch ->
+              OptimalGangCaps (liftWrapperTypedChain @($eTyQ) @($eQ) ch)
+        withOptimalGang pa k =
+          $mkM $
+            ReaderT $ \env ->
+              withOptimalGang @($mQ) @($eQ) pa $ \pn ->
+                runReaderT
+                  ($unM (dispatchOptimalGang (optimalGangCaps @($mTyQ) @($eTyQ)) (fromIntegral (natVal pn)) pa k))
+                  env
+      |]
+  pure $ case decs of
+    [TH.InstanceD ov _ hd body] ->
+      [TH.InstanceD ov (extraTypeables <> [basePred]) hd body]
+    other -> other

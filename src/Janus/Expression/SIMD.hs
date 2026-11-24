@@ -19,6 +19,7 @@ module Janus.Expression.SIMD
 
     -- * Shapes, Scalar Metadata, & Wide Unrolling
     JanusElemTag (..),
+    SIMDElemProof (..),
     SIMDElem (..),
     CPUSIMDElem,
     SIMDShape (..),

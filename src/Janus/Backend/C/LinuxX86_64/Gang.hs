@@ -14,13 +14,20 @@ import Janus.Backend.C.LinuxX86_64.SIMD.Mem ()
 import Janus.Backend.C.LinuxX86_64.SIMD.ReduceDot ()
 import Janus.Backend.C.LinuxX86_64.SIMD.Shuffle ()
 import Janus.Backend.C.LinuxX86_64.Types
-import Janus.SPMD.Gang (CmdOptimalGang (..), dispatchGangInt, optimalX86GangSize)
+import Janus.SPMD.Gang
+  ( CmdOptimalGang (..),
+    JanusTypedChain (..),
+    OptimalGangCaps (..),
+    dispatchOptimalGang,
+    optimalX86GangSize,
+  )
 
 --------------------------------------------------------------------------------
 -- Optimal Non-Splitting Gang Dispatch for LinuxX86_64
 --------------------------------------------------------------------------------
 
 instance CmdOptimalGang LinuxX86_64CM LinuxX86_64C where
+  optimalGangCaps = OptimalGangCaps JTChainC
   withOptimalGang pa k = do
     fs <- askX86Features
-    dispatchGangInt (optimalX86GangSize fs pa) k
+    dispatchOptimalGang optimalGangCaps (optimalX86GangSize fs pa) pa k
