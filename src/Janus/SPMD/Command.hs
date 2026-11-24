@@ -26,7 +26,7 @@ import Foreign.C.String (CString)
 import Foreign.C.Types (CChar, CFile, CInt)
 import Foreign.Ptr (Ptr)
 import GHC.TypeNats (KnownNat, Nat, natVal)
-import qualified Janus.Command.Array as A
+import qualified Janus.Command.Memory as M
 import Janus.Command.Case (CmdCase (..))
 import Janus.Command.Cond (CmdCond (..), whenM_)
 import Janus.Command.Format (CmdFormat (..), CmdPutString (..), CmdString (..))
@@ -207,7 +207,7 @@ instance
 instance
   ( KnownNat n,
     Monad m,
-    A.CmdMem m e,
+    M.CmdMem m e,
     CmdCond m e,
     CmdRef m e,
     ExpSIMDMask e n (SPMDMaskElem n),
@@ -220,23 +220,23 @@ instance
     PtrTreeOps n e VoidPtr,
     ExpPair e,
     ExpPtrCast e,
-    A.ExpPtr e Word8,
+    M.ExpPtr e Word8,
     rl ~ SPMDRawLayout n Int64,
     SPMDRawVec rl n e Int64,
     Num (e Int64)
   ) =>
-  A.CmdMem (SPMDM n m e) (SPMD n e)
+  M.CmdMem (SPMDM n m e) (SPMD n e)
   where
   malloc sz = do
     msk <- ask
     szE <- evalSPMD sz
     preds <- liftSPMD (laneActivePredsM msk)
     let szs = int64ToLanes szE
-        nullVP = mkVoidPtr (toVoidPtr (A.nullPtr @e @Word8))
+        nullVP = mkVoidPtr (toVoidPtr (M.nullPtr @e @Word8))
     vps <- liftSPMD $ forM (zip preds szs) $ \(act, s) -> do
       r <- newRef nullVP
       whenM_ act $ do
-        p <- A.malloc s
+        p <- M.malloc s
         writeRef r (mkVoidPtr p)
       readRef r
     pure (SPMD (pure (VoidPtrVarying (ptrTreeFromList @n vps))))
@@ -248,11 +248,11 @@ instance
     preds <- liftSPMD (laneActivePredsM msk)
     let cnts = int64ToLanes cntE
         szs = int64ToLanes szE
-        nullVP = mkVoidPtr (toVoidPtr (A.nullPtr @e @Word8))
+        nullVP = mkVoidPtr (toVoidPtr (M.nullPtr @e @Word8))
     vps <- liftSPMD $ forM (zip3 preds cnts szs) $ \(act, c, s) -> do
       r <- newRef nullVP
       whenM_ act $ do
-        p <- A.calloc c s
+        p <- M.calloc c s
         writeRef r (mkVoidPtr p)
       readRef r
     pure (SPMD (pure (VoidPtrVarying (ptrTreeFromList @n vps))))
@@ -267,7 +267,7 @@ instance
     newVPs <- liftSPMD $ forM (zip3 preds curVPs szs) $ \(act, oldVP, s) -> do
       r <- newRef oldVP
       whenM_ act $ do
-        p <- A.realloc (unVoidPtr oldVP) s
+        p <- M.realloc (unVoidPtr oldVP) s
         writeRef r (mkVoidPtr p)
       readRef r
     pure (SPMD (pure (VoidPtrVarying (ptrTreeFromList @n newVPs))))
@@ -278,7 +278,7 @@ instance
     preds <- liftSPMD (laneActivePredsM msk)
     let curVPs = ptrTreeToList @n (materializeVoidPtr vpE)
     liftSPMD $ forM_ (zip preds curVPs) $ \(act, p) ->
-      whenM_ act (A.free (unVoidPtr p))
+      whenM_ act (M.free (unVoidPtr p))
 
 -- CmdStorable: aligned/unaligned/masked contiguous SIMD loads & stores + masked per-lane fallback
 class
@@ -341,7 +341,7 @@ instance
     SPMDRawMem rlH h m e a,
     SPMDMaskSplit n h e,
     ExpPair e,
-    A.ExpPtr e a,
+    M.ExpPtr e a,
     Num (e Int64)
   ) =>
   SPMDRawMem ('LSplit h) n m e a
@@ -350,18 +350,18 @@ instance
     let (mLo, mHi) = splitExecMask @n @h msk
         hOff = fromIntegral (natVal (Proxy @h)) :: Int64
     lo <- rawContigLoad @rlH @h @m @e @a aligned mLo p
-    hi <- rawContigLoad @rlH @h @m @e @a aligned mHi (A.ptrIndex p (fromIntegral hOff))
+    hi <- rawContigLoad @rlH @h @m @e @a aligned mHi (M.ptrIndex p (fromIntegral hOff))
     pure (mkPair lo hi)
   rawContigStore aligned msk p v = do
     let (mLo, mHi) = splitExecMask @n @h msk
         hOff = fromIntegral (natVal (Proxy @h)) :: Int64
     rawContigStore @rlH @h @m @e @a aligned mLo p (fstPair v)
-    rawContigStore @rlH @h @m @e @a aligned mHi (A.ptrIndex p (fromIntegral hOff)) (sndPair v)
+    rawContigStore @rlH @h @m @e @a aligned mHi (M.ptrIndex p (fromIntegral hOff)) (sndPair v)
 
 instance
   ( Monad m,
     SPMDRawVec 'LPad4 2 e a,
-    A.CmdStorable m e a,
+    M.CmdStorable m e a,
     CmdCond m e,
     CmdRef m e,
     ExpSIMDMask e 2 Int64,
@@ -379,14 +379,14 @@ instance
     preds <- laneActivePredsM msk
     xs <- forM (zip [0 :: Int64, 1] preds) $ \(i, act) -> do
       r <- newRef 0
-      whenM_ act (A.peekElemOff p (fromIntegral i) >>= writeRef r)
+      whenM_ act (M.peekElemOff p (fromIntegral i) >>= writeRef r)
       readRef r
     pure (rawFromLanes @'LPad4 @2 @e @a xs)
   rawContigStore _ msk p v = do
     preds <- laneActivePredsM msk
     let xs = rawToLanes @'LPad4 @2 @e @a v
     forM_ (zip3 [0 :: Int64, 1] preds xs) $ \(i, act, x) ->
-      whenM_ act (A.pokeElemOff p x (fromIntegral i))
+      whenM_ act (M.pokeElemOff p x (fromIntegral i))
 
 instance
   ( Monad m,
@@ -511,9 +511,9 @@ instance
   ( KnownNat n,
     l ~ SPMDLayout n a,
     SPMDLayout n (Ptr a) ~ 'LPtr a,
-    A.ExpSized (SPMD n e) a,
+    M.ExpSized (SPMD n e) a,
     SPMDStorableByLayout l n m e a,
-    A.CmdStorable m e a,
+    M.CmdStorable m e a,
     CmdCond m e,
     CmdRef m e,
     ExpSIMDMask e n (SPMDMaskElem n),
@@ -523,12 +523,12 @@ instance
     JanusTyped e Word32,
     JanusTyped e a,
     PtrTreeOps n e (Ptr a),
-    A.ExpPtr e a,
+    M.ExpPtr e a,
     rlI ~ SPMDRawLayout n Int64,
     SPMDRawVec rlI n e Int64,
     Num (e Int64)
   ) =>
-  A.CmdStorable (SPMDM n m e) (SPMD n e) a
+  M.CmdStorable (SPMDM n m e) (SPMD n e) a
   where
   peek ptr = do
     msk <- ask
@@ -539,8 +539,8 @@ instance
       PtrUniform _ base -> liftSPMD $ do
         r <- newRef (spmdScalarZeroL @l @n @m @e @a)
         case msk of
-          SPMDMaskAllTrue -> A.peek base >>= writeRef r
-          SPMDMask m -> whenM_ (manyOf m) (A.peek base >>= writeRef r)
+          SPMDMaskAllTrue -> M.peek base >>= writeRef r
+          SPMDMask m -> whenM_ (manyOf m) (M.peek base >>= writeRef r)
         val <- readRef r
         pure (SPMD (pure (spmdBroadcastScalarL @l @n @m @e @a val)))
       _ -> liftSPMD $ do
@@ -548,7 +548,7 @@ instance
         let ps = ptrToLanes pe
         xs <- forM (zip preds ps) $ \(act, p) -> do
           r <- newRef (spmdScalarZeroL @l @n @m @e @a)
-          whenM_ act (A.peek p >>= writeRef r)
+          whenM_ act (M.peek p >>= writeRef r)
           readRef r
         pure (SPMD (pure (spmdPackScalarsL @l @n @m @e @a xs)))
 
@@ -564,7 +564,7 @@ instance
         let ps = ptrToLanes pe
             xs = spmdUnpackScalarsL @l @n @m @e @a ve
         forM_ (zip3 preds ps xs) $ \(act, p, x) ->
-          whenM_ act (A.poke p x)
+          whenM_ act (M.poke p x)
 
   peekElemOff ptr idx = do
     msk <- ask
@@ -573,23 +573,23 @@ instance
     let w = fromIntegral (natVal (Proxy @n)) :: Int64
     case (pe, ie) of
       (PtrUniform al1 base, I64UnitStride al2 off) | spmdHasContigSIMD @l @n @m @e @a ->
-        SPMD . pure <$> liftSPMD (spmdContigLoadL @l @n @m @e @a (al1 && al2) msk (A.ptrIndex base off))
+        SPMD . pure <$> liftSPMD (spmdContigLoadL @l @n @m @e @a (al1 && al2) msk (M.ptrIndex base off))
       (PtrUnitStride al base, I64Const c) | spmdHasContigSIMD @l @n @m @e @a ->
-        SPMD . pure <$> liftSPMD (spmdContigLoadL @l @n @m @e @a (al && c `mod` w == 0) msk (A.ptrIndex base (fromIntegral c)))
+        SPMD . pure <$> liftSPMD (spmdContigLoadL @l @n @m @e @a (al && c `mod` w == 0) msk (M.ptrIndex base (fromIntegral c)))
       (PtrUnitStride al1 base, I64Uniform al2 off) | spmdHasContigSIMD @l @n @m @e @a ->
-        SPMD . pure <$> liftSPMD (spmdContigLoadL @l @n @m @e @a (al1 && al2) msk (A.ptrIndex base off))
+        SPMD . pure <$> liftSPMD (spmdContigLoadL @l @n @m @e @a (al1 && al2) msk (M.ptrIndex base off))
       (PtrUniform _ base, I64Const c) -> liftSPMD $ do
         r <- newRef (spmdScalarZeroL @l @n @m @e @a)
         case msk of
-          SPMDMaskAllTrue -> A.peekElemOff base (fromIntegral c) >>= writeRef r
-          SPMDMask m -> whenM_ (manyOf m) (A.peekElemOff base (fromIntegral c) >>= writeRef r)
+          SPMDMaskAllTrue -> M.peekElemOff base (fromIntegral c) >>= writeRef r
+          SPMDMask m -> whenM_ (manyOf m) (M.peekElemOff base (fromIntegral c) >>= writeRef r)
         val <- readRef r
         pure (SPMD (pure (spmdBroadcastScalarL @l @n @m @e @a val)))
       (PtrUniform _ base, I64Uniform _ off) -> liftSPMD $ do
         r <- newRef (spmdScalarZeroL @l @n @m @e @a)
         case msk of
-          SPMDMaskAllTrue -> A.peekElemOff base off >>= writeRef r
-          SPMDMask m -> whenM_ (manyOf m) (A.peekElemOff base off >>= writeRef r)
+          SPMDMaskAllTrue -> M.peekElemOff base off >>= writeRef r
+          SPMDMask m -> whenM_ (manyOf m) (M.peekElemOff base off >>= writeRef r)
         val <- readRef r
         pure (SPMD (pure (spmdBroadcastScalarL @l @n @m @e @a val)))
       _ -> liftSPMD $ do
@@ -598,7 +598,7 @@ instance
             is = int64ToLanes ie
         xs <- forM (zip3 preds ps is) $ \(act, p, off) -> do
           r <- newRef (spmdScalarZeroL @l @n @m @e @a)
-          whenM_ act (A.peekElemOff p off >>= writeRef r)
+          whenM_ act (M.peekElemOff p off >>= writeRef r)
           readRef r
         pure (SPMD (pure (spmdPackScalarsL @l @n @m @e @a xs)))
 
@@ -610,32 +610,32 @@ instance
     let w = fromIntegral (natVal (Proxy @n)) :: Int64
     case (pe, ie) of
       (PtrUniform al1 base, I64UnitStride al2 off) | spmdHasContigSIMD @l @n @m @e @a ->
-        liftSPMD (spmdContigStoreL @l @n @m @e @a (al1 && al2) msk (A.ptrIndex base off) ve)
+        liftSPMD (spmdContigStoreL @l @n @m @e @a (al1 && al2) msk (M.ptrIndex base off) ve)
       (PtrUnitStride al base, I64Const c) | spmdHasContigSIMD @l @n @m @e @a ->
-        liftSPMD (spmdContigStoreL @l @n @m @e @a (al && c `mod` w == 0) msk (A.ptrIndex base (fromIntegral c)) ve)
+        liftSPMD (spmdContigStoreL @l @n @m @e @a (al && c `mod` w == 0) msk (M.ptrIndex base (fromIntegral c)) ve)
       (PtrUnitStride al1 base, I64Uniform al2 off) | spmdHasContigSIMD @l @n @m @e @a ->
-        liftSPMD (spmdContigStoreL @l @n @m @e @a (al1 && al2) msk (A.ptrIndex base off) ve)
+        liftSPMD (spmdContigStoreL @l @n @m @e @a (al1 && al2) msk (M.ptrIndex base off) ve)
       _ -> liftSPMD $ do
         preds <- laneActivePredsM msk
         let ps = ptrToLanes pe
             is = int64ToLanes ie
             xs = spmdUnpackScalarsL @l @n @m @e @a ve
         forM_ (zip3 preds (zip ps is) xs) $ \(act, (p, off), x) ->
-          whenM_ act (A.pokeElemOff p x off)
+          whenM_ act (M.pokeElemOff p x off)
 
 -- CmdRefPtr
 instance
   ( KnownNat n,
     l ~ SPMDLayout n a,
     SPMDLayout n (Ptr a) ~ 'LPtr a,
-    A.CmdStorable (SPMDM n m e) (SPMD n e) a,
+    M.CmdStorable (SPMDM n m e) (SPMD n e) a,
     SPMDStorableByLayout l n m e a,
-    A.CmdRefPtr m e a,
+    M.CmdRefPtr m e a,
     CmdRef m e,
     JanusTyped e a,
     PtrTreeOps n e (Ptr a)
   ) =>
-  A.CmdRefPtr (SPMDM n m e) (SPMD n e) a
+  M.CmdRefPtr (SPMDM n m e) (SPMD n e) a
   where
   withRefPtr ref@(SPMDRef r) f = do
     msk <- ask
@@ -646,7 +646,7 @@ instance
           let spmdPtr = SPMD (pure (PtrVarying (ptrTreeFromList @n @e @(Ptr a) (reverse accPtrs))))
           runReaderT (getSPMDM (f spmdPtr)) msk
         withPtrs (sr : srs) accPtrs =
-          A.withRefPtr sr (\p -> withPtrs srs (p : accPtrs))
+          M.withRefPtr sr (\p -> withPtrs srs (p : accPtrs))
     res <- liftSPMD (withPtrs scalarRefs [])
     finalScalars <- liftSPMD (mapM readRef scalarRefs)
     writeRef ref (SPMD (pure (spmdPackScalarsL @l @n @m @e @a finalScalars)))
@@ -667,8 +667,8 @@ instance
     JanusTyped e CInt,
     PtrTreeOps n e (Ptr CChar),
     PtrTreeOps n e (Ptr CFile),
-    A.ExpPtr e CChar,
-    A.ExpPtr e CFile,
+    M.ExpPtr e CChar,
+    M.ExpPtr e CFile,
     lCInt ~ SPMDLayout n CInt,
     SPMDLanesByLayout lCInt n e CInt,
     Num (e Int64),
@@ -686,7 +686,7 @@ instance
     let ps = ptrToLanes pe
         ms = ptrToLanes me
     files <- liftSPMD $ forM (zip3 preds ps ms) $ \(act, p, md) -> do
-      r <- newRef (A.nullPtr @e @CFile)
+      r <- newRef (M.nullPtr @e @CFile)
       whenM_ act (fopen p md >>= writeRef r)
       readRef r
     pure (SPMD (pure (PtrVarying (ptrTreeFromList @n @e @(Ptr CFile) files))))
@@ -725,8 +725,8 @@ instance
     JanusTyped e Word32,
     PtrTreeOps n e (Ptr CFile),
     PtrTreeOps n e (Ptr CChar),
-    A.ExpPtr e CFile,
-    A.ExpPtr e CChar,
+    M.ExpPtr e CFile,
+    M.ExpPtr e CChar,
     Num (e Int64)
   ) =>
   CmdPutString (SPMDM n m e) (SPMD n e)
@@ -756,7 +756,7 @@ instance
     Num (e Word32),
     JanusTyped e Word32,
     PtrTreeOps n e (Ptr CFile),
-    A.ExpPtr e CFile,
+    M.ExpPtr e CFile,
     Num (e Int64)
   ) =>
   CmdFormat (SPMDM n m e) (SPMD n e) a

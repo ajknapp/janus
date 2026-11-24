@@ -31,7 +31,7 @@ import Janus.Backend.C.Build
 import Janus.Backend.C.CUDA.Foreign
 import Janus.Backend.C.CUDA.Types
 import Janus.Backend.C.Target
-import qualified Janus.Command.Array as A
+import qualified Janus.Command.Memory as M
 import Janus.Command.Case
 import Janus.Command.Cond
 import Janus.Command.Format
@@ -118,26 +118,26 @@ instance (ExpOrd JanusC a) => ExpOrd JanusCUDA a where
   gt = coerce (gt @JanusC @a)
   ge = coerce (ge @JanusC @a)
 
-instance (JanusCTyped a, A.ExpSized JanusC a) => A.ExpSized JanusCUDA a where
-  sizeOf = coerce (A.sizeOf @JanusC @a)
-  alignOf = coerce (A.alignOf @JanusC @a)
+instance (JanusCTyped a, M.ExpSized JanusC a) => M.ExpSized JanusCUDA a where
+  sizeOf = coerce (M.sizeOf @JanusC @a)
+  alignOf = coerce (M.alignOf @JanusC @a)
 
-instance (A.ExpPtr JanusC a) => A.ExpPtr JanusCUDA a where
-  nullPtr = coerce (A.nullPtr @JanusC @a)
-  ptrAdd = coerce (A.ptrAdd @JanusC @a)
-  ptrIndex = coerce (A.ptrIndex @JanusC @a)
+instance (M.ExpPtr JanusC a) => M.ExpPtr JanusCUDA a where
+  nullPtr = coerce (M.nullPtr @JanusC @a)
+  ptrAdd = coerce (M.ptrAdd @JanusC @a)
+  ptrIndex = coerce (M.ptrIndex @JanusC @a)
 
-instance A.CmdMem JanusCUDAM JanusCUDA where
-  malloc n = JanusCUDAM $ lift $ coerce (A.malloc @JanusCM @JanusC) n
-  calloc n m = JanusCUDAM $ lift $ coerce (A.calloc @JanusCM @JanusC) n m
-  realloc p n = JanusCUDAM $ lift $ coerce (A.realloc @JanusCM @JanusC) p n
-  free p = JanusCUDAM $ lift $ coerce (A.free @JanusCM @JanusC) p
+instance M.CmdMem JanusCUDAM JanusCUDA where
+  malloc n = JanusCUDAM $ lift $ coerce (M.malloc @JanusCM @JanusC) n
+  calloc n m = JanusCUDAM $ lift $ coerce (M.calloc @JanusCM @JanusC) n m
+  realloc p n = JanusCUDAM $ lift $ coerce (M.realloc @JanusCM @JanusC) p n
+  free p = JanusCUDAM $ lift $ coerce (M.free @JanusCM @JanusC) p
 
-instance (A.ExpSized JanusCUDA a, JanusCTyped a) => A.CmdStorable JanusCUDAM JanusCUDA a where
-  peek p = JanusCUDAM $ lift $ coerce (A.peek @JanusCM @JanusC @a) p
-  poke p a = JanusCUDAM $ lift $ coerce (A.poke @JanusCM @JanusC @a) p a
-  peekElemOff p n = JanusCUDAM $ lift $ coerce (A.peekElemOff @JanusCM @JanusC @a) p n
-  pokeElemOff p a n = JanusCUDAM $ lift $ coerce (A.pokeElemOff @JanusCM @JanusC @a) p a n
+instance (M.ExpSized JanusCUDA a, JanusCTyped a) => M.CmdStorable JanusCUDAM JanusCUDA a where
+  peek p = JanusCUDAM $ lift $ coerce (M.peek @JanusCM @JanusC @a) p
+  poke p a = JanusCUDAM $ lift $ coerce (M.poke @JanusCM @JanusC @a) p a
+  peekElemOff p n = JanusCUDAM $ lift $ coerce (M.peekElemOff @JanusCM @JanusC @a) p n
+  pokeElemOff p a n = JanusCUDAM $ lift $ coerce (M.pokeElemOff @JanusCM @JanusC @a) p a n
 
 instance CmdCase JanusCUDAM JanusCUDA where
   switchCase_ tag cases def = JanusCUDAM $ lift $ switchCase_ (getJanusCUDA tag) (fmap (\(i, m) -> (i, runJanusCUDAM m)) cases) (runJanusCUDAM def)

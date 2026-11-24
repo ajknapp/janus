@@ -11,7 +11,7 @@ import Foreign.Ptr (Ptr)
 import GHC.Generics (Generic)
 import Janus.Backend.C (JanusC, JanusCM)
 import Janus.CSE (CSEExp, CSEM, withCSE)
-import qualified Janus.Command.Array as A
+import qualified Janus.Command.Memory as M
 import Janus.Data.HKD (HKD (..), JanusHKD)
 
 data Pair64 f = Pair64
@@ -25,36 +25,36 @@ instance JanusHKD Pair64
 -- | Effectful helper `bar`: increments counter at `logPtr[0]`, records `1000 + step`
 -- at `logPtr[step]`, and returns `x + 10 * step`.
 barEffect ::
-  (Monad m, A.CmdStorable m e Int64, Num (e Int64)) =>
+  (Monad m, M.CmdStorable m e Int64, Num (e Int64)) =>
   e Int64 ->
   e (Ptr Int64) ->
   m (e Int64)
 barEffect x logPtr = do
-  c0 <- A.peekElemOff logPtr 0
+  c0 <- M.peekElemOff logPtr 0
   let c1 = c0 + 1
-  A.pokeElemOff logPtr c1 0
-  A.pokeElemOff logPtr (1000 + c1) c1
+  M.pokeElemOff logPtr c1 0
+  M.pokeElemOff logPtr (1000 + c1) c1
   pure (x + 10 * c1)
 
 -- | Effectful helper `quux`: increments counter at `logPtr[0]`, records `2000 + step`
 -- at `logPtr[step]`, and returns `x * 3 + step`.
 quuxEffect ::
-  (Monad m, A.CmdStorable m e Int64, Num (e Int64)) =>
+  (Monad m, M.CmdStorable m e Int64, Num (e Int64)) =>
   e Int64 ->
   e (Ptr Int64) ->
   m (e Int64)
 quuxEffect x logPtr = do
-  c0 <- A.peekElemOff logPtr 0
+  c0 <- M.peekElemOff logPtr 0
   let c1 = c0 + 1
-  A.pokeElemOff logPtr c1 0
-  A.pokeElemOff logPtr (2000 + c1) c1
+  M.pokeElemOff logPtr c1 0
+  M.pokeElemOff logPtr (2000 + c1) c1
   pure (x * 3 + c1)
 
 -- | User's canonical scenario:
 -- @do { let x = foo y; a <- bar x; b <- quux x; pure (a, b) }@
 -- using an ordinary Haskell @let@ (no @let_@ or @letM@).
 canonicalTupleProg ::
-  (Monad m, A.CmdStorable m e Int64, Num (e Int64)) =>
+  (Monad m, M.CmdStorable m e Int64, Num (e Int64)) =>
   e Int64 ->
   e (Ptr Int64) ->
   m (e Int64, e Int64)
@@ -65,15 +65,15 @@ canonicalTupleProg y logPtr = do
   pure (a, b)
 
 canonicalOutProg ::
-  (Monad m, A.CmdStorable m e Int64, Num (e Int64)) =>
+  (Monad m, M.CmdStorable m e Int64, Num (e Int64)) =>
   e Int64 ->
   e (Ptr Int64) ->
   e (Ptr Int64) ->
   m (e Int64)
 canonicalOutProg y outPtr logPtr = do
   (a, b) <- canonicalTupleProg y logPtr
-  A.pokeElemOff outPtr a 0
-  A.pokeElemOff outPtr b 1
+  M.pokeElemOff outPtr a 0
+  M.pokeElemOff outPtr b 1
   pure (a * 31 + b)
 
 hkdInputProg :: (Num (e Int64)) => HKD Pair64 e -> e Int64 -> e Int64

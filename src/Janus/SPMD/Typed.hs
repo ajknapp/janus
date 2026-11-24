@@ -23,7 +23,7 @@ import Data.Proxy (Proxy (..))
 import Data.Word (Word32, Word8)
 import Foreign.Ptr (Ptr)
 import GHC.TypeNats (KnownNat, Nat, natVal)
-import qualified Janus.Command.Array as A
+import qualified Janus.Command.Memory as M
 import Janus.Expression.Bits (ExpBits)
 import Janus.Expression.Bool (ExpBool)
 import Janus.Expression.Cast (ExpPtrCast (..))
@@ -62,26 +62,26 @@ int64ToLanes = \case
 
 materializePtr ::
   forall n e a.
-  (PtrTreeOps n e (Ptr a), A.ExpPtr e a, Num (e Int64)) =>
+  (PtrTreeOps n e (Ptr a), M.ExpPtr e a, Num (e Int64)) =>
   SPMDPtrExpr n e a ->
   e (PtrTree n (Ptr a))
 materializePtr = \case
   PtrUniform _ p -> ptrTreeReplicate @n p
   PtrUnitStride _ p ->
     let lanes = fromIntegral (natVal (Proxy @n)) :: Int64
-     in ptrTreeFromList @n [A.ptrIndex p (fromIntegral i) | i <- [0 .. lanes - 1]]
+     in ptrTreeFromList @n [M.ptrIndex p (fromIntegral i) | i <- [0 .. lanes - 1]]
   PtrVarying t -> t
 
 ptrToLanes ::
   forall n e a.
-  (PtrTreeOps n e (Ptr a), A.ExpPtr e a, Num (e Int64)) =>
+  (PtrTreeOps n e (Ptr a), M.ExpPtr e a, Num (e Int64)) =>
   SPMDPtrExpr n e a ->
   [e (Ptr a)]
 ptrToLanes = \case
   PtrUniform _ p -> replicate (fromIntegral (natVal (Proxy @n))) p
   PtrUnitStride _ p ->
     let lanes = fromIntegral (natVal (Proxy @n)) :: Int64
-     in [A.ptrIndex p (fromIntegral i) | i <- [0 .. lanes - 1]]
+     in [M.ptrIndex p (fromIntegral i) | i <- [0 .. lanes - 1]]
   PtrVarying t -> ptrTreeToList @n t
 
 materializeVoidPtr ::
@@ -127,7 +127,7 @@ class
 
 defaultToVoidPtr ::
   forall n e a.
-  (JanusTyped e a, ExpPtrCast e, PtrTreeOps n e (Ptr a), PtrTreeOps n e VoidPtr, A.ExpPtr e a, Num (e Int64)) =>
+  (JanusTyped e a, ExpPtrCast e, PtrTreeOps n e (Ptr a), PtrTreeOps n e VoidPtr, M.ExpPtr e a, Num (e Int64)) =>
   SPMDPtrExpr n e a ->
   SPMDVoidPtrExpr n e
 defaultToVoidPtr = \case
@@ -149,7 +149,7 @@ instance
     JanusTyped e a,
     JanusTyped e (SIMDVector e n a),
     PtrTreeOps n e (Ptr a),
-    A.ExpPtr e a,
+    M.ExpPtr e a,
     Num (e Int64)
   ) =>
   SPMDTypedByLayout 'LDirect n e a
@@ -168,7 +168,7 @@ instance
     JanusTyped e a,
     JanusTyped e (SIMDPair (SPMDRepByLayout (SPMDRawLayout h a) h e a) (SPMDRepByLayout (SPMDRawLayout h a) h e a)),
     PtrTreeOps n e (Ptr a),
-    A.ExpPtr e a,
+    M.ExpPtr e a,
     Num (e Int64)
   ) =>
   SPMDTypedByLayout ('LSplit h) n e a
@@ -187,7 +187,7 @@ instance
     JanusTyped e a,
     JanusTyped e (SIMDVector e 4 a),
     PtrTreeOps 2 e (Ptr a),
-    A.ExpPtr e a,
+    M.ExpPtr e a,
     Num (e Int64)
   ) =>
   SPMDTypedByLayout 'LPad4 2 e a
@@ -206,7 +206,7 @@ instance
     JanusTyped e Int64,
     JanusTyped e (SPMDRepByLayout rl n e Int64),
     PtrTreeOps n e (Ptr Int64),
-    A.ExpPtr e Int64,
+    M.ExpPtr e Int64,
     Num (e Int64)
   ) =>
   SPMDTypedByLayout ('LInt64 rl) n e Int64
@@ -230,7 +230,7 @@ instance
     JanusTyped e a,
     JanusTyped e (SPMDRep n e base),
     PtrTreeOps n e (Ptr a),
-    A.ExpPtr e a,
+    M.ExpPtr e a,
     Num (e Int64)
   ) =>
   SPMDTypedByLayout ('LNewtype base) n e a
@@ -249,7 +249,7 @@ instance
     JanusTyped e (Complex b),
     JanusTyped e (SIMDPair (SPMDRep n e b) (SPMDRep n e b)),
     PtrTreeOps n e (Ptr (Complex b)),
-    A.ExpPtr e (Complex b),
+    M.ExpPtr e (Complex b),
     Num (e Int64)
   ) =>
   SPMDTypedByLayout ('LComplex b) n e (Complex b)
@@ -272,7 +272,7 @@ instance
     JanusTyped e Bool,
     JanusTyped e (SIMDMask e n (SPMDMaskElem n)),
     PtrTreeOps n e (Ptr Bool),
-    A.ExpPtr e Bool,
+    M.ExpPtr e Bool,
     Num (e Int64)
   ) =>
   SPMDTypedByLayout 'LBool n e Bool
@@ -295,13 +295,13 @@ instance
     JanusTyped e (Ptr b),
     PtrTreeOps n e (Ptr b),
     PtrTreeOps n e (Ptr (Ptr b)),
-    A.ExpPtr e b,
-    A.ExpPtr e (Ptr b),
+    M.ExpPtr e b,
+    M.ExpPtr e (Ptr b),
     Num (e Int64)
   ) =>
   SPMDTypedByLayout ('LPtr b) n e (Ptr b)
   where
-  spmdDefaultByLayout = PtrUniform True A.nullPtr
+  spmdDefaultByLayout = PtrUniform True M.nullPtr
   spmdMaterializeByLayout = materializePtr
   spmdDematerializeByLayout = PtrVarying
   spmdSelectRawByLayout m t f =
@@ -327,13 +327,13 @@ instance
     JanusTyped e Word8,
     JanusTyped e VoidPtr,
     PtrTreeOps n e VoidPtr,
-    A.ExpPtr e Word8,
+    M.ExpPtr e Word8,
     ExpPtrCast e,
     Num (e Int64)
   ) =>
   SPMDTypedByLayout 'LVoidPtr n e (Ptr ())
   where
-  spmdDefaultByLayout = VoidPtrUniform True (toVoidPtr (A.nullPtr @e @Word8))
+  spmdDefaultByLayout = VoidPtrUniform True (toVoidPtr (M.nullPtr @e @Word8))
   spmdMaterializeByLayout = materializeVoidPtr
   spmdDematerializeByLayout = VoidPtrVarying
   spmdSelectRawByLayout m t f =

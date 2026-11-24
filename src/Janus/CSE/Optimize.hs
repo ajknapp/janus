@@ -47,7 +47,7 @@ module Janus.CSE.Optimize
     isIdentityParamSubst,
     CSEParam (..),
     CSEParamMonad,
-    ReifyTensorBoundShape (..),
+    ReifyTensorBoundsShape (..),
     CSEApplySubst (..),
     CSEOptimizeFrom (..),
     CSEOptimize (..),
@@ -72,11 +72,11 @@ import GHC.Generics
 import GHC.TypeNats (KnownNat, Nat)
 import Janus.Backend.C.CUDA.Types (mapCUDAThreadInfo)
 import Janus.CSE.Types
-import Janus.Command.Array (Tensor (..), TensorBound (..))
 import Janus.Command.Ref (CmdRef (..))
 import Janus.Command.TicToc (Tic (..), Toc (..))
 import Janus.Control.Reader.Base (ExpNewtype (..))
 import Janus.Data.HKD (HKD (..))
+import Janus.Data.Tensor (Tensor (..), TensorBounds (..))
 import Janus.Expression.SIMD (ExpSIMD, SIMDShape, Wide)
 import qualified Type.Reflection as TR
 
@@ -1718,16 +1718,16 @@ instance CSETargetReturn e (Toc (CSEExp e)) where
 instance CSEReturn e (Tensor ds (CSEExp e) a) where
   traverseCSEReturn fn (Tensor tb p) = Tensor (coerceTB tb) <$> fn p
     where
-      coerceTB :: TensorBound sh (CSEExp e) -> TensorBound sh (CSEExp e)
+      coerceTB :: TensorBounds sh (CSEExp e) -> TensorBounds sh (CSEExp e)
       coerceTB = id
 
 instance CSETargetReturn e (Tensor ds (CSEExp e) a) where
   type CSETargetVal e (Tensor ds (CSEExp e) a) = Tensor ds e a
   interpretCSEReturn eval (Tensor tb p) = Tensor (retagTB tb) (eval p)
     where
-      retagTB :: TensorBound sh (CSEExp e) -> TensorBound sh e
-      retagTB TensorBoundNil = TensorBoundNil
-      retagTB (TensorBoundCons pn rest) = TensorBoundCons pn (retagTB rest)
+      retagTB :: TensorBounds sh (CSEExp e) -> TensorBounds sh e
+      retagTB TensorBoundsNil = TensorBoundsNil
+      retagTB (TensorBoundsCons pn rest) = TensorBoundsCons pn (retagTB rest)
 
 instance (CSEReturn e r) => CSEReturn e (Wide k r) where
   traverseCSEReturn fn = traverse (traverseCSEReturn fn)
@@ -1834,7 +1834,7 @@ instance (CmdRef m e, CSETyped e a) => CSEParam (CSERef m e a) where
   cseBindTargetParam k tgtRef =
     (k + 1, [], [(RefParam k, SomeTargetRef (TR.typeRep @a) tgtRef)])
 
-instance (CSETyped e a, ReifyTensorBoundShape ds) => CSEParam (Tensor ds (CSEExp e) a) where
+instance (CSETyped e a, ReifyTensorBoundsShape ds) => CSEParam (Tensor ds (CSEExp e) a) where
   type CSEParamExp (Tensor ds (CSEExp e) a) = e
   type CSEParamTarget (Tensor ds (CSEExp e) a) = Tensor ds e a
   cseAllocParam k =
@@ -1842,19 +1842,19 @@ instance (CSETyped e a, ReifyTensorBoundShape ds) => CSEParam (Tensor ds (CSEExp
         cap = BindPtrOf (BindDirect @e @a)
         vk = VarParam k
         vid = VarId vk tr (Just cap)
-        tb = reifyTensorBoundCSE @ds @(CSEExp e)
+        tb = reifyTensorBoundsCSE @ds @(CSEExp e)
      in (k + 1, Tensor tb (mkExpVar vid), \(Tensor _ actP) -> addExpParamSubst vk tr cap actP)
   cseBindTargetParam k (Tensor _ tgtP) =
     (k + 1, [(VarParam k, SomeTargetVal (TR.typeRep @(Ptr a)) tgtP)], [])
 
-class ReifyTensorBoundShape (ds :: [Nat]) where
-  reifyTensorBoundCSE :: TensorBound ds e
+class ReifyTensorBoundsShape (ds :: [Nat]) where
+  reifyTensorBoundsCSE :: TensorBounds ds e
 
-instance ReifyTensorBoundShape '[] where
-  reifyTensorBoundCSE = TensorBoundNil
+instance ReifyTensorBoundsShape '[] where
+  reifyTensorBoundsCSE = TensorBoundsNil
 
-instance (KnownNat d, ReifyTensorBoundShape ds) => ReifyTensorBoundShape (d ': ds) where
-  reifyTensorBoundCSE = TensorBoundCons (Proxy @d) (reifyTensorBoundCSE @ds)
+instance (KnownNat d, ReifyTensorBoundsShape ds) => ReifyTensorBoundsShape (d ': ds) where
+  reifyTensorBoundsCSE = TensorBoundsCons (Proxy @d) (reifyTensorBoundsCSE @ds)
 
 instance (CSEHKD d e, Typeable e) => CSEParam (HKD d (CSEExp e)) where
   type CSEParamExp (HKD d (CSEExp e)) = e

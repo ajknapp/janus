@@ -31,7 +31,7 @@ import Janus.Backend.C.Build (CBuildConfig, cBuildConfigCacheDir, defaultCBuildC
 import Janus.Backend.C.CUDA
 import Janus.Backend.C.CUDA.Foreign
 import Janus.Backend.C.LinuxX86_64
-import qualified Janus.Command.Array as A
+import qualified Janus.Command.Memory as M
 import Janus.Command.Case (CmdCase, switchCase)
 import Janus.Command.Cond (CmdCond, ifThenElseM_, whenM_)
 import Janus.Command.Range (CmdRange, rangeM)
@@ -42,6 +42,7 @@ import Janus.Control.Fold (drain, maximumF, minimumF, sumF)
 import Janus.Control.Pipe (delayP, dropP, filterP, pipeM, runPipe, takeP)
 import Janus.Control.Stream (rangeS)
 import Janus.Control.Unfold (range)
+import Janus.Data.Tensor (TensorIndex(..), newTensor, Vector, Tensor (..), ReifyTensorBounds (..), freeTensor, readTensor, writeTensor, withTensor, iterateTensorBounds, tensorBounds)
 import Janus.Expression.Bits (ExpBits)
 import Janus.Expression.Bool (ExpBool (false))
 import Janus.Expression.Cast (ExpBoolCast (fromBool), ExpFloatingCast (toFloating), ExpIntegralCast (toIntegral), ExpPtrCast)
@@ -74,15 +75,15 @@ getSPMDTestConfig = do
 
 cAlignmentKernel :: JanusC Int64 -> JanusCM (JanusC Int64)
 cAlignmentKernel n = do
-  p1 <- A.malloc n
-  p2 <- A.calloc n 4
-  p3 <- A.realloc p1 (n * 8 + 17)
-  t <- A.newTensor (A.tensorBound (Proxy @'[32])) :: JanusCM (A.Vector 32 JanusC Float)
-  A.writeTensor t (3 A.:. A.Z) 42.5
-  v <- A.readTensor t (3 A.:. A.Z)
-  A.free p2
-  A.free p3
-  A.freeTensor t
+  p1 <- M.malloc n
+  p2 <- M.calloc n 4
+  p3 <- M.realloc p1 (n * 8 + 17)
+  t <- newTensor (reifyTensorBounds (Proxy @'[32])) :: JanusCM (Vector 32 JanusC Float)
+  writeTensor t (3 :. Z) 42.5
+  v <- readTensor t (3 :. Z)
+  M.free p2
+  M.free p3
+  freeTensor t
   pure (toIntegral v)
 
 unit_aligned_allocations_and_tensors :: IO ()
@@ -91,22 +92,22 @@ unit_aligned_allocations_and_tensors = do
 
   -- 1. IO / Identity CmdMem 64-byte alignment across odd sizes & realloc
   forM_ [0, 1, 13, 63, 64, 129, 1000 :: Int64] $ \sz -> do
-    Identity pm <- A.malloc @IO @Identity (Identity sz)
-    (fromIntegral (ptrToWordPtr pm) `mod` A.janusSIMDAlignment) @?= 0
-    Identity pr <- A.realloc @IO @Identity (Identity pm) (Identity (sz + 257))
-    (fromIntegral (ptrToWordPtr pr) `mod` A.janusSIMDAlignment) @?= 0
-    A.free @IO @Identity (Identity pr)
+    Identity pm <- M.malloc @IO @Identity (Identity sz)
+    (fromIntegral (ptrToWordPtr pm) `mod` M.janusSIMDAlignment) @?= 0
+    Identity pr <- M.realloc @IO @Identity (Identity pm) (Identity (sz + 257))
+    (fromIntegral (ptrToWordPtr pr) `mod` M.janusSIMDAlignment) @?= 0
+    M.free @IO @Identity (Identity pr)
 
-    Identity pc <- A.calloc @IO @Identity (Identity (max 1 sz)) 4
-    (fromIntegral (ptrToWordPtr pc) `mod` A.janusSIMDAlignment) @?= 0
+    Identity pc <- M.calloc @IO @Identity (Identity (max 1 sz)) 4
+    (fromIntegral (ptrToWordPtr pc) `mod` M.janusSIMDAlignment) @?= 0
     v0 <- peekElemOff (castPtr pc :: Ptr Int32) 0
     v0 @?= 0
-    A.free @IO @Identity (Identity pc)
+    M.free @IO @Identity (Identity pc)
 
   -- 2. withTensor & withAlignedArray 64-byte alignment + misaligned vloadAligned detection
-  let bds = A.tensorBound (Proxy @'[16])
-  A.withTensor bds $ \(A.Tensor _ (Identity tp) :: A.Vector 16 Identity Float) -> do
-    (fromIntegral (ptrToWordPtr tp) `mod` A.janusSIMDAlignment) @?= 0
+  let bds = reifyTensorBounds (Proxy @'[16])
+  withTensor bds $ \(Tensor _ (Identity tp) :: Vector 16 Identity Float) -> do
+    (fromIntegral (ptrToWordPtr tp) `mod` M.janusSIMDAlignment) @?= 0
     pokeArray tp [fromIntegral i | i <- [0 .. 15 :: Int]]
     Identity vecAligned <- vloadAligned @IO @Identity @8 @Float (Identity tp)
     simdToList vecAligned @?= [0 .. 7]
@@ -128,7 +129,7 @@ unit_aligned_allocations_and_tensors = do
 -- Unmodified abstract Janus scalar step operating on a 1D Vector
 abstractFmaReluStep ::
   ( Monad m,
-    A.CmdStorable m e a,
+    M.CmdStorable m e a,
     ExpOrd e a,
     ExpCond e,
     FMA (e a),
@@ -137,33 +138,33 @@ abstractFmaReluStep ::
     Num (e Int64)
   ) =>
   e a ->
-  A.Vector d e a ->
-  A.Vector d e a ->
-  A.Vector d e a ->
-  A.TensorIndex '[d] e ->
+  Vector d e a ->
+  Vector d e a ->
+  Vector d e a ->
+  TensorIndex '[d] e ->
   m ()
 abstractFmaReluStep alpha vx vy vout idx = do
-  x <- A.readTensor vx idx
-  y <- A.readTensor vy idx
+  x <- readTensor vx idx
+  y <- readTensor vy idx
   let z = fma alpha x y
-  A.writeTensor vout idx (ifThenElse (z `lt` 0) 0 z)
+  writeTensor vout idx (ifThenElse (z `lt` 0) 0 z)
 
 -- Unmodified abstract Janus 3-point stencil step (tests aligned i vs unaligned i-1, i+1)
 abstractStencilStep ::
   ( Monad m,
-    A.CmdStorable m e Float,
+    M.CmdStorable m e Float,
     Fractional (e Float),
     Num (e Int64)
   ) =>
-  A.Vector d e Float ->
-  A.Vector d e Float ->
+  Vector d e Float ->
+  Vector d e Float ->
   e Int64 ->
   m ()
 abstractStencilStep vin vout i = do
-  xm <- A.readTensor vin ((i - 1) A.:. A.Z)
-  x0 <- A.readTensor vin (i A.:. A.Z)
-  xp <- A.readTensor vin ((i + 1) A.:. A.Z)
-  A.writeTensor vout (i A.:. A.Z) (0.25 * xm + 0.5 * x0 + 0.25 * xp)
+  xm <- readTensor vin ((i - 1) :. Z)
+  x0 <- readTensor vin (i :. Z)
+  xp <- readTensor vin ((i + 1) :. Z)
+  writeTensor vout (i :. Z) (0.25 * xm + 0.5 * x0 + 0.25 * xp)
 
 unit_optimal_gang_selection_and_aligned_codegen :: IO ()
 unit_optimal_gang_selection_and_aligned_codegen = do
@@ -192,7 +193,7 @@ unit_optimal_gang_selection_and_aligned_codegen = do
   optimalCUDAGangSize cudaSM80 (Proxy @Int8) @?= 16
 
   -- 2. Verify generated C code uses aligned SIMD intrinsics and NEVER splits main types
-  let bds64 = A.tensorBound (Proxy @'[64])
+  let bds64 = reifyTensorBounds (Proxy @'[64])
       floatX86Kern ::
         LinuxX86_64C Float ->
         LinuxX86_64C (Ptr Float) ->
@@ -200,9 +201,9 @@ unit_optimal_gang_selection_and_aligned_codegen = do
         LinuxX86_64C (Ptr Float) ->
         LinuxX86_64CM ()
       floatX86Kern alpha px py pout = do
-        let vx = A.Tensor bds64 px
-            vy = A.Tensor bds64 py
-            vout = A.Tensor bds64 pout
+        let vx = Tensor bds64 px
+            vy = Tensor bds64 py
+            vout = Tensor bds64 pout
         foreachOptimalTensorM (Proxy @Float) vx $ \idx ->
           abstractFmaReluStep (uniform alpha) (liftTensor vx) (liftTensor vy) (liftTensor vout) idx
 
@@ -224,11 +225,11 @@ unit_optimal_gang_selection_and_aligned_codegen = do
         LinuxX86_64C (Ptr Int32) ->
         LinuxX86_64CM ()
       int32X86Kern px pout = do
-        let vx = A.Tensor bds64 px
-            vout = A.Tensor bds64 pout
+        let vx = Tensor bds64 px
+            vout = Tensor bds64 pout
         foreachOptimalTensorM (Proxy @Int32) vx $ \idx -> do
-          x <- A.readTensor (liftTensor vx) idx
-          A.writeTensor (liftTensor vout) idx (x * 3 + 1)
+          x <- readTensor (liftTensor vx) idx
+          writeTensor (liftTensor vout) idx (x * 3 + 1)
 
       cIntAVX1 = showJanusCWith x86AVX "spmd_i32_avx1" int32X86Kern
       cIntAVX2 = showJanusCWith x86AVX2 "spmd_i32_avx2" int32X86Kern
@@ -242,11 +243,11 @@ unit_optimal_gang_selection_and_aligned_codegen = do
         LinuxX86_64C (Ptr Double) ->
         LinuxX86_64CM ()
       doubleX86Kern px pout = do
-        let vx = A.Tensor bds64 px
-            vout = A.Tensor bds64 pout
+        let vx = Tensor bds64 px
+            vout = Tensor bds64 pout
         foreachOptimalTensorM (Proxy @Double) vx $ \idx -> do
-          x <- A.readTensor (liftTensor vx) idx
-          A.writeTensor (liftTensor vout) idx (x * x)
+          x <- readTensor (liftTensor vx) idx
+          writeTensor (liftTensor vout) idx (x * x)
 
       cDblAVX2 = showJanusCWith x86AVX2 "spmd_f64_avx2" doubleX86Kern
 
@@ -258,8 +259,8 @@ unit_optimal_gang_selection_and_aligned_codegen = do
         LinuxX86_64C (Ptr Float) ->
         LinuxX86_64CM ()
       stencilKern pin pout = do
-        let vin = A.Tensor bds64 pin
-            vout = A.Tensor bds64 pout
+        let vin = Tensor bds64 pin
+            vout = Tensor bds64 pout
         foreachAlignedM (Proxy @8) 8 56 $ \i ->
           abstractStencilStep (liftTensor vin) (liftTensor vout) i
 
@@ -275,11 +276,11 @@ unit_optimal_gang_selection_and_aligned_codegen = do
         JanusCUDA (Ptr Float) ->
         JanusCUDAM ()
       cudaSpmdKern px pout = do
-        let vx = A.Tensor bds64 px
-            vout = A.Tensor bds64 pout
+        let vx = Tensor bds64 px
+            vout = Tensor bds64 pout
         foreachOptimalTensorM (Proxy @Float) vx $ \idx -> do
-          x <- A.readTensor (liftTensor vx) idx
-          A.writeTensor (liftTensor vout) idx (x + 1.0)
+          x <- readTensor (liftTensor vx) idx
+          writeTensor (liftTensor vout) idx (x + 1.0)
 
       cuCode = showJanusCUDA "cuda_spmd_f32" cudaSpmdKern
 
@@ -308,10 +309,10 @@ mixedUnliftedProgram ::
   e (Ptr Float) ->
   m (e Float)
 mixedUnliftedProgram alpha px py pout = do
-  let bds23 = A.tensorBound (Proxy @'[23])
-      vx = A.Tensor bds23 px
-      vy = A.Tensor bds23 py
-      vout = A.Tensor bds23 pout
+  let bds23 = reifyTensorBounds (Proxy @'[23])
+      vx = Tensor bds23 px
+      vy = Tensor bds23 py
+      vout = Tensor bds23 pout
   foreachOptimalTensorM (Proxy @Float) vx $ \idx ->
     abstractFmaReluStep (uniform alpha) (liftTensor vx) (liftTensor vy) (liftTensor vout) idx
   foldForeachOptimalTensorM
@@ -319,8 +320,8 @@ mixedUnliftedProgram alpha px py pout = do
     vout
     0
     ( \acc idx -> do
-        o <- A.readTensor (liftTensor vout) idx
-        x <- A.readTensor (liftTensor vx) idx
+        o <- readTensor (liftTensor vout) idx
+        x <- readTensor (liftTensor vx) idx
         pure (acc + o * x)
     )
     gangReduceAdd
@@ -337,9 +338,9 @@ unit_mixed_unlifted_and_spmd_subprograms = do
       expectedOut = [max 0.0 (fma alpha x y) | (x, y) <- zip xs ys]
       expectedDot = sum (zipWith (*) expectedOut xs)
 
-  A.withAlignedArray (xs <> replicate (allocLen - n) 99.0) $ \px ->
-    A.withAlignedArray (ys <> replicate (allocLen - n) 99.0) $ \py ->
-      A.allocaAligned allocLen $ \(pout :: Ptr Float) -> do
+  M.withAlignedArray (xs <> replicate (allocLen - n) 99.0) $ \px ->
+    M.withAlignedArray (ys <> replicate (allocLen - n) 99.0) $ \py ->
+      M.allocaAligned allocLen $ \(pout :: Ptr Float) -> do
         let resetOut = pokeArray pout (replicate allocLen sentinel)
             checkOut label actualDot = do
               actual <- peekArray n pout
@@ -390,18 +391,18 @@ unit_mixed_unlifted_and_spmd_subprograms = do
                   _cuLaunchConfigSharedMemBytes = 0,
                   _cuLaunchConfigStream = CUstream nullPtr
                 }
-        A.allocaAligned 1 $ \(pDot :: Ptr Float) -> do
+        M.allocaAligned 1 $ \(pDot :: Ptr Float) -> do
           resetOut
           launchCUDAIOM launch1 $ do
             d <- mixedUnliftedProgram @CUDAIOM @CUDAIO (inject alpha) (inject px) (inject py) (inject pout)
-            A.pokeElemOff (inject pDot) d 0
+            M.pokeElemOff (inject pDot) d 0
           [dotCUDAIO] <- peekArray 1 pDot
           checkOut "CUDAIO" dotCUDAIO
 
           resetOut
           (resDF, _) <- launchCUDADejaFuM launch1 $ do
             d <- mixedUnliftedProgram @CUDADejaFuM @CUDADejaFu (inject alpha) (inject px) (inject py) (inject pout)
-            A.pokeElemOff (inject pDot) d 0
+            M.pokeElemOff (inject pDot) d 0
           resDF @?= Right ()
           [dotDF] <- peekArray 1 pDot
           checkOut "CUDADejaFu" dotDF
@@ -417,8 +418,8 @@ unit_mixed_unlifted_and_spmd_subprograms = do
                     gpuKern :: JanusCUDA Float -> JanusCUDA (Ptr Float) -> JanusCUDA (Ptr Float) -> JanusCUDA (Ptr Float) -> JanusCUDA (Ptr Float) -> JanusCUDAM ()
                     gpuKern a dx dy dout ddot = do
                       d <- mixedUnliftedProgram a dx dy dout
-                      A.pokeElemOff ddot d 0
-                 in A.allocaAligned 1 $ \(pctx :: Ptr CUctx) ->
+                      M.pokeElemOff ddot d 0
+                 in M.allocaAligned 1 $ \(pctx :: Ptr CUctx) ->
                       withCuDevice 0 $ \dev -> withCuCtx pctx 0 dev $ \ctx -> do
                         resetOut
                         withCuDeviceArray nbytes $ \dx ->
@@ -437,18 +438,24 @@ unit_mixed_unlifted_and_spmd_subprograms = do
                                   checkOut "JanusCUDA GPU" dotGPU
 
   -- 5. batchTensors: run unmodified A.innerProduct & A.vectorNorm across 4 independent vectors in parallel!
-  let bds8 = A.tensorBound (Proxy @'[8])
-  A.withTensor bds8 $ \(v0 :: A.Vector 8 Identity Float) ->
-    A.withTensor bds8 $ \(v1 :: A.Vector 8 Identity Float) ->
-      A.withTensor bds8 $ \(v2 :: A.Vector 8 Identity Float) ->
-        A.withTensor bds8 $ \(v3 :: A.Vector 8 Identity Float) -> do
+  let bds8 = reifyTensorBounds (Proxy @'[8])
+  withTensor bds8 $ \(v0 :: Vector 8 Identity Float) ->
+    withTensor bds8 $ \(v1 :: Vector 8 Identity Float) ->
+      withTensor bds8 $ \(v2 :: Vector 8 Identity Float) ->
+        withTensor bds8 $ \(v3 :: Vector 8 Identity Float) -> do
           forM_ [0 .. 7 :: Int64] $ \i -> do
-            A.writeTensor v0 (Identity i A.:. A.Z) (Identity (fromIntegral (i + 1)))
-            A.writeTensor v1 (Identity i A.:. A.Z) (Identity (fromIntegral (2 * i + 1)))
-            A.writeTensor v2 (Identity i A.:. A.Z) (Identity (fromIntegral (i * i)))
-            A.writeTensor v3 (Identity i A.:. A.Z) (Identity 1.0)
+            writeTensor v0 (Identity i :. Z) (Identity (fromIntegral (i + 1)))
+            writeTensor v1 (Identity i :. Z) (Identity (fromIntegral (2 * i + 1)))
+            writeTensor v2 (Identity i :. Z) (Identity (fromIntegral (i * i)))
+            writeTensor v3 (Identity i :. Z) (Identity 1.0)
           let batched = batchTensors @4 [v0, v1, v2, v3]
-          norms <- runSPMDM $ A.vectorNorm2 batched
+
+          norms <- runSPMDM $ do
+            r <- newRef 0
+            iterateTensorBounds (tensorBounds batched) $ \i -> do
+              bi <- readTensor batched i
+              modifyRef r (+ (bi * bi))
+            readRef r
           spmdHostToList norms
             @?= [ sum [(fromIntegral (i + 1)) ^ (2 :: Int) | i <- [0 .. 7 :: Int]],
                   sum [(fromIntegral (2 * i + 1)) ^ (2 :: Int) | i <- [0 .. 7 :: Int]],
@@ -532,9 +539,9 @@ divergentScratchKernel ::
     CmdRange m e,
     CmdCond m e,
     CmdRef m e,
-    A.CmdMem m e,
-    A.CmdRefPtr m e Int64,
-    A.CmdStorable m e Int64,
+    M.CmdMem m e,
+    M.CmdRefPtr m e Int64,
+    M.CmdStorable m e Int64,
     ExpPtrCast e,
     ExpOrd e Int64,
     JanusTyped e Int64,
@@ -549,13 +556,13 @@ divergentScratchKernel tag lo hi = do
   -- Allocate private per-lane scratch tensor only when tag /= 99
   resRef <- newRef 0
   whenM_ (tag `ne` 99) $ do
-    scratch <- A.newTensor (A.tensorBound (Proxy @'[4])) :: m (A.Vector 4 e Int64)
-    A.writeTensor scratch (0 A.:. A.Z) 10
+    scratch <- newTensor (reifyTensorBounds (Proxy @'[4])) :: m (Vector 4 e Int64)
+    writeTensor scratch (0 :. Z) 10
     rangeM lo hi $ \i -> do
-      cur <- A.readTensor scratch (0 A.:. A.Z)
-      A.writeTensor scratch (0 A.:. A.Z) (cur + i)
-    base <- A.readTensor scratch (0 A.:. A.Z)
-    A.freeTensor scratch
+      cur <- readTensor scratch (0 :. Z)
+      writeTensor scratch (0 :. Z) (cur + i)
+    base <- readTensor scratch (0 :. Z)
+    freeTensor scratch
     picked <-
       switchCase
         tag
@@ -564,8 +571,8 @@ divergentScratchKernel tag lo hi = do
           (2, pure (base - 5))
         ]
         (pure (base + 100))
-    A.withRefPtr resRef $ \p ->
-      A.poke p picked
+    M.withRefPtr resRef $ \p ->
+      M.poke p picked
   readRef resRef
 
 unit_divergent_control_flow_and_safe_division :: IO ()

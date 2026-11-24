@@ -81,7 +81,7 @@ import GHC.Generics
 import GHC.TypeLits (KnownSymbol, symbolVal)
 import GHC.TypeNats (KnownNat, Nat, natVal)
 import Janus.Backend.C
-import Janus.Command.Array (CmdStorable (..), ExpPtr (..))
+import Janus.Command.Memory (CmdStorable (..), ExpPtr (..))
 import Janus.Command.Ref (Cell (..), CmdRef, RefCell (..))
 import Janus.Expression.Bits (ExpBits (..))
 import Janus.Expression.Cast (ExpPtrCast (..))

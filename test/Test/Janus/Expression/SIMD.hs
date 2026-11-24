@@ -33,8 +33,8 @@ import Janus.Backend.C.Build (CBuildConfig (..), cBuildConfigCacheDir, defaultCB
 import Janus.Backend.C.CUDA
 import Janus.Backend.C.CUDA.Foreign
 import Janus.Backend.C.LinuxX86_64
-import qualified Janus.Command.Array as A
 import Janus.Command.Cond (CmdCond, whenM_)
+import qualified Janus.Command.Memory as M
 import Janus.Command.Range (CmdRange, rangeM)
 import Janus.Command.Ref (CmdRef, letM, modifyRef, newRef, readRef)
 import Janus.Expression.Cast (ExpIntegralCast (toIntegral))
@@ -152,7 +152,7 @@ unit_explicit_cross_target_codegen_selection = do
             msk = vgt sat a
             blended = vselect msk sat a
             dot = vdp4aS blended b 10
-        A.pokeElemOff out dot 0
+        M.pokeElemOff out dot 0
 
       cu60 = showJanusCUDAWith cudaSM60 "cuda_kern" cudaKern
       cu80 = showJanusCUDAWith cudaSM80 "cuda_kern" cudaKern
@@ -439,7 +439,7 @@ simdChunkTransform ::
     ExpSIMDArith e 4 Int32,
     ExpSIMDCmp e 4 Int32,
     ExpSIMDCast e,
-    A.ExpPtr e Float,
+    M.ExpPtr e Float,
     JanusTyped e (SIMDVector e 4 Float),
     Num (e (SIMDVector e 4 Float)),
     Num (e Int32),
@@ -461,13 +461,13 @@ simdChunkTransform n baseIdx alpha px py pout = do
       inBoundsVec = vbitcast (vselect inBoundsInt (vsplat (-1 :: e Int32)) (vsplat 0))
       inBoundsMask = inBoundsVec `vne` 0
       off = toIntegral baseIdx
-  vx <- vloadMasked inBoundsMask 0 (A.ptrIndex px off)
-  vy <- vloadMasked inBoundsMask 0 (A.ptrIndex py off)
+  vx <- vloadMasked inBoundsMask 0 (M.ptrIndex px off)
+  vy <- vloadMasked inBoundsMask 0 (M.ptrIndex py off)
   accRef <- newRef (0 :: e (SIMDVector e 4 Float))
   modifyRef accRef (\acc -> acc + vfma (vsplat alpha) vx vy)
   raw <- readRef accRef
   let clipped = vselect (raw `vlt` 0) 0 raw
-  vstoreMasked inBoundsMask (A.ptrIndex pout off) clipped
+  vstoreMasked inBoundsMask (M.ptrIndex pout off) clipped
 
 cpuSimdLoop ::
   ( Monad m,
@@ -480,7 +480,7 @@ cpuSimdLoop ::
     ExpSIMDArith e 4 Int32,
     ExpSIMDCmp e 4 Int32,
     ExpSIMDCast e,
-    A.ExpPtr e Float,
+    M.ExpPtr e Float,
     ExpOrd e Int64,
     JanusTyped e Int64,
     JanusTyped e (SIMDVector e 4 Float),
@@ -513,7 +513,7 @@ cudaSimdKernel ::
     ExpSIMDArith e 4 Int32,
     ExpSIMDCmp e 4 Int32,
     ExpSIMDCast e,
-    A.ExpPtr e Float,
+    M.ExpPtr e Float,
     ExpOrd e Int32,
     JanusTyped e Int32,
     JanusTyped e (SIMDVector e 4 Float),
@@ -553,8 +553,8 @@ packedByteSimdKernel ::
     ExpInject e Word8,
     ExpSIMDDot e,
     ExpSIMDCast e,
-    A.ExpPtr e Int8,
-    A.CmdStorable m e Int32,
+    M.ExpPtr e Int8,
+    M.CmdStorable m e Int32,
     ExpOrd e Int32,
     JanusTyped e Int32,
     Num (e Int32),
@@ -573,8 +573,8 @@ packedByteSimdKernel numGroups pa pb pout = do
   gid <- letM (bdim * bidx + tidx)
   whenM_ (gid `lt` numGroups) $ do
     let byteOff = toIntegral (gid * 4)
-    va <- vload @m @e @4 @Int8 (A.ptrIndex pa byteOff)
-    vb <- vload @m @e @4 @Int8 (A.ptrIndex pb byteOff)
+    va <- vload @m @e @4 @Int8 (M.ptrIndex pa byteOff)
+    vb <- vload @m @e @4 @Int8 (M.ptrIndex pb byteOff)
     let satSum = vadds va vb
         wrapped = vadd (vabs va) vb
         chosen = vselect (satSum `vgt` vb) satSum wrapped
@@ -582,7 +582,7 @@ packedByteSimdKernel numGroups pa pb pout = do
         revCtrl = vfromLanes [inject 3, inject 2, inject 1, inject 0]
         shuf = vshuffleBytes chosen revCtrl
         dotVal = vdp4aS shuf vb 7
-    A.pokeElemOff pout dotVal (toIntegral gid)
+    M.pokeElemOff pout dotVal (toIntegral gid)
 
 unit_polymorphic_relu_fma_all_backends :: IO ()
 unit_polymorphic_relu_fma_all_backends = do

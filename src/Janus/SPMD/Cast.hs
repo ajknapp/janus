@@ -27,7 +27,7 @@ import Foreign.C.Types (CDouble, CFloat)
 import Foreign.Ptr (Ptr)
 import GHC.TypeNats (KnownNat, Nat, natVal)
 import Janus.Backend.C.CUDA.Types (CUDADejaFu, CUDAIO)
-import qualified Janus.Command.Array as A
+import qualified Janus.Command.Memory as M
 import Janus.Expression.Cast
   ( ExpBoolCast (..),
     ExpFloatingCast (..),
@@ -381,11 +381,11 @@ instance
 
 -- ExpSized & ExpPtr
 instance
-  (SPMDRawLayout n Int64 ~ rl, SPMDTyped n e a, A.ExpSized e a) =>
-  A.ExpSized (SPMD n e) a
+  (SPMDRawLayout n Int64 ~ rl, SPMDTyped n e a, M.ExpSized e a) =>
+  M.ExpSized (SPMD n e) a
   where
-  sizeOf p = SPMD (pure (I64Uniform False (A.sizeOf p)))
-  alignOf p = SPMD (pure (I64Uniform False (A.alignOf p)))
+  sizeOf p = SPMD (pure (I64Uniform False (M.sizeOf p)))
+  alignOf p = SPMD (pure (I64Uniform False (M.alignOf p)))
 
 instance
   ( KnownNat n,
@@ -393,41 +393,41 @@ instance
     rl ~ SPMDRawLayout n Int64,
     SPMDRawVec rl n e Int64,
     PtrTreeOps n e (Ptr a),
-    A.ExpPtr e a,
+    M.ExpPtr e a,
     Num (e Int64)
   ) =>
-  A.ExpPtr (SPMD n e) a
+  M.ExpPtr (SPMD n e) a
   where
-  nullPtr = SPMD (pure (PtrUniform True A.nullPtr))
+  nullPtr = SPMD (pure (PtrUniform True M.nullPtr))
   ptrAdd (SPMD mp) (SPMD mi) = SPMD $ do
     pe <- mp
     ie <- mi
     let w = fromIntegral (natVal (Proxy @n)) :: Int64
     pure $ case (pe, ie) of
       (PtrUniform al p, I64Const 0) -> PtrUniform al p
-      (PtrUniform _ p, I64Const c) -> PtrUniform False (A.ptrAdd p (fromIntegral c))
-      (PtrUniform _ p, I64Uniform _ u) -> PtrUniform False (A.ptrAdd p u)
+      (PtrUniform _ p, I64Const c) -> PtrUniform False (M.ptrAdd p (fromIntegral c))
+      (PtrUniform _ p, I64Uniform _ u) -> PtrUniform False (M.ptrAdd p u)
       (pOther, iOther) ->
         let ps = ptrToLanes pOther
             is = int64ToLanes iOther
             _ = w
-         in PtrVarying (ptrTreeFromList @n @e @(Ptr a) (zipWith A.ptrAdd ps is))
+         in PtrVarying (ptrTreeFromList @n @e @(Ptr a) (zipWith M.ptrAdd ps is))
   ptrIndex (SPMD mp) (SPMD mi) = SPMD $ do
     pe <- mp
     ie <- mi
     let w = fromIntegral (natVal (Proxy @n)) :: Int64
     pure $ case (pe, ie) of
       (PtrUniform al p, I64Const 0) -> PtrUniform al p
-      (PtrUniform al p, I64Const c) -> PtrUniform (al && c `mod` w == 0) (A.ptrIndex p (fromIntegral c))
-      (PtrUniform al1 p, I64Uniform al2 u) -> PtrUniform (al1 && al2) (A.ptrIndex p u)
-      (PtrUniform al1 p, I64UnitStride al2 base) -> PtrUnitStride (al1 && al2) (A.ptrIndex p base)
+      (PtrUniform al p, I64Const c) -> PtrUniform (al && c `mod` w == 0) (M.ptrIndex p (fromIntegral c))
+      (PtrUniform al1 p, I64Uniform al2 u) -> PtrUniform (al1 && al2) (M.ptrIndex p u)
+      (PtrUniform al1 p, I64UnitStride al2 base) -> PtrUnitStride (al1 && al2) (M.ptrIndex p base)
       (PtrUnitStride al p, I64Const 0) -> PtrUnitStride al p
-      (PtrUnitStride al p, I64Const c) -> PtrUnitStride (al && c `mod` w == 0) (A.ptrIndex p (fromIntegral c))
-      (PtrUnitStride al1 p, I64Uniform al2 u) -> PtrUnitStride (al1 && al2) (A.ptrIndex p u)
+      (PtrUnitStride al p, I64Const c) -> PtrUnitStride (al && c `mod` w == 0) (M.ptrIndex p (fromIntegral c))
+      (PtrUnitStride al1 p, I64Uniform al2 u) -> PtrUnitStride (al1 && al2) (M.ptrIndex p u)
       (pOther, iOther) ->
         let ps = ptrToLanes pOther
             is = int64ToLanes iOther
-         in PtrVarying (ptrTreeFromList @n @e @(Ptr a) (zipWith A.ptrIndex ps is))
+         in PtrVarying (ptrTreeFromList @n @e @(Ptr a) (zipWith M.ptrIndex ps is))
 
 -- ExpFix (direct fixpoint on Haskell-evaluated SIMD backends)
 instance ExpFix (SPMD n Identity) r where

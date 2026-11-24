@@ -27,7 +27,7 @@ import Foreign.Ptr (Ptr)
 import Foreign.Storable (Storable)
 import Janus.Backend.C.CUDA.Runtime
 import Janus.Backend.C.CUDA.Types
-import qualified Janus.Command.Array as A
+import qualified Janus.Command.Memory as M
 import Janus.Command.Case
 import Janus.Command.Cond
 import Janus.Command.Format
@@ -136,19 +136,19 @@ $( let mkCUDACPUBackend expTy monadTy refTy baseM =
              ge :: $expTy a -> $expTy a -> $expTy Bool
              ge = coerce (ge @Identity @a)
 
-           instance (Storable a) => A.ExpSized $expTy a where
+           instance (Storable a) => M.ExpSized $expTy a where
              sizeOf :: Proxy a -> $expTy Int64
-             sizeOf = coerce (A.sizeOf @Identity @a)
+             sizeOf = coerce (M.sizeOf @Identity @a)
              alignOf :: Proxy a -> $expTy Int64
-             alignOf = coerce (A.alignOf @Identity @a)
+             alignOf = coerce (M.alignOf @Identity @a)
 
-           instance (Storable a) => A.ExpPtr $expTy a where
+           instance (Storable a) => M.ExpPtr $expTy a where
              nullPtr :: $expTy (Ptr a)
-             nullPtr = coerce (A.nullPtr @Identity @a)
+             nullPtr = coerce (M.nullPtr @Identity @a)
              ptrAdd :: $expTy (Ptr a) -> $expTy Int64 -> $expTy (Ptr a)
-             ptrAdd = coerce (A.ptrAdd @Identity @a)
+             ptrAdd = coerce (M.ptrAdd @Identity @a)
              ptrIndex :: $expTy (Ptr a) -> $expTy Int64 -> $expTy (Ptr a)
-             ptrIndex = coerce (A.ptrIndex @Identity @a)
+             ptrIndex = coerce (M.ptrIndex @Identity @a)
 
            instance MonadReader (CUDAThreadInfo $expTy) $monadTy where
              ask :: $monadTy (CUDAThreadInfo $expTy)
@@ -156,7 +156,7 @@ $( let mkCUDACPUBackend expTy monadTy refTy baseM =
              local :: forall a. (CUDAThreadInfo $expTy -> CUDAThreadInfo $expTy) -> $monadTy a -> $monadTy a
              local = coerce (cudaLocalThreadInfo @($baseM) @($expTy) @a)
 
-           instance A.CmdMem $monadTy $expTy where
+           instance M.CmdMem $monadTy $expTy where
              malloc :: $expTy Int64 -> $monadTy ($expTy (Ptr ()))
              malloc = coerce (cudaMalloc @($baseM))
              calloc :: $expTy Int64 -> $expTy Int64 -> $monadTy ($expTy (Ptr ()))
@@ -166,7 +166,7 @@ $( let mkCUDACPUBackend expTy monadTy refTy baseM =
              free :: $expTy (Ptr ()) -> $monadTy ()
              free = coerce (cudaFree @($baseM))
 
-           instance (Storable a) => A.CmdStorable $monadTy $expTy a where
+           instance (Storable a) => M.CmdStorable $monadTy $expTy a where
              peek :: $expTy (Ptr a) -> $monadTy ($expTy a)
              peek = coerce (cudaPeek @($baseM) @a)
              poke :: $expTy (Ptr a) -> $expTy a -> $monadTy ()
@@ -176,7 +176,7 @@ $( let mkCUDACPUBackend expTy monadTy refTy baseM =
              pokeElemOff :: $expTy (Ptr a) -> $expTy a -> $expTy Int64 -> $monadTy ()
              pokeElemOff = coerce (cudaPokeElemOff @($baseM) @a)
 
-           instance (Storable a) => A.CmdRefPtr $monadTy $expTy a where
+           instance (Storable a) => M.CmdRefPtr $monadTy $expTy a where
              withRefPtr :: forall b. $refTy a -> ($expTy (Ptr a) -> $monadTy b) -> $monadTy b
              withRefPtr = coerce (cudaWithRefPtr @($baseM) @a @b)
 

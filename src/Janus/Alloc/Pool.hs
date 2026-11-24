@@ -33,7 +33,7 @@ import Foreign.Ptr (Ptr)
 import GHC.Generics (Generic)
 import Janus.Alloc.Dynamic (CmdAllocBase, alignUpWord64, isNullVoidPtr)
 import Janus.Backend.C
-import Janus.Command.Array (CmdStorable (..), ExpPtr (..), janusSIMDAlignment)
+import Janus.Command.Memory (CmdStorable (..), ExpPtr (..), janusSIMDAlignment)
 import Janus.Command.Cond (ifThenElseM_, whenM_)
 import Janus.Command.Ref (newRef, readRef, writeRef)
 import Janus.Control.Drain (drainAny, drainFind, drainForEach, runDrain)

@@ -14,7 +14,7 @@ import Foreign.Storable
 import Janus.Backend.C.CUDA
 import Janus.Backend.C.CUDA.Foreign
 import Janus.Backend.C.Build
-import qualified Janus.Command.Array as A
+import qualified Janus.Command.Memory as M
 import Janus.Command.Cond
 import Janus.Command.Ref
 import Janus.Expression.Cast
@@ -33,7 +33,7 @@ saxpy ::
     JanusTyped e Int32,
     CmdCond m e,
     CmdRef m e,
-    A.CmdStorable m e a,
+    M.CmdStorable m e a,
     ExpOrd e Int32,
     ExpIntegralCast e Int32 Int64,
     Num (e Int32),
@@ -46,9 +46,9 @@ saxpy n a x y = do
   threadIdx <- asks _cudaThreadInfoThreadIdxX
   i <- letM $ blockDim * blockIdx + threadIdx
   whenM_ (i `lt` n) $ do
-    xi <- A.peekElemOff x (toIntegral i)
-    yi <- A.peekElemOff y (toIntegral i)
-    A.pokeElemOff y (a * xi + yi) (toIntegral i)
+    xi <- M.peekElemOff x (toIntegral i)
+    yi <- M.peekElemOff y (toIntegral i)
+    M.pokeElemOff y (a * xi + yi) (toIntegral i)
 
 unit_saxpy :: IO ()
 unit_saxpy = runInBoundThread $ try (cuInit 0) >>= \case
@@ -136,7 +136,7 @@ blockNeighborSum ::
     MonadReader (CUDAThreadInfo e) m,
     CmdSync m,
     CmdRef m e,
-    A.CmdStorable m e Int32,
+    M.CmdStorable m e Int32,
     JanusTyped e Int32,
     ExpIntegral e Int32,
     ExpIntegralCast e Int32 Int64,
@@ -150,13 +150,13 @@ blockNeighborSum buf = do
   base <- letM $ blockDim * blockIdx
   gid <- letM $ base + threadIdx
   nextInBlock <- letM $ base + ((threadIdx + 1) `remainder` blockDim)
-  A.pokeElemOff buf (gid + 1) (toIntegral gid)
+  M.pokeElemOff buf (gid + 1) (toIntegral gid)
   syncWarp
   syncBlock
-  mine <- A.peekElemOff buf (toIntegral gid)
-  neighbor <- A.peekElemOff buf (toIntegral nextInBlock)
+  mine <- M.peekElemOff buf (toIntegral gid)
+  neighbor <- M.peekElemOff buf (toIntegral nextInBlock)
   syncBlock
-  A.pokeElemOff buf (mine + neighbor) (toIntegral gid)
+  M.pokeElemOff buf (mine + neighbor) (toIntegral gid)
 
 expectedNeighborSum :: Int -> Int -> Int -> Int32
 expectedNeighborSum blockX b t =

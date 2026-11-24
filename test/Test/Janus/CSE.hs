@@ -58,10 +58,9 @@ import Janus.CSE
     interpretCSE,
     withCSE,
   )
-import qualified Janus.Command.Array as A
 import Janus.Command.Cond (CmdCond, whenM_)
 import Janus.Command.Format (CmdString (withString))
-import Janus.Command.Memory (CmdRefPtr (withRefPtr), ExpPtr (ptrAdd))
+import qualified Janus.Command.Memory as M
 import Janus.Command.Range (CmdRange, rangeM)
 import Janus.Command.Ref (CmdRef, letM, modifyRef, newRef, readRef, writeRef)
 import Janus.Control.Reader (ReaderExp (..), liftReaderExp)
@@ -245,7 +244,7 @@ unit_deep_let_pyramid_40_levels = do
 --------------------------------------------------------------------------------
 
 nestedTwoUses ::
-  (Monad m, A.CmdStorable m e Int64, Num (e Int64)) =>
+  (Monad m, M.CmdStorable m e Int64, Num (e Int64)) =>
   e Int64 ->
   e (Ptr Int64) ->
   m (e Int64)
@@ -257,7 +256,7 @@ nestedTwoUses y logPtr = do
   pure (a + b)
 
 nestedThreeUses ::
-  (Monad m, A.CmdStorable m e Int64, Num (e Int64)) =>
+  (Monad m, M.CmdStorable m e Int64, Num (e Int64)) =>
   e Int64 ->
   e (Ptr Int64) ->
   m (e Int64)
@@ -269,7 +268,7 @@ nestedThreeUses y logPtr = do
   pure (a + b + fy)
 
 mixedExplicitLetM ::
-  (Monad m, CmdRef m e, A.CmdStorable m e Int64, Num (e Int64), JanusTyped e Int64) =>
+  (Monad m, CmdRef m e, M.CmdStorable m e Int64, Num (e Int64), JanusTyped e Int64) =>
   e Int64 ->
   e (Ptr Int64) ->
   m (e Int64)
@@ -338,13 +337,13 @@ refSnapshotProg initVal = do
   pure ((y1 * 37 + 11) + (y1 * 37 + 11) + (y2 * 37 + 11))
 
 ptrAliasingProg ::
-  (Monad m, A.CmdStorable m e Int64, Num (e Int64)) =>
+  (Monad m, M.CmdStorable m e Int64, Num (e Int64)) =>
   e (Ptr Int64) ->
   m (e Int64)
 ptrAliasingProg p = do
-  v1 <- A.peek p
-  A.poke p (v1 + 50)
-  v2 <- A.peek p
+  v1 <- M.peek p
+  M.poke p (v1 + 50)
+  v2 <- M.peek p
   pure ((v1 * 41 + 7) + (v1 * 41 + 7) + (v2 * 41 + 7))
 
 unit_mutable_ref_and_pointer_ordering_soundness :: IO ()
@@ -504,9 +503,9 @@ unit_conditional_hoisting_and_trap_safety = do
 scopedRefPtrProg ::
   ( Monad m,
     CmdRef m e,
-    CmdRefPtr m e Int64,
-    A.CmdStorable m e Int64,
-    ExpPtr e Int64,
+    M.CmdRefPtr m e Int64,
+    M.CmdStorable m e Int64,
+    M.ExpPtr e Int64,
     Num (e Int64),
     JanusTyped e Int64
   ) =>
@@ -515,10 +514,10 @@ scopedRefPtrProg ::
 scopedRefPtrProg x0 = do
   r <- newRef x0
   outRef <- newRef 0
-  withRefPtr r $ \p -> do
-    v <- A.peek (ptrAdd p 0)
+  M.withRefPtr r $ \p -> do
+    v <- M.peek (M.ptrAdd p 0)
     let liveExpr = v * 71 + 13
-    A.poke (ptrAdd p 0) (liveExpr + 5)
+    M.poke (M.ptrAdd p 0) (liveExpr + 5)
     writeRef outRef liveExpr
   afterMut <- readRef r
   saved <- readRef outRef
@@ -529,7 +528,7 @@ scopedStringProg ::
   forall m e.
   ( Monad m,
     CmdString m e,
-    A.CmdStorable m e Word8,
+    M.CmdStorable m e Word8,
     ExpPtrCast e,
     ExpIntegralCast e Word8 Int64,
     JanusTyped e CChar,
@@ -542,8 +541,8 @@ scopedStringProg idx = do
   withString "JanusCSE" $ \cs -> do
     let bytePtr = ptrCast cs :: e (Ptr Word8)
         off = idx + 1
-    b1 <- A.peekElemOff bytePtr off
-    b2 <- A.peekElemOff bytePtr off
+    b1 <- M.peekElemOff bytePtr off
+    b2 <- M.peekElemOff bytePtr off
     pure (toIntegral b1 + toIntegral b2)
 
 unit_scoped_withRefPtr_and_withString :: IO ()
@@ -751,7 +750,7 @@ saxpyImplicit ::
     CSETyped e Int32,
     CmdCond m e,
     CmdRef m e,
-    A.CmdStorable m e a,
+    M.CmdStorable m e a,
     ExpOrd e Int32,
     ExpIntegralCast e Int32 Int64,
     Num (e Int32),
@@ -768,9 +767,9 @@ saxpyImplicit n a x y = do
   threadIdx <- asks _cudaThreadInfoThreadIdxX
   let i = blockDim * blockIdx + threadIdx
   whenM_ (i `lt` n) $ do
-    xi <- A.peekElemOff x (toIntegral i)
-    yi <- A.peekElemOff y (toIntegral i)
-    A.pokeElemOff y (a * xi + yi) (toIntegral i)
+    xi <- M.peekElemOff x (toIntegral i)
+    yi <- M.peekElemOff y (toIntegral i)
+    M.pokeElemOff y (a * xi + yi) (toIntegral i)
 
 cpuLaunch1D :: Int -> Int -> CUlaunchConfig
 cpuLaunch1D gridX blockX =

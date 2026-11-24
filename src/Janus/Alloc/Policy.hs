@@ -76,7 +76,7 @@ import Janus.Alloc.Monotonic
 import Janus.Alloc.Pool
 import Janus.Alloc.Recycling
 import Janus.Alloc.Stats
-import Janus.Command.Array
+import Janus.Command.Memory
   ( CmdMemCopy (..),
     CmdStorable (..),
     ExpPtr (..),

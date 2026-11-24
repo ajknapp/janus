@@ -39,11 +39,12 @@ import Janus.Backend.C.Target
     getActiveHostX86Features,
     hasX86Feature,
   )
-import qualified Janus.Command.Array as A
+import qualified Janus.Command.Memory as M
 import Janus.Command.Cond (CmdCond, whenM_)
 import Janus.Command.Range (CmdRange (..))
 import Janus.Command.Ref (CmdRef (..))
 import Janus.Command.While (CmdWhile)
+import Janus.Data.Tensor (Vector, TensorIndex (..))
 import Janus.Control.Reader.Base (ExpNewtype)
 import Janus.Expression.Bits (ExpBits)
 import Janus.Expression.Bool (ExpBool)
@@ -193,9 +194,9 @@ class
     SPMDTyped n e (),
     SPMDTyped n e (Ptr ()),
     ExpPtrCast (SPMD n e),
-    A.CmdMem (SPMDM n m e) (SPMD n e),
-    A.CmdStorable (SPMDM n m e) (SPMD n e) Int64,
-    A.ExpPtr e Int64,
+    M.CmdMem (SPMDM n m e) (SPMD n e),
+    M.CmdStorable (SPMDM n m e) (SPMD n e) Int64,
+    M.ExpPtr e Int64,
     PtrTreeOps n e (Ptr Int64),
     SPMDRawIntegral (SPMDRawLayout n Int64) n e Int64,
     SPMDRawBits (SPMDRawLayout n Int64) n e Int64,
@@ -223,9 +224,9 @@ instance
     SPMDTyped n e (),
     SPMDTyped n e (Ptr ()),
     ExpPtrCast (SPMD n e),
-    A.CmdMem (SPMDM n m e) (SPMD n e),
-    A.CmdStorable (SPMDM n m e) (SPMD n e) Int64,
-    A.ExpPtr e Int64,
+    M.CmdMem (SPMDM n m e) (SPMD n e),
+    M.CmdStorable (SPMDM n m e) (SPMD n e) Int64,
+    M.ExpPtr e Int64,
     PtrTreeOps n e (Ptr Int64),
     SPMDRawIntegral (SPMDRawLayout n Int64) n e Int64,
     SPMDRawBits (SPMDRawLayout n Int64) n e Int64,
@@ -234,8 +235,8 @@ instance
   SPMDGangCore n m e
 
 type SPMDElemCtx n m e a =
-  ( A.CmdStorable (SPMDM n m e) (SPMD n e) a,
-    A.ExpPtr e a,
+  ( M.CmdStorable (SPMDM n m e) (SPMD n e) a,
+    M.ExpPtr e a,
     PtrTreeOps n e (Ptr a),
     SPMDCmpByLayout (SPMDLayout n a) n e a,
     SPMDInjectByLayout (SPMDLayout n a) n e a,
@@ -372,8 +373,8 @@ type family SPMDOptimalExtra (n :: Nat) (e :: K.Type -> K.Type) (a :: K.Type) ::
 -- combinators can invoke 'withSPMDGang' on demand.
 class
   ( SPMDGangCore n m e,
-    A.CmdStorable (SPMDM n m e) (SPMD n e) a,
-    A.ExpPtr (SPMD n e) a,
+    M.CmdStorable (SPMDM n m e) (SPMD n e) a,
+    M.ExpPtr (SPMD n e) a,
     PtrTreeOps n e (Ptr a),
     SPMDNumByLayout (SPMDLayout n a) n e a,
     SPMDCmpByLayout (SPMDLayout n a) n e a,
@@ -389,8 +390,8 @@ class
 
 instance
   ( SPMDGang n m e,
-    A.CmdStorable (SPMDM n m e) (SPMD n e) a,
-    A.ExpPtr (SPMD n e) a,
+    M.CmdStorable (SPMDM n m e) (SPMD n e) a,
+    M.ExpPtr (SPMD n e) a,
     PtrTreeOps n e (Ptr a),
     SPMDNumByLayout (SPMDLayout n a) n e a,
     SPMDCmpByLayout (SPMDLayout n a) n e a,
@@ -534,8 +535,8 @@ class
     ExpBits e a,
     ExpIntegral e a,
     ExpInject e a,
-    A.ExpPtr e a,
-    A.CmdStorable m e a
+    M.ExpPtr e a,
+    M.CmdStorable m e a
   ) =>
   GangIntScalar m e a
 
@@ -544,8 +545,8 @@ instance
     ExpBits e a,
     ExpIntegral e a,
     ExpInject e a,
-    A.ExpPtr e a,
-    A.CmdStorable m e a
+    M.ExpPtr e a,
+    M.CmdStorable m e a
   ) =>
   GangIntScalar m e a
 
@@ -639,9 +640,9 @@ class
     FMA (e Float),
     Hypot (e Float),
     ExpInject e Float,
-    A.ExpPtr e Float,
-    A.CmdStorable m e Float,
-    A.ExpPtr e (Complex Float),
+    M.ExpPtr e Float,
+    M.CmdStorable m e Float,
+    M.ExpPtr e (Complex Float),
     GangFloatShape m e 2 Float,
     GangFloatShape m e 4 Float,
     GangFloatShape m e 8 Float,
@@ -656,9 +657,9 @@ instance
     FMA (e Float),
     Hypot (e Float),
     ExpInject e Float,
-    A.ExpPtr e Float,
-    A.CmdStorable m e Float,
-    A.ExpPtr e (Complex Float),
+    M.ExpPtr e Float,
+    M.CmdStorable m e Float,
+    M.ExpPtr e (Complex Float),
     GangFloatShape m e 2 Float,
     GangFloatShape m e 4 Float,
     GangFloatShape m e 8 Float,
@@ -673,9 +674,9 @@ class
     FMA (e Double),
     Hypot (e Double),
     ExpInject e Double,
-    A.ExpPtr e Double,
-    A.CmdStorable m e Double,
-    A.ExpPtr e (Complex Double),
+    M.ExpPtr e Double,
+    M.CmdStorable m e Double,
+    M.ExpPtr e (Complex Double),
     GangFloatShape m e 2 Double,
     GangFloatShape m e 4 Double,
     ExpSIMDSplit e 4 2 Double
@@ -688,9 +689,9 @@ instance
     FMA (e Double),
     Hypot (e Double),
     ExpInject e Double,
-    A.ExpPtr e Double,
-    A.CmdStorable m e Double,
-    A.ExpPtr e (Complex Double),
+    M.ExpPtr e Double,
+    M.CmdStorable m e Double,
+    M.ExpPtr e (Complex Double),
     GangFloatShape m e 2 Double,
     GangFloatShape m e 4 Double,
     ExpSIMDSplit e 4 2 Double
@@ -714,7 +715,7 @@ data OptimalGangCaps (m :: K.Type -> K.Type) (e :: K.Type -> K.Type) where
       CmdCond m e,
       CmdWhile m e,
       CmdRange m e,
-      A.CmdMem m e,
+      M.CmdMem m e,
       ExpBool e,
       ExpCond e,
       ExpLet e,
@@ -722,7 +723,7 @@ data OptimalGangCaps (m :: K.Type -> K.Type) (e :: K.Type -> K.Type) where
       ExpPtrCast e,
       ExpNewtype e,
       ExpSIMDCast e,
-      A.ExpPtr e Bool,
+      M.ExpPtr e Bool,
       GangInt8Caps m e Int8,
       GangInt8Caps m e Word8,
       GangInt16Caps m e Int16,
@@ -985,8 +986,8 @@ foreachTensorM ::
   forall d n m e a.
   (KnownNat d, SPMDGangCore n m e) =>
   Proxy n ->
-  A.Vector d e a ->
-  (A.TensorIndex '[d] (SPMD n e) -> SPMDM n m e ()) ->
+  Vector d e a ->
+  (TensorIndex '[d] (SPMD n e) -> SPMDM n m e ()) ->
   m ()
 foreachTensorM p _ body = do
   let total = fromIntegral (natVal (Proxy @d)) :: Int64
@@ -997,11 +998,11 @@ foreachTensorM p _ body = do
   when (fullGangs > 0) $
     rangeM 0 (fromIntegral fullGangs) $ \g -> do
       base <- letM (g * wE)
-      withSPMD p (body (spmdAlignedUnitStride base A.:. A.Z))
+      withSPMD p (body (spmdAlignedUnitStride base :. Z))
   when (remElems > 0) $ do
     let tailStart = fullGangs * w
         tailIdx = SPMD (pure (I64UnitStride True (fromIntegral tailStart)))
-    withSPMDMasked (tailIdx `lt` fromIntegral total) (body (tailIdx A.:. A.Z))
+    withSPMDMasked (tailIdx `lt` fromIntegral total) (body (tailIdx :. Z))
 
 foldForeach0M ::
   forall n m e s.
@@ -1023,9 +1024,9 @@ foldForeachTensorM ::
   forall d n m e a s.
   (KnownNat d, SPMDGangCore n m e, SPMDTyped n e s) =>
   Proxy n ->
-  A.Vector d e a ->
+  Vector d e a ->
   SPMD n e s ->
-  (SPMD n e s -> A.TensorIndex '[d] (SPMD n e) -> SPMDM n m e (SPMD n e s)) ->
+  (SPMD n e s -> TensorIndex '[d] (SPMD n e) -> SPMDM n m e (SPMD n e s)) ->
   m (SPMD n e s)
 foldForeachTensorM p vec s0 step = do
   accRef <- withSPMD p (newRef s0)
@@ -1057,8 +1058,8 @@ foreachOptimalM pm l u body =
 foreachOptimalTensorM ::
   (KnownNat d, CmdOptimalGang m e, SIMDElem mainTy) =>
   Proxy mainTy ->
-  A.Vector d e a ->
-  (forall n. (SPMDOptimal n m e mainTy) => A.TensorIndex '[d] (SPMD n e) -> SPMDM n m e ()) ->
+  Vector d e a ->
+  (forall n. (SPMDOptimal n m e mainTy) => TensorIndex '[d] (SPMD n e) -> SPMDM n m e ()) ->
   m ()
 foreachOptimalTensorM pm vec body =
   withOptimalGang pm $ \pn -> foreachTensorM pn vec body
@@ -1078,9 +1079,9 @@ foldForeachOptimal0M pm u s0 step reduceFn =
 foldForeachOptimalTensorM ::
   (KnownNat d, CmdOptimalGang m e, SIMDElem mainTy, forall n. (SPMDOptimal n m e mainTy) => SPMDTyped n e s) =>
   Proxy mainTy ->
-  A.Vector d e a ->
+  Vector d e a ->
   (forall n. (SPMDOptimal n m e mainTy) => SPMD n e s) ->
-  (forall n. (SPMDOptimal n m e mainTy) => SPMD n e s -> A.TensorIndex '[d] (SPMD n e) -> SPMDM n m e (SPMD n e s)) ->
+  (forall n. (SPMDOptimal n m e mainTy) => SPMD n e s -> TensorIndex '[d] (SPMD n e) -> SPMDM n m e (SPMD n e s)) ->
   (forall n. (SPMDOptimal n m e mainTy) => SPMD n e s -> e s) ->
   m (e s)
 foldForeachOptimalTensorM pm vec s0 step reduceFn =

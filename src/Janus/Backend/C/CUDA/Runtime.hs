@@ -32,7 +32,7 @@ import Foreign.Storable (Storable (peek, poke))
 import Janus.Backend.C.CUDA.Foreign
 import Janus.Backend.C.CUDA.Types
 import Janus.Backend.C.Target
-import qualified Janus.Command.Array as A
+import qualified Janus.Command.Memory as M
 import Janus.Command.Format (hformat, hputString)
 import Janus.Command.IO (fclose, fopen)
 import Janus.Command.TicToc (Tic (..), Toc (..), tic, toc)
@@ -182,28 +182,28 @@ cudaLocalThreadInfo f =
     )
 
 cudaMalloc :: (MonadIO m) => Identity Int64 -> CUDAM m (Identity (Ptr ()))
-cudaMalloc = liftIO . A.malloc @IO @Identity
+cudaMalloc = liftIO . M.malloc @IO @Identity
 
 cudaCalloc :: (MonadIO m) => Identity Int64 -> Identity Int64 -> CUDAM m (Identity (Ptr ()))
-cudaCalloc n s = liftIO $ A.calloc @IO @Identity n s
+cudaCalloc n s = liftIO $ M.calloc @IO @Identity n s
 
 cudaRealloc :: (MonadIO m) => Identity (Ptr ()) -> Identity Int64 -> CUDAM m (Identity (Ptr ()))
-cudaRealloc p n = liftIO $ A.realloc @IO @Identity p n
+cudaRealloc p n = liftIO $ M.realloc @IO @Identity p n
 
 cudaFree :: (MonadIO m) => Identity (Ptr ()) -> CUDAM m ()
-cudaFree = liftIO . A.free @IO @Identity
+cudaFree = liftIO . M.free @IO @Identity
 
 cudaPeek :: (MonadIO m, Storable a) => Identity (Ptr a) -> CUDAM m (Identity a)
-cudaPeek = liftIO . A.peek @IO @Identity
+cudaPeek = liftIO . M.peek @IO @Identity
 
 cudaPoke :: (MonadIO m, Storable a) => Identity (Ptr a) -> Identity a -> CUDAM m ()
-cudaPoke p a = liftIO $ A.poke @IO @Identity p a
+cudaPoke p a = liftIO $ M.poke @IO @Identity p a
 
 cudaPeekElemOff :: (MonadIO m, Storable a) => Identity (Ptr a) -> Identity Int64 -> CUDAM m (Identity a)
-cudaPeekElemOff p i = liftIO $ A.peekElemOff @IO @Identity p i
+cudaPeekElemOff p i = liftIO $ M.peekElemOff @IO @Identity p i
 
 cudaPokeElemOff :: (MonadIO m, Storable a) => Identity (Ptr a) -> Identity a -> Identity Int64 -> CUDAM m ()
-cudaPokeElemOff p a i = liftIO $ A.pokeElemOff @IO @Identity p a i
+cudaPokeElemOff p a i = liftIO $ M.pokeElemOff @IO @Identity p a i
 
 cudaWithRefPtr ::
   (Catch.MonadMask m, MonadIO m, Storable a) =>

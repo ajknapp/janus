@@ -12,7 +12,7 @@ import Foreign.Ptr (Ptr)
 import Janus.Backend.C (JanusC, JanusCM)
 import Janus.Backend.C.Build (CBuildConfig, cBuildConfigCacheDir, defaultCBuildConfig)
 import Janus.Backend.C.LinuxX86_64 (LinuxX86_64C, LinuxX86_64CM)
-import qualified Janus.Command.Array as A
+import qualified Janus.Command.Memory as M
 import Janus.Command.Range (rangeM)
 import Janus.Command.Ref (letM, newRef, readRef, writeRef)
 import Janus.Expression.Bool (ExpBool (land))
@@ -53,9 +53,9 @@ saxpyJanusC ::
   JanusCM ()
 saxpyJanusC n alpha xs ys =
   rangeM 0 n $ \i -> do
-    xi <- A.peekElemOff xs i
-    yi <- A.peekElemOff ys i
-    A.pokeElemOff ys (alpha * xi + yi) i
+    xi <- M.peekElemOff xs i
+    yi <- M.peekElemOff ys i
+    M.pokeElemOff ys (alpha * xi + yi) i
 
 dotJanusC ::
   JanusC Int64 ->
@@ -65,8 +65,8 @@ dotJanusC ::
 dotJanusC n xs ys = do
   acc <- newRef 0
   rangeM 0 n $ \i -> do
-    xi <- A.peekElemOff xs i
-    yi <- A.peekElemOff ys i
+    xi <- M.peekElemOff xs i
+    yi <- M.peekElemOff ys i
     cur <- readRef acc
     writeRef acc (cur + xi * yi)
   readRef acc
@@ -95,9 +95,9 @@ x86Saxpy ::
   LinuxX86_64CM ()
 x86Saxpy n alpha xs ys =
   rangeM 0 n $ \i -> do
-    xi <- A.peekElemOff xs i
-    yi <- A.peekElemOff ys i
-    A.pokeElemOff ys (alpha * xi + yi) i
+    xi <- M.peekElemOff xs i
+    yi <- M.peekElemOff ys i
+    M.pokeElemOff ys (alpha * xi + yi) i
 
 x86Vfma8 ::
   LinuxX86_64C (SIMDVector LinuxX86_64C 8 Float) ->

@@ -30,10 +30,10 @@ import Foreign.Ptr (Ptr)
 import GHC.Generics (Generic)
 import Janus.Alloc.Dynamic (CmdAllocBase, alignUpWord64, isNullVoidPtr, sameVoidPtr)
 import Janus.Backend.C
-import Janus.Command.Array (CmdMemCopy (..), CmdStorable (..), ExpPtr (..), janusSIMDAlignment)
 import Janus.Command.Cond (ifThenElseM_, whenM_)
 import Janus.Command.Ref (letM, newRef, readRef, writeRef)
 import Janus.Control.Drain (drainAny, drainForEach, runDrain)
+import Janus.Command.Memory (CmdMemCopy (..), CmdStorable (..), ExpPtr (..), janusSIMDAlignment)
 import Janus.Control.Stream (Stream, streamM, unfoldWhileM)
 import Janus.Data.HKD
 import Janus.Expression.Bits (ExpBits (..))

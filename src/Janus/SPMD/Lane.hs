@@ -20,7 +20,8 @@ import Data.Proxy (Proxy (..))
 import Data.Word (Word32)
 import Foreign.Ptr (Ptr)
 import GHC.TypeNats (KnownNat, Nat, natVal)
-import qualified Janus.Command.Array as A
+import qualified Janus.Command.Memory as M
+import Janus.Data.Tensor
 import Janus.Expression.Bits (ExpBits)
 import Janus.Expression.Bool (ExpBool)
 import Janus.Expression.Cond (ExpCond (..))
@@ -76,7 +77,7 @@ instance
   spmdToLanesL = int64ToLanes
 
 instance
-  (KnownNat n, PtrTreeOps n e (Ptr b), A.ExpPtr e b, Num (e Int64)) =>
+  (KnownNat n, PtrTreeOps n e (Ptr b), M.ExpPtr e b, Num (e Int64)) =>
   SPMDLanesByLayout ('LPtr b) n e (Ptr b)
   where
   spmdSplatL p = PtrUniform False p
@@ -142,29 +143,29 @@ uniformPtr p = SPMD (pure (PtrUniform False p))
 uniformAlignedPtr :: (SPMDLayout n (Ptr a) ~ 'LPtr a) => e (Ptr a) -> SPMD n e (Ptr a)
 uniformAlignedPtr p = SPMD (pure (PtrUniform True p))
 
-rebaseTensorBound :: A.TensorBound ds e -> A.TensorBound ds e'
-rebaseTensorBound A.TensorBoundNil = A.TensorBoundNil
-rebaseTensorBound (A.TensorBoundCons p rest) = A.TensorBoundCons p (rebaseTensorBound rest)
+rebaseTensorBounds :: TensorBounds ds e -> TensorBounds ds e'
+rebaseTensorBounds TensorBoundsNil = TensorBoundsNil
+rebaseTensorBounds (TensorBoundsCons p rest) = TensorBoundsCons p (rebaseTensorBounds rest)
 
 -- | Lift an unlifted Janus 'A.Tensor' (whose memory is 64-byte aligned via
 -- 'A.withTensor' / 'A.newTensor') into an SPMD 'A.Tensor' with aligned provenance.
-liftTensor :: (SPMDLayout n (Ptr a) ~ 'LPtr a) => A.Tensor ds e a -> A.Tensor ds (SPMD n e) a
-liftTensor (A.Tensor tb p) = A.Tensor (rebaseTensorBound tb) (uniformAlignedPtr p)
+liftTensor :: (SPMDLayout n (Ptr a) ~ 'LPtr a) => Tensor ds e a -> Tensor ds (SPMD n e) a
+liftTensor (Tensor tb p) = Tensor (rebaseTensorBounds tb) (uniformAlignedPtr p)
 
-liftTensorUnaligned :: (SPMDLayout n (Ptr a) ~ 'LPtr a) => A.Tensor ds e a -> A.Tensor ds (SPMD n e) a
-liftTensorUnaligned (A.Tensor tb p) = A.Tensor (rebaseTensorBound tb) (uniformPtr p)
+liftTensorUnaligned :: (SPMDLayout n (Ptr a) ~ 'LPtr a) => Tensor ds e a -> Tensor ds (SPMD n e) a
+liftTensorUnaligned (Tensor tb p) = Tensor (rebaseTensorBounds tb) (uniformPtr p)
 
 -- | Batch @n@ independent unlifted 'A.Tensor's (one per SIMD lane) into a
 -- single SPMD 'A.Tensor' so unmodified array algorithms run @n@ instances in parallel.
 batchTensors ::
   forall n ds e a.
   (KnownNat n, SPMDLayout n (Ptr a) ~ 'LPtr a, PtrTreeOps n e (Ptr a)) =>
-  [A.Tensor ds e a] ->
-  A.Tensor ds (SPMD n e) a
+  [Tensor ds e a] ->
+  Tensor ds (SPMD n e) a
 batchTensors [] = error "batchTensors: empty tensor list"
-batchTensors ts@(A.Tensor tb0 _ : _) =
-  let ps = [p | A.Tensor _ p <- ts]
-   in A.Tensor (rebaseTensorBound tb0) (SPMD (pure (PtrVarying (ptrTreeFromList @n @e @(Ptr a) ps))))
+batchTensors ts@(Tensor tb0 _ : _) =
+  let ps = [p | Tensor _ p <- ts]
+   in Tensor (rebaseTensorBounds tb0) (SPMD (pure (PtrVarying (ptrTreeFromList @n @e @(Ptr a) ps))))
 
 spmdFromLanes :: forall n e a l. (l ~ SPMDLayout n a, SPMDLanesByLayout l n e a) => [e a] -> SPMD n e a
 spmdFromLanes xs = SPMD (pure (spmdFromLanesL @l @n @e @a xs))

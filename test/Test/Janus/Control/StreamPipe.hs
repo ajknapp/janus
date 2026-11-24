@@ -8,15 +8,13 @@ module Test.Janus.Control.StreamPipe where
 import Control.Applicative (Alternative (..))
 import Control.Category ((>>>))
 import Control.Lens ((&), (.~))
-import Control.Monad (forM_)
 import Data.Functor.Identity (Identity (..))
 import Data.IORef (modifyIORef', newIORef, readIORef, writeIORef)
 import Data.Int (Int64)
-import Data.Proxy (Proxy (..))
 import Janus.Backend.C (JanusC, JanusCM, withJanusC)
 import Janus.Backend.C.Build (cBuildConfigCacheDir, defaultCBuildConfig)
-import qualified Janus.Command.Array as A
 import Janus.Command.Cond (CmdCond)
+-- import qualified Janus.Command.Memory as M
 import Janus.Command.Ref (CmdRef, modifyRef, newRef, readRef)
 import Janus.Command.While (CmdWhile)
 import Janus.Control.Drain (drainFold, drainLength, drainSum, runDrain)
@@ -127,22 +125,6 @@ unit_stream_combinators_and_bracket = do
   total @?= 33
   wasReleased @?= True
 
-unit_array_inner_product_and_norm2 :: IO ()
-unit_array_inner_product_and_norm2 = do
-  let bds = A.tensorBound (Proxy @'[4])
-  A.withTensor bds $ \(vx :: A.Vector 4 Identity Float) ->
-    A.withTensor bds $ \(vy :: A.Vector 4 Identity Float) -> do
-      forM_ [0 .. 3 :: Int64] $ \i -> do
-        A.writeTensor vx (Identity i A.:. A.Z) (Identity (fromIntegral (i + 1)))
-        A.writeTensor vy (Identity i A.:. A.Z) (Identity (fromIntegral (2 * (i + 1))))
-      -- vx = [1,2,3,4], vy = [2,4,6,8]
-      -- innerProduct = 2 + 8 + 18 + 32 = 60
-      -- vectorNorm2 vx = 1 + 4 + 9 + 16 = 30
-      Identity ip <- A.innerProduct vx vy
-      Identity n2 <- A.vectorNorm2 vx
-      ip @?= 60.0
-      n2 @?= 30.0
-
 alternativeStreamDigest ::
   ( Monad m,
     CmdRef m e,
@@ -248,19 +230,6 @@ unit_stream_alternative = do
   -- dropS 1 >>> takeS 3 across s1 (1, 2) <|> s2 (3, 4, 5) -> 2, 3, 4 -> 234
   Identity sliced <- foldDigits (takeS 3 (dropS 1 (s1 <|> s2)))
   sliced @?= 234
-
-  -- Stateless multi-yield stream (tensorValuesS) + takeS + effectful streamM on left of (<|>):
-  -- left branch must not be re-stepped once it emits Stop
-  let bds = A.tensorBound (Proxy @'[3])
-  A.withTensor bds $ \(v :: A.Vector 3 Identity Int64) -> do
-    forM_ [0 .. 2 :: Int64] $ \i ->
-      A.writeTensor v (Identity i A.:. A.Z) (Identity (i + 1))
-    -- v = [1, 2, 3]: tensorValuesS v <|> rangeS 4 7 -> 1, 2, 3, 4, 5, 6 -> 123456
-    Identity tvConcat <- foldDigits (A.tensorValuesS v <|> rangeS 4 7)
-    tvConcat @?= 123456
-    -- takeS 2 (tensorValuesS v) <|> rangeS 8 10 -> 1, 2, 8, 9 -> 1289
-    Identity tvTake <- foldDigits (takeS 2 (A.tensorValuesS v) <|> rangeS 8 10)
-    tvTake @?= 1289
 
   stepsLeft <- newIORef (0 :: Int)
   let effLeft = takeS 1 (streamM (rangeS (1 :: Identity Int64) 10) (\x -> modifyIORef' stepsLeft (+ 1) >> pure x))

@@ -19,7 +19,7 @@ import qualified Hedgehog.Range as Range
 import Janus.Alloc
 import Janus.Backend.C (JanusC, JanusCM, withJanusC)
 import Janus.Backend.C.Build (CBuildConfig, cBuildConfigCacheDir, defaultCBuildConfig)
-import Janus.Command.Array (CmdStorable (peek, poke))
+import Janus.Command.Memory (CmdStorable (peek, poke))
 import Janus.Control.Drain (drainSum, runDrain)
 import Janus.Control.Stream (rangeS, streamM)
 import Janus.Expression.Cast (ExpPtrCast (..))

@@ -22,7 +22,7 @@ maintainer:         andy.j.knapp@gmail.com
 extra-source-files: CHANGELOG.md
 
 common warnings
-    ghc-options:      -Wall
+    ghc-options:      -Wall -Werror
 
 library janus-cbits
     import:           warnings
@@ -58,54 +58,6 @@ library
                       Janus.Backend.C.Target
                       Janus.Bench
                       Janus.CSE
-                      Janus.Control.CSV
-                      Janus.Control.Drain
-                      Janus.Control.Fold
-                      Janus.Control.Pipe
-                      Janus.Control.Reader
-                      Janus.Control.Step
-                      Janus.Control.Stream
-                      Janus.Control.Unfold
-                      Janus.Data.HKD
-                      Janus.Data.Layout
-                      Janus.Data.Sort
-                      Janus.Data.DynVec
-                      Janus.Data.SmallVec
-                      Janus.Data.StableVec
-                      Janus.Data.RingBuffer
-                      Janus.Data.Deque
-                      Janus.Data.Stack
-                      Janus.Data.SmallStack
-                      Janus.Data.PriorityQueue
-                      Janus.Data.IndexedPQ
-                      Janus.Data.BitSet
-                      Janus.Data.BitTree
-                      Janus.Data.BloomFilter
-                      Janus.Data.XorFilter
-                      Janus.Data.HashMap
-                      Janus.Data.HashSet
-                      Janus.Data.IndexMap
-                      Janus.Data.IndexSet
-                      Janus.Data.ClockCache
-                      Janus.Data.LruCache
-                      Janus.Data.FlatMap
-                      Janus.Data.FlatSet
-                      Janus.Data.BTreeMap
-                      Janus.Data.BTreeSet
-                      Janus.Data.DisjointSet
-                      Janus.Data.CsrGraph
-                      Janus.Data.EytzingerVec
-                      Janus.Data.FlatIntervalMap
-                      Janus.Data.SlotMap
-                      Janus.Data.SparseSet
-                      Janus.Data.SparseVec
-                      Janus.Data.Pool
-                      Janus.Data.Interner
-                      Janus.Data.IntrusiveList
-                      Janus.Data.IntrusiveHeap
-                      Janus.Data.TimerWheel
-                      Janus.Data
-                      Janus.Command.Array
                       Janus.Command.Case
                       Janus.Command.Cond
                       Janus.Command.Format
@@ -115,8 +67,56 @@ library
                       Janus.Command.Ref
                       Janus.Command.TicToc
                       Janus.Command.While
-                      Janus.Expression.Bool
+                      Janus.Control.CSV
+                      Janus.Control.Drain
+                      Janus.Control.Fold
+                      Janus.Control.Pipe
+                      Janus.Control.Reader
+                      Janus.Control.Step
+                      Janus.Control.Stream
+                      Janus.Control.Unfold
+                      Janus.Data
+                      Janus.Data.BTreeMap
+                      Janus.Data.BTreeSet
+                      Janus.Data.BitSet
+                      Janus.Data.BitTree
+                      Janus.Data.BloomFilter
+                      Janus.Data.ClockCache
+                      Janus.Data.CsrGraph
+                      Janus.Data.Deque
+                      Janus.Data.DisjointSet
+                      Janus.Data.DynVec
+                      Janus.Data.EytzingerVec
+                      Janus.Data.FlatIntervalMap
+                      Janus.Data.FlatMap
+                      Janus.Data.FlatSet
+                      Janus.Data.HKD
+                      Janus.Data.HashMap
+                      Janus.Data.HashSet
+                      Janus.Data.IndexMap
+                      Janus.Data.IndexSet
+                      Janus.Data.IndexedPQ
+                      Janus.Data.Interner
+                      Janus.Data.IntrusiveHeap
+                      Janus.Data.IntrusiveList
+                      Janus.Data.Layout
+                      Janus.Data.LruCache
+                      Janus.Data.Pool
+                      Janus.Data.PriorityQueue
+                      Janus.Data.RingBuffer
+                      Janus.Data.SlotMap
+                      Janus.Data.SmallStack
+                      Janus.Data.SmallVec
+                      Janus.Data.Sort
+                      Janus.Data.SparseSet
+                      Janus.Data.SparseVec
+                      Janus.Data.StableVec
+                      Janus.Data.Stack
+                      Janus.Data.Tensor
+                      Janus.Data.TimerWheel
+                      Janus.Data.XorFilter
                       Janus.Expression.Bits
+                      Janus.Expression.Bool
                       Janus.Expression.Cast
                       Janus.Expression.Cond
                       Janus.Expression.Eq

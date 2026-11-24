@@ -33,7 +33,7 @@ import Janus.Alloc
 import Janus.Backend.C (acquireJanusC, releaseJanusC)
 import Janus.Backend.C.Build (CBuildConfig, cBuildConfigCacheDir, defaultCBuildConfig)
 import Janus.Backend.C.LinuxX86_64 (LinuxX86_64C, LinuxX86_64CM)
-import Janus.Command.Array (CmdStorable (peek))
+import Janus.Command.Memory (CmdStorable (peek))
 import Janus.Command.Range (rangeM)
 import Janus.Control.Drain (drainForEach, drainSum, runDrain)
 import Janus.Control.Stream (Stream)
