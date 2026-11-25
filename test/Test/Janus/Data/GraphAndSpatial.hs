@@ -25,7 +25,7 @@ import qualified Hedgehog.Range as Range
 import Janus.Alloc
 import Janus.Backend.C (acquireJanusC, releaseJanusC)
 import Janus.Backend.C.Build (CBuildConfig, cBuildConfigCacheDir, defaultCBuildConfig)
-import Janus.Backend.C.LinuxX86_64 (LinuxX86_64C, LinuxX86_64CM)
+import Janus.Backend.C.LinuxX86_64 (LinuxX86_64CCSE, LinuxX86_64CMCSE)
 import Janus.Command.Cond (whenM_)
 import Janus.Command.Memory (CmdStorable (peekElemOff, pokeElemOff))
 import Janus.Control.Drain (drainForEach, drainSum, runDrain)
@@ -536,14 +536,14 @@ check_flat_interval_map_queries_and_early_stop = property $ do
 --------------------------------------------------------------------------------
 
 cGraphAndSpatialKernel ::
-  DisjointSet LinuxX86_64C ->
-  CsrGraph LinuxX86_64C Int64 ->
-  EytzingerVec LinuxX86_64C Int64 ->
-  FlatIntervalMap LinuxX86_64C Int64 Int64 ->
-  LinuxX86_64C Int64 ->
-  LinuxX86_64C Int64 ->
-  LinuxX86_64C Int64 ->
-  LinuxX86_64CM (LinuxX86_64C Int64)
+  DisjointSet LinuxX86_64CCSE ->
+  CsrGraph LinuxX86_64CCSE Int64 ->
+  EytzingerVec LinuxX86_64CCSE Int64 ->
+  FlatIntervalMap LinuxX86_64CCSE Int64 Int64 ->
+  LinuxX86_64CCSE Int64 ->
+  LinuxX86_64CCSE Int64 ->
+  LinuxX86_64CCSE Int64 ->
+  LinuxX86_64CMCSE (LinuxX86_64CCSE Int64)
 cGraphAndSpatialKernel ds g ev fim target qLo qHi = do
   nDs <- DS.numElements ds
   whenM_ (nDs `ge` 2) $ do

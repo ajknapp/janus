@@ -28,7 +28,7 @@ import qualified Data.Set as Set
 import qualified Data.Text as Text
 import qualified Data.Text.Encoding as Text
 import Data.Typeable (Typeable, typeRep)
-import Janus.Backend.C
+import Janus.Backend.C.Raw
 import Language.C.Quote
 
 class (Typeable r) => JanusCFix r where

@@ -7,7 +7,7 @@ import Data.Semilattice.Join
 import Data.Semilattice.Lower
 import Data.Semilattice.Meet
 import Data.Semilattice.Upper
-import Janus.Backend.C
+import Janus.Backend.C.Raw
 import Language.C.Quote
 
 class ExpBool e where

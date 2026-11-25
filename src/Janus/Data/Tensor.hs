@@ -40,7 +40,7 @@ import Data.Typeable
 import Foreign.Ptr as Ptr
 import qualified Foreign.Storable as Storable
 import GHC.TypeLits
-import Janus.Backend.C
+import Janus.Backend.C.Raw
 import Janus.Command.Memory
 import Janus.Command.Range
 import Janus.Command.Ref

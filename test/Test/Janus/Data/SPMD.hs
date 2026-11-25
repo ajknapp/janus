@@ -32,7 +32,7 @@ import qualified Hedgehog.Range as Range
 import Janus.Alloc
 import Janus.Backend.C (acquireJanusC, releaseJanusC)
 import Janus.Backend.C.Build (CBuildConfig, cBuildConfigCacheDir, defaultCBuildConfig)
-import Janus.Backend.C.LinuxX86_64 (LinuxX86_64C, LinuxX86_64CM)
+import Janus.Backend.C.LinuxX86_64 (LinuxX86_64CCSE, LinuxX86_64CMCSE)
 import Janus.Command.Memory (withAlignedArray)
 import Janus.Control.Drain (drainForEach, drainSum, runDrain)
 import Janus.Control.Step (Step (..))
@@ -642,12 +642,12 @@ check_spmd_graph_spatial_sparse_pool_interner = property $ do
 --------------------------------------------------------------------------------
 
 cMultiContainerSPMDKernel ::
-  BS.BitSet LinuxX86_64C ->
-  DV.DynVec LinuxX86_64C (SoA Vec2) ->
-  HM.HashMap LinuxX86_64C Int64 Int64 ->
-  EV.EytzingerVec LinuxX86_64C Int64 ->
-  POOL.Pool LinuxX86_64C Int64 ->
-  LinuxX86_64CM (LinuxX86_64C Int64)
+  BS.BitSet LinuxX86_64CCSE ->
+  DV.DynVec LinuxX86_64CCSE (SoA Vec2) ->
+  HM.HashMap LinuxX86_64CCSE Int64 Int64 ->
+  EV.EytzingerVec LinuxX86_64CCSE Int64 ->
+  POOL.Pool LinuxX86_64CCSE Int64 ->
+  LinuxX86_64CMCSE (LinuxX86_64CCSE Int64)
 cMultiContainerSPMDKernel bs dv hm ev pool = do
   -- 1. In-place SoA DynVec update gated by lane-gather BitSet membership (`testBitsSPMD`)!
   DV.foreachSPMD (Proxy @4) dv $ \idx (Vec2 x y) -> do
@@ -661,10 +661,10 @@ cMultiContainerSPMDKernel bs dv hm ev pool = do
   pc <- BS.spmdPopcount (Proxy @4) bs
   evHits <-
     runDrain drainSum $
-      streamM (rangeS (0 :: LinuxX86_64C Int64) 4) $ \g -> do
+      streamM (rangeS (0 :: LinuxX86_64CCSE Int64) 4) $ \g -> do
         let qGang = spmdAlignedUnitStride (g * 4)
         m <- withSPMD (Proxy @4) (EV.memberSPMD (Proxy @4) ev qGang)
-        pure (gangReduceAdd (fromBool m :: SPMD 4 LinuxX86_64C Int64))
+        pure (gangReduceAdd (fromBool m :: SPMD 4 LinuxX86_64CCSE Int64))
   hmSum <- gangReduceAdd <$> HM.foldValuesSPMD (Proxy @4) hm 0 (\acc _ v -> pure (acc + v))
   poolSum <- gangReduceAdd <$> POOL.foldOccupiedSPMD (Proxy @4) pool 0 (\acc _ v -> pure (acc + v))
   pure (pc + evHits * 100 + hmSum + poolSum)

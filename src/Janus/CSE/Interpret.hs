@@ -25,17 +25,21 @@ module Janus.CSE.Interpret
     interpretCSEExp,
     interpretCSEExpWithEnv,
     interpretCSEM,
+    interpretCSEMWithFeatures,
     interpretCSEMWithEnv,
+    interpretCSEMWithEnvAndFeatures,
 
-    -- * Curried Function Interpreter & Combined `withCSE` Helper
+    -- * Curried Function Interpreter & Combined `withCSE` Helpers
     CSEBodyMonad,
     CSEInterpretFrom (..),
     CSEInterpret (..),
     withCSE,
+    withCSEWithFeatures,
   )
 where
 
 import Control.Monad.Reader (MonadReader (ask))
+import qualified Data.Dependent.HashMap as DHM
 import Data.Foldable (foldlM, toList)
 import Data.Functor.Identity (Identity)
 import qualified Data.Kind as K
@@ -44,6 +48,7 @@ import Data.Proxy (Proxy (..))
 import Data.Type.Equality ((:~:) (Refl), testEquality)
 import GHC.TypeNats (natVal)
 import Janus.Backend.C.CUDA.Types (CUDAThreadInfo (..))
+import Janus.Backend.C.Target (TargetFeatureMap)
 import Janus.CSE.Optimize
 import Janus.CSE.Types
 import Janus.Command.Case (CmdCase (..))
@@ -54,6 +59,8 @@ import Janus.Command.Range (CmdRange (..))
 import Janus.Command.Ref (CmdRef (..))
 import Janus.Command.While (CmdWhile (..))
 import Janus.SPMD.Gang (CmdOptimalGang (..), clampGangWidth)
+import Janus.SPMD.Typed (SPMDTyped (..))
+import Janus.SPMD.Types (SPMD (..), SPMDM, SPMDRep, liftSPMD, runSPMD, runSPMDM)
 import qualified Type.Reflection as TR
 
 --------------------------------------------------------------------------------
@@ -229,7 +236,15 @@ interpretCSEM ::
   (Monad m, CmdRef m e, CSETargetExp e, CSETargetReturn e res) =>
   CSEM m e res ->
   m (CSETargetVal e res)
-interpretCSEM = interpretCSEMWithEnv emptyCSEEnv
+interpretCSEM = interpretCSEMWithFeatures DHM.empty
+
+-- | Interpret a closed 'CSEM' computation under a 'TargetFeatureMap'.
+interpretCSEMWithFeatures ::
+  (Monad m, CmdRef m e, CSETargetExp e, CSETargetReturn e res) =>
+  TargetFeatureMap ->
+  CSEM m e res ->
+  m (CSETargetVal e res)
+interpretCSEMWithFeatures tfm = interpretCSEMWithEnvAndFeatures tfm emptyCSEEnv
 
 -- | Interpret a 'CSEM' computation under an existing 'CSEEnv'.
 interpretCSEMWithEnv ::
@@ -238,8 +253,19 @@ interpretCSEMWithEnv ::
   CSEEnv m e ->
   CSEM m e res ->
   m (CSETargetVal e res)
-interpretCSEMWithEnv env0 mAct =
+interpretCSEMWithEnv = interpretCSEMWithEnvAndFeatures DHM.empty
+
+-- | Interpret a 'CSEM' computation under a 'TargetFeatureMap' and 'CSEEnv'.
+interpretCSEMWithEnvAndFeatures ::
+  forall m e res.
+  (Monad m, CmdRef m e, CSETargetExp e, CSETargetReturn e res) =>
+  TargetFeatureMap ->
+  CSEEnv m e ->
+  CSEM m e res ->
+  m (CSETargetVal e res)
+interpretCSEMWithEnvAndFeatures tfm env0 mAct =
   interpCSEMWith
+    tfm
     (\envFinal ret -> interpretCSEReturn @e @res (interpretCSEExpWithEnv envFinal) ret)
     env0
     mAct
@@ -247,18 +273,19 @@ interpretCSEMWithEnv env0 mAct =
 interpCSEMWith ::
   forall m e res out.
   (Monad m, CmdRef m e, CSETargetExp e) =>
+  TargetFeatureMap ->
   (CSEEnv m e -> res -> out) ->
   CSEEnv m e ->
   CSEM m e res ->
   m out
-interpCSEMWith finish env0 (CSEM buildFn) =
-  let (_, tree) = buildFn 0
+interpCSEMWith tfm finish env0 (CSEM buildFn) =
+  let (_, tree) = buildFn tfm 0
    in interpTree env0 tree
   where
     interpTree :: CSEEnv m e -> ProgTree m e res -> m out
     interpTree env = \case
       ProgLinear blk ret -> do
-        envFinal <- interpBlock env blk
+        envFinal <- interpBlock tfm env blk
         pure (finish envFinal ret)
       ProgOptimalGang (_ :: TR.TypeRep elemTy) b2 b4 b8 b16 b32 ->
         withOptimalGang @m @e (Proxy @elemTy) $ \pn ->
@@ -272,36 +299,47 @@ interpCSEMWith finish env0 (CSEM buildFn) =
 interpBlock ::
   forall m e.
   (Monad m, CmdRef m e, CSETargetExp e) =>
+  TargetFeatureMap ->
   CSEEnv m e ->
   Block m e ->
   m (CSEEnv m e)
-interpBlock env0 blk = foldlM interpItem env0 (toList blk)
+interpBlock tfm env0 blk = foldlM (interpItem tfm) env0 (toList blk)
 
 interpItem ::
   forall m e.
   (Monad m, CmdRef m e, CSETargetExp e) =>
+  TargetFeatureMap ->
   CSEEnv m e ->
   ScopeItem m e ->
   m (CSEEnv m e)
-interpItem env = \case
-  ItemStm stm -> interpStm env stm
+interpItem tfm env = \case
+  ItemStm stm -> interpStm tfm env stm
   ItemWithRefPtr cseRef vid innerBlk -> do
     let tgtRef = lookupEnvRef env cseRef
     envInner <- withRefPtr tgtRef $ \tgtPtr ->
-      interpBlock (insertEnvVar vid tgtPtr env) innerBlk
+      interpBlock tfm (insertEnvVar vid tgtPtr env) innerBlk
     pure (deleteEnvVar vid envInner)
   ItemWithString str vid innerBlk -> do
     envInner <- withString str $ \tgtCStr ->
-      interpBlock (insertEnvVar vid tgtCStr env) innerBlk
+      interpBlock tfm (insertEnvVar vid tgtCStr env) innerBlk
     pure (deleteEnvVar vid envInner)
+  ItemOptimalGang (_ :: TR.TypeRep elemTy) b2 b4 b8 b16 b32 ->
+    withOptimalGang @m @e (Proxy @elemTy) $ \pn ->
+      env <$ case clampGangWidth (fromIntegral (natVal pn)) of
+        2 -> interpBlock tfm env b2
+        4 -> interpBlock tfm env b4
+        8 -> interpBlock tfm env b8
+        16 -> interpBlock tfm env b16
+        _ -> interpBlock tfm env b32
 
 interpStm ::
   forall m e.
   (Monad m, CmdRef m e, CSETargetExp e) =>
+  TargetFeatureMap ->
   CSEEnv m e ->
   Stm m e ->
   m (CSEEnv m e)
-interpStm env = \case
+interpStm tfm env = \case
   StmLetM vid cap rhs -> do
     let rhsVal = interpretCSEExpWithEnv env rhs
     boundVal <- cseLetMWithCap cap rhsVal
@@ -331,26 +369,26 @@ interpStm env = \case
     let condVal = interpretCSEExpWithEnv env cond
     ifThenElseM_
       condVal
-      (interpBlock env tBlk >> pure ())
-      (interpBlock env fBlk >> pure ())
+      (interpBlock tfm env tBlk >> pure ())
+      (interpBlock tfm env fBlk >> pure ())
     pure env
   StmWhile cond cseRef bodyBlk -> do
     let condVal = interpretCSEExpWithEnv env cond
     whileM condVal $ \tgtLoopRef -> do
-      _ <- interpBlock (insertEnvRef cseRef tgtLoopRef env) bodyBlk
+      _ <- interpBlock tfm (insertEnvRef cseRef tgtLoopRef env) bodyBlk
       pure ()
     pure env
   StmRange lo hi vid bodyBlk -> do
     let loVal = interpretCSEExpWithEnv env lo
         hiVal = interpretCSEExpWithEnv env hi
     rangeM loVal hiVal $ \tgtIdx -> do
-      _ <- interpBlock (insertEnvVar vid tgtIdx env) bodyBlk
+      _ <- interpBlock tfm (insertEnvVar vid tgtIdx env) bodyBlk
       pure ()
     pure env
   StmSwitch tag cases defBlk -> do
     let tagVal = interpretCSEExpWithEnv env tag
-        tgtCases = [(k, interpBlock env b >> pure ()) | (k, b) <- cases]
-    switchCase_ tagVal tgtCases (interpBlock env defBlk >> pure ())
+        tgtCases = [(k, interpBlock tfm env b >> pure ()) | (k, b) <- cases]
+    switchCase_ tagVal tgtCases (interpBlock tfm env defBlk >> pure ())
     pure env
   StmCUDAAsk tiVars -> do
     tiVals <- ask
@@ -394,7 +432,7 @@ interpStm env = \case
                             envPureFuns = envPureFuns env
                           }
                       )
-               in interpCSEMWith interpretCSEExpWithEnv localEnv (mfdBody mfd)
+               in interpCSEMWith tfm interpretCSEExpWithEnv localEnv (mfdBody mfd)
          in mfdEmitTarget mfd step tgtArgs
     pure (insertEnvVar vid resVal env)
 
@@ -414,12 +452,15 @@ evalHArgsWith env (HCons x xs) =
 type family CSEBodyMonad (r :: K.Type) :: K.Type -> K.Type where
   CSEBodyMonad (CSEExp _ _) = Identity
   CSEBodyMonad (CSEM m _ _) = m
+  CSEBodyMonad (SPMD _ _ _) = Identity
+  CSEBodyMonad (SPMDM _ (CSEM m _) _ _) = m
   CSEBodyMonad (_ -> r) = CSEBodyMonad r
 
 class CSEInterpretFrom (r :: K.Type) where
   type CSETarget r :: K.Type
   type CSEInterpExp r :: K.Type -> K.Type
   buildCSEInterpreter ::
+    TargetFeatureMap ->
     Int ->
     r ->
     CSEEnv (CSEBodyMonad r) (CSEInterpExp r) ->
@@ -428,7 +469,7 @@ class CSEInterpretFrom (r :: K.Type) where
 instance (CSETargetExp e, CSEExpReturnLeaf e a) => CSEInterpretFrom (CSEExp e a) where
   type CSETarget (CSEExp e a) = e (TargetExpElem e a)
   type CSEInterpExp (CSEExp e a) = e
-  buildCSEInterpreter _ !expr = \env -> interpretExpLeaf (interpretCSEExpWithEnv env expr)
+  buildCSEInterpreter _ _ !expr = \env -> interpretExpLeaf (interpretCSEExpWithEnv env expr)
 
 instance
   (Monad m, CmdRef m e, CSETargetExp e, CSETargetReturn e res) =>
@@ -436,7 +477,32 @@ instance
   where
   type CSETarget (CSEM m e res) = m (CSETargetVal e res)
   type CSEInterpExp (CSEM m e res) = e
-  buildCSEInterpreter _ !mAct = \env -> interpretCSEMWithEnv env mAct
+  buildCSEInterpreter tfm _ !mAct = \env -> interpretCSEMWithEnvAndFeatures tfm env mAct
+
+instance
+  ( CSETargetExp e,
+    SPMDTyped n (CSEExp e) a,
+    SPMDTyped n e a,
+    CSEExpReturnLeaf e (SPMDRep n (CSEExp e) a),
+    TargetExpElem e (SPMDRep n (CSEExp e) a) ~ SPMDRep n e a
+  ) =>
+  CSEInterpretFrom (SPMD n (CSEExp e) a)
+  where
+  type CSETarget (SPMD n (CSEExp e) a) = SPMD n e a
+  type CSEInterpExp (SPMD n (CSEExp e) a) = e
+  buildCSEInterpreter _ _ !spmdExp = \env ->
+    let rawExp = spmdMaterialize @n @(CSEExp e) @a (runSPMD spmdExp)
+        rawTgt = interpretExpLeaf @e @(SPMDRep n (CSEExp e) a) (interpretCSEExpWithEnv env rawExp)
+     in SPMD (pure (spmdDematerialize @n @e @a rawTgt))
+
+instance
+  (Monad m, CmdRef m e, CSETargetExp e, CSETargetReturn e res) =>
+  CSEInterpretFrom (SPMDM n (CSEM m e) (CSEExp e) res)
+  where
+  type CSETarget (SPMDM n (CSEM m e) (CSEExp e) res) = SPMDM n m e (CSETargetVal e res)
+  type CSEInterpExp (SPMDM n (CSEM m e) (CSEExp e) res) = e
+  buildCSEInterpreter tfm _ !act = \env ->
+    liftSPMD (interpretCSEMWithEnvAndFeatures tfm env (runSPMDM act))
 
 instance
   ( CSEParam p,
@@ -449,22 +515,24 @@ instance
   where
   type CSETarget (p -> r) = CSEParamTarget p -> CSETarget r
   type CSEInterpExp (p -> r) = CSEParamExp p
-  buildCSEInterpreter idx fn =
+  buildCSEInterpreter tfm idx fn =
     let (idx', formalP, _) = cseAllocParam @p idx
-        !restInterp = buildCSEInterpreter idx' (fn formalP)
+        !restInterp = buildCSEInterpreter tfm idx' (fn formalP)
      in \env targetP ->
           let (_, vs, rs) = cseBindTargetParam @p @(CSEBodyMonad r) idx targetP
            in restInterp (extendCSEEnv vs rs env)
 
--- | Interpret a pure 'CSEExp', a monadic 'CSEM' action, or an arbitrarily
--- curried function over @('CSEM' m e, 'CSEExp' e)@ into the underlying Janus
--- typeclasses on @(m, e)@.
+-- | Interpret a pure 'CSEExp', a monadic 'CSEM' action, an 'SPMD' / 'SPMDM'
+-- computation, or an arbitrarily curried function over @('CSEM' m e, 'CSEExp' e)@
+-- into the underlying Janus typeclasses on @(m, e)@.
 class (CSEInterpretFrom r) => CSEInterpret (r :: K.Type) where
   interpretCSE :: r -> CSETarget r
+  interpretCSEWithFeatures :: TargetFeatureMap -> r -> CSETarget r
 
 instance (CSEInterpretFrom r) => CSEInterpret r where
-  interpretCSE r =
-    let !runner = buildCSEInterpreter 0 r
+  interpretCSE = interpretCSEWithFeatures DHM.empty
+  interpretCSEWithFeatures tfm r =
+    let !runner = buildCSEInterpreter tfm 0 r
      in runner emptyCSEEnv
 
 -- | Optimize a Janus program via algorithmic Common Subexpression Elimination
@@ -472,3 +540,7 @@ instance (CSEInterpretFrom r) => CSEInterpret r where
 -- ('interpretCSE').
 withCSE :: (CSEOptimize r, CSEInterpret r) => r -> CSETarget r
 withCSE = interpretCSE . cse
+
+-- | Optimize and lower a Janus program under a known 'TargetFeatureMap'.
+withCSEWithFeatures :: (CSEOptimize r, CSEInterpret r) => TargetFeatureMap -> r -> CSETarget r
+withCSEWithFeatures tfm = interpretCSEWithFeatures tfm . cseWithFeatures tfm

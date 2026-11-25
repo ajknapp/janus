@@ -26,7 +26,7 @@ import qualified Hedgehog.Range as Range
 import Janus.Alloc
 import Janus.Backend.C (acquireJanusC, releaseJanusC)
 import Janus.Backend.C.Build (CBuildConfig, cBuildConfigCacheDir, defaultCBuildConfig)
-import Janus.Backend.C.LinuxX86_64 (LinuxX86_64C, LinuxX86_64CM)
+import Janus.Backend.C.LinuxX86_64 (LinuxX86_64CCSE, LinuxX86_64CMCSE)
 import Janus.Command.Cond (whenM_)
 import Janus.Control.Drain (drainForEach, drainSum, runDrain)
 import Janus.Control.Stream (Stream, rangeS)
@@ -493,11 +493,11 @@ check_indexed_pq_and_dijkstra = property $ do
 --------------------------------------------------------------------------------
 
 cMutateStackAndHeaps ::
-  Stack LinuxX86_64C Int64 ->
-  PriorityQueue LinuxX86_64C Int64 Int64 ->
-  IndexedPQ LinuxX86_64C Int64 Int64 ->
-  LinuxX86_64C Int64 ->
-  LinuxX86_64CM (LinuxX86_64C Int64)
+  Stack LinuxX86_64CCSE Int64 ->
+  PriorityQueue LinuxX86_64CCSE Int64 Int64 ->
+  IndexedPQ LinuxX86_64CCSE Int64 Int64 ->
+  LinuxX86_64CCSE Int64 ->
+  LinuxX86_64CMCSE (LinuxX86_64CCSE Int64)
 cMutateStackAndHeaps st pq ipq n = do
   runDrain
     ( drainForEach $ \i -> do

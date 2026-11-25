@@ -18,7 +18,7 @@ import Data.Proxy
 import Data.Typeable (Typeable)
 import Data.Word (Word32)
 import Foreign.Ptr (Ptr)
-import Janus.Backend.C
+import Janus.Backend.C.Raw
 import Janus.Backend.C.CUDA.SIMD.Base
 import Janus.Backend.C.CUDA.Types
 import Janus.Expression.SIMD

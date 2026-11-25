@@ -31,7 +31,7 @@ import Data.Typeable (Typeable)
 import Data.Word (Word16, Word32, Word64, Word8)
 import Foreign.Ptr (Ptr)
 import GHC.TypeNats (KnownNat, Nat, natVal)
-import Janus.Backend.C (JanusCTyped)
+import Janus.Backend.C.Raw (JanusCTyped)
 import Janus.Backend.C.Target
   ( CUDAFeatures,
     X86Feature (..),

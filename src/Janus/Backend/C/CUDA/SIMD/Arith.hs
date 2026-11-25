@@ -15,7 +15,7 @@ import Data.Int (Int32, Int64)
 import Data.Loc
 import Data.Proxy
 import Data.Word (Word32, Word64)
-import Janus.Backend.C
+import Janus.Backend.C.Raw
 import Janus.Backend.C.CUDA.Kernel ()
 import Janus.Backend.C.CUDA.SIMD.Base
 import Janus.Backend.C.CUDA.Types

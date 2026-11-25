@@ -27,7 +27,7 @@ import Foreign.C (CDouble, CFloat, withCString)
 import Foreign.Marshal.Alloc (alloca, free, mallocBytes)
 import Foreign.Ptr (Ptr, castPtr, nullPtr, plusPtr)
 import Foreign.Storable (Storable (alignment, peek, poke, pokeElemOff, sizeOf))
-import Janus.Backend.C
+import Janus.Backend.C.Raw
 import Janus.Backend.C.Build
 import Janus.Backend.C.CUDA.Foreign
 import Janus.Backend.C.CUDA.Types
@@ -270,8 +270,8 @@ type family JanusCUDAEval r where
   JanusCUDAEval (JanusCUDAM ()) = IO ()
   JanusCUDAEval (JanusCUDA a -> r) = JanusCUDAEval' a -> JanusCUDAEval r
 
-showJanusCUDAWith :: forall a. (JanusCUDAParam a) => CUDAFeatures -> String -> a -> String
-showJanusCUDAWith fs name a =
+showRawJanusCUDAWith :: forall a. (JanusCUDAParam a) => CUDAFeatures -> String -> a -> String
+showRawJanusCUDAWith fs name a =
   let jcs = jcudaparamWithFeatures fs name 0 (pure []) a
       banner = "/* janus-cuda-target: sm_" <> show (cudaSMMajor fs) <> show (cudaSMMinor fs) <> " */\n"
       strChar 0 = '\n'
@@ -280,14 +280,14 @@ showJanusCUDAWith fs name a =
       str = fmap strChar [0 .. 81 :: Int]
    in banner <> foldMap ((<> str) . renderJCFunc) jcs
 
-showJanusCUDA :: forall a. (JanusCUDAParam a) => String -> a -> String
-showJanusCUDA = showJanusCUDAWith cudaSM80
+showRawJanusCUDA :: forall a. (JanusCUDAParam a) => String -> a -> String
+showRawJanusCUDA = showRawJanusCUDAWith cudaSM80
 
-printJanusCUDAWith :: (JanusCUDAParam r) => CUDAFeatures -> r -> IO ()
-printJanusCUDAWith fs = putStrLn . showJanusCUDAWith fs "janus_main"
+printRawJanusCUDAWith :: (JanusCUDAParam r) => CUDAFeatures -> r -> IO ()
+printRawJanusCUDAWith fs = putStrLn . showRawJanusCUDAWith fs "janus_main"
 
-printJanusCUDA :: (JanusCUDAParam r) => r -> IO ()
-printJanusCUDA = putStrLn . showJanusCUDA "janus_main"
+printRawJanusCUDA :: (JanusCUDAParam r) => r -> IO ()
+printRawJanusCUDA = putStrLn . showRawJanusCUDA "janus_main"
 
 -- this is required for GHC to infer enough injectivity for jcudaeval to compile
 type family JanusCUDAEval' a where
@@ -337,7 +337,7 @@ instance (Storable (JanusCUDAEval' a), JanusCUDAEvaluate r) => JanusCUDAEvaluate
             pokeElemOff argPtrs nptrs (castPtr pa)
             pack
 
-withJanusCUDAFnWith ::
+withRawJanusCUDAFnWith ::
   (JanusCUDAParam r, JanusCUDAEvaluate r) =>
   CUDAFeatures ->
   CUdevice ->
@@ -346,7 +346,7 @@ withJanusCUDAFnWith ::
   r ->
   (CUfunction -> (CUlaunchConfig -> JanusCUDAEval r) -> IO a) ->
   IO a
-withJanusCUDAFnWith reqFeatures dev ctx config f k = do
+withRawJanusCUDAFnWith reqFeatures dev ctx config f k = do
   observed <- observeCUDAFeatures dev
   ensureCUDAAdmitted observed reqFeatures
   let dir = config ^. cBuildConfigCacheDir
@@ -359,7 +359,7 @@ withJanusCUDAFnWith reqFeatures dev ctx config f k = do
           fn <- cuModuleGetFunction pfn m s >> peek pfn
           k fn (\kernelArgs -> jcudaeval fn argbuf 0 argPtrs 0 (pure ()) kernelArgs f)
 
-withJanusCUDAWith ::
+withRawJanusCUDAWith ::
   (JanusCUDAParam r, JanusCUDAEvaluate r) =>
   CUDAFeatures ->
   CUdevice ->
@@ -368,9 +368,9 @@ withJanusCUDAWith ::
   r ->
   ((CUlaunchConfig -> JanusCUDAEval r) -> IO a) ->
   IO a
-withJanusCUDAWith fs dev ctx config f k = withJanusCUDAFnWith fs dev ctx config f (const k)
+withRawJanusCUDAWith fs dev ctx config f k = withRawJanusCUDAFnWith fs dev ctx config f (const k)
 
-withJanusCUDAFn ::
+withRawJanusCUDAFn ::
   (JanusCUDAParam r, JanusCUDAEvaluate r) =>
   CUdevice ->
   CUctx ->
@@ -378,11 +378,11 @@ withJanusCUDAFn ::
   r ->
   (CUfunction -> (CUlaunchConfig -> JanusCUDAEval r) -> IO a) ->
   IO a
-withJanusCUDAFn dev ctx config f k = do
+withRawJanusCUDAFn dev ctx config f k = do
   fs <- observeCUDAFeatures dev
-  withJanusCUDAFnWith fs dev ctx config f k
+  withRawJanusCUDAFnWith fs dev ctx config f k
 
-withJanusCUDA ::
+withRawJanusCUDA ::
   (JanusCUDAParam r, JanusCUDAEvaluate r) =>
   CUdevice ->
   CUctx ->
@@ -390,7 +390,7 @@ withJanusCUDA ::
   r ->
   ((CUlaunchConfig -> JanusCUDAEval r) -> IO a) ->
   IO a
-withJanusCUDA dev ctx config f k = withJanusCUDAFn dev ctx config f (const k)
+withRawJanusCUDA dev ctx config f k = withRawJanusCUDAFn dev ctx config f (const k)
 
 -- -- class CmdCudaSynchronized m e | m -> e where
 -- --   synchronized :: (CUDAThreadInfo e -> m ()) -> CUDAT e m ()

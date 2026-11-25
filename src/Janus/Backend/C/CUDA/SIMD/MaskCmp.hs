@@ -20,7 +20,7 @@ import Data.Semilattice.Lower (Lower (..))
 import Data.Semilattice.Meet (Meet (..))
 import Data.Semilattice.Upper (Upper (..))
 import Data.Word (Word32, Word64)
-import Janus.Backend.C
+import Janus.Backend.C.Raw
 import Janus.Backend.C.CUDA.Kernel ()
 import Janus.Backend.C.CUDA.SIMD.Base
 import Janus.Backend.C.CUDA.Types

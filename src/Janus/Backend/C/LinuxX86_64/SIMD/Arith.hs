@@ -15,7 +15,7 @@ import Data.Int (Int64)
 import Data.Loc
 import Data.Proxy
 import Data.Word (Word32)
-import Janus.Backend.C
+import Janus.Backend.C.Raw
 import Janus.Backend.C.LinuxX86_64.SIMD.Base
 import Janus.Backend.C.LinuxX86_64.SIMD.Bits ()
 import Janus.Backend.C.LinuxX86_64.SIMD.MaskCmp (x86Cmp128)

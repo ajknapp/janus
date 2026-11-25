@@ -49,8 +49,8 @@ test_let = do
   let acquire f = do
         tmpdir <- getEnv "TMPDIR"
         acquireJanusC (defaultCBuildConfig & cBuildConfigCacheDir .~ tmpdir) f
-  withResource (acquire (pow5 @JanusC @Int64)) releaseJanusC $ \cpow5 ->
-    withResource (acquire (pow6 @JanusC @Int64)) releaseJanusC $ \cpow6 ->
+  withResource (acquire (pow5 @JanusCCSE @Int64)) releaseJanusC $ \cpow5 ->
+    withResource (acquire (pow6 @JanusCCSE @Int64)) releaseJanusC $ \cpow6 ->
       let cpow5' = fst <$> cpow5
           cpow6' = fst <$> cpow6
       in testGroup

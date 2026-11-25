@@ -18,6 +18,7 @@
 {-# LANGUAGE TypeFamilies #-}
 {-# LANGUAGE TypeOperators #-}
 {-# LANGUAGE UndecidableInstances #-}
+{-# LANGUAGE UndecidableSuperClasses #-}
 
 -- | Pure algorithmic Common Subexpression Elimination over 'CSEExp' and 'CSEM'
 -- via deduplicated Merkle DAG construction, lexical scope-tree LCA placement,
@@ -33,6 +34,7 @@ module Janus.CSE.Optimize
     cseExp,
     cseProgTreeWith,
     cseM,
+    cseMWithFeatures,
 
     -- * Return, Parameter, & Curried Function Optimization Classes
     TargetExpElem,
@@ -40,6 +42,8 @@ module Janus.CSE.Optimize
     CSEExpParamLeaf (..),
     CSEHKD (..),
     GCSEHKD (..),
+    GCSETraverse (..),
+    GCSEMap (..),
     CSEReturn (..),
     CSETargetReturn (..),
     ParamSubst (..),
@@ -50,12 +54,15 @@ module Janus.CSE.Optimize
     ReifyTensorBoundsShape (..),
     CSEApplySubst (..),
     CSEOptimizeFrom (..),
+    cseFromIdx,
     CSEOptimize (..),
   )
 where
 
 import Control.Applicative (Const (..))
 import Control.Monad.State.Strict (State, evalState, execState, get, gets, modify', put, runState)
+import Data.Coerce (Coercible)
+import qualified Data.Dependent.HashMap as DHM
 import Data.Foldable (toList)
 import Data.Functor.Identity (Identity (..))
 import qualified Data.IntMap.Strict as IntMap
@@ -71,6 +78,7 @@ import Foreign.Ptr (Ptr)
 import GHC.Generics
 import GHC.TypeNats (KnownNat, Nat)
 import Janus.Backend.C.CUDA.Types (mapCUDAThreadInfo)
+import Janus.Backend.C.Target (TargetFeatureMap)
 import Janus.CSE.Types
 import Janus.Command.Ref (CmdRef (..))
 import Janus.Command.TicToc (Tic (..), Toc (..))
@@ -78,6 +86,8 @@ import Janus.Control.Reader.Base (ExpNewtype (..))
 import Janus.Data.HKD (HKD (..))
 import Janus.Data.Tensor (Tensor (..), TensorBounds (..))
 import Janus.Expression.SIMD (ExpSIMD, SIMDShape, Wide)
+import Janus.SPMD.Typed (SPMDTyped (..))
+import Janus.SPMD.Types (SIMDPair, SPMD (..), SPMDM, SPMDRep, liftSPMD, runSPMD, runSPMDM)
 import qualified Type.Reflection as TR
 
 --------------------------------------------------------------------------------
@@ -177,6 +187,14 @@ normalizeItem = \case
   ItemStm stm -> ItemStm (normalizeStm stm)
   ItemWithRefPtr ref vid blk -> ItemWithRefPtr ref vid (normalizeBlock blk)
   ItemWithString s vid blk -> ItemWithString s vid (normalizeBlock blk)
+  ItemOptimalGang tr b2 b4 b8 b16 b32 ->
+    ItemOptimalGang
+      tr
+      (normalizeBlock b2)
+      (normalizeBlock b4)
+      (normalizeBlock b8)
+      (normalizeBlock b16)
+      (normalizeBlock b32)
 
 normalizeStm :: Stm m e -> Stm m e
 normalizeStm = \case
@@ -590,6 +608,18 @@ registerItem sid idx item =
           addUncondChild sid sInner
           recordVarDef (vidKey vid) sInner 0
           registerBlock sInner innerBlk
+        ItemOptimalGang _ b2 b4 b8 b16 b32 -> do
+          s2 <- allocScope sid idx SKBlock
+          s4 <- allocScope sid idx SKBlock
+          s8 <- allocScope sid idx SKBlock
+          s16 <- allocScope sid idx SKBlock
+          s32 <- allocScope sid idx SKBlock
+          addExhaustiveGroup sid [s2, s4, s8, s16, s32]
+          registerBlock s2 b2
+          registerBlock s4 b4
+          registerBlock s8 b8
+          registerBlock s16 b16
+          registerBlock s32 b32
 
 --------------------------------------------------------------------------------
 -- Scope LCA, Dominance, & Reverse-Topological Placement Pass
@@ -985,6 +1015,16 @@ rewriteItem cs siteIdx act site@(UseSite sid idx) item =
                 _ -> error "Janus.CSE.Optimize: ItemWithString scope mismatch"
               (actAfter, innerBlk') = emitBlockCSE cs siteIdx act sInner innerBlk
            in (actAfter, ItemWithString s vid innerBlk')
+        ItemOptimalGang tr b2 b4 b8 b16 b32 ->
+          case blockChildren of
+            [s2, s4, s8, s16, s32] ->
+              let (_, b2') = emitBlockCSE cs siteIdx act s2 b2
+                  (_, b4') = emitBlockCSE cs siteIdx act s4 b4
+                  (_, b8') = emitBlockCSE cs siteIdx act s8 b8
+                  (_, b16') = emitBlockCSE cs siteIdx act s16 b16
+                  (_, b32') = emitBlockCSE cs siteIdx act s32 b32
+               in (act, ItemOptimalGang tr b2' b4' b8' b16' b32')
+            _ -> error "Janus.CSE.Optimize: ItemOptimalGang scope mismatch"
 
 rewriteHArgs ::
   CommitState e ->
@@ -1230,6 +1270,13 @@ copyPropBlock sub0 cuda0 blk =
       ItemWithString s vid innerBlk ->
         let (subAfter, cudaAfter, innerBlk') = copyPropBlock sub cudaSeen innerBlk
          in (subAfter, cudaAfter, out Seq.|> ItemWithString s vid innerBlk')
+      ItemOptimalGang tr b2 b4 b8 b16 b32 ->
+        let b2' = thd3 (copyPropBlock sub cudaSeen b2)
+            b4' = thd3 (copyPropBlock sub cudaSeen b4)
+            b8' = thd3 (copyPropBlock sub cudaSeen b8)
+            b16' = thd3 (copyPropBlock sub cudaSeen b16)
+            b32' = thd3 (copyPropBlock sub cudaSeen b32)
+         in (sub, cudaSeen, out Seq.|> ItemOptimalGang tr b2' b4' b8' b16' b32')
 
     thd3 (_, _, z) = z
 
@@ -1296,12 +1343,41 @@ cseProgTreeWith trav = goTree
 -- sharing pure expressions across effectful commands via 'StmLetM' ('letM').
 cseM :: forall m e res. (CSEReturn e res) => CSEM m e res -> CSEM m e res
 cseM (CSEM buildFn) =
-  let (nextCounter, rawTree) = buildFn 0
-      !optTree = cseProgTreeWith (traverseCSEReturn @e @res) rawTree
-   in CSEM $ \baseCounter ->
-        if baseCounter == 0 && maxCSEVarInTree optTree < 0
-          then (nextCounter, optTree)
-          else instantiateOptTree emptyParamSubst baseCounter nextCounter optTree
+  let (emptyNext, emptyRaw) = buildFn DHM.empty 0
+      emptyOpt = cseProgTreeWith (traverseCSEReturn @e @res) emptyRaw
+   in CSEM $ \tfm baseCounter ->
+        if DHM.null tfm
+          then
+            emptyOpt `seq`
+              if baseCounter == 0 && maxCSEVarInTree emptyOpt < 0
+                then (emptyNext, emptyOpt)
+                else instantiateOptTree emptyParamSubst baseCounter emptyNext emptyOpt
+          else
+            let (nextCounter, rawTree) = buildFn tfm 0
+                !optTree = cseProgTreeWith (traverseCSEReturn @e @res) rawTree
+             in if baseCounter == 0 && maxCSEVarInTree optTree < 0
+                  then (nextCounter, optTree)
+                  else instantiateOptTree emptyParamSubst baseCounter nextCounter optTree
+
+-- | Eliminate common subexpressions across a monadic 'CSEM' computation under
+-- a known 'TargetFeatureMap'.
+cseMWithFeatures ::
+  forall m e res.
+  (CSEReturn e res) =>
+  TargetFeatureMap ->
+  CSEM m e res ->
+  CSEM m e res
+cseMWithFeatures tfm mAct
+  | DHM.null tfm = cseM mAct
+  | otherwise =
+      case mAct of
+        CSEM buildFn ->
+          let (nextCounter, rawTree) = buildFn tfm 0
+              !optTree = cseProgTreeWith (traverseCSEReturn @e @res) rawTree
+           in CSEM $ \_ baseCounter ->
+                if baseCounter == 0 && maxCSEVarInTree optTree < 0
+                  then (nextCounter, optTree)
+                  else instantiateOptTree emptyParamSubst baseCounter nextCounter optTree
 
 maxCSEVarInExp :: CSEExp e a -> Int
 maxCSEVarInExp expr =
@@ -1341,6 +1417,8 @@ maxCSEVarInTree = \case
         StmFixCall _ _ args -> maxCSEHArgs args
       ItemWithRefPtr _ _ b -> maxCSEBlk b
       ItemWithString _ _ b -> maxCSEBlk b
+      ItemOptimalGang _ b2 b4 b8 b16 b32 ->
+        maximum [maxCSEBlk b2, maxCSEBlk b4, maxCSEBlk b8, maxCSEBlk b16, maxCSEBlk b32]
 
 -- | Instantiate an optimized `ProgTree` inside an outer `CSEM` context (applying
 -- any parameter substitutions and remapping local `VarSSA` / `VarCSE` / `RefLocal`
@@ -1408,6 +1486,8 @@ instantiateOptTree sub baseCounter countUsed tree
             ItemStm s -> ItemStm (remapStm s)
             ItemWithRefPtr ref vid b -> ItemWithRefPtr (remapRef ref) (remapVid vid) (remapBlk b)
             ItemWithString str vid b -> ItemWithString str (remapVid vid) (remapBlk b)
+            ItemOptimalGang tr b2 b4 b8 b16 b32 ->
+              ItemOptimalGang tr (remapBlk b2) (remapBlk b4) (remapBlk b8) (remapBlk b16) (remapBlk b32)
           remapStm = \case
             StmLetM vid cap rhs -> StmLetM (remapVid vid) cap (remapExp rhs)
             StmEffectVal vid args eval ->
@@ -1572,14 +1652,15 @@ instance (CSEHKD sub e) => GCSEHKD e (K1 i (sub (CSEExp e))) (K1 i (sub e)) wher
   gBindTargetHKD n0 (K1 sTgt) = bindTargetCSEHKD @sub @e n0 sTgt
 
 -- | Map a 'CSEExp' element type to the corresponding target @e@ element type,
--- unwrapping 'SIMDVector' and 'SIMDMask' from @'CSEExp' e@ to @e@ while
--- leaving all other types unchanged.
+-- unwrapping 'SIMDVector' and 'SIMDMask' (including inside 'SIMDPair') from
+-- @'CSEExp' e@ to @e@ while leaving all other types unchanged.
 type family TargetExpElem (e :: K.Type -> K.Type) (a :: K.Type) :: K.Type where
   TargetExpElem e (SIMDVector (CSEExp e) n a) = SIMDVector e n a
   TargetExpElem e (SIMDMask (CSEExp e) n a) = SIMDMask e n a
+  TargetExpElem e (SIMDPair x y) = SIMDPair (TargetExpElem e x) (TargetExpElem e y)
   TargetExpElem _ a = a
 
-class CSEExpReturnLeaf (e :: K.Type -> K.Type) (a :: K.Type) where
+class (Coercible a (TargetExpElem e a)) => CSEExpReturnLeaf (e :: K.Type -> K.Type) (a :: K.Type) where
   interpretExpLeaf :: (CSETargetExp e) => e a -> e (TargetExpElem e a)
 
 instance {-# OVERLAPPABLE #-} (TargetExpElem e a ~ a) => CSEExpReturnLeaf e a where
@@ -1599,6 +1680,39 @@ instance
   where
   interpretExpLeaf = coerceExpNewtype
 
+instance
+  {-# OVERLAPPING #-}
+  (CSEExpReturnLeaf e x, CSEExpReturnLeaf e y) =>
+  CSEExpReturnLeaf e (SIMDPair x y)
+  where
+  interpretExpLeaf = coerceExpNewtype
+
+class GCSETraverse (e :: K.Type -> K.Type) (rep :: K.Type -> K.Type) where
+  gTraverseCSEReturn :: (Applicative f) => (forall a. CSEExp e a -> f (CSEExp e a)) -> rep p -> f (rep p)
+
+instance (GCSETraverse e f) => GCSETraverse e (M1 i c f) where
+  gTraverseCSEReturn fn (M1 x) = M1 <$> gTraverseCSEReturn @e @f fn x
+
+instance (GCSETraverse e f, GCSETraverse e g) => GCSETraverse e (f :*: g) where
+  gTraverseCSEReturn fn (fx :*: gx) =
+    (:*:) <$> gTraverseCSEReturn @e @f fn fx <*> gTraverseCSEReturn @e @g fn gx
+
+instance GCSETraverse e (K1 i (CSEExp e a)) where
+  gTraverseCSEReturn fn (K1 x) = K1 <$> fn x
+
+class GCSEMap (e :: K.Type -> K.Type) (repCSE :: K.Type -> K.Type) (repTgt :: K.Type -> K.Type) where
+  gMapCSEReturn :: (forall a. CSEExp e a -> e a) -> repCSE p -> repTgt p
+
+instance (GCSEMap e fCSE fTgt) => GCSEMap e (M1 i c fCSE) (M1 i c fTgt) where
+  gMapCSEReturn fn (M1 x) = M1 (gMapCSEReturn @e @fCSE @fTgt fn x)
+
+instance (GCSEMap e fCSE fTgt, GCSEMap e gCSE gTgt) => GCSEMap e (fCSE :*: gCSE) (fTgt :*: gTgt) where
+  gMapCSEReturn fn (fx :*: gx) =
+    gMapCSEReturn @e @fCSE @fTgt fn fx :*: gMapCSEReturn @e @gCSE @gTgt fn gx
+
+instance GCSEMap e (K1 i (CSEExp e a)) (K1 i (e a)) where
+  gMapCSEReturn fn (K1 x) = K1 (fn x)
+
 -- | Types that can be returned from a 'CSEM' computation, exposing all
 -- 'CSEExp' leaves to the enclosing block's CSE pass.
 class CSEReturn (e :: K.Type -> K.Type) (res :: K.Type) where
@@ -1607,6 +1721,12 @@ class CSEReturn (e :: K.Type -> K.Type) (res :: K.Type) where
     (forall a. CSEExp e a -> f (CSEExp e a)) ->
     res ->
     f res
+  default traverseCSEReturn ::
+    (Generic res, GCSETraverse e (Rep res), Applicative f) =>
+    (forall a. CSEExp e a -> f (CSEExp e a)) ->
+    res ->
+    f res
+  traverseCSEReturn fn x = to <$> gTraverseCSEReturn @e @(Rep res) fn (from x)
 
 -- | Return types of 'CSEM' that can be lowered to target @e@ by
 -- @interpretCSE@.
@@ -1617,6 +1737,13 @@ class (CSEReturn e res) => CSETargetReturn (e :: K.Type -> K.Type) (res :: K.Typ
     (forall a. CSEExp e a -> e a) ->
     res ->
     CSETargetVal e res
+  default interpretCSEReturn ::
+    (Generic res, Generic (CSETargetVal e res), GCSEMap e (Rep res) (Rep (CSETargetVal e res))) =>
+    (forall a. CSEExp e a -> e a) ->
+    res ->
+    CSETargetVal e res
+  interpretCSEReturn eval x =
+    to (gMapCSEReturn @e @(Rep res) @(Rep (CSETargetVal e res)) eval (from x))
 
 instance CSEReturn e () where
   traverseCSEReturn _ () = pure ()
@@ -1743,6 +1870,27 @@ instance (CSEHKD d e) => CSETargetReturn e (HKD d (CSEExp e)) where
   type CSETargetVal e (HKD d (CSEExp e)) = HKD d e
   interpretCSEReturn eval (HKD x) = HKD (mapCSEHKDToTarget eval x)
 
+instance (SPMDTyped n (CSEExp e) a) => CSEReturn e (SPMD n (CSEExp e) a) where
+  traverseCSEReturn fn x =
+    (\v -> SPMD (pure (spmdDematerialize @n @(CSEExp e) @a v)))
+      <$> fn (spmdMaterialize @n @(CSEExp e) @a (runSPMD x))
+
+instance
+  ( SPMDTyped n (CSEExp e) a,
+    SPMDTyped n e a,
+    CSEExpReturnLeaf e (SPMDRep n (CSEExp e) a),
+    TargetExpElem e (SPMDRep n (CSEExp e) a) ~ SPMDRep n e a
+  ) =>
+  CSETargetReturn e (SPMD n (CSEExp e) a)
+  where
+  type CSETargetVal e (SPMD n (CSEExp e) a) = SPMD n e a
+  interpretCSEReturn eval x =
+    let rawTgt :: e (SPMDRep n e a)
+        rawTgt =
+          interpretExpLeaf @e @(SPMDRep n (CSEExp e) a)
+            (eval (spmdMaterialize @n @(CSEExp e) @a (runSPMD x)))
+     in SPMD (pure (spmdDematerialize @n @e @a rawTgt))
+
 --------------------------------------------------------------------------------
 -- Function Parameter Reification & `CSEOptimize` (`cse`)
 --------------------------------------------------------------------------------
@@ -1751,6 +1899,14 @@ class CSEParam (p :: K.Type) where
   type CSEParamExp p :: K.Type -> K.Type
   type CSEParamTarget p :: K.Type
   cseAllocParam :: Int -> (Int, p, p -> ParamSubst (CSEParamExp p) -> ParamSubst (CSEParamExp p))
+  default cseAllocParam ::
+    (Generic p, Generic (CSEParamTarget p), GCSEHKD (CSEParamExp p) (Rep p) (Rep (CSEParamTarget p))) =>
+    Int ->
+    (Int, p, p -> ParamSubst (CSEParamExp p) -> ParamSubst (CSEParamExp p))
+  cseAllocParam n0 =
+    let (n1, repFormal, bindRep) =
+          gAllocFormalHKD @(CSEParamExp p) @(Rep p) @(Rep (CSEParamTarget p)) n0
+     in (n1, to repFormal, bindRep . from)
   cseBindTargetParam ::
     forall m.
     (CSEParamMonad p m) =>
@@ -1760,6 +1916,19 @@ class CSEParam (p :: K.Type) where
       [(VarKey, SomeTargetVal (CSEParamExp p))],
       [(RefKey, SomeTargetRef m (CSEParamExp p))]
     )
+  default cseBindTargetParam ::
+    forall m.
+    (Generic p, Generic (CSEParamTarget p), GCSEHKD (CSEParamExp p) (Rep p) (Rep (CSEParamTarget p))) =>
+    Int ->
+    CSEParamTarget p ->
+    ( Int,
+      [(VarKey, SomeTargetVal (CSEParamExp p))],
+      [(RefKey, SomeTargetRef m (CSEParamExp p))]
+    )
+  cseBindTargetParam n0 tgt =
+    let (n1, vs) =
+          gBindTargetHKD @(CSEParamExp p) @(Rep p) @(Rep (CSEParamTarget p)) n0 (from tgt)
+     in (n1, vs, [])
 
 type family CSEParamMonad (p :: K.Type) (m :: K.Type -> K.Type) :: K.Constraint where
   CSEParamMonad (CSERef m1 _ _) m = (m1 ~ m)
@@ -1768,11 +1937,13 @@ type family CSEParamMonad (p :: K.Type) (m :: K.Type -> K.Type) :: K.Constraint 
   CSEParamMonad (Wide _ p) m = CSEParamMonad p m
   CSEParamMonad _ _ = ()
 
-class CSEExpParamLeaf (e :: K.Type -> K.Type) (a :: K.Type) where
+class (Coercible a (TargetExpElem e a)) => CSEExpParamLeaf (e :: K.Type -> K.Type) (a :: K.Type) where
+  cseLeafBindCap :: BindCap e a
   cseAllocExpParam :: Int -> (Int, CSEExp e a, CSEExp e a -> ParamSubst e -> ParamSubst e)
   cseBindTargetExpParam :: Int -> e (TargetExpElem e a) -> (Int, [(VarKey, SomeTargetVal e)])
 
 instance {-# OVERLAPPABLE #-} (CSETyped e a, TargetExpElem e a ~ a) => CSEExpParamLeaf e a where
+  cseLeafBindCap = BindDirect @e @a
   cseAllocExpParam n =
     let tr = TR.typeRep @a
         cap = BindDirect @e @a
@@ -1787,6 +1958,7 @@ instance
   (CSESIMDTarget e, ExpNewtype e, SIMDShape n a, Typeable e) =>
   CSEExpParamLeaf e (SIMDVector (CSEExp e) n a)
   where
+  cseLeafBindCap = BindSIMDVec @e @n @a
   cseAllocExpParam k =
     let tr = TR.typeRep @(SIMDVector (CSEExp e) n a)
         cap = BindSIMDVec @e @n @a
@@ -1803,6 +1975,7 @@ instance
   (CSESIMDTarget e, ExpNewtype e, SIMDShape n a, Typeable e) =>
   CSEExpParamLeaf e (SIMDMask (CSEExp e) n a)
   where
+  cseLeafBindCap = BindSIMDMask @e @n @a
   cseAllocExpParam k =
     let tr = TR.typeRep @(SIMDMask (CSEExp e) n a)
         cap = BindSIMDMask @e @n @a
@@ -1814,6 +1987,23 @@ instance
         wrapped = coerceExpNewtype val
      in (k + 1, [(VarParam k, SomeTargetVal (TR.typeRep @(SIMDMask (CSEExp e) n a)) wrapped)])
 
+instance
+  {-# OVERLAPPING #-}
+  (CSEExpParamLeaf e x, CSEExpParamLeaf e y, ExpNewtype e, Typeable x, Typeable y) =>
+  CSEExpParamLeaf e (SIMDPair x y)
+  where
+  cseLeafBindCap = BindPairOf (cseLeafBindCap @e @x) (cseLeafBindCap @e @y)
+  cseAllocExpParam k =
+    let tr = TR.typeRep @(SIMDPair x y)
+        cap = cseLeafBindCap @e @(SIMDPair x y)
+        vk = VarParam k
+        vid = VarId vk tr (Just cap)
+     in (k + 1, mkExpVar vid, \actual -> addExpParamSubst vk tr cap actual)
+  cseBindTargetExpParam k val =
+    let wrapped :: e (SIMDPair x y)
+        wrapped = coerceExpNewtype val
+     in (k + 1, [(VarParam k, SomeTargetVal (TR.typeRep @(SIMDPair x y)) wrapped)])
+
 instance (CSEExpParamLeaf e a) => CSEParam (CSEExp e a) where
   type CSEParamExp (CSEExp e a) = e
   type CSEParamTarget (CSEExp e a) = e (TargetExpElem e a)
@@ -1821,6 +2011,28 @@ instance (CSEExpParamLeaf e a) => CSEParam (CSEExp e a) where
   cseBindTargetParam n val =
     let (n', vs) = cseBindTargetExpParam @e @a n val
      in (n', vs, [])
+
+instance
+  ( SPMDTyped n (CSEExp e) a,
+    SPMDTyped n e a,
+    CSEExpParamLeaf e (SPMDRep n (CSEExp e) a),
+    TargetExpElem e (SPMDRep n (CSEExp e) a) ~ SPMDRep n e a
+  ) =>
+  CSEParam (SPMD n (CSEExp e) a)
+  where
+  type CSEParamExp (SPMD n (CSEExp e) a) = e
+  type CSEParamTarget (SPMD n (CSEExp e) a) = SPMD n e a
+  cseAllocParam k0 =
+    let (k1, formalExp, bindExp) = cseAllocExpParam @e @(SPMDRep n (CSEExp e) a) k0
+     in ( k1,
+          SPMD (pure (spmdDematerialize @n @(CSEExp e) @a formalExp)),
+          \actualSPMD -> bindExp (spmdMaterialize @n @(CSEExp e) @a (runSPMD actualSPMD))
+        )
+  cseBindTargetParam k0 tgtSPMD =
+    let rawTgt :: e (SPMDRep n e a)
+        rawTgt = spmdMaterialize @n @e @a (runSPMD tgtSPMD)
+        (k1, vs) = cseBindTargetExpParam @e @(SPMDRep n (CSEExp e) a) k0 rawTgt
+     in (k1, vs, [])
 
 instance (CmdRef m e, CSETyped e a) => CSEParam (CSERef m e a) where
   type CSEParamExp (CSERef m e a) = e
@@ -1944,23 +2156,51 @@ instance (CSEReturn e res) => CSEApplySubst e (CSEM m e res) where
   applyParamSubst sub mAct@(CSEM buildFn)
     | isIdentityParamSubst sub = mAct
     | otherwise =
-        let (countUsed, tree) = buildFn 0
-         in CSEM $ \baseCounter -> instantiateOptTree sub baseCounter countUsed tree
+        let (emptyUsed, emptyTree) = buildFn DHM.empty 0
+         in CSEM $ \tfm baseCounter ->
+              if DHM.null tfm
+                then instantiateOptTree sub baseCounter emptyUsed emptyTree
+                else
+                  let (countUsed, tree) = buildFn tfm 0
+                   in instantiateOptTree sub baseCounter countUsed tree
+
+instance (SPMDTyped n (CSEExp e) a) => CSEApplySubst e (SPMD n (CSEExp e) a) where
+  applyParamSubst sub x
+    | isIdentityParamSubst sub = x
+    | otherwise =
+        let raw = spmdMaterialize @n @(CSEExp e) @a (runSPMD x)
+         in SPMD (pure (spmdDematerialize @n @(CSEExp e) @a (applyParamSubst sub raw)))
+
+instance (CSEReturn e res) => CSEApplySubst e (SPMDM n (CSEM m e) (CSEExp e) res) where
+  applyParamSubst sub act = liftSPMD (applyParamSubst sub (runSPMDM act))
 
 instance (CSEApplySubst e r) => CSEApplySubst e (p -> r) where
   applyParamSubst sub fn p = applyParamSubst sub (fn p)
 
 class CSEOptimizeFrom (r :: K.Type) where
   type CSEOptimizeExp r :: K.Type -> K.Type
-  cseFromIdx :: Int -> r -> r
+  cseFromIdxWith :: TargetFeatureMap -> Int -> r -> r
+
+cseFromIdx :: (CSEOptimizeFrom r) => Int -> r -> r
+cseFromIdx = cseFromIdxWith DHM.empty
 
 instance CSEOptimizeFrom (CSEExp e a) where
   type CSEOptimizeExp (CSEExp e a) = e
-  cseFromIdx _ = cseExp
+  cseFromIdxWith _ _ = cseExp
 
 instance (CSEReturn e res) => CSEOptimizeFrom (CSEM m e res) where
   type CSEOptimizeExp (CSEM m e res) = e
-  cseFromIdx _ = cseM
+  cseFromIdxWith tfm _ = cseMWithFeatures tfm
+
+instance (SPMDTyped n (CSEExp e) a) => CSEOptimizeFrom (SPMD n (CSEExp e) a) where
+  type CSEOptimizeExp (SPMD n (CSEExp e) a) = e
+  cseFromIdxWith _ _ x =
+    let raw = spmdMaterialize @n @(CSEExp e) @a (runSPMD x)
+     in SPMD (pure (spmdDematerialize @n @(CSEExp e) @a (cseExp raw)))
+
+instance (CSEReturn e res) => CSEOptimizeFrom (SPMDM n (CSEM m e) (CSEExp e) res) where
+  type CSEOptimizeExp (SPMDM n (CSEM m e) (CSEExp e) res) = e
+  cseFromIdxWith tfm _ act = liftSPMD (cseMWithFeatures tfm (runSPMDM act))
 
 instance
   ( CSEParam p,
@@ -1972,9 +2212,9 @@ instance
   CSEOptimizeFrom (p -> r)
   where
   type CSEOptimizeExp (p -> r) = CSEParamExp p
-  cseFromIdx idx f =
+  cseFromIdxWith tfm idx f =
     let (idx', formalP, bindP) = cseAllocParam @p idx
-        !optRest = cseFromIdx idx' (f formalP)
+        !optRest = cseFromIdxWith tfm idx' (f formalP)
      in \actualP ->
           let sub = bindP actualP emptyParamSubst
            in if isIdentityParamSubst sub
@@ -1982,11 +2222,13 @@ instance
                 else applyParamSubst @e @r sub optRest
 
 -- | Eliminate common subexpressions across a pure 'CSEExp' expression, a
--- monadic 'CSEM' computation, or an arbitrarily curried Janus function over
--- @('CSEM' m e, 'CSEExp' e)@.
+-- monadic 'CSEM' computation, an 'SPMD' / 'SPMDM' computation, or an
+-- arbitrarily curried Janus function over @('CSEM' m e, 'CSEExp' e)@.
 class (CSEOptimizeFrom r) => CSEOptimize (r :: K.Type) where
   cse :: r -> r
+  cseWithFeatures :: TargetFeatureMap -> r -> r
 
 instance (CSEOptimizeFrom r) => CSEOptimize r where
-  cse = cseFromIdx 0
+  cse = cseFromIdxWith DHM.empty 0
+  cseWithFeatures tfm = cseFromIdxWith tfm 0
 

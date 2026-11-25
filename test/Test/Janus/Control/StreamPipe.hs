@@ -11,7 +11,7 @@ import Control.Lens ((&), (.~))
 import Data.Functor.Identity (Identity (..))
 import Data.IORef (modifyIORef', newIORef, readIORef, writeIORef)
 import Data.Int (Int64)
-import Janus.Backend.C (JanusC, JanusCM, withJanusC)
+import Janus.Backend.C (JanusCCSE, JanusCMCSE, withJanusC)
 import Janus.Backend.C.Build (cBuildConfigCacheDir, defaultCBuildConfig)
 import Janus.Command.Cond (CmdCond)
 -- import qualified Janus.Command.Memory as M
@@ -56,7 +56,7 @@ unit_pipe_stream_io_and_c = do
 
   tmpdir <- getEnv "TMPDIR"
   let cfg = defaultCBuildConfig & cBuildConfigCacheDir .~ tmpdir
-  resC <- withJanusC cfg (pipelineSum @JanusCM @JanusC) (\f -> f 20)
+  resC <- withJanusC cfg (pipelineSum @JanusCMCSE @JanusCCSE) (\f -> f 20)
   resC @?= 56
 
 cartesianWeightedSum ::
@@ -90,7 +90,7 @@ unit_stream_monad_bind = do
 
   tmpdir <- getEnv "TMPDIR"
   let cfg = defaultCBuildConfig & cBuildConfigCacheDir .~ tmpdir
-  resC <- withJanusC cfg (cartesianWeightedSum @JanusCM @JanusC) (\f -> f 4)
+  resC <- withJanusC cfg (cartesianWeightedSum @JanusCMCSE @JanusCCSE) (\f -> f 4)
   resC @?= 144
 
 unit_stream_combinators_and_bracket :: IO ()
@@ -193,14 +193,14 @@ unit_stream_alternative = do
 
   tmpdir <- getEnv "TMPDIR"
   let cfg = defaultCBuildConfig & cBuildConfigCacheDir .~ tmpdir
-  digestC <- withJanusC cfg (alternativeStreamDigest @JanusCM @JanusC) (\f -> f 6)
+  digestC <- withJanusC cfg (alternativeStreamDigest @JanusCMCSE @JanusCCSE) (\f -> f 6)
   digestC @?= 24789
 
   -- Interaction with Monad (>>=): i in [1, 2, 5] >>= [i, i + 1] -> [1, 2, 2, 3, 5, 6] -> 122356
   Identity bindIO <- alternativeBindDigest @IO @Identity 5
   bindIO @?= 122356
 
-  bindC <- withJanusC cfg (alternativeBindDigest @JanusCM @JanusC) (\f -> f 5)
+  bindC <- withJanusC cfg (alternativeBindDigest @JanusCMCSE @JanusCCSE) (\f -> f 5)
   bindC @?= 122356
 
   -- Lockstep zipWithS across (<|>) and empty transitions (no spurious Skip ticks) in IO and C:
@@ -208,7 +208,7 @@ unit_stream_alternative = do
   Identity zipIO <- alternativeZipSum @IO @Identity 5
   zipIO @?= 1046
 
-  zipC <- withJanusC cfg (alternativeZipSum @JanusCM @JanusC) (\f -> f 5)
+  zipC <- withJanusC cfg (alternativeZipSum @JanusCMCSE @JanusCCSE) (\f -> f 5)
   zipC @?= 1046
 
   -- Step-level Alternative laws under lockstep zipWithS

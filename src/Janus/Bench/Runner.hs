@@ -43,15 +43,15 @@ import Foreign.C (CString)
 import Foreign.Ptr (Ptr)
 import Janus.Alloc.Policy (dynamicAlloc)
 import Janus.Backend.C
-  ( JanusCEval,
-    JanusCEvaluate,
-    JanusCMT,
-    JanusCParam,
-    JanusCT,
+  ( JanusCCSEEval,
+    JanusCCSEEvaluate,
+    JanusCMTCSE,
+    JanusCTCSE,
     JanusCTarget,
     withJanusC,
   )
 import Janus.Backend.C.Build (CBuildConfig, defaultCBuildConfig)
+import Janus.CSE ()
 import Janus.Bench.Choice
   ( SelectionSpec,
     choiceDescriptionFields,
@@ -418,25 +418,25 @@ ensureOutDir outDir =
     createDirectoryIfMissing True outDir
 
 -- | Compile a multi-choice Janus benchmark (with per-choice @setup@/@teardown@)
--- to native target C (@t@), execute the entire timing + Bayesian bootstrap +
--- ascending CSV generation pipeline in C with zero per-call FFI overhead, and
--- return the winning 'ChoiceSelection' and serializable 'SelectionSpec'.
+-- to native target C (@t@) with automatic CSE, execute the entire timing +
+-- Bayesian bootstrap + ascending CSV generation pipeline in C with zero
+-- per-call FFI overhead, and return the winning 'ChoiceSelection' and
+-- serializable 'SelectionSpec'.
 benchmarkAndSelectCWithSetup ::
   forall t c res a.
   ( JanusCTarget t,
     ChoiceColumns c,
-    CmdBenchRunner (JanusCMT t) (JanusCT t),
-    JanusCParam t (JanusCMT t (JanusCT t Int64)),
-    JanusCEvaluate t (JanusCMT t (JanusCT t Int64)),
-    JanusCEval (JanusCMT t (JanusCT t Int64)) ~ IO Int64
+    CmdBenchRunner (JanusCMTCSE t) (JanusCTCSE t),
+    JanusCCSEEvaluate t (JanusCMTCSE t (JanusCTCSE t Int64)),
+    JanusCCSEEval (JanusCMTCSE t (JanusCTCSE t Int64)) ~ IO Int64
   ) =>
   CBuildConfig ->
   BenchConfig ->
   FilePath ->
   ChoiceSpace c ->
-  BenchT c (JanusCMT t) (JanusCT t) res ->
-  (res -> BenchT c (JanusCMT t) (JanusCT t) ()) ->
-  (res -> BenchT c (JanusCMT t) (JanusCT t) a) ->
+  BenchT c (JanusCMTCSE t) (JanusCTCSE t) res ->
+  (res -> BenchT c (JanusCMTCSE t) (JanusCTCSE t) ()) ->
+  (res -> BenchT c (JanusCMTCSE t) (JanusCTCSE t) a) ->
   IO (ChoiceSelection c, SelectionSpec)
 benchmarkAndSelectCWithSetup buildCfg benchCfg outDir space setup teardown body = do
   let selections = enumerateChoices space
@@ -459,16 +459,15 @@ benchmarkAndSelectCWith ::
   forall t c a.
   ( JanusCTarget t,
     ChoiceColumns c,
-    CmdBenchRunner (JanusCMT t) (JanusCT t),
-    JanusCParam t (JanusCMT t (JanusCT t Int64)),
-    JanusCEvaluate t (JanusCMT t (JanusCT t Int64)),
-    JanusCEval (JanusCMT t (JanusCT t Int64)) ~ IO Int64
+    CmdBenchRunner (JanusCMTCSE t) (JanusCTCSE t),
+    JanusCCSEEvaluate t (JanusCMTCSE t (JanusCTCSE t Int64)),
+    JanusCCSEEval (JanusCMTCSE t (JanusCTCSE t Int64)) ~ IO Int64
   ) =>
   CBuildConfig ->
   BenchConfig ->
   FilePath ->
   ChoiceSpace c ->
-  BenchT c (JanusCMT t) (JanusCT t) a ->
+  BenchT c (JanusCMTCSE t) (JanusCTCSE t) a ->
   IO (ChoiceSelection c, SelectionSpec)
 benchmarkAndSelectCWith buildCfg benchCfg outDir space body =
   benchmarkAndSelectCWithSetup
@@ -488,15 +487,14 @@ benchmarkAndSelectC ::
   forall t c a.
   ( JanusCTarget t,
     ChoiceColumns c,
-    CmdBenchRunner (JanusCMT t) (JanusCT t),
-    JanusCParam t (JanusCMT t (JanusCT t Int64)),
-    JanusCEvaluate t (JanusCMT t (JanusCT t Int64)),
-    JanusCEval (JanusCMT t (JanusCT t Int64)) ~ IO Int64
+    CmdBenchRunner (JanusCMTCSE t) (JanusCTCSE t),
+    JanusCCSEEvaluate t (JanusCMTCSE t (JanusCTCSE t Int64)),
+    JanusCCSEEval (JanusCMTCSE t (JanusCTCSE t Int64)) ~ IO Int64
   ) =>
   BenchConfig ->
   FilePath ->
   ChoiceSpace c ->
-  BenchT c (JanusCMT t) (JanusCT t) a ->
+  BenchT c (JanusCMTCSE t) (JanusCTCSE t) a ->
   IO (ChoiceSelection c, SelectionSpec)
 benchmarkAndSelectC = benchmarkAndSelectCWith @t defaultCBuildConfig
 
@@ -505,15 +503,14 @@ benchmarkAndSelectC = benchmarkAndSelectCWith @t defaultCBuildConfig
 benchmarkCandidatesC ::
   forall t implTy b.
   ( JanusCTarget t,
-    CmdBenchRunner (JanusCMT t) (JanusCT t),
-    JanusCParam t (JanusCMT t (JanusCT t Int64)),
-    JanusCEvaluate t (JanusCMT t (JanusCT t Int64)),
-    JanusCEval (JanusCMT t (JanusCT t Int64)) ~ IO Int64
+    CmdBenchRunner (JanusCMTCSE t) (JanusCTCSE t),
+    JanusCCSEEvaluate t (JanusCMTCSE t (JanusCTCSE t Int64)),
+    JanusCCSEEval (JanusCMTCSE t (JanusCTCSE t Int64)) ~ IO Int64
   ) =>
   BenchConfig ->
   FilePath ->
   [Impl implTy] ->
-  (implTy -> BenchT (SimpleChoice implTy) (JanusCMT t) (JanusCT t) b) ->
+  (implTy -> BenchT (SimpleChoice implTy) (JanusCMTCSE t) (JanusCTCSE t) b) ->
   IO (Impl implTy)
 benchmarkCandidatesC benchCfg outDir cands fn = do
   if null cands
@@ -526,21 +523,21 @@ benchmarkCandidatesC benchCfg outDir cands fn = do
           (benchmarkCandidatesJanus benchCfg outDir cands fn)
           id
       let bestIdx = max 0 (min (length cands - 1) (fromIntegral bestIdx64))
-      pure (cands !! bestIdx)
+          winner = cands !! bestIdx
+      pure winner
 
 -- | Compile and execute a single-implementation Janus benchmark on target @t@,
 -- writing @overall.csv@ and per-named-timer CSV files into @outDir@.
 benchmarkSimpleC ::
   forall t a.
   ( JanusCTarget t,
-    CmdBenchRunner (JanusCMT t) (JanusCT t),
-    JanusCParam t (JanusCMT t ()),
-    JanusCEvaluate t (JanusCMT t ()),
-    JanusCEval (JanusCMT t ()) ~ IO ()
+    CmdBenchRunner (JanusCMTCSE t) (JanusCTCSE t),
+    JanusCCSEEvaluate t (JanusCMTCSE t ()),
+    JanusCCSEEval (JanusCMTCSE t ()) ~ IO ()
   ) =>
   BenchConfig ->
   FilePath ->
-  BenchT NoChoice (JanusCMT t) (JanusCT t) a ->
+  BenchT NoChoice (JanusCMTCSE t) (JanusCTCSE t) a ->
   IO ()
 benchmarkSimpleC benchCfg outDir body = do
   ensureOutDir outDir

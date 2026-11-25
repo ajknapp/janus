@@ -65,7 +65,7 @@ import Foreign.Ptr (Ptr)
 import GHC.Generics (Generic, Rep)
 import Janus.Alloc.Dynamic (CmdAllocBase)
 import Janus.Alloc.Policy (Alloc, CmdAlloc, allocStruct, freeStruct)
-import Janus.Backend.C
+import Janus.Backend.C.Raw
 import Janus.Command.Cond (ifThenElseM_, whenM_)
 import Janus.Command.Memory (CmdStorable (..), ExpPtr (..), ExpSized (..))
 import Janus.Command.Ref (newRef, readRef, writeRef)

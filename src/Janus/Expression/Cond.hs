@@ -9,7 +9,7 @@ import Control.Lens
 import Data.Loc
 import Data.Monoid
 import Data.Proxy
-import Janus.Backend.C
+import Janus.Backend.C.Raw
 import Janus.Expression.Bool
 import Janus.Expression.Cast
 import Janus.Expression.Let

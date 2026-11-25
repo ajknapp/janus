@@ -97,6 +97,7 @@ import Foreign.C.Types
   )
 import Janus.Backend.C
 import Janus.Backend.C.Build
+import Janus.CSE (CSETarget)
 import Janus.FFI.Arg
   ( THNat1,
     THNat16,
@@ -156,13 +157,13 @@ class JanusCTH r where
   janusCTHPrepare :: CBuildConfig -> String -> r -> IO (String, [String])
   janusCTHSpec :: Proxy r -> ([THParamSpec], THRetSpec)
 
-instance (JanusCTarget t, JanusCParam t r) => JanusCTH r where
-  type JanusCTHEval r = JanusCEval r
+instance (JanusCCSEParam t r) => JanusCTH r where
+  type JanusCTHEval r = JanusCCSEEval r
   janusCTHPrepare config cSymName prog = do
     fs <- resolveCTargetFeatures (Proxy @t) config
     (cSrc, cflags, _ldflags) <- prepareJanusCUnit fs cSymName prog
     pure (cSrc, cflags)
-  janusCTHSpec = jcTHSpec @t @r
+  janusCTHSpec _ = jcTHSpec @t @(CSETarget r) (Proxy @(CSETarget r))
 
 --------------------------------------------------------------------------------
 -- Identifier Validation, Object Linking, & Declaration Generation

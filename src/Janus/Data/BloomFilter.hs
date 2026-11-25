@@ -69,7 +69,7 @@ import Janus.Alloc.Policy
     freeBytes,
     freeStruct,
   )
-import Janus.Backend.C
+import Janus.Backend.C.Raw
 import Janus.Command.Cond (whenM_)
 import Janus.Command.Memory (CmdMemCopy (..), CmdStorable (..), janusSIMDAlignment)
 import Janus.Command.Ref (letM, newRef, readRef, writeRef)

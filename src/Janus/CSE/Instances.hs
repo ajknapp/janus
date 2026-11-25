@@ -66,7 +66,7 @@ import Janus.Command.Ref (Cell (..), CmdRef (..), RefCell (..))
 import Janus.Command.TicToc (CmdTicToc (..), Tic (..), Toc (..))
 import Janus.Command.While (CmdWhile (..))
 import Janus.Constraints (CmdJanus, CmdJanusIO, ExpJanus)
-import Janus.Control.Reader.Base (ExpNewtype (..))
+import Janus.Control.Reader.Base (ExpNewtype (..), ReaderExp (..))
 import Janus.Data.HKD (ExpPtrWord (..), ExpStructPtr (..))
 import Janus.Expression.Bits (ExpBits (..))
 import Janus.Expression.Bool (ExpBool (..))
@@ -81,7 +81,6 @@ import Janus.Expression.Eq (ExpEq (..))
 import Janus.Expression.Extract (ExpExtract (..))
 import Janus.Expression.Inject (ExpInject (..))
 import Janus.Expression.Integral (ExpIntegral (..))
-import Janus.Expression.Let (ExpLet (..))
 import Janus.Expression.Math (ExpComplex (..), FMA (..), Hypot (..))
 import Janus.Expression.MurmurHash (ExpMurmurHash (..))
 import Janus.Expression.Ord (ExpOrd (..))
@@ -384,9 +383,6 @@ instance (ExpIntegral e a, CSETyped e a) => ExpIntegral (CSEExp e) a where
   quotient = binOpTyped "ExpIntegral.quotient" [] True quotient
   remainder = binOpTyped "ExpIntegral.remainder" [] True remainder
 
-instance ExpLet (CSEExp e) where
-  let_ = mkExpUserLet
-
 instance (ExpComplex e a, CSETyped e a) => ExpComplex (CSEExp e) a where
   rePart = unOpTyped "ExpComplex.rePart" [] False rePart
   imPart = unOpTyped "ExpComplex.imPart" [] False imPart
@@ -668,6 +664,29 @@ instance
         selfStub = cseMakeFixStub @e @r callBuilder
         rawBody = peelFn (stepFn selfStub)
      in selfStub
+
+class ReaderCSEFix (env :: K.Type) (e :: K.Type -> K.Type) (fn :: K.Type) | fn -> env e where
+  type ReaderCSEFixInner fn :: K.Type
+  toInnerCSEFix :: fn -> ReaderCSEFixInner fn
+  fromInnerCSEFix :: ReaderCSEFixInner fn -> fn
+
+instance ReaderCSEFix env e (ReaderExp env (CSEExp e) a) where
+  type ReaderCSEFixInner (ReaderExp env (CSEExp e) a) = CSEExp e a
+  toInnerCSEFix = getReaderExp
+  fromInnerCSEFix = ReaderExp
+
+instance (ReaderCSEFix env e fn) => ReaderCSEFix env e (ReaderExp env (CSEExp e) a -> fn) where
+  type ReaderCSEFixInner (ReaderExp env (CSEExp e) a -> fn) = CSEExp e a -> ReaderCSEFixInner fn
+  toInnerCSEFix f = toInnerCSEFix . f . ReaderExp
+  fromInnerCSEFix g = fromInnerCSEFix . g . getReaderExp
+
+instance
+  (ReaderCSEFix env e fn, ExpFix (CSEExp e) (ReaderCSEFixInner fn)) =>
+  ExpFix (ReaderExp env (CSEExp e)) fn
+  where
+  fun _ name step =
+    fromInnerCSEFix $
+      fun (Proxy @(CSEExp e)) name (toInnerCSEFix . step . fromInnerCSEFix)
 
 --------------------------------------------------------------------------------
 -- SIMD Expression & Memory Instances on `(CSEM m e, CSEExp e)`
@@ -1336,7 +1355,7 @@ instance (CSESIMDTarget e, CmdSIMDMem m e n a) => CmdSIMDMem (CSEM m e) (CSEExp 
 --------------------------------------------------------------------------------
 
 allocLocalRef :: forall m e a. (CSETyped e a) => CSEM m e (CSERef m e a)
-allocLocalRef = CSEM $ \n ->
+allocLocalRef = CSEM $ \_ n ->
   (n + 1, ProgLinear Seq.empty (CSERef (RefLocal n) (TR.typeRep @a) (BindDirect @e @a)))
 
 instance (CmdRef m e) => CmdRef (CSEM m e) (CSEExp e) where
@@ -1378,49 +1397,37 @@ instance (CmdJanus m e) => CmdJanus (CSEM m e) (CSEExp e)
 
 instance (CmdJanusIO m e) => CmdJanusIO (CSEM m e) (CSEExp e)
 
-runBranchTree ::
-  Int ->
-  ProgTree m e () ->
-  (Int, Block m e)
-runBranchTree n0 = \case
-  ProgLinear blk () -> (n0, blk)
-  _ -> (n0, Seq.empty)
-
 instance (CmdCond m e) => CmdCond (CSEM m e) (CSEExp e) where
-  ifThenElseM_ cond tAct fAct = CSEM $ \n0 ->
-    let (n1, tTree) = unCSEM tAct n0
-        (n2, fTree) = unCSEM fAct n1
-     in case (tTree, fTree) of
-          (ProgLinear tBlk (), ProgLinear fBlk ()) ->
-            (n2, ProgLinear (Seq.singleton (ItemStm (StmIf cond tBlk fBlk))) ())
-          _ ->
-            let (_, tB) = runBranchTree n1 tTree
-                (_, fB) = runBranchTree n2 fTree
-             in (n2, ProgLinear (Seq.singleton (ItemStm (StmIf cond tB fB))) ())
+  ifThenElseM_ cond tAct fAct = CSEM $ \tfm n0 ->
+    let (n1, tTree) = unCSEM tAct tfm n0
+        (n2, fTree) = unCSEM fAct tfm n1
+        tBlk = progTreeUnitToBlock tTree
+        fBlk = progTreeUnitToBlock fTree
+     in (n2, ProgLinear (Seq.singleton (ItemStm (StmIf cond tBlk fBlk))) ())
 
 instance (CmdWhile m e) => CmdWhile (CSEM m e) (CSEExp e) where
-  whileM cond bodyFn = CSEM $ \n0 ->
+  whileM cond bodyFn = CSEM $ \tfm n0 ->
     let loopRef = CSERef (RefLocal n0) (TR.typeRep @Bool) BindBool
-        (n1, bTree) = unCSEM (bodyFn loopRef) (n0 + 1)
-        (_, bodyBlk) = runBranchTree n1 bTree
+        (n1, bTree) = unCSEM (bodyFn loopRef) tfm (n0 + 1)
+        bodyBlk = progTreeUnitToBlock bTree
      in (n1, ProgLinear (Seq.singleton (ItemStm (StmWhile cond loopRef bodyBlk))) ())
 
 instance (CmdRange m e) => CmdRange (CSEM m e) (CSEExp e) where
-  rangeM lo hi bodyFn = CSEM $ \n0 ->
+  rangeM lo hi bodyFn = CSEM $ \tfm n0 ->
     let vid = VarId (VarSSA n0) (TR.typeRep @Int64) (Just BindInt64)
-        (n1, bTree) = unCSEM (bodyFn (mkExpVar vid)) (n0 + 1)
-        (_, bodyBlk) = runBranchTree n1 bTree
+        (n1, bTree) = unCSEM (bodyFn (mkExpVar vid)) tfm (n0 + 1)
+        bodyBlk = progTreeUnitToBlock bTree
      in (n1, ProgLinear (Seq.singleton (ItemStm (StmRange lo hi vid bodyBlk))) ())
 
 instance (CmdCase m e) => CmdCase (CSEM m e) (CSEExp e) where
-  switchCase_ tag cases defAct = CSEM $ \n0 ->
+  switchCase_ tag cases defAct = CSEM $ \tfm n0 ->
     let stepCase (n, acc) (k, act) =
-          let (n', tree) = unCSEM act n
-              (_, blk) = runBranchTree n' tree
+          let (n', tree) = unCSEM act tfm n
+              blk = progTreeUnitToBlock tree
            in (n', acc <> [(k, blk)])
         (n1, caseBlks) = foldl stepCase (n0, []) cases
-        (n2, defTree) = unCSEM defAct n1
-        (_, defBlk) = runBranchTree n2 defTree
+        (n2, defTree) = unCSEM defAct tfm n1
+        defBlk = progTreeUnitToBlock defTree
      in (n2, ProgLinear (Seq.singleton (ItemStm (StmSwitch tag caseBlks defBlk))) ())
 
 instance (CmdMem m e) => CmdMem (CSEM m e) (CSEExp e) where
@@ -1490,9 +1497,9 @@ instance (CmdStorable m e a, Typeable a) => CmdStorable (CSEM m e) (CSEExp e) a 
       (\(HCons vp (HCons vv (HCons vi HNil))) -> pokeElemOff vp vv vi)
 
 instance (CmdRefPtr m e a, Typeable a) => CmdRefPtr (CSEM m e) (CSEExp e) a where
-  withRefPtr ref bodyFn = CSEM $ \n0 ->
+  withRefPtr ref bodyFn = CSEM $ \tfm n0 ->
     let vid = VarId (VarSSA n0) (TR.typeRep @(Ptr a)) (Just (BindPtrOf (BindDirect @e @a)))
-        (n1, innerTree) = unCSEM (bodyFn (mkExpVar vid)) (n0 + 1)
+        (n1, innerTree) = unCSEM (bodyFn (mkExpVar vid)) tfm (n0 + 1)
      in (n1, wrapScopeWith (ItemWithRefPtr ref vid) innerTree)
 
 instance (CmdIO m e) => CmdIO (CSEM m e) (CSEExp e) where
@@ -1512,9 +1519,9 @@ instance (CmdIO m e) => CmdIO (CSEM m e) (CSEExp e) where
       (\(HCons vh HNil) -> fclose vh)
 
 instance (CmdString m e) => CmdString (CSEM m e) (CSEExp e) where
-  withString s bodyFn = CSEM $ \n0 ->
+  withString s bodyFn = CSEM $ \tfm n0 ->
     let vid = VarId (VarSSA n0) (TR.typeRep @CString) (Just BindCString)
-        (n1, innerTree) = unCSEM (bodyFn (mkExpVar vid)) (n0 + 1)
+        (n1, innerTree) = unCSEM (bodyFn (mkExpVar vid)) tfm (n0 + 1)
      in (n1, wrapScopeWith (ItemWithString s vid) innerTree)
 
 instance (CmdPutString m e) => CmdPutString (CSEM m e) (CSEExp e) where
@@ -1577,7 +1584,7 @@ instance
     let tiVars = cudaThreadInfoVarIds @e
     emitStm (StmCUDAAsk tiVars)
     pure (mapCUDAThreadInfo mkExpVar tiVars)
-  local modFn (CSEM buildFn) = CSEM $ \n0 ->
+  local modFn (CSEM buildFn) = CSEM $ \tfm n0 ->
     let tiVars = cudaThreadInfoVarIds @e
         tiModified = modFn (mapCUDAThreadInfo mkExpVar tiVars)
         sub =
@@ -1595,7 +1602,7 @@ instance
               (VarCUDAField 10, SomeCSEExp (TR.typeRep @Int32) (_cudaThreadInfoGridDimY tiModified)),
               (VarCUDAField 11, SomeCSEExp (TR.typeRep @Int32) (_cudaThreadInfoGridDimZ tiModified))
             ]
-        (n1, tree) = buildFn n0
+        (n1, tree) = buildFn tfm n0
      in (n1, substCUDAInTree sub tree)
     where
       substCUDAInExp :: forall x. Map.Map VarKey (SomeCSEExp e) -> CSEExp e x -> CSEExp e x
@@ -1635,6 +1642,14 @@ instance
         ItemStm s -> ItemStm (substCUDAInStm sub s)
         ItemWithRefPtr ref vid b -> ItemWithRefPtr ref vid (substCUDAInBlk sub b)
         ItemWithString str vid b -> ItemWithString str vid (substCUDAInBlk sub b)
+        ItemOptimalGang tr b2 b4 b8 b16 b32 ->
+          ItemOptimalGang
+            tr
+            (substCUDAInBlk sub b2)
+            (substCUDAInBlk sub b4)
+            (substCUDAInBlk sub b8)
+            (substCUDAInBlk sub b16)
+            (substCUDAInBlk sub b32)
       substCUDAInStm sub = \case
         StmLetM vid cap rhs -> StmLetM vid cap (substCUDAInExp sub rhs)
         StmEffectVal vid args eval ->

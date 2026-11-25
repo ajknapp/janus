@@ -22,7 +22,7 @@ import Foreign.C
 import Foreign.Ptr
 import GHC.Generics
 import GHC.TypeLits
-import Janus.Backend.C
+import Janus.Backend.C.Raw
 import Janus.Command.IO
 import Janus.Expression.Cast
 import Janus.Expression.Extract
@@ -185,7 +185,7 @@ instance CmdString IO Identity where
   withString s f = withCString s (f . Identity)
 
 instance CmdString (JanusCMT t) (JanusCT t) where
-  withString s f = f $ JanusC $ do
+  withString s f = do
     JCType spec dec <- getJanusCType (Proxy @(Ptr CChar))
     case spec of
       DeclSpec attr tqual tspec _ -> do
@@ -201,7 +201,7 @@ instance CmdString (JanusCMT t) (JanusCT t) where
               & jcfVarCounter +~ 1
         fname <- askFuncName
         modify $ \st -> st & ix fname .~ fn'
-        pure $ RVal (Var x noLoc)
+        f $ JanusC $ pure $ RVal (Var x noLoc)
       _antiSpec -> error "JanusC.withString: the impossible happened"
 
 putString :: (CmdPutString m e) => e CString -> m ()

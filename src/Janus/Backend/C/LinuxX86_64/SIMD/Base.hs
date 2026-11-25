@@ -23,7 +23,7 @@ import Data.Word (Word32, Word64)
 import Foreign.LibFFI (argPtr, callFFI, retVoid)
 import qualified Foreign.Storable as Storable
 import GHC.TypeLits (natVal)
-import Janus.Backend.C
+import Janus.Backend.C.Raw
 import Janus.Backend.C.LinuxX86_64.Types
 import Janus.Backend.C.Target
 import Janus.Expression.SIMD

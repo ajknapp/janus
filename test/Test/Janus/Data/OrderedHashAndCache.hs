@@ -31,7 +31,7 @@ import qualified Hedgehog.Range as Range
 import Janus.Alloc
 import Janus.Backend.C (acquireJanusC, releaseJanusC)
 import Janus.Backend.C.Build (CBuildConfig, cBuildConfigCacheDir, defaultCBuildConfig)
-import Janus.Backend.C.LinuxX86_64 (LinuxX86_64C, LinuxX86_64CM)
+import Janus.Backend.C.LinuxX86_64 (LinuxX86_64CCSE, LinuxX86_64CMCSE)
 import Janus.Control.Drain (drainForEach, drainSum, runDrain)
 import Janus.Control.Stream (Stream, rangeS)
 import Janus.Data.ClockCache (ClockCache)
@@ -690,12 +690,12 @@ check_clock_cache_second_chance_and_zero_steady_allocs = property $ do
 --------------------------------------------------------------------------------
 
 cMutateOrderedAndCaches ::
-  IndexMap LinuxX86_64C Int64 Int64 ->
-  IndexSet LinuxX86_64C Int64 ->
-  ClockCache LinuxX86_64C Int64 Int64 ->
-  LruCache LinuxX86_64C Int64 Int64 ->
-  LinuxX86_64C Int64 ->
-  LinuxX86_64CM (LinuxX86_64C Int64)
+  IndexMap LinuxX86_64CCSE Int64 Int64 ->
+  IndexSet LinuxX86_64CCSE Int64 ->
+  ClockCache LinuxX86_64CCSE Int64 Int64 ->
+  LruCache LinuxX86_64CCSE Int64 Int64 ->
+  LinuxX86_64CCSE Int64 ->
+  LinuxX86_64CMCSE (LinuxX86_64CCSE Int64)
 cMutateOrderedAndCaches im is cc lru n = do
   runDrain
     ( drainForEach $ \i -> do

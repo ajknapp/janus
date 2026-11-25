@@ -91,7 +91,7 @@ import Foreign.Ptr (Ptr)
 import GHC.Generics (Generic, Rep)
 import GHC.TypeNats (natVal)
 import Janus.Alloc.Policy (Alloc, allocStruct, freeStruct)
-import Janus.Backend.C
+import Janus.Backend.C.Raw
 import Janus.Command.Cond (ifThenElseM_, whenM_)
 import Janus.Command.Memory (CmdStorable (..), ExpPtr (..))
 import Janus.Command.Ref (letM, newRef, readRef, writeRef)

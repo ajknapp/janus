@@ -15,7 +15,7 @@ import Data.Int
 import Data.Loc
 import Data.Monoid
 import Data.Proxy
-import Janus.Backend.C
+import Janus.Backend.C.Raw
 import Janus.Command.Ref
 import Janus.Command.While
 import Janus.Expression.Ord

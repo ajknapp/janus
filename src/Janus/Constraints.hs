@@ -84,7 +84,7 @@ import Foreign.C
   )
 import Foreign.Ptr (Ptr)
 import Foreign.Storable (Storable)
-import Janus.Backend.C (JanusCMT, JanusCT, JanusCTyped)
+import Janus.Backend.C.Raw (JanusCMT, JanusCT, JanusCTyped)
 import Janus.Command.Case (CmdCase)
 import Janus.Command.Cond (CmdCond)
 import Janus.Command.Format (CmdFormat, CmdPutString, CmdString)

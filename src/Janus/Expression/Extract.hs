@@ -13,7 +13,7 @@ import Data.Loc
 import Data.Proxy
 import GHC.Generics
 import GHC.TypeLits
-import Janus.Backend.C
+import Janus.Backend.C.Raw
 import Janus.Expression.Cast
 import Language.C.Quote
 

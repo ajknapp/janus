@@ -7,7 +7,7 @@ import Data.Functor.Identity
 import Data.Loc
 import Foreign.C
 import Foreign.Ptr
-import Janus.Backend.C
+import Janus.Backend.C.Raw
 import Janus.CBits ()
 import Language.C.Quote
 

@@ -12,7 +12,7 @@ import qualified Data.Map as Map
 import Data.Proxy
 import qualified Data.Set as Set
 import Data.Word
-import Janus.Backend.C
+import Janus.Backend.C.Raw
 import Janus.Backend.C.Target
 import Janus.Command.Ref (JanusCRefT)
 import Janus.Command.TicToc
@@ -31,7 +31,7 @@ type LinuxX86_64CM = JanusCMT LinuxX86_64
 
 type LinuxX86_64CRef = JanusCRefT LinuxX86_64
 
-askX86Features :: JanusCMT t X86Features
+askX86Features :: (MonadTargetFeatures m) => m X86Features
 askX86Features = askCTargetFeatures @LinuxX86_64
 
 instance JanusCTarget LinuxX86_64 where

@@ -23,7 +23,7 @@ import Foreign.C (CBool, CDouble (..), CFloat (..))
 import Foreign.Ptr (Ptr, ptrToWordPtr)
 import GHC.Float
 import GHC.Generics
-import Janus.Backend.C
+import Janus.Backend.C.Raw
 import Janus.Command.Cond (CmdCond, whenM_)
 import Janus.Command.Memory (CmdStorable (..))
 import Janus.Command.Ref (CmdRef (..), RefCell)

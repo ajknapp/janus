@@ -138,7 +138,7 @@ import Janus.Alloc.Policy
     freeTypedArray,
     reallocTypedArray,
   )
-import Janus.Backend.C (JanusCTyped)
+import Janus.Backend.C.Raw (JanusCTyped)
 import Janus.Command.Memory
   ( CmdMemCopy (..),
     CmdStorable (..),

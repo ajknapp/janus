@@ -96,6 +96,7 @@ module Janus.CSE.Types
     emitEffectUnit,
     prependItems,
     wrapScopeWith,
+    progTreeUnitToBlock,
   )
 where
 
@@ -109,11 +110,13 @@ import qualified Data.ByteString.Char8 as BS8
 import Data.Coerce (Coercible, coerce)
 import Data.Complex (Complex)
 import Data.Constraint (Dict (..))
+import qualified Data.Dependent.HashMap as DHM
 import Data.Functor.Identity (Identity (..))
 import Data.Int (Int16, Int32, Int64, Int8)
 import qualified Data.Kind as K
 import Data.Proxy (Proxy (..))
 import Data.Ratio (denominator, numerator)
+import Data.Semilattice.Lower (Lower (..))
 import qualified Data.Sequence as Seq
 import qualified Data.Set as Set
 import qualified Data.Text as Text
@@ -125,7 +128,7 @@ import Foreign.Ptr (Ptr)
 import Foreign.Storable (Storable)
 import GHC.Fingerprint (Fingerprint (..))
 import GHC.TypeNats (Nat)
-import Janus.Backend.C (JanusCT (..), JanusCTyped (..))
+import Janus.Backend.C.Raw (JanusCT (..), JanusCTyped (..), MonadTargetFeatures (..))
 import Janus.Backend.C.CUDA.CPU ()
 import Janus.Backend.C.CUDA.CPUSIMD ()
 import Janus.Backend.C.CUDA.Kernel ()
@@ -133,8 +136,7 @@ import Janus.Backend.C.CUDA.SIMD.Base ()
 import Janus.Backend.C.CUDA.Types (CUDADejaFu (..), CUDAIO (..), CUDAThreadInfo, JanusCUDA (..))
 import Janus.Backend.C.LinuxX86_64.SIMD.Base ()
 import Janus.Backend.C.LinuxX86_64.Types (LinuxX86_64C)
-import Janus.Bench.Instances (SIMDMask (..), SIMDVector (..))
-import Janus.Bench.Types (Bench (..))
+import Janus.Backend.C.Target (TargetFeatureMap, cudaFeatureKey, x86FeatureKey)
 import Janus.Command.Case (CmdCase)
 import Janus.Command.Cond (CmdCond)
 import Janus.Command.Format (CmdString)
@@ -142,11 +144,11 @@ import Janus.Command.Memory (CmdRefPtr)
 import Janus.Command.Range (CmdRange)
 import Janus.Command.Ref (CmdRef (..))
 import Janus.Command.While (CmdWhile)
-import Janus.Control.Reader.Base (ExpNewtype (..), ReaderExp (..))
+import Janus.Control.Reader.Base (ExpNewtype (..), ReaderExp (..), SIMDMask (..), SIMDVector (..))
 import Janus.Expression.Cast (janusCReallyUnsafeCast)
 import Janus.Expression.Let (ExpLet (..))
 import Janus.Expression.SIMD (ExpSIMD (..), HostSIMDMask (..), HostSIMDValue (..), SIMDElem, SIMDShape)
-import Janus.SPMD.Gang (CmdOptimalGang)
+import Janus.SPMD.Gang (CmdOptimalGang, optimalCUDAGangSize, optimalX86GangSize)
 import Janus.SPMD.Types (SIMDPair, VoidPtr (..))
 import Janus.Typed (JanusTyped, KnownJanusType, TypeableTyped)
 import qualified Type.Reflection as TR
@@ -257,13 +259,13 @@ type CSETyped = TypeableTyped
 
 data SIMDVecWitness (e :: K.Type -> K.Type) (n :: Nat) (a :: K.Type) where
   SIMDVecWitness ::
-    (Coercible (SIMDVector e n a) baseV, JanusTyped e baseV) =>
+    (Coercible (SIMDVector e n a) baseV, JanusTyped e baseV, Typeable baseV) =>
     !(Proxy baseV) ->
     SIMDVecWitness e n a
 
 data SIMDMaskWitness (e :: K.Type -> K.Type) (n :: Nat) (a :: K.Type) where
   SIMDMaskWitness ::
-    (Coercible (SIMDMask e n a) baseM, JanusTyped e baseM) =>
+    (Coercible (SIMDMask e n a) baseM, JanusTyped e baseM, Typeable baseM) =>
     !(Proxy baseM) ->
     SIMDMaskWitness e n a
 
@@ -293,6 +295,8 @@ class
   where
   cseSIMDVecWitness :: (SIMDShape n a) => SIMDVecWitness e n a
   cseSIMDMaskWitness :: (SIMDShape n a) => SIMDMaskWitness e n a
+  cseOptimalGangWidth :: (SIMDElem a) => Proxy a -> TargetFeatureMap -> Maybe Int
+  cseOptimalGangWidth _ _ = Nothing
 
 instance CSESIMDTarget Identity where
   cseSIMDVecWitness :: forall n a. (SIMDShape n a) => SIMDVecWitness Identity n a
@@ -305,12 +309,16 @@ instance CSESIMDTarget LinuxX86_64C where
   cseSIMDVecWitness = SIMDVecWitness (Proxy @(SIMDVector LinuxX86_64C n a))
   cseSIMDMaskWitness :: forall n a. (SIMDShape n a) => SIMDMaskWitness LinuxX86_64C n a
   cseSIMDMaskWitness = SIMDMaskWitness (Proxy @(SIMDMask LinuxX86_64C n a))
+  cseOptimalGangWidth pa tfm =
+    (\(Identity fs) -> optimalX86GangSize fs pa) <$> DHM.lookup x86FeatureKey tfm
 
 instance CSESIMDTarget JanusCUDA where
   cseSIMDVecWitness :: forall n a. (SIMDShape n a) => SIMDVecWitness JanusCUDA n a
   cseSIMDVecWitness = SIMDVecWitness (Proxy @(SIMDVector JanusCUDA n a))
   cseSIMDMaskWitness :: forall n a. (SIMDShape n a) => SIMDMaskWitness JanusCUDA n a
   cseSIMDMaskWitness = SIMDMaskWitness (Proxy @(SIMDMask JanusCUDA n a))
+  cseOptimalGangWidth pa tfm =
+    (\(Identity fs) -> optimalCUDAGangSize fs pa) <$> DHM.lookup cudaFeatureKey tfm
 
 instance CSESIMDTarget CUDAIO where
   cseSIMDVecWitness :: forall n a. (SIMDShape n a) => SIMDVecWitness CUDAIO n a
@@ -333,16 +341,7 @@ instance (Typeable r, CSESIMDTarget e) => CSESIMDTarget (ReaderExp r e) where
   cseSIMDMaskWitness =
     case cseSIMDMaskWitness @e @n @a of
       SIMDMaskWitness p -> SIMDMaskWitness p
-
-instance (Typeable c, CSESIMDTarget e) => CSESIMDTarget (Bench c e) where
-  cseSIMDVecWitness :: forall n a. (SIMDShape n a) => SIMDVecWitness (Bench c e) n a
-  cseSIMDVecWitness =
-    case cseSIMDVecWitness @e @n @a of
-      SIMDVecWitness p -> SIMDVecWitness p
-  cseSIMDMaskWitness :: forall n a. (SIMDShape n a) => SIMDMaskWitness (Bench c e) n a
-  cseSIMDMaskWitness =
-    case cseSIMDMaskWitness @e @n @a of
-      SIMDMaskWitness p -> SIMDMaskWitness p
+  cseOptimalGangWidth = cseOptimalGangWidth @e
 
 -- | Witness enabling CSE to bind an expression of type @a@ via 'let_' or 'letM'
 -- in target backend @e@ without imposing extra 'JanusTyped' constraints on
@@ -472,23 +471,6 @@ instance (CSETargetExp e) => CSETargetExp (ReaderExp r e) where
   cseTargetPair = cseTargetPair @e @a @b
   cseWrapVoidPtr (ReaderExp p) = ReaderExp (cseWrapVoidPtr p)
   cseUnwrapVoidPtr (ReaderExp p) = ReaderExp (cseUnwrapVoidPtr p)
-
-instance (CSETargetExp e) => CSETargetExp (Bench c e) where
-  cseTargetBool = cseTargetBool @e
-  cseTargetInt32 = cseTargetInt32 @e
-  cseTargetWord32 = cseTargetWord32 @e
-  cseTargetInt64 = cseTargetInt64 @e
-  cseTargetWord64 = cseTargetWord64 @e
-  cseTargetCInt = cseTargetCInt @e
-  cseTargetCFileP = cseTargetCFileP @e
-  cseTargetCStr = cseTargetCStr @e
-  cseTargetVoidPtr = cseTargetVoidPtr @e
-  cseTargetPtr :: forall a. (JanusTyped (Bench c e) a) => Dict (JanusTyped (Bench c e) (Ptr a))
-  cseTargetPtr = cseTargetPtr @e @a
-  cseTargetPair :: forall a b. (JanusTyped (Bench c e) a, JanusTyped (Bench c e) b) => Dict (JanusTyped (Bench c e) (SIMDPair a b))
-  cseTargetPair = cseTargetPair @e @a @b
-  cseWrapVoidPtr (Bench p) = Bench (cseWrapVoidPtr p)
-  cseUnwrapVoidPtr (Bench p) = Bench (cseUnwrapVoidPtr p)
 
 data BindRep (e :: K.Type -> K.Type) (a :: K.Type) where
   BindRep ::
@@ -1140,6 +1122,17 @@ data ScopeItem (m :: K.Type -> K.Type) (e :: K.Type -> K.Type) where
     -- | Inner block executed unconditionally with the 'CString' variable in scope.
     !(Block m e) ->
     ScopeItem m e
+  -- | Scoped multi-versioned SIMD gang dispatch ('Janus.SPMD.Gang.withOptimalGang')
+  -- inside a structured control-flow branch ('StmIf', 'StmWhile', 'StmRange', 'StmSwitch').
+  ItemOptimalGang ::
+    (SIMDElem a, CmdOptimalGang m e) =>
+    !(TR.TypeRep a) ->
+    !(Block m e) ->
+    !(Block m e) ->
+    !(Block m e) ->
+    !(Block m e) ->
+    !(Block m e) ->
+    ScopeItem m e
 
 -- | Top-level program tree of a 'CSEM' action, representing either a linear
 -- statement block or a compile-time SIMD gang-width dispatch split.
@@ -1175,6 +1168,19 @@ data ProgTree (m :: K.Type -> K.Type) (e :: K.Type -> K.Type) (r :: K.Type) wher
 
 deriving stock instance Functor (ProgTree m e)
 
+progTreeUnitToBlock :: ProgTree m e () -> Block m e
+progTreeUnitToBlock = \case
+  ProgLinear blk () -> blk
+  ProgOptimalGang tr b2 b4 b8 b16 b32 ->
+    Seq.singleton $
+      ItemOptimalGang
+        tr
+        (progTreeUnitToBlock b2)
+        (progTreeUnitToBlock b4)
+        (progTreeUnitToBlock b8)
+        (progTreeUnitToBlock b16)
+        (progTreeUnitToBlock b32)
+
 prependItems :: Block m e -> ProgTree m e r -> ProgTree m e r
 prependItems items tree
   | Seq.null items = tree
@@ -1206,50 +1212,54 @@ wrapScopeWith mkItem = \case
 
 -- | Monadic Janus command builder paired with 'CSEExp'.
 newtype CSEM (m :: K.Type -> K.Type) (e :: K.Type -> K.Type) (r :: K.Type) = CSEM
-  { unCSEM :: Int -> (Int, ProgTree m e r)
+  { unCSEM :: TargetFeatureMap -> Int -> (Int, ProgTree m e r)
   }
   deriving stock (Functor)
 
-bindProgTree :: Int -> ProgTree m e a -> (a -> CSEM m e b) -> (Int, ProgTree m e b)
-bindProgTree s1 (ProgLinear items1 a) k =
-  let (s2, t2) = unCSEM (k a) s1
+bindProgTree :: TargetFeatureMap -> Int -> ProgTree m e a -> (a -> CSEM m e b) -> (Int, ProgTree m e b)
+bindProgTree tfm s1 (ProgLinear items1 a) k =
+  let (s2, t2) = unCSEM (k a) tfm s1
    in (s2, prependItems items1 t2)
-bindProgTree s1 (ProgOptimalGang tr b2 b4 b8 b16 b32) k =
-  let (s2, b2') = bindProgTree s1 b2 k
-      (s3, b4') = bindProgTree s2 b4 k
-      (s4, b8') = bindProgTree s3 b8 k
-      (s5, b16') = bindProgTree s4 b16 k
-      (s6, b32') = bindProgTree s5 b32 k
+bindProgTree tfm s1 (ProgOptimalGang tr b2 b4 b8 b16 b32) k =
+  let (s2, b2') = bindProgTree tfm s1 b2 k
+      (s3, b4') = bindProgTree tfm s2 b4 k
+      (s4, b8') = bindProgTree tfm s3 b8 k
+      (s5, b16') = bindProgTree tfm s4 b16 k
+      (s6, b32') = bindProgTree tfm s5 b32 k
    in (s6, ProgOptimalGang tr b2' b4' b8' b16' b32')
 
 instance Applicative (CSEM m e) where
-  pure x = CSEM $ \s -> (s, ProgLinear Seq.empty x)
-  mf <*> mx = CSEM $ \s0 ->
-    let (s1, tf) = unCSEM mf s0
-     in bindProgTree s1 tf (\f -> fmap f mx)
+  pure x = CSEM $ \_ s -> (s, ProgLinear Seq.empty x)
+  mf <*> mx = CSEM $ \tfm s0 ->
+    let (s1, tfn) = unCSEM mf tfm s0
+     in bindProgTree tfm s1 tfn (\f -> fmap f mx)
 
 instance Monad (CSEM m e) where
-  ma >>= k = CSEM $ \s0 ->
-    let (s1, ta) = unCSEM ma s0
-     in bindProgTree s1 ta k
+  ma >>= k = CSEM $ \tfm s0 ->
+    let (s1, ta) = unCSEM ma tfm s0
+     in bindProgTree tfm s1 ta k
+
+instance MonadTargetFeatures (CSEM m e) where
+  askTargetFeature k = CSEM $ \tfm s ->
+    (s, ProgLinear Seq.empty (maybe lowerBound runIdentity (DHM.lookup k tfm)))
 
 extractLazyResult :: ProgTree m e a -> a
 extractLazyResult (ProgLinear _ a) = a
 extractLazyResult (ProgOptimalGang _ b2 _ _ _ _) = extractLazyResult b2
 
 instance MonadFix (CSEM m e) where
-  mfix f = CSEM $ \s0 ->
+  mfix f = CSEM $ \tfm s0 ->
     let res =
-          let (s1, tree) = unCSEM (f (extractLazyResult tree)) s0
+          let (s1, tree) = unCSEM (f (extractLazyResult tree)) tfm s0
            in (s1, tree)
      in res
 
 allocSSAId :: TR.TypeRep a -> Maybe (BindCap e a) -> CSEM m e (VarId e a)
-allocSSAId tr mbCap = CSEM $ \n ->
+allocSSAId tr mbCap = CSEM $ \_ n ->
   (n + 1, ProgLinear Seq.empty (VarId (VarSSA n) tr mbCap))
 
 emitStm :: Stm m e -> CSEM m e ()
-emitStm stm = CSEM $ \n ->
+emitStm stm = CSEM $ \_ n ->
   (n, ProgLinear (Seq.singleton (ItemStm stm)) ())
 
 emitEffectVal ::
@@ -1271,8 +1281,11 @@ emitEffectUnit args eval = emitStm (StmEffectUnit args eval)
 
 
 --------------------------------------------------------------------------------
--- Representational Coercion & Associated SIMD Types for `CSEExp`
+-- Representational Coercion, Idempotent Stacking, & Associated SIMD Types
 --------------------------------------------------------------------------------
+
+instance ExpLet (CSEExp e) where
+  let_ = mkExpUserLet
 
 instance (ExpNewtype e) => ExpNewtype (CSEExp e) where
   coerceExpNewtype x =
@@ -1328,3 +1341,45 @@ instance
   where
   simdMaskFromBools = CSESIMDMask . simdMaskFromBools
   simdMaskToBools = simdMaskToBools . getCSESIMDMask
+
+instance (CSESIMDTarget e) => CSESIMDTarget (CSEExp e) where
+  cseSIMDVecWitness :: forall n a. (SIMDShape n a) => SIMDVecWitness (CSEExp e) n a
+  cseSIMDVecWitness =
+    case cseSIMDVecWitness @e @n @a of
+      SIMDVecWitness p -> SIMDVecWitness p
+  cseSIMDMaskWitness :: forall n a. (SIMDShape n a) => SIMDMaskWitness (CSEExp e) n a
+  cseSIMDMaskWitness =
+    case cseSIMDMaskWitness @e @n @a of
+      SIMDMaskWitness p -> SIMDMaskWitness p
+  cseOptimalGangWidth = cseOptimalGangWidth @e
+
+instance (CSETargetExp e) => CSETargetExp (CSEExp e) where
+  cseTargetBool = case cseTargetBool @e of Dict -> Dict
+  cseTargetInt32 = case cseTargetInt32 @e of Dict -> Dict
+  cseTargetWord32 = case cseTargetWord32 @e of Dict -> Dict
+  cseTargetInt64 = case cseTargetInt64 @e of Dict -> Dict
+  cseTargetWord64 = case cseTargetWord64 @e of Dict -> Dict
+  cseTargetCInt = case cseTargetCInt @e of Dict -> Dict
+  cseTargetCFileP = case cseTargetCFileP @e of Dict -> Dict
+  cseTargetCStr = case cseTargetCStr @e of Dict -> Dict
+  cseTargetVoidPtr = case cseTargetVoidPtr @e of Dict -> Dict
+  cseTargetPtr :: forall a. (JanusTyped (CSEExp e) a) => Dict (JanusTyped (CSEExp e) (Ptr a))
+  cseTargetPtr = case cseTargetPtr @e @a of Dict -> Dict
+  cseTargetPair :: forall a b. (JanusTyped (CSEExp e) a, JanusTyped (CSEExp e) b) => Dict (JanusTyped (CSEExp e) (SIMDPair a b))
+  cseTargetPair = case cseTargetPair @e @a @b of Dict -> Dict
+  cseWrapVoidPtr p =
+    case cseTargetVoidPtr @e of
+      Dict ->
+        mkExpZeroCostOp
+          "cseWrapVoidPtr"
+          []
+          (Just (TR.typeRep @VoidPtr, BindDirect))
+          (HCons p HNil)
+          (\(HCons vp HNil) -> cseWrapVoidPtr vp)
+  cseUnwrapVoidPtr p =
+    mkExpZeroCostOp
+      "cseUnwrapVoidPtr"
+      []
+      (Just (TR.typeRep @(Ptr ()), BindVoidPtr))
+      (HCons p HNil)
+      (\(HCons vp HNil) -> cseUnwrapVoidPtr vp)

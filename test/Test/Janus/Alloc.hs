@@ -17,7 +17,7 @@ import Hedgehog (Gen, Property, forAll, property, (===))
 import qualified Hedgehog.Gen as Gen
 import qualified Hedgehog.Range as Range
 import Janus.Alloc
-import Janus.Backend.C (JanusC, JanusCM, withJanusC)
+import Janus.Backend.C (JanusCCSE, JanusCMCSE, withJanusC)
 import Janus.Backend.C.Build (CBuildConfig, cBuildConfigCacheDir, defaultCBuildConfig)
 import Janus.Command.Memory (CmdStorable (peek, poke))
 import Janus.Control.Drain (drainSum, runDrain)
@@ -234,7 +234,7 @@ check_composable_fallback_segregate_pool_monotonic = property $ do
 -- Compiled C Execution of Composable Allocator Hierarchy
 --------------------------------------------------------------------------------
 
-cCompositeAllocKernel :: JanusC Int64 -> JanusCM (JanusC Int64)
+cCompositeAllocKernel :: JanusCCSE Int64 -> JanusCMCSE (JanusCCSE Int64)
 cCompositeAllocKernel n = do
   tracker <- newAllocTracker
   let root = statsAlloc tracker dynamicAlloc
@@ -251,8 +251,8 @@ cCompositeAllocKernel n = do
       streamM (rangeS 0 n) $ \i -> do
         vpSmall <- allocBytes policy 32
         vpLarge <- allocBytesAligned policy 160 64
-        let pSmall = fromVoidPtr vpSmall :: JanusC (Ptr Int64)
-            pLarge = fromVoidPtr vpLarge :: JanusC (Ptr Int64)
+        let pSmall = fromVoidPtr vpSmall :: JanusCCSE (Ptr Int64)
+            pLarge = fromVoidPtr vpLarge :: JanusCCSE (Ptr Int64)
         poke pSmall (i + 1)
         poke pLarge (i * 2)
         v1 <- peek pSmall

@@ -16,7 +16,7 @@ import Data.Loc
 import Data.Proxy
 import Data.Word (Word64)
 import GHC.TypeLits (natVal)
-import Janus.Backend.C
+import Janus.Backend.C.Raw
 import Janus.Backend.C.CUDA.Kernel ()
 import Janus.Backend.C.CUDA.SIMD.Base
 import Janus.Backend.C.CUDA.Types

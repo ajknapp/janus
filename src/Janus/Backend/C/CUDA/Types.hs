@@ -27,7 +27,7 @@ import Data.Loc (noLoc)
 import Foreign.Marshal.Alloc (alloca)
 import Foreign.Storable (peek)
 import GHC.Generics (Generic)
-import Janus.Backend.C
+import Janus.Backend.C.Raw
 import Janus.Backend.C.CUDA.Foreign
 import Janus.Backend.C.Target
 import Janus.Command.Ref (JanusCRef)
@@ -87,7 +87,7 @@ mapCUDAThreadInfo f CUDAThreadInfo {..} =
 newtype JanusCUDA a = JanusCUDA {getJanusCUDA :: JanusC a}
 
 newtype JanusCUDAM a = JanusCUDAM {getJanusCUDAM :: ReaderT (CUDAThreadInfo JanusCUDA) JanusCM a}
-  deriving newtype (Functor, Applicative, Monad, MonadFix, MonadReader (CUDAThreadInfo JanusCUDA))
+  deriving newtype (Functor, Applicative, Monad, MonadFix, MonadReader (CUDAThreadInfo JanusCUDA), MonadTargetFeatures)
 
 runJanusCUDAM :: JanusCUDAM a -> JanusCM a
 runJanusCUDAM (JanusCUDAM m) = runReaderT m magicThreadInfo
@@ -114,7 +114,7 @@ newtype JanusCUDARef a = JanusCUDARef {getJanusCUDARef :: JanusCRef a}
 mkCUDAFuncInfo :: CUDAFeatures -> String -> JCFuncInfo
 mkCUDAFuncInfo fs name = setTargetFeature cudaFeatureKey fs (mkJCFuncInfo name JCUDA False)
 
-askCUDAFeatures :: JanusCMT t CUDAFeatures
+askCUDAFeatures :: (MonadTargetFeatures m) => m CUDAFeatures
 askCUDAFeatures = askTargetFeature cudaFeatureKey
 
 class CmdSync m where

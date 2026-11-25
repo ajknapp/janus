@@ -8,7 +8,7 @@ import Foreign.C
 import Data.Functor.Identity
 import Data.Coerce
 import Data.Complex
-import Janus.Backend.C
+import Janus.Backend.C.Raw
 import Language.C.Quote
 import Data.Loc
 

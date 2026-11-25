@@ -7,7 +7,7 @@ module Janus.Expression.Bits where
 import Data.Bits (Bits (..))
 import Data.Functor.Identity
 import qualified Data.Set as Set
-import Janus.Backend.C
+import Janus.Backend.C.Raw
 import Janus.Expression.Eq
 import Janus.Typed
 import Language.C.Quote

@@ -9,9 +9,9 @@ import Control.Lens ((&), (.~))
 import Data.Int (Int32, Int64)
 import Data.Proxy (Proxy (..))
 import Foreign.Ptr (Ptr)
-import Janus.Backend.C (JanusC, JanusCM)
+import Janus.Backend.C (JanusCCSE, JanusCMCSE)
 import Janus.Backend.C.Build (CBuildConfig, cBuildConfigCacheDir, defaultCBuildConfig)
-import Janus.Backend.C.LinuxX86_64 (LinuxX86_64C, LinuxX86_64CM)
+import Janus.Backend.C.LinuxX86_64 (LinuxX86_64CCSE, LinuxX86_64CMCSE)
 import qualified Janus.Command.Memory as M
 import Janus.Command.Range (rangeM)
 import Janus.Command.Ref (letM, newRef, readRef, writeRef)
@@ -36,21 +36,21 @@ getTHTestCacheConfig = do
   let dir = maybe "_cache" id mtmp
   pure (defaultCBuildConfig & cBuildConfigCacheDir .~ dir)
 
-constFortyTwo :: JanusC Int64
+constFortyTwo :: JanusCCSE Int64
 constFortyTwo = 42
 
-affineI64 :: JanusC Int64 -> JanusC Int64 -> JanusC Int64 -> JanusC Int64
+affineI64 :: JanusCCSE Int64 -> JanusCCSE Int64 -> JanusCCSE Int64 -> JanusCCSE Int64
 affineI64 a x b = a * x + b
 
-boolLogic :: JanusC Int64 -> JanusC Bool -> JanusC Bool
+boolLogic :: JanusCCSE Int64 -> JanusCCSE Bool -> JanusCCSE Bool
 boolLogic x flag = (x `gt` 0) `land` flag
 
 saxpyJanusC ::
-  JanusC Int64 ->
-  JanusC Float ->
-  JanusC (Ptr Float) ->
-  JanusC (Ptr Float) ->
-  JanusCM ()
+  JanusCCSE Int64 ->
+  JanusCCSE Float ->
+  JanusCCSE (Ptr Float) ->
+  JanusCCSE (Ptr Float) ->
+  JanusCMCSE ()
 saxpyJanusC n alpha xs ys =
   rangeM 0 n $ \i -> do
     xi <- M.peekElemOff xs i
@@ -58,10 +58,10 @@ saxpyJanusC n alpha xs ys =
     M.pokeElemOff ys (alpha * xi + yi) i
 
 dotJanusC ::
-  JanusC Int64 ->
-  JanusC (Ptr Double) ->
-  JanusC (Ptr Double) ->
-  JanusCM (JanusC Double)
+  JanusCCSE Int64 ->
+  JanusCCSE (Ptr Double) ->
+  JanusCCSE (Ptr Double) ->
+  JanusCMCSE (JanusCCSE Double)
 dotJanusC n xs ys = do
   acc <- newRef 0
   rangeM 0 n $ \i -> do
@@ -83,16 +83,16 @@ facPoly ::
   e a
 facPoly = fun (Proxy @e) "fac" $ \self n -> ifThenElse (n `le` 0) 1 (n * self (n - 1))
 
-doubleFacSum :: JanusC Int32 -> JanusC Int64 -> JanusC Int64
+doubleFacSum :: JanusCCSE Int32 -> JanusCCSE Int64 -> JanusCCSE Int64
 doubleFacSum a b =
-  toIntegral (facPoly @JanusC @Int32 a) + facPoly @JanusC @Int64 b
+  toIntegral (facPoly @JanusCCSE @Int32 a) + facPoly @JanusCCSE @Int64 b
 
 x86Saxpy ::
-  LinuxX86_64C Int64 ->
-  LinuxX86_64C Float ->
-  LinuxX86_64C (Ptr Float) ->
-  LinuxX86_64C (Ptr Float) ->
-  LinuxX86_64CM ()
+  LinuxX86_64CCSE Int64 ->
+  LinuxX86_64CCSE Float ->
+  LinuxX86_64CCSE (Ptr Float) ->
+  LinuxX86_64CCSE (Ptr Float) ->
+  LinuxX86_64CMCSE ()
 x86Saxpy n alpha xs ys =
   rangeM 0 n $ \i -> do
     xi <- M.peekElemOff xs i
@@ -100,34 +100,34 @@ x86Saxpy n alpha xs ys =
     M.pokeElemOff ys (alpha * xi + yi) i
 
 x86Vfma8 ::
-  LinuxX86_64C (SIMDVector LinuxX86_64C 8 Float) ->
-  LinuxX86_64C (SIMDVector LinuxX86_64C 8 Float) ->
-  LinuxX86_64C (SIMDVector LinuxX86_64C 8 Float) ->
-  LinuxX86_64C (SIMDVector LinuxX86_64C 8 Float)
+  LinuxX86_64CCSE (SIMDVector LinuxX86_64CCSE 8 Float) ->
+  LinuxX86_64CCSE (SIMDVector LinuxX86_64CCSE 8 Float) ->
+  LinuxX86_64CCSE (SIMDVector LinuxX86_64CCSE 8 Float) ->
+  LinuxX86_64CCSE (SIMDVector LinuxX86_64CCSE 8 Float)
 x86Vfma8 = vfma
 
 x86MaskBlend4 ::
-  LinuxX86_64C (SIMDMask LinuxX86_64C 4 Int32) ->
-  LinuxX86_64C (SIMDVector LinuxX86_64C 4 Int32) ->
-  LinuxX86_64C (SIMDVector LinuxX86_64C 4 Int32) ->
-  LinuxX86_64C (SIMDVector LinuxX86_64C 4 Int32)
+  LinuxX86_64CCSE (SIMDMask LinuxX86_64CCSE 4 Int32) ->
+  LinuxX86_64CCSE (SIMDVector LinuxX86_64CCSE 4 Int32) ->
+  LinuxX86_64CCSE (SIMDVector LinuxX86_64CCSE 4 Int32) ->
+  LinuxX86_64CCSE (SIMDVector LinuxX86_64CCSE 4 Int32)
 x86MaskBlend4 = vselect
 
 x86SleefSin4 ::
-  LinuxX86_64C (SIMDVector LinuxX86_64C 4 Float) ->
-  LinuxX86_64C (SIMDVector LinuxX86_64C 4 Float)
+  LinuxX86_64CCSE (SIMDVector LinuxX86_64CCSE 4 Float) ->
+  LinuxX86_64CCSE (SIMDVector LinuxX86_64CCSE 4 Float)
 x86SleefSin4 = sin
 
 spmdPoly8 ::
-  LinuxX86_64C Float ->
-  SPMD 8 LinuxX86_64C Float ->
-  SPMD 8 LinuxX86_64C Float ->
-  SPMD 8 LinuxX86_64C Float
+  LinuxX86_64CCSE Float ->
+  SPMD 8 LinuxX86_64CCSE Float ->
+  SPMD 8 LinuxX86_64CCSE Float ->
+  SPMD 8 LinuxX86_64CCSE Float
 spmdPoly8 scale xs ys = spmdSplat scale * xs + ys
 
 spmdEffectAdd4 ::
-  SPMD 4 LinuxX86_64C Double ->
-  SPMDM 4 LinuxX86_64CM LinuxX86_64C (SPMD 4 LinuxX86_64C Double)
+  SPMD 4 LinuxX86_64CCSE Double ->
+  SPMDM 4 LinuxX86_64CMCSE LinuxX86_64CCSE (SPMD 4 LinuxX86_64CCSE Double)
 spmdEffectAdd4 xs = do
   doubled <- letM (xs * 2)
   pure (doubled + 1)

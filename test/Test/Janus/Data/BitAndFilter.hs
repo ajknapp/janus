@@ -26,7 +26,7 @@ import qualified Hedgehog.Range as Range
 import Janus.Alloc
 import Janus.Backend.C (acquireJanusC, releaseJanusC)
 import Janus.Backend.C.Build (CBuildConfig, cBuildConfigCacheDir, defaultCBuildConfig)
-import Janus.Backend.C.LinuxX86_64 (LinuxX86_64C, LinuxX86_64CM)
+import Janus.Backend.C.LinuxX86_64 (LinuxX86_64CCSE, LinuxX86_64CMCSE)
 import Janus.Control.Drain (drainCountWhere, drainForEach, drainSum, runDrain)
 import Janus.Control.Step (Step (..))
 import Janus.Control.Stream (Stream, rangeS, statefulS, streamM)
@@ -519,12 +519,12 @@ check_xorfilter_zero_fn_fpr_duplicates_empty_and_leaks = property $ do
 --------------------------------------------------------------------------------
 
 cMutateAndProbeBitFilter ::
-  BitSet LinuxX86_64C ->
-  BitTree LinuxX86_64C ->
-  BloomFilter LinuxX86_64C Int64 ->
-  XorFilter LinuxX86_64C Int64 ->
-  LinuxX86_64C Int64 ->
-  LinuxX86_64CM (LinuxX86_64C Int64)
+  BitSet LinuxX86_64CCSE ->
+  BitTree LinuxX86_64CCSE ->
+  BloomFilter LinuxX86_64CCSE Int64 ->
+  XorFilter LinuxX86_64CCSE Int64 ->
+  LinuxX86_64CCSE Int64 ->
+  LinuxX86_64CMCSE (LinuxX86_64CCSE Int64)
 cMutateAndProbeBitFilter bs bt bf xf n = do
   tmpBs <- BS.new dynamicAlloc
   runDrain
@@ -533,7 +533,7 @@ cMutateAndProbeBitFilter bs bt bf xf n = do
         _ <- BT.insert bt (i * 13)
         BF.insert bf (i * 19 + 3)
     )
-    (rangeS (0 :: LinuxX86_64C Int64) n)
+    (rangeS (0 :: LinuxX86_64CCSE Int64) n)
   BS.spmdUnionInto (Proxy @8) dynamicAlloc bs tmpBs
   BS.free dynamicAlloc tmpBs
 
@@ -541,17 +541,17 @@ cMutateAndProbeBitFilter bs bt bf xf n = do
   btSum <- runDrain drainSum (BT.stream bt)
   bfHits <-
     runDrain (drainCountWhere id) $
-      streamM (rangeS (0 :: LinuxX86_64C Int64) n) (\i -> BF.mightContain bf (i * 19 + 3))
+      streamM (rangeS (0 :: LinuxX86_64CCSE Int64) n) (\i -> BF.mightContain bf (i * 19 + 3))
   xfHits <-
     runDrain (drainCountWhere id) $
-      streamM (rangeS (0 :: LinuxX86_64C Int64) n) (\i -> XF.mightContain xf (i * 5 + 1))
+      streamM (rangeS (0 :: LinuxX86_64CCSE Int64) n) (\i -> XF.mightContain xf (i * 5 + 1))
   pure (bsCnt + btSum + bfHits * 1000 + xfHits * 10000)
 
 cBuildXorFilterInC ::
-  LinuxX86_64C Int64 ->
-  LinuxX86_64CM (XorFilter LinuxX86_64C Int64)
+  LinuxX86_64CCSE Int64 ->
+  LinuxX86_64CMCSE (XorFilter LinuxX86_64CCSE Int64)
 cBuildXorFilterInC n =
-  XF.fromStream @Int64 dynamicAlloc ((\i -> i * 11 + 7) <$> rangeS (0 :: LinuxX86_64C Int64) n)
+  XF.fromStream @Int64 dynamicAlloc ((\i -> i * 11 + 7) <$> rangeS (0 :: LinuxX86_64CCSE Int64) n)
 
 check_bit_and_filter_host_c_ffi ::
   IO

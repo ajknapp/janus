@@ -14,7 +14,7 @@ import qualified Data.Set as Set
 import Data.Typeable (Typeable)
 import Data.Word
 import Foreign.C
-import Janus.Backend.C
+import Janus.Backend.C.Raw
 import Language.Haskell.TH
 
 type family JanusTyped (e :: K.Type -> K.Type) :: K.Type -> Constraint

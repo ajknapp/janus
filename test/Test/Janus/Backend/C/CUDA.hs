@@ -70,7 +70,7 @@ unit_saxpy = runInBoundThread $ try (cuInit 0) >>= \case
             cuMemcpyHtoD d_y (castPtr py) (fromIntegral nbytes)
             tmpdir <- getEnv "TMPDIR"
             let buildConfig = defaultCBuildConfig { _cBuildConfigCacheDir = tmpdir }
-            withJanusCUDAFn dev ctx buildConfig (\m a x y -> saxpy @JanusCUDAM @JanusCUDA @Float m a x y) $ \fn k -> do
+            withJanusCUDAFn dev ctx buildConfig (\m a x y -> saxpy @JanusCUDAMCSE @JanusCUDACSE @Float m a x y) $ \fn k -> do
               (minGrid, _) <- cuOccupancyMaxPotentialBlockSize fn nullFunPtr 0 0
               let kernelLaunch =
                     CUlaunchConfig

@@ -13,7 +13,7 @@ module Janus.Backend.C.CUDA.SIMD.Float where
 import Control.Monad (forM_)
 import Data.Loc
 import Data.Proxy
-import Janus.Backend.C
+import Janus.Backend.C.Raw
 import Janus.Backend.C.CUDA.Kernel ()
 import Janus.Backend.C.CUDA.SIMD.Arith ()
 import Janus.Backend.C.CUDA.SIMD.Base

@@ -15,7 +15,7 @@ import Data.Loc
 import Data.Proxy
 import GHC.Generics
 import GHC.TypeLits
-import Janus.Backend.C
+import Janus.Backend.C.Raw
 import Language.C.Quote
 
 class ExpInject e a where

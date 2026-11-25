@@ -7,7 +7,7 @@ module Janus.Command.Cond where
 import Control.Lens
 import Data.Loc
 import Data.Monoid
-import Janus.Backend.C
+import Janus.Backend.C.Raw
 import Janus.Command.Ref
 import Janus.Expression.Bool
 import Janus.Typed

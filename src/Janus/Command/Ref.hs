@@ -21,7 +21,7 @@ import Data.IORef
 import qualified Data.Kind as K
 import Data.Loc
 import Data.Proxy
-import Janus.Backend.C
+import Janus.Backend.C.Raw
 import Janus.Typed
 import Language.C.Quote
 

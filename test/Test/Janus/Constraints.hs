@@ -25,19 +25,19 @@ import qualified Foreign.Storable as Storable
 import GHC.Generics (Generic)
 import Janus
 import Janus.Alloc hiding (CmdJanus, CmdJanusIO, ExpJanus)
-import Janus.Backend.C (JanusC, JanusCM, PortableC, withJanusC)
+import Janus.Backend.C (JanusCCSE, JanusCMCSE, PortableC, withJanusC)
 import Janus.Backend.C.Build (CBuildConfig, cBuildConfigCacheDir, defaultCBuildConfig)
 import Janus.Backend.C.CUDA
   ( CUDAIO (..),
     CUDAIOM,
-    JanusCUDA,
-    JanusCUDAM,
+    JanusCUDACSE,
+    JanusCUDAMCSE,
     launchCUDAIOM,
     showJanusCUDA,
   )
 import Janus.Backend.C.CUDA.Foreign (CUlaunchConfig (..), CUstream (..))
-import Janus.Backend.C.LinuxX86_64 (LinuxX86_64, LinuxX86_64C, LinuxX86_64CM)
-import Janus.CSE (CSEExp, CSEM, withCSE)
+import Janus.Backend.C.LinuxX86_64 (LinuxX86_64, LinuxX86_64CCSE, LinuxX86_64CMCSE)
+import Janus.CSE (CSEExp, cse, withCSE)
 import Janus.Command.Cond (whenM_)
 import Janus.Command.Format (hformat, hputString, withString)
 import Janus.Command.IO (fclose, fopen)
@@ -180,21 +180,21 @@ unit_exp_janus_all_backends = do
       arg = 17
       expected = runIdentity (purePrimKernel @Identity (Identity arg))
 
-  cPortable <- withJanusC @PortableC cfg (purePrimKernel @JanusC) (\f -> pure (f arg))
-  cX86 <- withJanusC @LinuxX86_64 cfg (purePrimKernel @LinuxX86_64C) (\f -> pure (f arg))
+  cPortable <- withJanusC @PortableC cfg (purePrimKernel @JanusCCSE) (\f -> pure (f arg))
+  cX86 <- withJanusC @LinuxX86_64 cfg (purePrimKernel @LinuxX86_64CCSE) (\f -> pure (f arg))
   cCSE <-
     withJanusC
       @PortableC
       cfg
-      (withCSE (purePrimKernel @(CSEExp JanusC)))
+      (withCSE (purePrimKernel @(CSEExp JanusCCSE)))
       (\f -> pure (f arg))
-  let readerCProg :: JanusC Int64 -> JanusCM (JanusC Double)
+  let readerCProg :: JanusCCSE Int64 -> JanusCMCSE (JanusCCSE Double)
       readerCProg x =
-        pure (getReaderExp (purePrimKernel @(ReaderExp Int64 JanusC) (ReaderExp x)))
+        pure (getReaderExp (purePrimKernel @(ReaderExp Int64 JanusCCSE) (ReaderExp x)))
   cReader <- withJanusC @PortableC cfg readerCProg (\f -> f arg)
 
   let cudaVal = getCUDAIO (purePrimKernel @CUDAIO (CUDAIO arg))
-      cudaSrc = showJanusCUDA "cuda_constraints_kern" (cudaConstraintStoreKernel @JanusCUDAM @JanusCUDA)
+      cudaSrc = showJanusCUDA "cuda_constraints_kern" (cudaConstraintStoreKernel @JanusCUDAMCSE @JanusCUDACSE)
   assertBool "CUDA source should contain kernel name" ("cuda_constraints_kern" `isInfixOf` cudaSrc)
 
   withArray [0.0 :: Double] $ \pOut -> do
@@ -379,13 +379,13 @@ unit_cmd_janus_multi_container_all_backends = do
     withJanusC
       @LinuxX86_64
       cfg
-      (multiContainerKernel @LinuxX86_64CM @LinuxX86_64C)
+      (multiContainerKernel @LinuxX86_64CMCSE @LinuxX86_64CCSE)
       (\f -> f seed)
   cCSERes <-
     withJanusC
       @PortableC
       cfg
-      (withCSE (multiContainerKernel @(CSEM JanusCM JanusC) @(CSEExp JanusC)))
+      (cse (multiContainerKernel @JanusCMCSE @JanusCCSE))
       (\f -> f seed)
   ReaderExp (Identity readerRes) <-
     runReaderT
@@ -424,7 +424,7 @@ unit_cmd_janus_io_format_parity = do
       cPath = dir </> "janus_constraints_c.txt"
   withCString ioPath $ \pIO ->
     formatSummaryToFile @IO @Identity (Identity pIO) (Identity 12)
-  withJanusC @PortableC cfg (formatSummaryToFile @JanusCM @JanusC) $ \fn ->
+  withJanusC @PortableC cfg (formatSummaryToFile @JanusCMCSE @JanusCCSE) $ \fn ->
     withCString cPath $ \pC ->
       fn pC 12
   ioTxt <- readFile ioPath
@@ -508,7 +508,7 @@ unit_polymorphic_element_and_key_helpers = do
       arrOut <- peekArray 2 p
       pure (r, arrOut)
   (cRes, cArr) <-
-    withJanusC @LinuxX86_64 cfg (polyElemKernel @LinuxX86_64CM @LinuxX86_64C) $ \fn ->
+    withJanusC @LinuxX86_64 cfg (polyElemKernel @LinuxX86_64CMCSE @LinuxX86_64CCSE) $ \fn ->
       withArray initArr $ \p -> do
         r <- fn p
         arrOut <- peekArray 2 p

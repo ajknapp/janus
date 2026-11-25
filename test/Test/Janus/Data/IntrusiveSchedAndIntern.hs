@@ -26,7 +26,7 @@ import qualified Hedgehog.Range as Range
 import Janus.Alloc
 import Janus.Backend.C (acquireJanusC, releaseJanusC)
 import Janus.Backend.C.Build (CBuildConfig, cBuildConfigCacheDir, defaultCBuildConfig)
-import Janus.Backend.C.LinuxX86_64 (LinuxX86_64C, LinuxX86_64CM)
+import Janus.Backend.C.LinuxX86_64 (LinuxX86_64CCSE, LinuxX86_64CMCSE)
 import Janus.Command.Memory (CmdStorable (..))
 import Janus.Control.Drain (drainForEach, drainSum, runDrain)
 import Janus.Control.Stream (Stream)
@@ -373,11 +373,11 @@ check_interner_bijection_and_resolution = property $ do
 --------------------------------------------------------------------------------
 
 cSchedAndInternKernel ::
-  IntrusiveHeap SchedNode Int64 LinuxX86_64C ->
-  TimerWheel SchedNode LinuxX86_64C ->
-  Interner LinuxX86_64C ->
-  LinuxX86_64C Word64 ->
-  LinuxX86_64CM (LinuxX86_64C Int64)
+  IntrusiveHeap SchedNode Int64 LinuxX86_64CCSE ->
+  TimerWheel SchedNode LinuxX86_64CCSE ->
+  Interner LinuxX86_64CCSE ->
+  LinuxX86_64CCSE Word64 ->
+  LinuxX86_64CMCSE (LinuxX86_64CCSE Int64)
 cSchedAndInternKernel hp wheel intr targetTick = do
   pMin <- IH.popMinNode hp
   minPrio <- peek (getPtrOf (snPriority (projectPtrs pMin)))

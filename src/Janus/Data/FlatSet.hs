@@ -70,7 +70,7 @@ import Data.Typeable (Typeable)
 import Foreign.Ptr (Ptr)
 import GHC.Generics (Generic)
 import Janus.Alloc.Policy (Alloc, allocStruct, freeStruct)
-import Janus.Backend.C
+import Janus.Backend.C.Raw
 import Janus.Command.Cond (ifThenElseM_, whenM_)
 import Janus.Command.Memory (CmdStorable (..))
 import Janus.Command.Ref (RefCell, letM, newRef, readRef, writeRef)

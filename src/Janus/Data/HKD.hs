@@ -80,7 +80,7 @@ import qualified Foreign.Storable as Storable
 import GHC.Generics
 import GHC.TypeLits (KnownSymbol, symbolVal)
 import GHC.TypeNats (KnownNat, Nat, natVal)
-import Janus.Backend.C
+import Janus.Backend.C.Raw
 import Janus.Command.Memory (CmdStorable (..), ExpPtr (..))
 import Janus.Command.Ref (Cell (..), CmdRef, RefCell (..))
 import Janus.Expression.Bits (ExpBits (..))

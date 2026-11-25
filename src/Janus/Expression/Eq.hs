@@ -9,7 +9,7 @@ import Data.Functor.Identity
 import qualified Data.Set as Set
 import Foreign.C (CBool)
 import Foreign.Ptr (Ptr)
-import Janus.Backend.C
+import Janus.Backend.C.Raw
 import Janus.Typed
 import Language.C.Quote
 import Language.Haskell.TH

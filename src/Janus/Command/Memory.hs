@@ -39,7 +39,7 @@ import qualified Foreign.Marshal.Utils as MarshalUtils
 import Foreign.Ptr (Ptr, castPtr, plusPtr)
 import qualified Foreign.Ptr as Ptr
 import qualified Foreign.Storable as Storable
-import Janus.Backend.C
+import Janus.Backend.C.Raw
 import Janus.CBits ()
 import Janus.Command.Ref (CmdRef (..), JanusCRefT (..))
 import Janus.Typed (JanusTyped)

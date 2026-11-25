@@ -26,12 +26,16 @@ import Foreign.Storable (peek, peekElemOff, poke, pokeElemOff, sizeOf)
 import Hedgehog (Property, forAll, property, (===))
 import qualified Hedgehog.Gen as Gen
 import qualified Hedgehog.Range as Range
+import Janus.Alloc.Policy (dynamicAlloc)
 import Janus.Backend.C
   ( JanusC,
+    JanusCCSE,
     JanusCM,
+    JanusCMCSE,
     acquireJanusC,
     releaseJanusC,
     showJanusC,
+    showRawJanusC,
     withJanusC,
   )
 import Janus.Backend.C.Build (CBuildConfig, cBuildConfigCacheDir, defaultCBuildConfig)
@@ -42,20 +46,22 @@ import Janus.Backend.C.CUDA
     CUDAIOM,
     CUDAThreadInfo (..),
     JanusCUDA,
+    JanusCUDACSE,
     JanusCUDAM,
+    JanusCUDAMCSE,
     launchCUDADejaFuM,
     launchCUDAIOM,
     showJanusCUDA,
+    showRawJanusCUDA,
   )
 import Janus.Backend.C.CUDA.Foreign (CUlaunchConfig (..), CUstream (..))
-import Janus.Backend.C.LinuxX86_64 (LinuxX86_64C, LinuxX86_64CM)
+import Janus.Backend.C.LinuxX86_64 (LinuxX86_64C, LinuxX86_64CCSE, LinuxX86_64CMCSE)
 import Janus.Backend.C.TH (Safety (Safe, Unsafe), declareJanusC, spliceJanusC)
 import Janus.CSE
   ( CSEExp,
     CSEM,
     CSETyped,
     cse,
-    interpretCSE,
     withCSE,
   )
 import Janus.Command.Cond (CmdCond, whenM_)
@@ -64,6 +70,7 @@ import qualified Janus.Command.Memory as M
 import Janus.Command.Range (CmdRange, rangeM)
 import Janus.Command.Ref (CmdRef, letM, modifyRef, newRef, readRef, writeRef)
 import Janus.Control.Reader (ReaderExp (..), liftReaderExp)
+import qualified Janus.Data.DynVec as DV
 import Janus.Expression.Bool (ExpBool (land))
 import Janus.Expression.Cast (ExpIntegralCast (toIntegral), ExpPtrCast (ptrCast))
 import Janus.Expression.Cond (ExpCond (ifThenElse))
@@ -80,6 +87,7 @@ import Janus.Expression.SIMD
 import Janus.Fix (ExpFix (fun))
 import Janus.SPMD
   ( CmdOptimalGang,
+    SPMD,
     foldForeachOptimal0M,
     gangReduceAdd,
   )
@@ -148,15 +156,15 @@ unit_canonical_monadic_tuple_cse = do
     logged <- peekArray 3 logPtr
     logged @?= [2, 1001, 2002]
 
-  -- B. Inspect generated C code without CSE vs with CSE (and separate `interpretCSE . cse`).
+  -- B. Inspect generated C code without CSE (`showRawJanusC`) vs automatic CSE (`showJanusC`)
+  -- and verify `showJanusC` is idempotent with explicit `cse`.
   -- In `canonicalOutProg`, `(a, b)` are each used twice (poke + return), so without CSE
   -- `x = (y * 17 + 23) * (y - 5)` is emitted 4 times; with CSE, `x`, `a`, and `b` are each
   -- computed once!
-  rawC <- showJanusC "canonical_raw" (canonicalOutProg @JanusCM @JanusC)
-  optC <-
-    showJanusC
-      "canonical_cse"
-      (interpretCSE (cse (canonicalOutProg @(CSEM JanusCM JanusC) @(CSEExp JanusC))))
+  rawC <- showRawJanusC "canonical_raw" (canonicalOutProg @JanusCM @JanusC)
+  optC <- showJanusC "canonical_cse" (canonicalOutProg @JanusCMCSE @JanusCCSE)
+  optIdempC <- showJanusC "canonical_cse" (cse (canonicalOutProg @JanusCMCSE @JanusCCSE))
+  optIdempC @?= optC
 
   countOccurrences "17LL" rawC @?= 4
   countOccurrences "23LL" rawC @?= 4
@@ -164,7 +172,7 @@ unit_canonical_monadic_tuple_cse = do
   countOccurrences "23LL" optC @?= 1
 
   -- C. Execute dynamically compiled C (`withJanusC`) and statically linked TH (`th_cse_canonical`).
-  withJanusC cfg (withCSE (canonicalOutProg @(CSEM JanusCM JanusC) @(CSEExp JanusC))) $ \cFn -> do
+  withJanusC cfg (canonicalOutProg @JanusCMCSE @JanusCCSE) $ \cFn -> do
     forM_ [-19, -5, 0, 5, 12, 100 :: Int64] $ \y -> do
       let (expA, expB) = canonicalSpec y
       withArray [0, 0 :: Int64] $ \outPtr ->
@@ -213,7 +221,7 @@ test_cse_canonical_property :: TestTree
 test_cse_canonical_property =
   let acquire = do
         cfg <- getCSETestConfig
-        acquireJanusC cfg (withCSE (canonicalOutProg @(CSEM JanusCM JanusC) @(CSEExp JanusC)))
+        acquireJanusC cfg (canonicalOutProg @JanusCMCSE @JanusCCSE)
    in withResource acquire releaseJanusC $ \res ->
         testGroup
           "CSE canonical property"
@@ -290,7 +298,7 @@ unit_minimal_dag_temporaries_and_copy_prop = do
   twoC <-
     showJanusC
       "nested_two"
-      (withCSE (nestedTwoUses @(CSEM JanusCM JanusC) @(CSEExp JanusC)))
+      (nestedTwoUses @JanusCMCSE @JanusCCSE)
   countOccurrences "31LL" twoC @?= 1
   countOccurrences "43LL" twoC @?= 1
   countOccurrences "int64_t x_" twoC @?= 5
@@ -301,7 +309,7 @@ unit_minimal_dag_temporaries_and_copy_prop = do
   threeC <-
     showJanusC
       "nested_three"
-      (withCSE (nestedThreeUses @(CSEM JanusCM JanusC) @(CSEExp JanusC)))
+      (nestedThreeUses @JanusCMCSE @JanusCCSE)
   countOccurrences "31LL" threeC @?= 1
   countOccurrences "43LL" threeC @?= 1
   countOccurrences "int64_t x_" threeC @?= 6
@@ -311,11 +319,11 @@ unit_minimal_dag_temporaries_and_copy_prop = do
   mixedC <-
     showJanusC
       "mixed_letm"
-      (withCSE (mixedExplicitLetM @(CSEM JanusCM JanusC) @(CSEExp JanusC)))
+      (mixedExplicitLetM @JanusCMCSE @JanusCCSE)
   countOccurrences "53LL" mixedC @?= 1
   assertBool "copy propagation should eliminate = x_0; alias" (not ("= x_0;" `isInfixOf` mixedC))
 
-  withJanusC cfg (withCSE (mixedExplicitLetM @(CSEM JanusCM JanusC) @(CSEExp JanusC))) $ \fn ->
+  withJanusC cfg (mixedExplicitLetM @JanusCMCSE @JanusCCSE) $ \fn ->
     withArray [0, 0, 0 :: Int64] $ \p -> do
       res <- fn 10 p
       let x = 10 * 53 + 61
@@ -352,7 +360,7 @@ unit_mutable_ref_and_pointer_ordering_soundness = do
 
   -- A. Mutable `Ref`: `y1 * 37 + 11` is shared across `writeRef` (since `y1` is immutable SSA),
   -- while `y2 * 37 + 11` uses the distinct post-write snapshot `y2`.
-  refC <- showJanusC "ref_snap" (withCSE (refSnapshotProg @(CSEM JanusCM JanusC) @(CSEExp JanusC)))
+  refC <- showJanusC "ref_snap" (refSnapshotProg @JanusCMCSE @JanusCCSE)
   countOccurrences "37LL" refC @?= 2
 
   let refExpected z = 2 * (z * 37 + 11) + ((z + 100) * 37 + 11)
@@ -360,12 +368,12 @@ unit_mutable_ref_and_pointer_ordering_soundness = do
     withCSE (refSnapshotProg @(CSEM IO Identity) @(CSEExp Identity)) (Identity 9)
   ioRefRes @?= refExpected 9
   cRefRes <-
-    withJanusC cfg (withCSE (refSnapshotProg @(CSEM JanusCM JanusC) @(CSEExp JanusC))) (\f -> f 9)
+    withJanusC cfg (refSnapshotProg @JanusCMCSE @JanusCCSE) (\f -> f 9)
   cRefRes @?= refExpected 9
 
   -- B. Pointer `peek`/`poke`: `peek p` is effectful (never CSE'd across `poke p`),
   -- while pure math on `v1` IS CSE'd.
-  ptrC <- showJanusC "ptr_alias" (withCSE (ptrAliasingProg @(CSEM JanusCM JanusC) @(CSEExp JanusC)))
+  ptrC <- showJanusC "ptr_alias" (ptrAliasingProg @JanusCMCSE @JanusCCSE)
   countOccurrences "41LL" ptrC @?= 2
 
   let ptrExpected v = 2 * (v * 41 + 7) + ((v + 50) * 41 + 7)
@@ -379,7 +387,7 @@ unit_mutable_ref_and_pointer_ordering_soundness = do
 
     poke p (15 :: Int64)
     cPtrRes <-
-      withJanusC cfg (withCSE (ptrAliasingProg @(CSEM JanusCM JanusC) @(CSEExp JanusC))) (\f -> f p)
+      withJanusC cfg (ptrAliasingProg @JanusCMCSE @JanusCCSE) (\f -> f p)
     cPtrRes @?= ptrExpected 15
     afterC <- peek p
     afterC @?= 65
@@ -457,42 +465,42 @@ unit_conditional_hoisting_and_trap_safety = do
   cfg <- getCSETestConfig
 
   -- 1. Non-trapping pure expression shared across sibling `whenM_` blocks IS hoisted
-  hoistC <- showJanusC "sib_hoist" (withCSE (siblingHoistProg @(CSEM JanusCM JanusC) @(CSEExp JanusC)))
+  hoistC <- showJanusC "sib_hoist" (siblingHoistProg @JanusCMCSE @JanusCCSE)
   countOccurrences "59LL" hoistC @?= 1
-  withJanusC cfg (withCSE (siblingHoistProg @(CSEM JanusCM JanusC) @(CSEExp JanusC))) $ \f -> do
+  withJanusC cfg (siblingHoistProg @JanusCMCSE @JanusCCSE) $ \f -> do
     f 10 0 0 >>= (@?= 0)
     f 10 1 1 >>= (@?= 3 * ((10 * 59 + 67) * 7))
 
   -- 2. Pure `ifThenElse` guarding `quotient`: shared INSIDE true branch, never speculated on y == 0
-  pureDivC <- showJanusC "pure_div" (withCSE (pureGuardedDiv @(CSEExp JanusC)))
+  pureDivC <- showJanusC "pure_div" (pureGuardedDiv @JanusCCSE)
   countOccurrences "/" pureDivC @?= 1
   runIdentity (withCSE (pureGuardedDiv @(CSEExp Identity)) 100 0) @?= 777
   runIdentity (withCSE (pureGuardedDiv @(CSEExp Identity)) 43 5) @?= 16
-  withJanusC cfg (withCSE (pureGuardedDiv @(CSEExp JanusC))) $ \f -> do
+  withJanusC cfg (pureGuardedDiv @JanusCCSE) $ \f -> do
     f 100 0 @?= 777
     f 43 5 @?= 16
 
   -- 3. Monadic `whenM_` guarding `quotient` & `remainder`: shared inside `whenM_`, safe on y == 0
-  monDivC <- showJanusC "mon_div" (withCSE (monadicGuardedDiv @(CSEM JanusCM JanusC) @(CSEExp JanusC)))
+  monDivC <- showJanusC "mon_div" (monadicGuardedDiv @JanusCMCSE @JanusCCSE)
   countOccurrences "/" monDivC @?= 1
   Identity ioMon0 <- withCSE (monadicGuardedDiv @(CSEM IO Identity) @(CSEExp Identity)) 100 0
   ioMon0 @?= 999
-  withJanusC cfg (withCSE (monadicGuardedDiv @(CSEM JanusCM JanusC) @(CSEExp JanusC))) $ \f -> do
+  withJanusC cfg (monadicGuardedDiv @JanusCMCSE @JanusCCSE) $ \f -> do
     f 100 0 >>= (@?= 999)
     f 50 7 >>= (@?= 15)
 
   -- 4. Short-circuit `land` guarding `quotient`: never lifted into `jcfBlock` before `&&`!
   runIdentity (withCSE (shortCircuitGuardedDiv @(CSEExp Identity)) 100 0) @?= False
   runIdentity (withCSE (shortCircuitGuardedDiv @(CSEExp Identity)) 21 3) @?= True
-  withJanusC cfg (withCSE (shortCircuitGuardedDiv @(CSEExp JanusC))) $ \f -> do
+  withJanusC cfg (shortCircuitGuardedDiv @JanusCCSE) $ \f -> do
     f 100 0 @?= False
     f 21 3 @?= True
     f 12 3 @?= False
 
   -- 5. Zero-trip `rangeM 0 n` guarding `x quotient n`: stays inside loop body, safe when n == 0!
-  loopDivC <- showJanusC "loop_div" (withCSE (zeroTripLoopDiv @(CSEM JanusCM JanusC) @(CSEExp JanusC)))
+  loopDivC <- showJanusC "loop_div" (zeroTripLoopDiv @JanusCMCSE @JanusCCSE)
   countOccurrences "/" loopDivC @?= 1
-  withJanusC cfg (withCSE (zeroTripLoopDiv @(CSEM JanusCM JanusC) @(CSEExp JanusC))) $ \f -> do
+  withJanusC cfg (zeroTripLoopDiv @JanusCMCSE @JanusCCSE) $ \f -> do
     f 100 0 >>= (@?= 0)
     f 20 4 >>= (@?= 40)
 
@@ -549,7 +557,7 @@ unit_scoped_withRefPtr_and_withString :: IO ()
 unit_scoped_withRefPtr_and_withString = do
   cfg <- getCSETestConfig
 
-  scopedC <- showJanusC "scoped_refptr" (withCSE (scopedRefPtrProg @(CSEM JanusCM JanusC) @(CSEExp JanusC)))
+  scopedC <- showJanusC "scoped_refptr" (scopedRefPtrProg @JanusCMCSE @JanusCCSE)
   countOccurrences "71LL" scopedC @?= 1
   countOccurrences "79LL" scopedC @?= 1
 
@@ -558,12 +566,12 @@ unit_scoped_withRefPtr_and_withString = do
          in (live + 5) + live + 2 * (x * 79 + 3)
   Identity ioRes <- withCSE (scopedRefPtrProg @(CSEM IO Identity) @(CSEExp Identity)) (Identity 6)
   ioRes @?= expected 6
-  cRes <- withJanusC cfg (withCSE (scopedRefPtrProg @(CSEM JanusCM JanusC) @(CSEExp JanusC))) (\f -> f 6)
+  cRes <- withJanusC cfg (scopedRefPtrProg @JanusCMCSE @JanusCCSE) (\f -> f 6)
   cRes @?= expected 6
 
   Identity ioStr <- withCSE (scopedStringProg @(CSEM IO Identity) @(CSEExp Identity)) (Identity 4)
   ioStr @?= fromIntegral (2 * ord 'C')
-  cStr <- withJanusC cfg (withCSE (scopedStringProg @(CSEM JanusCM JanusC) @(CSEExp JanusC))) (\f -> f 4)
+  cStr <- withJanusC cfg (scopedStringProg @JanusCMCSE @JanusCCSE) (\f -> f 4)
   cStr @?= fromIntegral (2 * ord 'C')
 
 --------------------------------------------------------------------------------
@@ -607,8 +615,8 @@ unit_recursive_expfix_pure_and_monadic :: IO ()
 unit_recursive_expfix_pure_and_monadic = do
   cfg <- getCSETestConfig
 
-  rawRecC <- showJanusC "dup_tree_raw" (dupTreeRec @JanusC)
-  recC <- showJanusC "dup_tree_main" (withCSE (dupTreeRec @(CSEExp JanusC)))
+  rawRecC <- showRawJanusC "dup_tree_raw" (dupTreeRec @JanusC)
+  recC <- showJanusC "dup_tree_main" (dupTreeRec @JanusCCSE)
   -- `jfix` mangles `"dup_tree"` as `"janus_local_dup_tree_<hash>"`; CSE eliminates
   -- one of the two recursive calls inside `dup_tree`, reducing total occurrences by 1!
   (countOccurrences "janus_local_dup_tree_" rawRecC - countOccurrences "janus_local_dup_tree_" recC) @?= 1
@@ -616,17 +624,17 @@ unit_recursive_expfix_pure_and_monadic = do
   runIdentity (withCSE (dupTreeRec @(CSEExp Identity)) 0) @?= 1
   runIdentity (withCSE (dupTreeRec @(CSEExp Identity)) 35) @?= (2 ^ (36 :: Int)) - 1
 
-  withJanusC cfg (withCSE (dupTreeRec @(CSEExp JanusC))) $ \f -> do
+  withJanusC cfg (dupTreeRec @JanusCCSE) $ \f -> do
     f 0 @?= 1
     f 35 @?= (2 ^ (36 :: Int)) - 1
 
-  monRecC <- showJanusC "mon_rec_main" (withCSE (monadicRecProg @(CSEM JanusCM JanusC) @(CSEExp JanusC)))
+  monRecC <- showJanusC "mon_rec_main" (monadicRecProg @JanusCMCSE @JanusCCSE)
   countOccurrences "73LL" monRecC @?= 1
 
   let monExpected k = sum [2 * (i * 73 + 19) | i <- [1 .. k]]
   Identity ioMon <- withCSE (monadicRecProg @(CSEM IO Identity) @(CSEExp Identity)) (Identity 10)
   ioMon @?= monExpected 10
-  cMon <- withJanusC cfg (withCSE (monadicRecProg @(CSEM JanusCM JanusC) @(CSEExp JanusC))) (\f -> f 10)
+  cMon <- withJanusC cfg (monadicRecProg @JanusCMCSE @JanusCCSE) (\f -> f 10)
   cMon @?= monExpected 10
 
 --------------------------------------------------------------------------------
@@ -670,8 +678,8 @@ unit_simd_spmd_and_reader_cse = do
   cfg <- getCSETestConfig
 
   -- A. SIMD (`LinuxX86_64C` & `Identity`): `vadd va vb` computed once instead of 4 times
-  simdRawC <- showJanusC "simd_raw" (simdDupKernel @LinuxX86_64C)
-  simdOptC <- showJanusC "simd_cse" (withCSE (simdDupKernel @(CSEExp LinuxX86_64C)))
+  simdRawC <- showRawJanusC "simd_raw" (simdDupKernel @LinuxX86_64C)
+  simdOptC <- showJanusC "simd_cse" (simdDupKernel @LinuxX86_64CCSE)
   countOccurrences "_mm_add_ps" simdRawC @?= 4
   countOccurrences "_mm_add_ps" simdOptC @?= 1
 
@@ -686,42 +694,40 @@ unit_simd_spmd_and_reader_cse = do
   simdToList idVec @?= expectedLanes
 
   cVec <-
-    withJanusC cfg (withCSE (simdDupKernel @(CSEExp LinuxX86_64C))) $ \f ->
+    withJanusC cfg (simdDupKernel @LinuxX86_64CCSE) $ \f ->
       pure (f (simdFromList aLanes) (simdFromList bLanes))
   simdToList cVec @?= expectedLanes
 
-  -- B. SPMD (`CmdOptimalGang`) wrapped in `withCSE` across `IO` and `LinuxX86_64C`
+  -- B. SPMD (`CmdOptimalGang`) with automatic CSE across `IO` and `LinuxX86_64C`
   let spmdSpec n = sum [(i * 3 + 1) * (i * 3 + 1) | i <- [0 .. n - 1]]
   Identity ioSpmd <-
     withCSE (spmdFoldCSE @(CSEM IO Identity) @(CSEExp Identity)) (Identity 37)
   ioSpmd @?= spmdSpec 37
   cSpmd <-
-    withJanusC cfg (withCSE (spmdFoldCSE @(CSEM LinuxX86_64CM LinuxX86_64C) @(CSEExp LinuxX86_64C))) $ \f ->
+    withJanusC cfg (spmdFoldCSE @LinuxX86_64CMCSE @LinuxX86_64CCSE) $ \f ->
       f 37
   cSpmd @?= spmdSpec 37
 
   -- C. `ReaderT` / `ReaderExp` both over `CSEM` AND as a target of `interpretCSE`
   let runReaderOverCSE ::
-        CSEExp JanusC Int64 ->
-        CSEExp JanusC Int64 ->
-        CSEM JanusCM JanusC (CSEExp JanusC Int64)
+        JanusCCSE Int64 ->
+        JanusCCSE Int64 ->
+        JanusCMCSE (JanusCCSE Int64)
       runReaderOverCSE scale arg =
         getReaderExp <$> runReaderT (readerCSEProg id (ReaderExp arg)) scale
-      runReaderC :: JanusC Int64 -> JanusC Int64 -> JanusCM (JanusC Int64)
-      runReaderC = withCSE runReaderOverCSE
-  readerC <- showJanusC "reader_cse" runReaderC
+  readerC <- showJanusC "reader_cse" runReaderOverCSE
   countOccurrences "83LL" readerC @?= 1
-  withJanusC cfg runReaderC $ \f ->
+  withJanusC cfg runReaderOverCSE $ \f ->
     f 4 10 >>= (@?= 2 * ((10 * 83 + 17) * 4))
 
-  let runTargetReaderC :: JanusC Int64 -> JanusCM (JanusC Int64)
+  let runTargetReaderC :: JanusCCSE Int64 -> JanusCMCSE (JanusCCSE Int64)
       runTargetReaderC arg =
         getReaderExp
           <$> runReaderT
             ( withCSE
                 ( refSnapshotProg
-                    @(CSEM (ReaderT () JanusCM) (ReaderExp () JanusC))
-                    @(CSEExp (ReaderExp () JanusC))
+                    @(CSEM (ReaderT () JanusCMCSE) (ReaderExp () JanusCCSE))
+                    @(CSEExp (ReaderExp () JanusCCSE))
                 )
                 (ReaderExp arg)
             )
@@ -730,13 +736,44 @@ unit_simd_spmd_and_reader_cse = do
     f 9 >>= (@?= 2 * (9 * 37 + 11) + (109 * 37 + 11))
 
   -- D. Zero-boilerplate `HKD` record parameter CSE
-  hkdC <- showJanusC "hkd_cse" (withCSE (hkdInputProg @(CSEExp JanusC)))
+  hkdC <- showJanusC "hkd_cse" (hkdInputProg @JanusCCSE)
   countOccurrences "89LL" hkdC @?= 1
   hkdVal <-
-    withJanusC cfg (withCSE (hkdInputProg @(CSEExp JanusC))) $ \f ->
+    withJanusC cfg (hkdInputProg @JanusCCSE) $ \f ->
       pure (f (Pair64 (Identity 3) (Identity 7)) 5)
   let hkdShared = 3 * 89 + 7 * 5
   hkdVal @?= hkdShared * hkdShared + hkdShared
+
+  -- E. Stacked `CSEExp (CSEExp JanusC)`, direct `SPMD` parameter/return CSE, & container handle CSE
+  let stackedChain :: JanusCCSE Int64 -> JanusCCSE Int64
+      stackedChain = withCSE (deepChain @(CSEExp JanusCCSE) 20)
+  stackedC <- showJanusC "stacked_chain20" stackedChain
+  countOccurrences "int64_t x_" stackedC @?= 19
+  withJanusC cfg stackedChain (\f -> f 3 @?= 3 * (2 ^ (20 :: Int)))
+
+  let spmdDirectDup :: SPMD 4 LinuxX86_64CCSE Float -> SPMD 4 LinuxX86_64CCSE Float -> SPMD 4 LinuxX86_64CCSE Float
+      spmdDirectDup xs ys =
+        let s = xs + ys
+         in s * s + s
+  spmdDirectC <- showJanusC "spmd_direct_cse" spmdDirectDup
+  countOccurrences "_mm_add_ps" spmdDirectC @?= 2
+  withJanusC cfg spmdDirectDup $ \f ->
+    f aLanes bLanes @?= [(a + b) * (a + b) + (a + b) | (a, b) <- zip aLanes bLanes]
+
+  let dynVecDup :: DV.DynVec JanusCCSE Int64 -> JanusCCSE Int64 -> JanusCMCSE (JanusCCSE Int64)
+      dynVecDup dv x = do
+        let shared = x * 97 + 13
+        DV.push dynamicAlloc dv shared
+        DV.push dynamicAlloc dv (shared + 1)
+        n <- DV.len dv
+        pure (n + shared)
+  dvC <- showJanusC "dynvec_cse" dynVecDup
+  countOccurrences "97LL" dvC @?= 1
+  dvHost <- DV.new @Int64 dynamicAlloc
+  withJanusC cfg dynVecDup $ \f -> do
+    r <- f dvHost 5
+    r @?= 2 + (5 * 97 + 13)
+  DV.free dynamicAlloc dvHost
 
 --------------------------------------------------------------------------------
 -- 9. CUDA Backend (`showJanusCUDA`, `CUDAIOM`, `CUDADejaFuM`)
@@ -788,13 +825,18 @@ unit_cuda_saxpy_cse_codegen_and_emulation :: IO ()
 unit_cuda_saxpy_cse_codegen_and_emulation = do
   -- 1. Inspect generated CUDA C source (works even on machines without a GPU!)
   let rawCuda =
-        showJanusCUDA
+        showRawJanusCUDA
           "saxpy_raw"
           (saxpyImplicit @JanusCUDAM @JanusCUDA @Float)
       optCuda =
         showJanusCUDA
           "saxpy_cse"
-          (withCSE (saxpyImplicit @(CSEM JanusCUDAM JanusCUDA) @(CSEExp JanusCUDA) @Float))
+          (saxpyImplicit @JanusCUDAMCSE @JanusCUDACSE @Float)
+      optCudaIdemp =
+        showJanusCUDA
+          "saxpy_cse"
+          (cse (saxpyImplicit @JanusCUDAMCSE @JanusCUDACSE @Float))
+  optCudaIdemp @?= optCuda
 
   -- Without CSE, `blockDim.x * blockIdx.x + threadIdx.x` is emitted 4 times
   -- and `(int64_t)` cast is emitted 3 times.

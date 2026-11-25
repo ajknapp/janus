@@ -8,7 +8,7 @@ import Control.Monad
 import Control.Monad.State
 import Data.Loc
 import Data.Monoid
-import Janus.Backend.C
+import Janus.Backend.C.Raw
 import Janus.Command.Ref
 import Janus.Expression.Bool
 import Language.C.Quote

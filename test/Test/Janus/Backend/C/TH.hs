@@ -17,7 +17,7 @@ import Foreign.Ptr (Ptr)
 import Hedgehog (Property, assert, forAll, property, (===))
 import qualified Hedgehog.Gen as Gen
 import qualified Hedgehog.Range as Range
-import Janus.Backend.C (JanusC, compileJanusCNamed, jcparam, renderJCProgram)
+import Janus.Backend.C (JanusCCSE, compileJanusCNamed, prepareJanusCUnit)
 import Janus.Backend.C.Build
   ( buildCachedJanusObject,
     cBuildConfigCFlags,
@@ -26,7 +26,7 @@ import Janus.Backend.C.Build
     defaultCBuildConfig,
     defaultTHBuildConfig,
   )
-import Janus.Backend.C.LinuxX86_64 (LinuxX86_64C, LinuxX86_64CM)
+import Janus.Backend.C.LinuxX86_64 (LinuxX86_64CCSE, LinuxX86_64CMCSE)
 import Janus.Backend.C.TH
 import Janus.Backend.C.Target
   ( admitsX86Features,
@@ -62,7 +62,7 @@ import Test.Tasty.Hedgehog (testProperty)
 --------------------------------------------------------------------------------
 
 -- Entry point explicitly named "fac", matching internal ExpFix helper name "fac"
-$(declareJanusC Unsafe "fac" (facPoly @JanusC @Int64))
+$(declareJanusC Unsafe "fac" (facPoly @JanusCCSE @Int64))
 
 -- Safe ccall with multiple specializations of polymorphic ExpFix helper in one TU
 $(declareJanusC Safe "th_double_fac_sum" doubleFacSum)
@@ -86,7 +86,7 @@ $( declareJanusCWithConfig
      (defaultTHBuildConfig & cBuildConfigCFlags %~ (<> ["-fno-math-errno"]))
      Unsafe
      "th_custom_cflags_sub"
-     (\(a :: JanusC Double) b -> a - b)
+     (\(a :: JanusCCSE Double) b -> a - b)
  )
 
 -- Explicit multi-ISA static compilation (SSE2 baseline + AVX2) in the same module
@@ -113,7 +113,7 @@ $(declareJanusC Safe "th_sleef_sin4" x86SleefSin4)
 -- Expression splices via addTopDecls
 splicedInlineMul :: Int64 -> Int64 -> Int64
 splicedInlineMul =
-  $(spliceJanusC Unsafe "th_spliced_mul" (\(x :: JanusC Int64) y -> x * y))
+  $(spliceJanusC Unsafe "th_spliced_mul" (\(x :: JanusCCSE Int64) y -> x * y))
 
 splicedX86Saxpy :: Int64 -> Float -> Ptr Float -> Ptr Float -> IO ()
 splicedX86Saxpy =
@@ -140,7 +140,7 @@ unit_th_ast_safety_and_fastpath = do
         Unsafe
         "fast_affine"
         (mkName "fast_affine")
-        (janusCTHSpec (Proxy @(JanusC Int64 -> JanusC Int64 -> JanusC Int64 -> JanusC Int64)))
+        (janusCTHSpec (Proxy @(JanusCCSE Int64 -> JanusCCSE Int64 -> JanusCCSE Int64 -> JanusCCSE Int64)))
   case unsafeDecs of
     [ForeignD (ImportF CCall Unsafe "fast_affine" _ _)] -> pure ()
     other -> assertFailure ("Expected single Unsafe ForeignD, got: " <> show other)
@@ -151,7 +151,7 @@ unit_th_ast_safety_and_fastpath = do
         Safe
         "safe_saxpy"
         (mkName "safe_saxpy")
-        (janusCTHSpec (Proxy @(LinuxX86_64C Int64 -> LinuxX86_64C Float -> LinuxX86_64C (Ptr Float) -> LinuxX86_64C (Ptr Float) -> LinuxX86_64CM ())))
+        (janusCTHSpec (Proxy @(LinuxX86_64CCSE Int64 -> LinuxX86_64CCSE Float -> LinuxX86_64CCSE (Ptr Float) -> LinuxX86_64CCSE (Ptr Float) -> LinuxX86_64CMCSE ())))
   case safeDecs of
     [ForeignD (ImportF CCall Safe "safe_saxpy" _ _)] -> pure ()
     other -> assertFailure ("Expected single Safe ForeignD for x86 scalar/ptr kernel, got: " <> show other)
@@ -163,7 +163,7 @@ unit_th_ast_safety_and_fastpath = do
         Unsafe
         "bool_fn"
         (mkName "bool_fn")
-        (janusCTHSpec (Proxy @(JanusC Int64 -> JanusC Bool -> JanusC Bool)))
+        (janusCTHSpec (Proxy @(JanusCCSE Int64 -> JanusCCSE Bool -> JanusCCSE Bool)))
   case boolDecs of
     [ForeignD (ImportF CCall Unsafe "bool_fn" _ _), SigD {}, FunD {}, PragmaD (InlineP {})] -> pure ()
     other -> assertFailure ("Expected wrapped Bool declarations, got: " <> show other)
@@ -190,10 +190,10 @@ unit_th_ast_safety_and_fastpath = do
   assertBool "Haskell keyword rejected" (isLeft (checkHsVarName "foreign"))
 
 type Sx86Vec8F =
-  LinuxX86_64C (SIMDVector LinuxX86_64C 8 Float) ->
-  LinuxX86_64C (SIMDVector LinuxX86_64C 8 Float) ->
-  LinuxX86_64C (SIMDVector LinuxX86_64C 8 Float) ->
-  LinuxX86_64C (SIMDVector LinuxX86_64C 8 Float)
+  LinuxX86_64CCSE (SIMDVector LinuxX86_64CCSE 8 Float) ->
+  LinuxX86_64CCSE (SIMDVector LinuxX86_64CCSE 8 Float) ->
+  LinuxX86_64CCSE (SIMDVector LinuxX86_64CCSE 8 Float) ->
+  LinuxX86_64CCSE (SIMDVector LinuxX86_64CCSE 8 Float)
 
 unit_th_janus_c_execution :: IO ()
 unit_th_janus_c_execution = do
@@ -278,7 +278,7 @@ unit_th_cached_object_and_named_dynamic_build = do
       cacheDir = baseDir </> "janus_th_cache_test"
       cfg1 = defaultCBuildConfig & cBuildConfigCacheDir .~ cacheDir
       cfg2 = cfg1 & cBuildConfigCFlags %~ (<> ["-fno-math-errno"])
-      cSrc = renderJCProgram "cached_fn" (jcparam "cached_fn" 0 (pure []) affineI64)
+  (cSrc, _, _) <- prepareJanusCUnit () "cached_fn" affineI64
 
   obj1 <- buildCachedJanusObject cfg1 [] cSrc
   obj1Again <- buildCachedJanusObject cfg1 [] cSrc

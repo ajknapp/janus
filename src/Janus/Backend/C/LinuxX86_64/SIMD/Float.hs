@@ -14,7 +14,7 @@ import Control.Monad (forM_)
 import Data.Loc
 import Data.Proxy
 import GHC.Float (expm1, log1p)
-import Janus.Backend.C
+import Janus.Backend.C.Raw
 import Janus.Backend.C.LinuxX86_64.SIMD.Arith ()
 import Janus.Backend.C.LinuxX86_64.SIMD.Base
 import Janus.Backend.C.LinuxX86_64.Types

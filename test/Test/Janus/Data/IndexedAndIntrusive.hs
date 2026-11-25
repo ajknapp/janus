@@ -32,7 +32,7 @@ import qualified Hedgehog.Range as Range
 import Janus.Alloc
 import Janus.Backend.C (acquireJanusC, releaseJanusC)
 import Janus.Backend.C.Build (CBuildConfig, cBuildConfigCacheDir, defaultCBuildConfig)
-import Janus.Backend.C.LinuxX86_64 (LinuxX86_64C, LinuxX86_64CM)
+import Janus.Backend.C.LinuxX86_64 (LinuxX86_64CCSE, LinuxX86_64CMCSE)
 import Janus.Command.Memory (CmdStorable (peek))
 import Janus.Command.Range (rangeM)
 import Janus.Control.Drain (drainForEach, drainSum, runDrain)
@@ -400,12 +400,12 @@ check_intrusive_list_multihook_splice_and_unlink = property $ do
 --------------------------------------------------------------------------------
 
 cMutateIndexedAndIntrusive ::
-  SlotMap LinuxX86_64C Int64 ->
-  SparseSet LinuxX86_64C ->
-  Pool LinuxX86_64C Int64 ->
-  IntrusiveList DualNode LinuxX86_64C ->
-  LinuxX86_64C Int64 ->
-  LinuxX86_64CM (LinuxX86_64C Int64)
+  SlotMap LinuxX86_64CCSE Int64 ->
+  SparseSet LinuxX86_64CCSE ->
+  Pool LinuxX86_64CCSE Int64 ->
+  IntrusiveList DualNode LinuxX86_64CCSE ->
+  LinuxX86_64CCSE Int64 ->
+  LinuxX86_64CMCSE (LinuxX86_64CCSE Int64)
 cMutateIndexedAndIntrusive sm sps pool ilst n = do
   rangeM 0 n $ \i -> do
     _ <- SM.insert dynamicAlloc sm (i * 5)

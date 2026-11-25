@@ -41,9 +41,9 @@ import Janus.Alloc.Stats
     newAllocTracker,
     readAllocSnapshot,
   )
-import Janus.Backend.C (JanusC, JanusCM, PortableC, showJanusC, withJanusC)
+import Janus.Backend.C (JanusCCSE, JanusCMCSE, PortableC, showJanusC, withJanusC)
 import Janus.Backend.C.Build (CBuildConfig, cBuildConfigCacheDir, defaultCBuildConfig)
-import Janus.Backend.C.LinuxX86_64 (LinuxX86_64, LinuxX86_64C, LinuxX86_64CM)
+import Janus.Backend.C.LinuxX86_64 (LinuxX86_64, LinuxX86_64CCSE, LinuxX86_64CMCSE)
 import Janus.Bench
 import Janus.Command.Cond (whenM_)
 import Janus.Command.Format (CmdFormat, CmdPutString, CmdString (..))
@@ -214,7 +214,7 @@ unit_csv_drain_io_and_compiled_c =
         cDyn = dir </> "c_dyn.csv"
 
     emitTestCSV @IO @Identity ioTuple ioDyn
-    withJanusC @PortableC buildCfg (emitTestCSV @JanusCM @JanusC cTuple cDyn) id
+    withJanusC @PortableC buildCfg (emitTestCSV @JanusCMCSE @JanusCCSE cTuple cDyn) id
 
     ioTupleText <- readFile ioTuple
     cTupleText <- readFile cTuple
@@ -275,7 +275,7 @@ unit_bayesian_bootstrap_outlier_immunity = do
     withJanusC @LinuxX86_64
       buildCfg
       ( do
-          (mVal, _loVal, _hiVal) <- syntheticPosteriorKernel @LinuxX86_64CM @LinuxX86_64C
+          (mVal, _loVal, _hiVal) <- syntheticPosteriorKernel @LinuxX86_64CMCSE @LinuxX86_64CCSE
           pure mVal
       )
       id
@@ -464,7 +464,7 @@ unit_multi_choice_benchmark_c_io_and_library_promotion =
           freeBuf @Int64 dynamicAlloc buf arrLen
           freeBuf @Int64 dynamicAlloc sink 1
 
-        benchKernelC :: LinuxX86_64CM (LinuxX86_64C Int64)
+        benchKernelC :: LinuxX86_64CMCSE (LinuxX86_64CCSE Int64)
         benchKernelC =
           benchmarkChoicesJanusWithSetup
             fastCfg
@@ -534,7 +534,7 @@ unit_multi_choice_benchmark_c_io_and_library_promotion =
     extractSelectionSpec reloadedWinner @?= cSpec
 
     let thWinner = resolveSelectionOrFail kernelChoiceSpace fixtureCompiledSpec
-        prodKernelC :: LinuxX86_64CM (LinuxX86_64C Int64)
+        prodKernelC :: LinuxX86_64CMCSE (LinuxX86_64CCSE Int64)
         prodKernelC =
           runProduction thWinner $ do
             buf <- setupArr
@@ -565,7 +565,7 @@ unit_multi_choice_benchmark_c_io_and_library_promotion =
       (fastCfg {benchWarmupIters = 2, benchSamples = 10, benchBootstrapDraws = 80, benchFixedBatchSize = Just 4})
       simpleDir
       $ do
-        acc <- newRef (0 :: Bench NoChoice LinuxX86_64C Int64)
+        acc <- newRef (0 :: Bench NoChoice LinuxX86_64CCSE Int64)
         withNamedTimer "loop" $
           rangeM 0 64 $ \i -> do
             cur <- readRef acc
@@ -657,12 +657,12 @@ unit_reader_t_direct_and_choose_via_ask = do
   cFast <-
     withJanusC @LinuxX86_64
       buildCfg
-      (runReaderT (getReaderExp <$> rawReaderKernel @(KernelChoice Identity) @LinuxX86_64CM @LinuxX86_64C) (selChoices fastSel))
+      (runReaderT (getReaderExp <$> rawReaderKernel @(KernelChoice Identity) @LinuxX86_64CMCSE @LinuxX86_64CCSE) (selChoices fastSel))
       id
   cSlow <-
     withJanusC @LinuxX86_64
       buildCfg
-      (runReaderT (getReaderExp <$> rawReaderKernel @(KernelChoice Identity, KernelChoice (Const String)) @LinuxX86_64CM @LinuxX86_64C) slowPair)
+      (runReaderT (getReaderExp <$> rawReaderKernel @(KernelChoice Identity, KernelChoice (Const String)) @LinuxX86_64CMCSE @LinuxX86_64CCSE) slowPair)
       id
 
   -- sum(1..64) = 2080; slow branch starts at 1000 -> 3080
@@ -761,7 +761,7 @@ unit_with_buf_realloc_across_policies_io_and_c :: Assertion
 unit_with_buf_realloc_across_policies_io_and_c = do
   buildCfg <- getBenchTestBuildConfig
   Identity ioRes <- withBufReallocKernel @IO @Identity
-  cRes <- withJanusC @LinuxX86_64 buildCfg (withBufReallocKernel @LinuxX86_64CM @LinuxX86_64C) id
+  cRes <- withJanusC @LinuxX86_64 buildCfg (withBufReallocKernel @LinuxX86_64CMCSE @LinuxX86_64CCSE) id
   -- sum(1..256) = 32896, oomCheckVal = 777, all liveBlocks == 0 and liveBytes == 0 -> 33673
   ioRes @?= 33673
   cRes @?= 33673

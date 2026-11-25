@@ -46,9 +46,9 @@ import Janus.Alloc
     withAllocTracker,
     withFixedBuf,
   )
-import Janus.Backend.C (JanusC, JanusCM, acquireJanusC, releaseJanusC, withJanusC)
+import Janus.Backend.C (JanusCCSE, JanusCMCSE, acquireJanusC, releaseJanusC, withJanusC)
 import Janus.Backend.C.Build (CBuildConfig, cBuildConfigCacheDir, defaultCBuildConfig)
-import Janus.Backend.C.LinuxX86_64 (LinuxX86_64, LinuxX86_64C, LinuxX86_64CM)
+import Janus.Backend.C.LinuxX86_64 (LinuxX86_64, LinuxX86_64CCSE, LinuxX86_64CMCSE)
 import Janus.Command.Memory (ExpSized (..))
 import Janus.Command.Cond (whenM_)
 import Janus.Command.Range (rangeM)
@@ -152,13 +152,13 @@ instance JanusStruct ParticleSys
 -- 1. C-ABI Struct Size, Alignment, & Field Offset Verification vs Compiled C
 --------------------------------------------------------------------------------
 
-cMixedStructSizeKernel :: JanusC Int64 -> JanusCM (JanusC Int64)
+cMixedStructSizeKernel :: JanusCCSE Int64 -> JanusCMCSE (JanusCCSE Int64)
 cMixedStructSizeKernel dummy = do
   let sz = sizeOf (Proxy @(CStruct MixedRecord))
       al = alignOf (Proxy @(CStruct MixedRecord))
   pure (dummy + sz * 1000 + al)
 
-cParticleHKDKernel :: HKD Particle LinuxX86_64C -> LinuxX86_64CM (LinuxX86_64C Float)
+cParticleHKDKernel :: HKD Particle LinuxX86_64CCSE -> LinuxX86_64CMCSE (LinuxX86_64CCSE Float)
 cParticleHKDKernel (HKD p) =
   pure (pX p * pVx p + pY p * pVy p)
 
@@ -279,11 +279,11 @@ check_all_five_layouts_equivalent = property $ do
 --------------------------------------------------------------------------------
 
 cIntegrateSoAKernel ::
-  DynVec LinuxX86_64C (SoA Particle) ->
-  LinuxX86_64CM (LinuxX86_64C Float)
+  DynVec LinuxX86_64CCSE (SoA Particle) ->
+  LinuxX86_64CMCSE (LinuxX86_64CCSE Float)
 cIntegrateSoAKernel v = do
   DV.foreachSoAVecSPMD (Proxy @8) v $ \idx p -> do
-    let scale = toFloating idx * (0.0 :: SPMD 8 LinuxX86_64C Float) + 2.0
+    let scale = toFloating idx * (0.0 :: SPMD 8 LinuxX86_64CCSE Float) + 2.0
     pure
       p
         { pX = pX p + scale * pVx p,
@@ -292,8 +292,8 @@ cIntegrateSoAKernel v = do
   runDrain drainSum (pX <$> DV.stream v)
 
 cIntegrateAoSoAKernel ::
-  DynVec LinuxX86_64C (AoSoA 8 Particle) ->
-  LinuxX86_64CM (LinuxX86_64C Float)
+  DynVec LinuxX86_64CCSE (AoSoA 8 Particle) ->
+  LinuxX86_64CMCSE (LinuxX86_64CCSE Float)
 cIntegrateAoSoAKernel v = do
   DV.foreachAoSoAVecSPMD (Proxy @8) v $ \_ p ->
     pure
@@ -637,7 +637,7 @@ unit_normal_and_scoped_buf_new_realloc_free_all_layouts = do
     colsList oomReCols @?= colsList nullCols
 
   Identity ioScore <- lifecycleAllLayoutsKernel @IO @Identity
-  cScore <- withJanusC @LinuxX86_64 cfg (lifecycleAllLayoutsKernel @LinuxX86_64CM @LinuxX86_64C) id
+  cScore <- withJanusC @LinuxX86_64 cfg (lifecycleAllLayoutsKernel @LinuxX86_64CMCSE @LinuxX86_64CCSE) id
   -- Each of the 5 layouts scores 257 (normal) + 416 (scoped) = 673 -> 5 * 673 = 3365
   ioScore @?= 3365.0
   cScore @?= 3365.0

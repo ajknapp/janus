@@ -28,7 +28,7 @@ import qualified Hedgehog.Range as Range
 import Janus.Alloc
 import Janus.Backend.C (acquireJanusC, releaseJanusC)
 import Janus.Backend.C.Build (CBuildConfig, cBuildConfigCacheDir, defaultCBuildConfig)
-import Janus.Backend.C.LinuxX86_64 (LinuxX86_64C, LinuxX86_64CM)
+import Janus.Backend.C.LinuxX86_64 (LinuxX86_64CCSE, LinuxX86_64CMCSE)
 import Janus.Command.Range (rangeM)
 import Janus.Control.Drain (drainForEach, drainSum, runDrain)
 import Janus.Control.Stream (Stream)
@@ -208,10 +208,10 @@ check_hashset_algebra_and_trace = property $ do
 --------------------------------------------------------------------------------
 
 cMutateHashMapAndSet ::
-  HashMap LinuxX86_64C Int64 Int64 ->
-  HashSet LinuxX86_64C Int64 ->
-  LinuxX86_64C Int64 ->
-  LinuxX86_64CM (LinuxX86_64C Int64)
+  HashMap LinuxX86_64CCSE Int64 Int64 ->
+  HashSet LinuxX86_64CCSE Int64 ->
+  LinuxX86_64CCSE Int64 ->
+  LinuxX86_64CMCSE (LinuxX86_64CCSE Int64)
 cMutateHashMapAndSet hm hs n = do
   rangeM 0 n $ \i -> do
     HM.insertWith dynamicAlloc hm (+) i (i * 3 + 1)

@@ -17,7 +17,7 @@ import Data.Int (Int32)
 import Data.Loc
 import Data.Proxy
 import Data.Word (Word32, Word8)
-import Janus.Backend.C
+import Janus.Backend.C.Raw
 import Janus.Backend.C.CUDA.SIMD.Base
 import Janus.Backend.C.CUDA.Types
 import Janus.Expression.SIMD

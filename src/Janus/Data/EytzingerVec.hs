@@ -55,7 +55,7 @@ import Data.Word (Word64)
 import Foreign.Ptr (Ptr)
 import GHC.Generics (Generic)
 import Janus.Alloc.Policy (Alloc, CmdAlloc, allocStruct, freeStruct)
-import Janus.Backend.C
+import Janus.Backend.C.Raw
 import Janus.Command.Cond (ifThenElseM_, whenM_)
 import Janus.Command.Memory (CmdStorable (..))
 import Janus.Command.Ref (newRef, readRef, writeRef)

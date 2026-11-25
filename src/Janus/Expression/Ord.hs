@@ -6,7 +6,7 @@ module Janus.Expression.Ord where
 
 import Data.Functor.Identity
 import qualified Data.Set as Set
-import Janus.Backend.C
+import Janus.Backend.C.Raw
 import Janus.Expression.Cond (ExpCond (ifThenElse))
 import Janus.Expression.Eq
 import Janus.Typed

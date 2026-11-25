@@ -25,7 +25,7 @@ import qualified Hedgehog.Range as Range
 import Janus.Alloc.Policy (dynamicAlloc)
 import Janus.Backend.C
 import Janus.Backend.C.Build
-import Janus.Backend.C.LinuxX86_64 (LinuxX86_64C)
+import Janus.Backend.C.LinuxX86_64 (LinuxX86_64CCSE)
 import Janus.Backend.C.Target (TargetFeatureKey, TargetFeatureOf, targetFeatureKey, x86AVX2, x86FeatureKey)
 import qualified Janus.Data.DynVec as DV
 import Janus.Data.HKD (HKD (..), JanusHKD)
@@ -71,9 +71,9 @@ unit_withJanusC_lazy_dl_lifetime :: IO ()
 unit_withJanusC_lazy_dl_lifetime = do
   tmpdir <- getEnv "TMPDIR"
   let cfg = defaultCBuildConfig & cBuildConfigCacheDir .~ tmpdir
-  lazyConst <- withJanusC cfg (fac @JanusC @Int64 10) pure
-  lazyApp <- withJanusC cfg (fac @JanusC @Int64) (\f -> pure (f 10))
-  escapedFn <- withJanusC cfg (fac @JanusC @Int64) pure
+  lazyConst <- withJanusC cfg (fac @JanusCCSE @Int64 10) pure
+  lazyApp <- withJanusC cfg (fac @JanusCCSE @Int64) (\f -> pure (f 10))
+  escapedFn <- withJanusC cfg (fac @JanusCCSE @Int64) pure
   performGC
   threadDelay 10000
   lazyConst @?= 3628800
@@ -107,8 +107,8 @@ type CustomFreeBSDTarget = CustomArch CustomFreeBSDOS
 sharedCustomFeatureProg ::
   forall os.
   (JanusCTarget (CustomArch os), CTargetFeatures (CustomArch os) ~ CustomFeatures) =>
-  JanusCT (CustomArch os) Int64 ->
-  JanusCMT (CustomArch os) (JanusCT (CustomArch os) Int64)
+  JanusCTCSE (CustomArch os) Int64 ->
+  JanusCMTCSE (CustomArch os) (JanusCTCSE (CustomArch os) Int64)
 sharedCustomFeatureProg x = do
   CustomFeatures mult <- askCTargetFeatures @(CustomArch os)
   pure (x * fromIntegral mult)
@@ -144,13 +144,13 @@ unit_expfix_on_linux_x86_64_and_custom_target = do
   tmpdir <- getEnv "TMPDIR"
   let cfg = defaultCBuildConfig & cBuildConfigCacheDir .~ tmpdir
 
-  -- 1. ExpFix works directly on LinuxX86_64C via target-polymorphic JanusCT
-  x86Res <- withJanusC cfg (fac @LinuxX86_64C @Int64) (\f -> pure (f 10))
+  -- 1. ExpFix works directly on LinuxX86_64CCSE via target-polymorphic JanusCT
+  x86Res <- withJanusC cfg (fac @LinuxX86_64CCSE @Int64) (\f -> pure (f 10))
   x86Res @?= 3628800
 
   -- 2. Open-world TargetFeatureKey: two OS targets sharing CustomFeatures + x86FeatureKey
   --    coexist in CBuildConfig without colliding and share codegen via askCTargetFeatures
-  let customFac = fac @(JanusCT CustomTestTarget) @Int64
+  let customFac = fac @(JanusCTCSE CustomTestTarget) @Int64
       cBannerSrc = showJanusCWith (CustomFeatures 4) "custom_fac" customFac
   assertBool
     "custom target banner emitted"
@@ -173,19 +173,19 @@ unit_expfix_on_linux_x86_64_and_custom_target = do
   linuxRes @?= 70
   freebsdRes @?= 210
 
-  let hkdProg :: HKD CustomPair (JanusCT CustomTestTarget) -> JanusCT CustomTestTarget Int64 -> JanusCT CustomTestTarget Int64
+  let hkdProg :: HKD CustomPair (JanusCTCSE CustomTestTarget) -> JanusCTCSE CustomTestTarget Int64 -> JanusCTCSE CustomTestTarget Int64
       hkdProg (HKD p) x = cpScale p * x + cpBias p
   hkdRes <- withJanusC cfg hkdProg (\f -> pure (f (CustomPair (Identity 7) (Identity 11)) 5))
   hkdRes @?= 46
 
-  let buildAndSumVec :: JanusCT CustomTestTarget Int64 -> JanusCMT CustomTestTarget (DV.DynVec (JanusCT CustomTestTarget) Int64)
+  let buildAndSumVec :: JanusCTCSE CustomTestTarget Int64 -> JanusCMTCSE CustomTestTarget (DV.DynVec (JanusCTCSE CustomTestTarget) Int64)
       buildAndSumVec x = do
         v <- DV.new @Int64 dynamicAlloc
         DV.push dynamicAlloc v x
         DV.push dynamicAlloc v (x * 2)
         DV.push dynamicAlloc v (x * 3)
         pure v
-      readVecLen :: DV.DynVec (JanusCT CustomTestTarget) Int64 -> JanusCMT CustomTestTarget (JanusCT CustomTestTarget Int64)
+      readVecLen :: DV.DynVec (JanusCTCSE CustomTestTarget) Int64 -> JanusCMTCSE CustomTestTarget (JanusCTCSE CustomTestTarget Int64)
       readVecLen v = do
         n <- DV.len v
         a0 <- DV.readVec v 0
@@ -201,7 +201,7 @@ test_fix = do
   let acquire f = do
         tmpdir <- getEnv "TMPDIR"
         acquireJanusC (defaultCBuildConfig & cBuildConfigCacheDir .~ tmpdir) f
-  withResource (acquire (fac @JanusC @Int64)) releaseJanusC $ \k ->
+  withResource (acquire (fac @JanusCCSE @Int64)) releaseJanusC $ \k ->
     let k' = fst <$> k
      in testGroup
         "fix"

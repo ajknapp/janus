@@ -16,7 +16,7 @@ import Data.Bits (Bits (..))
 import Data.Int (Int64)
 import Data.Loc
 import Data.Proxy
-import Janus.Backend.C
+import Janus.Backend.C.Raw
 import Janus.Backend.C.CUDA.SIMD.Base
 import Janus.Backend.C.CUDA.Types
 import Janus.Expression.SIMD

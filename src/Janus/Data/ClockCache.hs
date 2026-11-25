@@ -71,7 +71,7 @@ import Janus.Alloc.Policy
     freeStruct,
     freeTypedArray,
   )
-import Janus.Backend.C
+import Janus.Backend.C.Raw
 import Janus.Command.Cond (ifThenElseM_, whenM_)
 import Janus.Command.Memory
   ( CmdMemCopy (..),

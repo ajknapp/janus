@@ -30,7 +30,7 @@ import Data.Word (Word64, Word8)
 import Foreign.Ptr (Ptr)
 import GHC.Generics (Generic)
 import Janus.Alloc.Dynamic (CmdAllocBase, alignUpWord64, isNullVoidPtr, sameVoidPtr)
-import Janus.Backend.C
+import Janus.Backend.C.Raw
 import Janus.Command.Memory (CmdMemCopy (..), CmdStorable (..), ExpPtr (..), allocaAligned, janusSIMDAlignment)
 import Janus.Command.Cond (ifThenElseM_, whenM_)
 import Janus.Command.Ref (letM, newRef, readRef, writeRef)

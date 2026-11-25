@@ -21,7 +21,7 @@ import Data.Loc
 import Data.Proxy
 import Foreign.Storable (Storable)
 import GHC.TypeLits (natVal)
-import Janus.Backend.C
+import Janus.Backend.C.Raw
 import Janus.Backend.C.CUDA.Types
 import Janus.Expression.SIMD
 import Janus.Expression.SIMD.Types (rawMaskFromBools, rawMaskToBools, rawSIMDFromList, rawSIMDToList)

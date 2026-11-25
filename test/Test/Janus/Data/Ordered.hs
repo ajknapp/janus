@@ -20,7 +20,7 @@ import qualified Hedgehog.Range as Range
 import Janus.Alloc
 import Janus.Backend.C (acquireJanusC, releaseJanusC)
 import Janus.Backend.C.Build (CBuildConfig, cBuildConfigCacheDir, defaultCBuildConfig)
-import Janus.Backend.C.LinuxX86_64 (LinuxX86_64C, LinuxX86_64CM)
+import Janus.Backend.C.LinuxX86_64 (LinuxX86_64CCSE, LinuxX86_64CMCSE)
 import Janus.Command.Range (rangeM)
 import Janus.Control.Drain (drainForEach, drainSum, runDrain)
 import Janus.Control.Stream (Stream)
@@ -306,10 +306,10 @@ check_btreeset_invariants_and_set_algebra = property $ do
 --------------------------------------------------------------------------------
 
 cMutateOrderedContainers ::
-  BTreeMap LinuxX86_64C Int64 Int64 ->
-  FlatMap LinuxX86_64C Int64 Int64 ->
-  LinuxX86_64C Int64 ->
-  LinuxX86_64CM (LinuxX86_64C Int64)
+  BTreeMap LinuxX86_64CCSE Int64 Int64 ->
+  FlatMap LinuxX86_64CCSE Int64 Int64 ->
+  LinuxX86_64CCSE Int64 ->
+  LinuxX86_64CMCSE (LinuxX86_64CCSE Int64)
 cMutateOrderedContainers btm fm n = do
   -- Insert `n` entries in C (forcing B+Tree leaf & internal splits inside compiled C!)
   rangeM 0 n $ \i -> do

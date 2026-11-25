@@ -30,7 +30,7 @@ import Data.Proxy (Proxy (..))
 import Foreign.Ptr (Ptr)
 import GHC.Generics (Generic)
 import Janus.Alloc.Dynamic (CmdAllocBase, isNullVoidPtr)
-import Janus.Backend.C
+import Janus.Backend.C.Raw
 import Janus.Command.Memory (CmdMem (..), CmdStorable (..), ExpSized (..), allocaAligned)
 import Janus.Command.Cond (whenM_)
 import Janus.Expression.Bool (ExpBool (..))

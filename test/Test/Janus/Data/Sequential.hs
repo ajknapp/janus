@@ -23,7 +23,7 @@ import qualified Hedgehog.Range as Range
 import Janus.Alloc
 import Janus.Backend.C (acquireJanusC, releaseJanusC)
 import Janus.Backend.C.Build (CBuildConfig, cBuildConfigCacheDir, defaultCBuildConfig)
-import Janus.Backend.C.LinuxX86_64 (LinuxX86_64C, LinuxX86_64CM)
+import Janus.Backend.C.LinuxX86_64 (LinuxX86_64CCSE, LinuxX86_64CMCSE)
 import Janus.Command.Range (rangeM)
 import Janus.Control.Drain
   ( drainAll,
@@ -454,10 +454,10 @@ check_deque_stateful = property $ do
 --------------------------------------------------------------------------------
 
 cMutateHostDynVecAndDeque ::
-  DynVec LinuxX86_64C Int64 ->
-  Deque LinuxX86_64C Int64 ->
-  LinuxX86_64C Int64 ->
-  LinuxX86_64CM (LinuxX86_64C Int64)
+  DynVec LinuxX86_64CCSE Int64 ->
+  Deque LinuxX86_64CCSE Int64 ->
+  LinuxX86_64CCSE Int64 ->
+  LinuxX86_64CMCSE (LinuxX86_64CCSE Int64)
 cMutateHostDynVecAndDeque vec dq count = do
   -- Push `count` items into BOTH containers in C (triggering C-side reallocations visible to Haskell!)
   rangeM 0 count $ \i -> do
@@ -470,8 +470,8 @@ cMutateHostDynVecAndDeque vec dq count = do
   pure (s1 + s2)
 
 cBuildVecViaDrainInC ::
-  LinuxX86_64C Int64 ->
-  LinuxX86_64CM (DynVec LinuxX86_64C Int64)
+  LinuxX86_64CCSE Int64 ->
+  LinuxX86_64CMCSE (DynVec LinuxX86_64CCSE Int64)
 cBuildVecViaDrainInC n =
   runDrain (DV.drainToVect @Int64 dynamicAlloc) ((+ 5) <$> rangeS 0 n)
 

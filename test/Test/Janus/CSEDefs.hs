@@ -9,8 +9,7 @@ module Test.Janus.CSEDefs where
 import Data.Int (Int64)
 import Foreign.Ptr (Ptr)
 import GHC.Generics (Generic)
-import Janus.Backend.C (JanusC, JanusCM)
-import Janus.CSE (CSEExp, CSEM, withCSE)
+import Janus.Backend.C (JanusCCSE, JanusCMCSE)
 import qualified Janus.Command.Memory as M
 import Janus.Data.HKD (HKD (..), JanusHKD)
 
@@ -86,10 +85,10 @@ hkdInputProg (HKD p) x =
 deepChain :: (Num (e Int64)) => Int -> e Int64 -> e Int64
 deepChain n x0 = iterate (\x -> x + x) x0 !! n
 
-thCanonicalCSE :: JanusC Int64 -> JanusC (Ptr Int64) -> JanusC (Ptr Int64) -> JanusCM (JanusC Int64)
+thCanonicalCSE :: JanusCCSE Int64 -> JanusCCSE (Ptr Int64) -> JanusCCSE (Ptr Int64) -> JanusCMCSE (JanusCCSE Int64)
 thCanonicalCSE =
-  withCSE (canonicalOutProg @(CSEM JanusCM JanusC) @(CSEExp JanusC))
+  canonicalOutProg @JanusCMCSE @JanusCCSE
 
-thDeepChain40CSE :: JanusC Int64 -> JanusC Int64
+thDeepChain40CSE :: JanusCCSE Int64 -> JanusCCSE Int64
 thDeepChain40CSE =
-  withCSE (deepChain @(CSEExp JanusC) 40)
+  deepChain @JanusCCSE 40

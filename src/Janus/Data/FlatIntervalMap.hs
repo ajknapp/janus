@@ -63,7 +63,7 @@ import Janus.Alloc.Policy
     freeStruct,
     freeTypedArray,
   )
-import Janus.Backend.C
+import Janus.Backend.C.Raw
 import Janus.Command.Cond (ifThenElseM_, whenM_)
 import Janus.Command.Memory (CmdStorable (..))
 import Janus.Command.Ref (letM, newRef, readRef, writeRef)

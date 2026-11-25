@@ -34,16 +34,20 @@ module Janus.CSE
     CSEOptimize (..),
     cseExp,
     cseM,
+    cseMWithFeatures,
 
     -- * Polymorphic Interpreter into Janus Typeclasses
     CSEInterpret (..),
     CSETarget,
     interpretCSEExp,
     interpretCSEM,
+    interpretCSEMWithFeatures,
     withCSE,
+    withCSEWithFeatures,
   )
 where
 
+import Janus.CSE.Data ()
 import Janus.CSE.Gang ()
 import Janus.CSE.Instances
 import Janus.CSE.Interpret

@@ -8,7 +8,7 @@ import Data.Int
 import Data.Loc
 import Data.Monoid
 import Data.Traversable
-import Janus.Backend.C
+import Janus.Backend.C.Raw
 import Janus.Command.Ref
 import Janus.Typed
 import Language.C.Quote

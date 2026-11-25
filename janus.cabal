@@ -137,12 +137,14 @@ library
                       Janus.Typed
     -- Modules included in this library but not exported.
     other-modules:    Janus.Backend.C.CUDA.CPU
+                      Janus.Backend.C.Raw
                       Janus.Bench.Choice
                       Janus.Bench.Gang
                       Janus.Bench.Instances
                       Janus.Bench.Runner
                       Janus.Bench.Stats
                       Janus.Bench.Types
+                      Janus.CSE.Data
                       Janus.CSE.Gang
                       Janus.CSE.Instances
                       Janus.CSE.Interpret

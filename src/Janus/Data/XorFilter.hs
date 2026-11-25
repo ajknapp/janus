@@ -53,7 +53,7 @@ import Janus.Alloc.Policy
     freeTypedArray,
     reallocTypedArray,
   )
-import Janus.Backend.C
+import Janus.Backend.C.Raw
 import Janus.Command.Cond (ifThenElseM_, whenM_)
 import Janus.Command.Memory (CmdMemCopy (..), CmdStorable (..), ExpPtr (..), janusSIMDAlignment)
 import Janus.Command.Ref (CmdRef, letM, newRef, readRef, writeRef)

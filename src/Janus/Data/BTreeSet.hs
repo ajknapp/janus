@@ -76,7 +76,7 @@ import Janus.Alloc.Policy
     freeBytes,
     freeStruct,
   )
-import Janus.Backend.C
+import Janus.Backend.C.Raw
 import Janus.Command.Cond (ifThenElseM_, whenM_)
 import Janus.Command.Memory (CmdStorable (..), ExpPtr (..), ExpSized (..))
 import Janus.Command.Ref (RefCell, newRef, readRef, writeRef)

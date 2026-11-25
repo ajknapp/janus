@@ -21,7 +21,7 @@ import Data.Int (Int64)
 import Data.Proxy (Proxy (..))
 import Data.Typeable (Typeable, typeRep)
 import GHC.TypeNats (KnownNat, Nat, natVal)
-import Janus.Backend.C
+import Janus.Backend.C.Raw
 import Janus.Backend.C.CUDA.Types (CUDADejaFu (..), CUDAIO (..))
 import Janus.Expression.Extract (ExpExtract (..))
 import Janus.Expression.SIMD

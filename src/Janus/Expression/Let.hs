@@ -6,7 +6,7 @@ import Control.Lens
 import Control.Monad.State
 import Data.Loc
 import Data.Proxy
-import Janus.Backend.C
+import Janus.Backend.C.Raw
 import Janus.Typed
 import Language.C.Quote
 
