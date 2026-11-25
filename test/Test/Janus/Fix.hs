@@ -18,6 +18,8 @@ import Data.Int
 import Data.List (isInfixOf)
 import Data.Proxy
 import Data.Semilattice.Lower (Lower (..))
+import Foreign.Marshal.Utils (with)
+import Foreign.Ptr (Ptr)
 import GHC.Generics (Generic)
 import Hedgehog
 import qualified Hedgehog.Gen as Gen
@@ -27,8 +29,13 @@ import Janus.Backend.C
 import Janus.Backend.C.Build
 import Janus.Backend.C.LinuxX86_64 (LinuxX86_64CCSE)
 import Janus.Backend.C.Target (TargetFeatureKey, TargetFeatureOf, targetFeatureKey, x86AVX2, x86FeatureKey)
+import Janus.Command.Cond (whenM_)
+import qualified Janus.Command.Memory as M
+import Janus.Command.Ref (newRef, readRef, writeRef)
 import qualified Janus.Data.DynVec as DV
 import Janus.Data.HKD (HKD (..), JanusHKD)
+import Janus.Data.Layout (Elem)
+import Janus.Expression.Cast (ExpFloatingCast (toFloating), ExpIntegralCast (toIntegral))
 import Janus.Expression.Cond
 import Janus.Expression.Ord
 import Janus.Fix
@@ -195,6 +202,111 @@ unit_expfix_on_linux_x86_64_and_custom_target = do
   vecHandle <- withJanusC cfg buildAndSumVec (\mk -> mk 9)
   vecSummary <- withJanusC cfg readVecLen (\rd -> rd vecHandle)
   vecSummary @?= (3000 + 9 + 27)
+
+polyConstLocal ::
+  forall e a.
+  (Num (e a), ExpFix e (e a)) =>
+  e a
+polyConstLocal = fun (Proxy @e) "poly_const" $ \_ -> 7
+
+polyPushSeqLocal ::
+  forall m e a.
+  ( DV.DynVecCtx m e a,
+    Elem e a ~ e a,
+    Num (e a),
+    ExpOrd e Int64,
+    ExpFix e (DV.DynVec e a -> e Int64 -> e a -> m ())
+  ) =>
+  DV.DynVec e a ->
+  e Int64 ->
+  e a ->
+  m ()
+polyPushSeqLocal =
+  fun (Proxy @e) "poly_push_seq" $ \self dv cnt val ->
+    whenM_ (cnt `gt` 0) $ do
+      DV.push dynamicAlloc dv val
+      self dv (cnt - 1) (val + 1)
+
+unit_polymorphic_and_compound_local_functions :: IO ()
+unit_polymorphic_and_compound_local_functions = do
+  tmpdir <- getEnv "TMPDIR"
+  let cfg = defaultCBuildConfig & cBuildConfigCacheDir .~ tmpdir
+
+      polyKernel ::
+        forall m e.
+        ( DV.DynVecCtx m e Int32,
+          DV.DynVecCtx m e Int64,
+          ExpFloatingCast e Int32 Double,
+          ExpFloatingCast e Int64 Double,
+          ExpIntegralCast e Int32 Int64,
+          ExpFix e (e Int32 -> e Int32),
+          ExpFix e (e Int64 -> e Int64),
+          ExpFix e (e Double -> e Double),
+          ExpFix e (e Int32),
+          ExpFix e (e Int64),
+          ExpFix e (DV.DynVec e Int32 -> e Int64 -> e Int32 -> m ()),
+          ExpFix e (DV.DynVec e Int64 -> e Int64 -> e Int64 -> m ()),
+          ExpFix e (HKD CustomPair e -> (e Int64, e Int64) -> m (e Int64, e Int64))
+        ) =>
+        e Int32 ->
+        e Int64 ->
+        m (e Double)
+      polyKernel a32 b64 = do
+        -- 1. Same helper name "fac" specialized at 3 input types (Int32, Int64, Double) in one TU
+        let f32 = fac @e @Int32 a32
+            f64 = fac @e @Int64 b64
+            fDbl = fac @e @Double 4.0
+        -- 2. Return-type-polymorphic 0-arg helper "poly_const" specialized at Int32 and Int64
+            c32 = polyConstLocal @e @Int32
+            c64 = polyConstLocal @e @Int64
+
+        -- 3. Polymorphic void monadic helper "poly_push_seq" over DynVec Int32 and DynVec Int64 handles
+        dv32 <- DV.new @Int32 dynamicAlloc
+        dv64 <- DV.new @Int64 dynamicAlloc
+        polyPushSeqLocal @m @e @Int32 dv32 3 10
+        polyPushSeqLocal @m @e @Int64 dv64 3 100
+        v32 <- DV.readVec dv32 2
+        v64 <- DV.readVec dv64 2
+        DV.free dynamicAlloc dv32
+        DV.free dynamicAlloc dv64
+
+        -- 4. Effectful multi-return (tuple) + HKD parameter local function; verify side effect runs ONCE per call
+        sideRef <- newRef (0 :: e Int64)
+        let pairStep :: HKD CustomPair e -> (e Int64, e Int64) -> m (e Int64, e Int64)
+            pairStep =
+              fun (Proxy @e) "pair_step" $ \_ (HKD p) (x, y) -> do
+                pure (cpScale p * x + cpBias p, cpScale p * y - cpBias p)
+        (r1, r2) <- pairStep (HKD (CustomPair 3 5)) (10, 20)
+        cur <- readRef sideRef
+        writeRef sideRef (cur + r1 + r2)
+        sTot <- readRef sideRef
+
+        let intSum = toIntegral f32 + f64 + toIntegral c32 + c64 + toIntegral v32 + v64 + sTot
+        pure (toFloating intSum + fDbl)
+
+  -- Also verify single-evaluation of side effects inside a monadic local function via a pointer counter
+  let sideEffectOnceProg :: JanusCCSE (Ptr Int64) -> JanusCMCSE (JanusCCSE Int64)
+      sideEffectOnceProg cntPtr = do
+        let bumpAndReturn :: JanusCCSE (Ptr Int64) -> JanusCCSE Int64 -> JanusCMCSE (JanusCCSE Int64, JanusCCSE Int64)
+            bumpAndReturn =
+              fun (Proxy @JanusCCSE) "bump_once" $ \_ p x -> do
+                old <- M.peek p
+                M.poke p (old + 1)
+                pure (x + 10, x * 2)
+        (u, v) <- bumpAndReturn cntPtr 7
+        c <- M.peek cntPtr
+        pure (c * 1000 + u + v)
+
+  cSrc <- showJanusC @PortableC "poly_entry" (polyKernel @JanusCMCSE @JanusCCSE)
+  assertBool "mangled local fac helper emitted" ("janus_local_fac_" `isInfixOf` cSrc)
+  assertBool "mangled local poly_push_seq helper emitted" ("janus_local_poly_push_seq_" `isInfixOf` cSrc)
+
+  Identity ioOut <- polyKernel @IO @Identity (Identity 5) (Identity 6)
+  cOut <- withJanusC @PortableC cfg (polyKernel @JanusCMCSE @JanusCCSE) (\fn -> fn 5 6)
+  cOut @?= ioOut
+
+  onceOut <- withJanusC @PortableC cfg sideEffectOnceProg (\fn -> with (0 :: Int64) fn)
+  onceOut @?= (1000 + 17 + 14)
 
 test_fix :: TestTree
 test_fix = do

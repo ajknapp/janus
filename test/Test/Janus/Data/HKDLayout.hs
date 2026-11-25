@@ -1,4 +1,5 @@
 {-# LANGUAGE AllowAmbiguousTypes #-}
+{-# LANGUAGE ConstraintKinds #-}
 {-# LANGUAGE DataKinds #-}
 {-# LANGUAGE DeriveGeneric #-}
 {-# LANGUAGE DerivingStrategies #-}
@@ -26,13 +27,16 @@ import qualified Hedgehog.Gen as Gen
 import qualified Hedgehog.Range as Range
 import Janus.Alloc
   ( Alloc,
-    CmdAlloc,
+    AllocTracker,
+    FixedBuf,
+    Recycler,
     destroyFixedBuf,
     destroyRecycler,
     dynamicAlloc,
     fallbackAlloc,
     fixedAlloc,
     freeAllocTracker,
+    localAlloc,
     newAllocTracker,
     newFixedBuf,
     newRecycler,
@@ -60,8 +64,8 @@ import Janus.Expression.Bool (ExpBool (..))
 import Janus.Expression.Cast (ExpFloatingCast (..))
 import Janus.Expression.Cond (ExpCond (..))
 import Janus.Expression.Eq (ExpEq (..))
+import Janus.Fix (ExpFix (..))
 import Janus.SPMD (SPMD)
-import Janus.Typed (JanusTyped)
 import System.Environment (lookupEnv)
 import Test.Tasty (TestTree, testGroup, withResource)
 import Test.Tasty.HUnit ((@?=))
@@ -349,223 +353,308 @@ check_compiled_c_spmd_soa_and_aosoa getSoAFn getAoSoAFn = property $ do
 -- 4. Normal & Scoped Buffer `new -> reallocate -> free` Across All 5 Layouts
 --------------------------------------------------------------------------------
 
-fillRangeBuf ::
+type CompHandles e = (AllocTracker e, FixedBuf e, Recycler e)
+
+type TinyHandles e = (AllocTracker e, FixedBuf e)
+
+mkLifecycleCompositeAlloc :: (ExpJanus e) => CompHandles e -> Alloc e
+mkLifecycleCompositeAlloc (tracker, fb, rec) =
+  localAlloc "hkd_composite" $
+    statsAlloc
+      tracker
+      ( segregateAlloc
+          512
+          (fallbackAlloc (fixedAlloc fb) (recyclingAlloc rec dynamicAlloc))
+          dynamicAlloc
+      )
+
+mkLifecycleTinyAlloc :: TinyHandles e -> Alloc e
+mkLifecycleTinyAlloc (tinyTracker, tinyFb) =
+  localAlloc "hkd_tiny" (statsAlloc tinyTracker (fixedAlloc tinyFb))
+
+class (StorageLayout a) => TestLifecycleLayout a where
+  mkTestElem :: (ExpJanus e) => e Int64 -> Elem e a
+  projTestElem :: (ExpJanus e) => Elem e a -> e Float
+
+instance TestLifecycleLayout Int64 where
+  mkTestElem = id
+  projTestElem = toFloating
+
+instance TestLifecycleLayout (AoS Particle) where
+  mkTestElem v =
+    let fv = toFloating v
+     in Particle fv (fv + 1.0) (fv * 2.0) (fv - 3.0)
+  projTestElem = pX
+
+instance TestLifecycleLayout (SoA Particle) where
+  mkTestElem = mkTestElem @(AoS Particle)
+  projTestElem = projTestElem @(AoS Particle)
+
+instance TestLifecycleLayout (AoSoA 8 Particle) where
+  mkTestElem = mkTestElem @(AoS Particle)
+  projTestElem = projTestElem @(AoS Particle)
+
+instance TestLifecycleLayout (SOAOA 8 ParticleSys) where
+  mkTestElem v =
+    let fv = toFloating v
+     in ParticleSys (mkTestElem @(AoS Particle) v) (ThermoGroup (fv + 5.0) (fv + 10.0))
+  projTestElem s = pX (psKin s)
+
+type LifecycleFixCtx m e a =
+  ( CmdJanus m e,
+    TestLifecycleLayout a,
+    LayoutElemCtx m e a,
+    ExpFix e (Buf a e -> e Int64 -> e Int64 -> e Int64 -> e Int64 -> m ()),
+    ExpFix e (Buf a e -> e Int64 -> m (e Float)),
+    ExpFix e (Buf a e -> CompHandles e -> m (e Bool)),
+    ExpFix e (Buf a e -> CompHandles e -> TinyHandles e -> m (e Float))
+  )
+
+fillAffineBuf ::
   forall a m e.
-  (CmdAlloc m e, StorageLayout a, LayoutElemCtx m e a) =>
+  (LifecycleFixCtx m e a) =>
   Buf a e ->
   e Int64 ->
   e Int64 ->
-  (e Int64 -> Elem e a) ->
+  e Int64 ->
+  e Int64 ->
   m ()
-fillRangeBuf b lo hi mk =
-  whenM_ (lnot (isNullBuf @a (Proxy @m) b)) $
-    rangeM lo hi $ \i -> writeBuf @a b i (mk i)
+fillAffineBuf =
+  fun (Proxy @e) "fill_affine_buf" $ \_ b lo hi base scale ->
+    whenM_ (lnot (isNullBuf @a (Proxy @m) b)) $
+      rangeM lo hi $ \i -> writeBuf @a b i (mkTestElem @a ((i + base) * scale))
 
-fillRangeScopedBuf ::
+fillAffineScopedBuf ::
   forall a m e.
-  (CmdAlloc m e, StorageLayout a, LayoutElemCtx m e a) =>
+  (LifecycleFixCtx m e a) =>
   ScopedBuf m e a ->
   e Int64 ->
   e Int64 ->
-  (e Int64 -> Elem e a) ->
+  e Int64 ->
+  e Int64 ->
   m ()
-fillRangeScopedBuf sb lo hi mk = do
+fillAffineScopedBuf sb lo hi base scale = do
   b <- scopedBuf sb
-  fillRangeBuf @a b lo hi mk
+  fillAffineBuf @a b lo hi base scale
 
 sumBufPrefix ::
   forall a m e.
-  (CmdAlloc m e, StorageLayout a, LayoutElemCtx m e a, JanusTyped e Float, Num (e Float)) =>
+  (LifecycleFixCtx m e a) =>
   Buf a e ->
   e Int64 ->
-  (Elem e a -> e Float) ->
   m (e Float)
-sumBufPrefix b n proj = do
-  acc <- newRef (0 :: e Float)
-  whenM_ (lnot (isNullBuf @a (Proxy @m) b)) $
-    rangeM 0 n $ \i -> do
-      v <- readBuf @a b i
-      cur <- readRef acc
-      writeRef acc (cur + proj v)
-  readRef acc
+sumBufPrefix =
+  fun (Proxy @e) "sum_buf_prefix" $ \_ b n -> do
+    acc <- newRef (0 :: e Float)
+    whenM_ (lnot (isNullBuf @a (Proxy @m) b)) $
+      rangeM 0 n $ \i -> do
+        v <- readBuf @a b i
+        cur <- readRef acc
+        writeRef acc (cur + projTestElem @a v)
+    readRef acc
 
 sumScopedBufPrefix ::
   forall a m e.
-  (CmdAlloc m e, StorageLayout a, LayoutElemCtx m e a, JanusTyped e Float, Num (e Float)) =>
+  (LifecycleFixCtx m e a) =>
   ScopedBuf m e a ->
   e Int64 ->
-  (Elem e a -> e Float) ->
   m (e Float)
-sumScopedBufPrefix sb n proj = do
+sumScopedBufPrefix sb n = do
   b <- scopedBuf sb
-  sumBufPrefix @a b n proj
+  sumBufPrefix @a b n
 
 exerciseEmptyNoAlloc ::
   forall a m e.
-  (CmdAlloc m e, StorageLayout a, LayoutElemCtx m e a) =>
-  Alloc e ->
+  (LifecycleFixCtx m e a) =>
+  Buf a e ->
+  CompHandles e ->
   m (e Bool)
-exerciseEmptyNoAlloc alloc = do
-  b0 <- allocBuf @a alloc 0
-  bNeg <- allocBuf @a alloc (-4)
-  b0Re <- reallocBuf @a alloc b0 0 0 0
-  bNegRe <- reallocBuf @a alloc bNeg 0 (-3) 0
-  freeBuf @a alloc b0Re 0
-  freeBuf @a alloc bNegRe 0
-  sbOk <-
-    withBuf @a alloc 0 $ \sb -> do
-      c0 <- scopedBufCap sb
-      bz <- reallocScopedBuf sb 0 0
-      cz <- scopedBufCap sb
-      freeScopedBuf sb
-      pure ((c0 `eq` 0) `land` isNullBuf @a (Proxy @m) bz `land` (cz `eq` 0))
-  pure
-    ( isNullBuf @a (Proxy @m) b0
-        `land` isNullBuf @a (Proxy @m) bNeg
-        `land` isNullBuf @a (Proxy @m) b0Re
-        `land` isNullBuf @a (Proxy @m) bNegRe
-        `land` sbOk
-    )
+exerciseEmptyNoAlloc =
+  fun (Proxy @e) "exercise_empty_no_alloc" $ \_ _ compH -> do
+    let alloc = mkLifecycleCompositeAlloc compH
+    b0 <- allocBuf @a alloc 0
+    bNeg <- allocBuf @a alloc (-4)
+    b0Re <- reallocBuf @a alloc b0 0 0 0
+    bNegRe <- reallocBuf @a alloc bNeg 0 (-3) 0
+    freeBuf @a alloc b0Re 0
+    freeBuf @a alloc bNegRe 0
+    sbOk <-
+      withBuf @a alloc 0 $ \sb -> do
+        c0 <- scopedBufCap sb
+        bz <- reallocScopedBuf sb 0 0
+        cz <- scopedBufCap sb
+        freeScopedBuf sb
+        pure ((c0 `eq` 0) `land` isNullBuf @a (Proxy @m) bz `land` (cz `eq` 0))
+    pure
+      ( isNullBuf @a (Proxy @m) b0
+          `land` isNullBuf @a (Proxy @m) bNeg
+          `land` isNullBuf @a (Proxy @m) b0Re
+          `land` isNullBuf @a (Proxy @m) bNegRe
+          `land` sbOk
+      )
+
+exerciseLayoutNormal ::
+  forall a m e.
+  (LifecycleFixCtx m e a) =>
+  Buf a e ->
+  CompHandles e ->
+  TinyHandles e ->
+  m (e Float)
+exerciseLayoutNormal =
+  fun (Proxy @e) "exercise_layout_normal" $ \_ _ compH tinyH -> do
+    let composite = mkLifecycleCompositeAlloc compH
+        tinyPolicy = mkLifecycleTinyAlloc tinyH
+    -- Part A: Normal buffer `allocBuf -> reallocBuf* -> freeBuf`
+    b0 <- allocBuf @a composite 0
+    b0' <- reallocBuf @a composite b0 0 0 0
+    b5 <- reallocBuf @a composite b0' 0 5 0
+    fillAffineBuf @a b5 0 5 1 1
+    -- Same-tile / same-aligned-slab growth (5 -> 7)
+    b7 <- reallocBuf @a composite b5 5 7 5
+    fillAffineBuf @a b7 5 7 1 1
+    -- Cross-tile / cross-slab growth with `liveLen > oldCap` (clamped to `oldCap = 7`)
+    b25 <- reallocBuf @a composite b7 7 25 25
+    fillAffineBuf @a b25 7 25 1 1
+    -- Identical-capacity realloc (`25 -> 25`)
+    b25Same <- reallocBuf @a composite b25 25 25 25
+    -- Shrink (`25 -> 10`)
+    b10 <- reallocBuf @a composite b25Same 25 10 10
+    sumNorm10 <- sumBufPrefix @a b10 10
+    -- Shrink to zero (`10 -> 0`) and negative (`0 -> -4`), then re-grow (`0 -> 12`)
+    bZero <- reallocBuf @a composite b10 10 0 0
+    bZero2 <- reallocBuf @a composite bZero 0 (-4) 0
+    b12 <- reallocBuf @a composite bZero2 0 12 0
+    fillAffineBuf @a b12 0 12 1 2
+    sumNorm12 <- sumBufPrefix @a b12 12
+    freeBuf @a composite b12 12
+
+    -- Normal buffer OOM on `allocBuf` and `reallocBuf`
+    bFailNew <- allocBuf @a tinyPolicy 100000
+    freeBuf @a tinyPolicy bFailNew 100000
+    bSmall <- allocBuf @a tinyPolicy 4
+    fillAffineBuf @a bSmall 0 4 10 1
+    bFailGrow <- reallocBuf @a tinyPolicy bSmall 4 100000 4
+    sumNormOom <- sumBufPrefix @a bSmall 4
+    freeBuf @a tinyPolicy bSmall 4
+
+    let normOk =
+          isNullBuf @a (Proxy @m) b0
+            `land` isNullBuf @a (Proxy @m) b0'
+            `land` isNullBuf @a (Proxy @m) bZero
+            `land` isNullBuf @a (Proxy @m) bZero2
+            `land` isNullBuf @a (Proxy @m) bFailNew
+            `land` isNullBuf @a (Proxy @m) bFailGrow
+    pure (ifThenElse normOk (sumNorm10 + sumNorm12 + sumNormOom) (-1000000.0))
+
+exerciseLayoutScoped ::
+  forall a m e.
+  (LifecycleFixCtx m e a) =>
+  Buf a e ->
+  CompHandles e ->
+  TinyHandles e ->
+  m (e Float)
+exerciseLayoutScoped =
+  fun (Proxy @e) "exercise_layout_scoped" $ \_ _ compH tinyH -> do
+    let composite = mkLifecycleCompositeAlloc compH
+        tinyPolicy = mkLifecycleTinyAlloc tinyH
+    -- Part B1: Scoped buffer `withBuf -> reallocScopedBuf* -> scope-exit free`
+    scopedScoreA <-
+      withBuf @a composite 0 $ \sb -> do
+        c0 <- scopedBufCap sb
+        bz0 <- reallocScopedBuf sb 0 0
+        _ <- reallocScopedBuf sb 5 0
+        fillAffineScopedBuf @a sb 0 5 1 1
+        _ <- reallocScopedBuf sb 7 5
+        fillAffineScopedBuf @a sb 5 7 1 1
+        _ <- reallocScopedBuf sb 25 25
+        fillAffineScopedBuf @a sb 7 25 1 1
+        _ <- reallocScopedBuf sb 25 25
+        _ <- reallocScopedBuf sb 10 10
+        s10 <- sumScopedBufPrefix @a sb 10
+        bz1 <- reallocScopedBuf sb 0 0
+        cz1 <- scopedBufCap sb
+        _ <- reallocScopedBuf sb 12 0
+        c12 <- scopedBufCap sb
+        fillAffineScopedBuf @a sb 0 12 1 2
+        s12 <- sumScopedBufPrefix @a sb 12
+        let okA =
+              (c0 `eq` 0)
+                `land` isNullBuf @a (Proxy @m) bz0
+                `land` isNullBuf @a (Proxy @m) bz1
+                `land` (cz1 `eq` 0)
+                `land` (c12 `eq` 12)
+        pure (ifThenElse okA (s10 + s12) (-1000000.0))
+
+    -- Part B2: Explicit early `freeScopedBuf` (idempotent + re-allocatable in same scope)
+    scopedScoreB <-
+      withBuf @a composite 9 $ \sb -> do
+        fillAffineScopedBuf @a sb 0 9 1 1
+        s9 <- sumScopedBufPrefix @a sb 9
+        freeScopedBuf sb
+        bFreed <- scopedBuf sb
+        cFreed <- scopedBufCap sb
+        freeScopedBuf sb
+        _ <- reallocScopedBuf sb 6 0
+        cRe <- scopedBufCap sb
+        fillAffineScopedBuf @a sb 0 6 1 3
+        s6 <- sumScopedBufPrefix @a sb 6
+        let okB =
+              isNullBuf @a (Proxy @m) bFreed
+                `land` (cFreed `eq` 0)
+                `land` (cRe `eq` 6)
+        pure (ifThenElse okB (s9 + s6) (-1000000.0))
+
+    -- Part B3: Scoped buffer OOM on initial `withBuf` (`scopedBufCap` must be 0)
+    scopedScoreC <-
+      withBuf @a tinyPolicy 100000 $ \sb -> do
+        bOom <- scopedBuf sb
+        cOom <- scopedBufCap sb
+        pure (ifThenElse (isNullBuf @a (Proxy @m) bOom `land` (cOom `eq` 0)) 11.0 (-1000000.0))
+
+    -- Part B4: Scoped buffer OOM on `reallocScopedBuf` (preserves live buffer & cap)
+    scopedScoreD <-
+      withBuf @a tinyPolicy 4 $ \sb -> do
+        fillAffineScopedBuf @a sb 0 4 20 1
+        bFail <- reallocScopedBuf sb 100000 4
+        cKeep <- scopedBufCap sb
+        sKeep <- sumScopedBufPrefix @a sb 4
+        pure (ifThenElse (isNullBuf @a (Proxy @m) bFail `land` (cKeep `eq` 4)) sKeep (-1000000.0))
+
+    pure (scopedScoreA + scopedScoreB + scopedScoreC + scopedScoreD)
 
 exerciseLayoutLifecycle ::
   forall a m e.
-  (CmdAlloc m e, StorageLayout a, LayoutElemCtx m e a, JanusTyped e Float, Fractional (e Float)) =>
-  Alloc e ->
-  Alloc e ->
-  (e Int64 -> Elem e a) ->
-  (Elem e a -> e Float) ->
+  (LifecycleFixCtx m e a) =>
+  CompHandles e ->
+  TinyHandles e ->
   m (e Float)
-exerciseLayoutLifecycle composite tinyPolicy mkElem projElem = do
-  -- Part A: Normal buffer `allocBuf -> reallocBuf* -> freeBuf`
-  b0 <- allocBuf @a composite 0
-  b0' <- reallocBuf @a composite b0 0 0 0
-  b5 <- reallocBuf @a composite b0' 0 5 0
-  fillRangeBuf @a b5 0 5 (\i -> mkElem (i + 1))
-  -- Same-tile / same-aligned-slab growth (5 -> 7)
-  b7 <- reallocBuf @a composite b5 5 7 5
-  fillRangeBuf @a b7 5 7 (\i -> mkElem (i + 1))
-  -- Cross-tile / cross-slab growth with `liveLen > oldCap` (clamped to `oldCap = 7`)
-  b25 <- reallocBuf @a composite b7 7 25 25
-  fillRangeBuf @a b25 7 25 (\i -> mkElem (i + 1))
-  -- Identical-capacity realloc (`25 -> 25`)
-  b25Same <- reallocBuf @a composite b25 25 25 25
-  -- Shrink (`25 -> 10`)
-  b10 <- reallocBuf @a composite b25Same 25 10 10
-  sumNorm10 <- sumBufPrefix @a b10 10 projElem
-  -- Shrink to zero (`10 -> 0`) and negative (`0 -> -4`), then re-grow (`0 -> 12`)
-  bZero <- reallocBuf @a composite b10 10 0 0
-  bZero2 <- reallocBuf @a composite bZero 0 (-4) 0
-  b12 <- reallocBuf @a composite bZero2 0 12 0
-  fillRangeBuf @a b12 0 12 (\i -> mkElem ((i + 1) * 2))
-  sumNorm12 <- sumBufPrefix @a b12 12 projElem
-  freeBuf @a composite b12 12
-
-  -- Normal buffer OOM on `allocBuf` and `reallocBuf`
-  bFailNew <- allocBuf @a tinyPolicy 100000
-  freeBuf @a tinyPolicy bFailNew 100000
-  bSmall <- allocBuf @a tinyPolicy 4
-  fillRangeBuf @a bSmall 0 4 (\i -> mkElem (10 + i))
-  bFailGrow <- reallocBuf @a tinyPolicy bSmall 4 100000 4
-  sumNormOom <- sumBufPrefix @a bSmall 4 projElem
-  freeBuf @a tinyPolicy bSmall 4
-
-  let normOk =
-        isNullBuf @a (Proxy @m) b0
-          `land` isNullBuf @a (Proxy @m) b0'
-          `land` isNullBuf @a (Proxy @m) bZero
-          `land` isNullBuf @a (Proxy @m) bZero2
-          `land` isNullBuf @a (Proxy @m) bFailNew
-          `land` isNullBuf @a (Proxy @m) bFailGrow
-      normScore = ifThenElse normOk (sumNorm10 + sumNorm12 + sumNormOom) (-1000000.0)
-
-  -- Part B1: Scoped buffer `withBuf -> reallocScopedBuf* -> scope-exit free`
-  scopedScoreA <-
-    withBuf @a composite 0 $ \sb -> do
-      c0 <- scopedBufCap sb
-      bz0 <- reallocScopedBuf sb 0 0
-      _ <- reallocScopedBuf sb 5 0
-      fillRangeScopedBuf sb 0 5 (\i -> mkElem (i + 1))
-      _ <- reallocScopedBuf sb 7 5
-      fillRangeScopedBuf sb 5 7 (\i -> mkElem (i + 1))
-      _ <- reallocScopedBuf sb 25 25
-      fillRangeScopedBuf sb 7 25 (\i -> mkElem (i + 1))
-      _ <- reallocScopedBuf sb 25 25
-      _ <- reallocScopedBuf sb 10 10
-      s10 <- sumScopedBufPrefix sb 10 projElem
-      bz1 <- reallocScopedBuf sb 0 0
-      cz1 <- scopedBufCap sb
-      _ <- reallocScopedBuf sb 12 0
-      c12 <- scopedBufCap sb
-      fillRangeScopedBuf sb 0 12 (\i -> mkElem ((i + 1) * 2))
-      s12 <- sumScopedBufPrefix sb 12 projElem
-      let okA =
-            (c0 `eq` 0)
-              `land` isNullBuf @a (Proxy @m) bz0
-              `land` isNullBuf @a (Proxy @m) bz1
-              `land` (cz1 `eq` 0)
-              `land` (c12 `eq` 12)
-      pure (ifThenElse okA (s10 + s12) (-1000000.0))
-
-  -- Part B2: Explicit early `freeScopedBuf` (idempotent + re-allocatable in same scope)
-  scopedScoreB <-
-    withBuf @a composite 9 $ \sb -> do
-      fillRangeScopedBuf sb 0 9 (\i -> mkElem (i + 1))
-      s9 <- sumScopedBufPrefix sb 9 projElem
-      freeScopedBuf sb
-      bFreed <- scopedBuf sb
-      cFreed <- scopedBufCap sb
-      freeScopedBuf sb
-      _ <- reallocScopedBuf sb 6 0
-      cRe <- scopedBufCap sb
-      fillRangeScopedBuf sb 0 6 (\i -> mkElem ((i + 1) * 3))
-      s6 <- sumScopedBufPrefix sb 6 projElem
-      let okB =
-            isNullBuf @a (Proxy @m) bFreed
-              `land` (cFreed `eq` 0)
-              `land` (cRe `eq` 6)
-      pure (ifThenElse okB (s9 + s6) (-1000000.0))
-
-  -- Part B3: Scoped buffer OOM on initial `withBuf` (`scopedBufCap` must be 0)
-  scopedScoreC <-
-    withBuf @a tinyPolicy 100000 $ \sb -> do
-      bOom <- scopedBuf sb
-      cOom <- scopedBufCap sb
-      pure (ifThenElse (isNullBuf @a (Proxy @m) bOom `land` (cOom `eq` 0)) 11.0 (-1000000.0))
-
-  -- Part B4: Scoped buffer OOM on `reallocScopedBuf` (preserves live buffer & cap)
-  scopedScoreD <-
-    withBuf @a tinyPolicy 4 $ \sb -> do
-      fillRangeScopedBuf sb 0 4 (\i -> mkElem (20 + i))
-      bFail <- reallocScopedBuf sb 100000 4
-      cKeep <- scopedBufCap sb
-      sKeep <- sumScopedBufPrefix sb 4 projElem
-      pure (ifThenElse (isNullBuf @a (Proxy @m) bFail `land` (cKeep `eq` 4)) sKeep (-1000000.0))
-
-  pure (normScore + scopedScoreA + scopedScoreB + scopedScoreC + scopedScoreD)
+exerciseLayoutLifecycle compH tinyH = do
+  let tag = nullBuf @a (Proxy @m)
+  sNorm <- exerciseLayoutNormal @a tag compH tinyH
+  sScoped <- exerciseLayoutScoped @a tag compH tinyH
+  pure (sNorm + sScoped)
 
 lifecycleAllLayoutsKernel ::
   forall m e.
-  (CmdJanus m e) =>
+  ( LifecycleFixCtx m e Int64,
+    LifecycleFixCtx m e (AoS Particle),
+    LifecycleFixCtx m e (SoA Particle),
+    LifecycleFixCtx m e (AoSoA 8 Particle),
+    LifecycleFixCtx m e (SOAOA 8 ParticleSys)
+  ) =>
   m (e Float)
 lifecycleAllLayoutsKernel = do
   tracker <- newAllocTracker
   fb <- newFixedBuf dynamicAlloc 768
   rec <- newRecycler dynamicAlloc 8
-  let composite =
-        statsAlloc
-          tracker
-          ( segregateAlloc
-              512
-              (fallbackAlloc (fixedAlloc fb) (recyclingAlloc rec dynamicAlloc))
-              dynamicAlloc
-          )
+  let compH = (tracker, fb, rec)
 
   -- Verify `new(0) -> realloc(0) -> free(0)` across all 5 layouts performs 0 allocations
-  z1 <- exerciseEmptyNoAlloc @Int64 composite
-  z2 <- exerciseEmptyNoAlloc @(AoS Particle) composite
-  z3 <- exerciseEmptyNoAlloc @(SoA Particle) composite
-  z4 <- exerciseEmptyNoAlloc @(AoSoA 8 Particle) composite
-  z5 <- exerciseEmptyNoAlloc @(SOAOA 8 ParticleSys) composite
+  z1 <- exerciseEmptyNoAlloc @Int64 (nullBuf @Int64 (Proxy @m)) compH
+  z2 <- exerciseEmptyNoAlloc @(AoS Particle) (nullBuf @(AoS Particle) (Proxy @m)) compH
+  z3 <- exerciseEmptyNoAlloc @(SoA Particle) (nullBuf @(SoA Particle) (Proxy @m)) compH
+  z4 <- exerciseEmptyNoAlloc @(AoSoA 8 Particle) (nullBuf @(AoSoA 8 Particle) (Proxy @m)) compH
+  z5 <- exerciseEmptyNoAlloc @(SOAOA 8 ParticleSys) (nullBuf @(SOAOA 8 ParticleSys) (Proxy @m)) compH
   snapZero <- readAllocSnapshot tracker
   let zeroOk =
         z1
@@ -578,25 +667,13 @@ lifecycleAllLayoutsKernel = do
 
   tinyTracker <- newAllocTracker
   tinyFb <- newFixedBuf dynamicAlloc 512
-  let tinyPolicy = statsAlloc tinyTracker (fixedAlloc tinyFb)
-      mkPart :: e Int64 -> Particle e
-      mkPart v =
-        let fv = toFloating v
-         in Particle fv (fv + 1.0) (fv * 2.0) (fv - 3.0)
-      projPart :: Particle e -> e Float
-      projPart = pX
-      mkSys :: e Int64 -> ParticleSys e
-      mkSys v =
-        let fv = toFloating v
-         in ParticleSys (mkPart v) (ThermoGroup (fv + 5.0) (fv + 10.0))
-      projSys :: ParticleSys e -> e Float
-      projSys s = pX (psKin s)
+  let tinyH = (tinyTracker, tinyFb)
 
-  sScalar <- exerciseLayoutLifecycle @Int64 composite tinyPolicy id toFloating
-  sAoS <- exerciseLayoutLifecycle @(AoS Particle) composite tinyPolicy mkPart projPart
-  sSoA <- exerciseLayoutLifecycle @(SoA Particle) composite tinyPolicy mkPart projPart
-  sAoSoA <- exerciseLayoutLifecycle @(AoSoA 8 Particle) composite tinyPolicy mkPart projPart
-  sSOAOA <- exerciseLayoutLifecycle @(SOAOA 8 ParticleSys) composite tinyPolicy mkSys projSys
+  sScalar <- exerciseLayoutLifecycle @Int64 compH tinyH
+  sAoS <- exerciseLayoutLifecycle @(AoS Particle) compH tinyH
+  sSoA <- exerciseLayoutLifecycle @(SoA Particle) compH tinyH
+  sAoSoA <- exerciseLayoutLifecycle @(AoSoA 8 Particle) compH tinyH
+  sSOAOA <- exerciseLayoutLifecycle @(SOAOA 8 ParticleSys) compH tinyH
 
   snapMain <- readAllocSnapshot tracker
   snapTiny <- readAllocSnapshot tinyTracker

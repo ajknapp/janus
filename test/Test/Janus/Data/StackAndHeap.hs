@@ -18,6 +18,7 @@ import Data.Int (Int64)
 import Data.List (minimumBy, sort, sortBy)
 import qualified Data.Map.Strict as Map
 import Data.Ord (comparing)
+import Data.Proxy (Proxy (..))
 import qualified Data.Set as Set
 import GHC.Generics (Generic)
 import Hedgehog (Gen, Property, assert, forAll, property, (===))
@@ -40,6 +41,7 @@ import qualified Janus.Data.SmallStack as SST
 import Janus.Data.Stack (Stack)
 import qualified Janus.Data.Stack as ST
 import Janus.Expression.Ord (ExpOrd (..))
+import Janus.Fix (fun)
 import System.Environment (lookupEnv)
 import Test.Tasty (TestTree, testGroup, withResource)
 import Test.Tasty.Hedgehog (testProperty)
@@ -499,17 +501,39 @@ cMutateStackAndHeaps ::
   LinuxX86_64CCSE Int64 ->
   LinuxX86_64CMCSE (LinuxX86_64CCSE Int64)
 cMutateStackAndHeaps st pq ipq n = do
-  runDrain
-    ( drainForEach $ \i -> do
-        ST.push dynamicAlloc st (i + 10)
-        PQ.push dynamicAlloc pq (100 - i) (i * 2)
-        _ <- IPQ.decreasePriority dynamicAlloc ipq i (200 - i * 3) i
-        pure ()
-    )
-    (rangeS 0 n)
-  s1 <- runDrain drainSum (ST.topDownStream st)
-  s2 <- runDrain drainSum (fst <$> PQ.unorderedStream pq)
-  (_, _, minP, _) <- IPQ.peekMin 0 0 ipq
+  let stPhase ::
+        Stack LinuxX86_64CCSE Int64 ->
+        LinuxX86_64CCSE Int64 ->
+        LinuxX86_64CMCSE (LinuxX86_64CCSE Int64)
+      stPhase =
+        fun (Proxy @LinuxX86_64CCSE) "sh_stack_phase" $ \_ st' n' -> do
+          runDrain (drainForEach (\i -> ST.push dynamicAlloc st' (i + 10))) (rangeS 0 n')
+          runDrain drainSum (ST.topDownStream st')
+
+      pqPhase ::
+        PriorityQueue LinuxX86_64CCSE Int64 Int64 ->
+        LinuxX86_64CCSE Int64 ->
+        LinuxX86_64CMCSE (LinuxX86_64CCSE Int64)
+      pqPhase =
+        fun (Proxy @LinuxX86_64CCSE) "sh_pq_phase" $ \_ pq' n' -> do
+          runDrain (drainForEach (\i -> PQ.push dynamicAlloc pq' (100 - i) (i * 2))) (rangeS 0 n')
+          runDrain drainSum (fst <$> PQ.unorderedStream pq')
+
+      ipqPhase ::
+        IndexedPQ LinuxX86_64CCSE Int64 Int64 ->
+        LinuxX86_64CCSE Int64 ->
+        LinuxX86_64CMCSE (LinuxX86_64CCSE Int64)
+      ipqPhase =
+        fun (Proxy @LinuxX86_64CCSE) "sh_ipq_phase" $ \_ ipq' n' -> do
+          runDrain
+            (drainForEach (\i -> IPQ.decreasePriority dynamicAlloc ipq' i (200 - i * 3) i >> pure ()))
+            (rangeS 0 n')
+          (_, _, minP, _) <- IPQ.peekMin 0 0 ipq'
+          pure minP
+
+  s1 <- stPhase st n
+  s2 <- pqPhase pq n
+  minP <- ipqPhase ipq n
   pure (s1 + s2 + minP)
 
 check_stack_heap_c_ffi ::

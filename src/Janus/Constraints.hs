@@ -9,6 +9,7 @@
 {-# LANGUAGE QuantifiedConstraints #-}
 {-# LANGUAGE RankNTypes #-}
 {-# LANGUAGE ScopedTypeVariables #-}
+{-# LANGUAGE TypeApplications #-}
 {-# LANGUAGE UndecidableInstances #-}
 {-# LANGUAGE UndecidableSuperClasses #-}
 
@@ -28,6 +29,10 @@ module Janus.Constraints
     ExpJanus,
     CmdJanus,
     CmdJanusIO,
+    CmdLocalFun (..),
+    localFunArgsM,
+    localFunArgsM_,
+    LocalArgs (..),
 
     -- * Polymorphic Element Capability Synonyms
     ExpScalar,
@@ -59,9 +64,11 @@ module Janus.Constraints
 where
 
 import Data.Complex (Complex)
+import Data.Function (fix)
 import Data.Functor.Identity (Identity)
 import Data.Int (Int16, Int32, Int64, Int8)
 import qualified Data.Kind as K
+import Data.Typeable (Typeable)
 import Data.Word (Word16, Word32, Word64, Word8)
 import Foreign.C
   ( CBool,
@@ -117,6 +124,7 @@ import Janus.Expression.Let (ExpLet)
 import Janus.Expression.Math (ExpComplex, FMA, Hypot)
 import Janus.Expression.MurmurHash (ExpMurmurHash)
 import Janus.Expression.Ord (ExpOrd)
+import Janus.Fix (LocalArgs (..), jfixLocalArgsM, jfixLocalArgsM_)
 import Janus.Typed (JanusTyped, KnownJanusType)
 
 --------------------------------------------------------------------------------
@@ -538,6 +546,31 @@ instance ExpJanus Identity
 
 instance ExpJanus (JanusCT t)
 
+-- | Scope-safe monadic local function capability over flat heterogeneous
+-- 'LocalArgs', available automatically inside any 'CmdJanus' computation.
+class CmdLocalFun (m :: K.Type -> K.Type) (e :: K.Type -> K.Type) | m -> e, e -> m where
+  emitLocalFunArgsM ::
+    (Typeable b, Storable b, JanusCTyped b) =>
+    String ->
+    ((LocalArgs e ts -> m (e b)) -> LocalArgs e ts -> m (e b)) ->
+    LocalArgs e ts ->
+    m (e b)
+  emitLocalFunArgsM_ ::
+    String ->
+    ((LocalArgs e ts -> m ()) -> LocalArgs e ts -> m ()) ->
+    LocalArgs e ts ->
+    m ()
+
+instance CmdLocalFun IO Identity where
+  emitLocalFunArgsM _ = fix
+  {-# INLINE emitLocalFunArgsM #-}
+  emitLocalFunArgsM_ _ = fix
+  {-# INLINE emitLocalFunArgsM_ #-}
+
+instance CmdLocalFun (JanusCMT t) (JanusCT t) where
+  emitLocalFunArgsM = jfixLocalArgsM
+  emitLocalFunArgsM_ = jfixLocalArgsM_
+
 -- | Full imperative Janus bundle combining 'ExpJanus' with mutable references,
 -- structured control flow, aligned heap/policy memory operations, and quantified
 -- 'CmdStorable' / 'CmdRefPtr' / 'RefCell' support across all @('Storable', 'JanusCTyped')@
@@ -548,6 +581,7 @@ instance ExpJanus (JanusCT t)
 class
   ( Monad m,
     ExpJanus e,
+    CmdLocalFun m e,
     CmdRef m e,
     CmdCond m e,
     CmdWhile m e,
@@ -566,6 +600,26 @@ class
 instance CmdJanus IO Identity
 
 instance CmdJanus (JanusCMT t) (JanusCT t)
+
+localFunArgsM ::
+  forall m e ts b.
+  (CmdJanus m e, Typeable b, Storable b, JanusCTyped b) =>
+  String ->
+  (forall m0 e0. (CmdJanus m0 e0) => (LocalArgs e0 ts -> m0 (e0 b)) -> LocalArgs e0 ts -> m0 (e0 b)) ->
+  LocalArgs e ts ->
+  m (e b)
+localFunArgsM name step = emitLocalFunArgsM @m @e name (step @m @e)
+{-# INLINE localFunArgsM #-}
+
+localFunArgsM_ ::
+  forall m e ts.
+  (CmdJanus m e) =>
+  String ->
+  (forall m0 e0. (CmdJanus m0 e0) => (LocalArgs e0 ts -> m0 ()) -> LocalArgs e0 ts -> m0 ()) ->
+  LocalArgs e ts ->
+  m ()
+localFunArgsM_ name step = emitLocalFunArgsM_ @m @e name (step @m @e)
+{-# INLINE localFunArgsM_ #-}
 
 -- | Extension of 'CmdJanus' adding @FILE*@ handles, scoped C strings, and
 -- formatted numeric output across all standard integer and floating-point types.

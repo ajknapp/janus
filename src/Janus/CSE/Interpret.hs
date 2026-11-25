@@ -67,22 +67,6 @@ import qualified Type.Reflection as TR
 -- Type-Safe Parameter Signature Witness for Recursive Functions
 --------------------------------------------------------------------------------
 
-data HParamTypes (params :: [K.Type]) where
-  HPTNil :: HParamTypes '[]
-  HPTCons :: !(TR.TypeRep p) -> !(HParamTypes ps) -> HParamTypes (p ': ps)
-
-hargsParamTypes :: HArgs (VarId e) params -> HParamTypes params
-hargsParamTypes HNil = HPTNil
-hargsParamTypes (HCons (VarId _ tr _) rest) = HPTCons tr (hargsParamTypes rest)
-
-eqHParamTypes :: HParamTypes as -> HParamTypes bs -> Maybe (as :~: bs)
-eqHParamTypes HPTNil HPTNil = Just Refl
-eqHParamTypes (HPTCons t1 ts1) (HPTCons t2 ts2) = do
-  Refl <- testEquality t1 t2
-  Refl <- eqHParamTypes ts1 ts2
-  pure Refl
-eqHParamTypes _ _ = Nothing
-
 data SomePureTargetFun (e :: K.Type -> K.Type) where
   SomePureTargetFun ::
     !(HParamTypes params) ->
@@ -93,8 +77,8 @@ data SomePureTargetFun (e :: K.Type -> K.Type) where
 data SomeMonadicTargetFun (m :: K.Type -> K.Type) (e :: K.Type -> K.Type) where
   SomeMonadicTargetFun ::
     !(HParamTypes params) ->
-    !(TR.TypeRep ret) ->
-    !(HArgs e params -> m (e ret)) ->
+    !(HParamTypes rets) ->
+    !(HArgs e params -> m (HArgs e rets)) ->
     SomeMonadicTargetFun m e
 
 --------------------------------------------------------------------------------
@@ -407,15 +391,15 @@ interpStm tfm env = \case
             . insertEnvVar (_cudaThreadInfoGridDimZ tiVars) (_cudaThreadInfoGridDimZ tiVals)
             $ env
     pure env'
-  StmFixCall vid mfd callArgs -> do
+  StmFixCall vids mfd callArgs -> do
     let tgtArgs = evalHArgsWith env callArgs
         funKey = mfdKey mfd
         pts = hargsParamTypes (mfdParams mfd)
-        retTr = mfdRetType mfd
-    resVal <- case Map.lookup funKey (envMonadicFuns env) of
-      Just (SomeMonadicTargetFun ptsFound retFound activeSelf)
+        rts = hretParamTypes (mfdRetSpec mfd)
+    resVals <- case Map.lookup funKey (envMonadicFuns env) of
+      Just (SomeMonadicTargetFun ptsFound rtsFound activeSelf)
         | Just Refl <- eqHParamTypes pts ptsFound,
-          Just Refl <- testEquality retTr retFound ->
+          Just Refl <- eqHParamTypes rts rtsFound ->
             activeSelf tgtArgs
       _ ->
         let step selfFn formalVals =
@@ -427,14 +411,14 @@ interpStm tfm env = \case
                           { envMonadicFuns =
                               Map.insert
                                 funKey
-                                (SomeMonadicTargetFun pts retTr selfFn)
+                                (SomeMonadicTargetFun pts rts selfFn)
                                 (envMonadicFuns env),
                             envPureFuns = envPureFuns env
                           }
                       )
-               in interpCSEMWith tfm interpretCSEExpWithEnv localEnv (mfdBody mfd)
+               in interpCSEMWith tfm evalHArgsWith localEnv (mfdBody mfd)
          in mfdEmitTarget mfd step tgtArgs
-    pure (insertEnvVar vid resVal env)
+    pure (bindFormalHArgs vids resVals env)
 
 evalHArgsWith ::
   (CSETargetExp e) =>

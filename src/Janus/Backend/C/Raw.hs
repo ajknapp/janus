@@ -31,6 +31,7 @@ import Control.Monad.State
 import Crypto.Hash.SHA256 as SHA256
 import qualified Data.ByteString.Base16 as B16
 import Data.ByteString.Char8 (unpack)
+import Data.Char (isAlphaNum)
 import Data.Coerce
 import Data.Complex
 import qualified Data.Dependent.HashMap as DHM
@@ -486,16 +487,57 @@ type family JanusCRetType (r :: K.Type) :: K.Type where
   JanusCRetType (_ -> r) = JanusCRetType r
   JanusCRetType mres = JanusCTermRet mres
 
+--------------------------------------------------------------------------------
+-- Canonical Type Signature Hashing & C Symbol Mangling
+--------------------------------------------------------------------------------
+
+renderCanonicalTypeRep :: TypeRep -> String
+renderCanonicalTypeRep tr =
+  let (tc, args) = splitTyConApp tr
+      headStr = tyConPackage tc <> ":" <> tyConModule tc <> "." <> tyConName tc
+   in case args of
+        [] -> headStr
+        _ -> headStr <> "(" <> intercalate "," (map renderCanonicalTypeRep args) <> ")"
+
+sanitizeCIdent :: String -> String
+sanitizeCIdent s =
+  case map (\c -> if isAlphaNum c || c == '_' then c else '_') s of
+    "" -> "janus_fn"
+    c0 : cs
+      | c0 >= '0' && c0 <= '9' -> '_' : c0 : cs
+      | otherwise -> c0 : cs
+
+hashJanusSignature :: [TypeRep] -> [TypeRep] -> String
+hashJanusSignature inTys outTys =
+  let payload =
+        "in:["
+          <> intercalate "," (map renderCanonicalTypeRep inTys)
+          <> "]|out:["
+          <> intercalate "," (map renderCanonicalTypeRep outTys)
+          <> "]"
+      digest = SHA256.hash (Text.encodeUtf8 (Text.pack payload))
+   in take 16 (unpack (B16.encode digest))
+
+mangleJanusEntryName :: String -> [TypeRep] -> [TypeRep] -> String
+mangleJanusEntryName baseName inTys outTys =
+  sanitizeCIdent baseName <> "_" <> hashJanusSignature inTys outTys
+
+mangleJanusLocalName :: String -> [TypeRep] -> [TypeRep] -> String
+mangleJanusLocalName baseName inTys outTys =
+  "janus_local_" <> sanitizeCIdent baseName <> "_" <> hashJanusSignature inTys outTys
+
 class JanusCArg (t :: K.Type) (p :: K.Type) | p -> t where
   jcEmitArg :: Int -> (Int, JanusCM [Param], p)
   jcDummyArg :: p
   jcWithHostArg :: Proxy p -> JanusCHost p -> [Arg] -> ([Arg] -> IO b) -> IO b
   jcTHParamSpecs :: Proxy p -> [THParamSpec]
+  jcArgSignatureTypes :: Proxy p -> [TypeRep]
 
 class JanusCValRet (t :: K.Type) (res :: K.Type) where
   jcFinishValRet :: Proxy t -> res -> JanusCM [Param]
   jcCallValRet :: Proxy t -> Proxy res -> FunPtr () -> [Arg] -> IO (JanusCHost res)
   jcTHValRetSpec :: Proxy t -> THRetEffect -> Proxy res -> THRetSpec
+  jcRetSignatureTypes :: Proxy t -> Proxy res -> [TypeRep]
 
 instance (JanusCABIParam t a) => JanusCArg t (JanusCT t a) where
   jcEmitArg n =
@@ -506,20 +548,29 @@ instance (JanusCABIParam t a) => JanusCArg t (JanusCT t a) where
   jcWithHostArg _ val prevArgs k =
     jcWithABIArg (Proxy @t) val (\a -> k (a : prevArgs))
   jcTHParamSpecs _ = [jcABIParamTHSpec (Proxy @t) (Proxy @a)]
+  jcArgSignatureTypes _ = [typeRep (Proxy @a)]
 
 instance JanusCValRet t () where
   jcFinishValRet _ () = finishFunction_ >> pure []
   jcCallValRet _ _ fp args = callFFI fp retVoid (reverse args)
   jcTHValRetSpec _ eff _ = THRetSpec eff unitTHType (THRetDirect unitTHType)
+  jcRetSignatureTypes _ _ = []
 
 instance (JanusCABIRet t a) => JanusCValRet t (JanusCT t a) where
   jcFinishValRet pt a = jcFinishABIRet pt a
   jcCallValRet pt _ fp args = jcCallABIRet pt (Proxy @a) fp args
   jcTHValRetSpec pt eff _ = jcABIRetTHSpec pt eff (Proxy @a)
+  jcRetSignatureTypes _ _ = [typeRep (Proxy @a)]
 
 class (JanusCTarget t) => JanusCParam (t :: K.Type) (r :: K.Type) | r -> t where
   jcparamWith :: CTargetFeatures t -> String -> Int -> JanusCM [Param] -> r -> [JCFunc]
   jcTHSpec :: Proxy r -> ([THParamSpec], THRetSpec)
+  jcSignatureTypes :: Proxy r -> ([TypeRep], [TypeRep])
+
+jcMangledSymbol :: forall t r. (JanusCParam t r) => Proxy r -> String -> String
+jcMangledSymbol pr baseName =
+  let (inTys, outTys) = jcSignatureTypes @t @r pr
+   in mangleJanusEntryName baseName inTys outTys
 
 class (JanusCTarget t) => JanusCEvaluate (t :: K.Type) (r :: K.Type) | r -> t where
   jcevalCont :: (([Arg] -> IO (JanusCRetType r)) -> IO (JanusCRetType r)) -> ForeignPtr () -> r -> JanusCEval r
@@ -544,6 +595,7 @@ instance (JanusCTarget t, JanusCABIRet t a) => JanusCParam t (JanusCT t a) where
       extra <- jcFinishABIRet (Proxy @t) a
       modify $ \s -> s & ix name . jcfParams .~ Params (reverse ps <> extra) False noLoc
   jcTHSpec _ = ([], jcABIRetTHSpec (Proxy @t) THRetPure (Proxy @a))
+  jcSignatureTypes _ = ([], [typeRep (Proxy @a)])
 
 instance (JanusCTarget t, JanusCABIRet t a) => JanusCEvaluate t (JanusCT t a) where
   jcevalCont withArgs dlFPtr _ =
@@ -558,6 +610,7 @@ instance (JanusCTarget t, JanusCValRet t res) => JanusCParam t (JanusCMT t res) 
       extra <- jcFinishValRet (Proxy @t) res
       modify $ \s -> s & ix name . jcfParams .~ Params (reverse ps <> extra) False noLoc
   jcTHSpec _ = ([], jcTHValRetSpec (Proxy @t) THRetIO (Proxy @res))
+  jcSignatureTypes _ = ([], jcRetSignatureTypes (Proxy @t) (Proxy @res))
 
 instance (JanusCTarget t, JanusCValRet t res) => JanusCEvaluate t (JanusCMT t res) where
   jcevalCont withArgs dlFPtr _ =
@@ -575,6 +628,9 @@ instance (JanusCArg t p, JanusCParam t r) => JanusCParam t (p -> r) where
   jcTHSpec _ =
     let (ps, retSpec) = jcTHSpec @t @r (Proxy @r)
      in (jcTHParamSpecs (Proxy @p) <> ps, retSpec)
+  jcSignatureTypes _ =
+    let (inRest, outTys) = jcSignatureTypes @t @r (Proxy @r)
+     in (jcArgSignatureTypes @t @p (Proxy @p) <> inRest, outTys)
 
 instance (JanusCArg t p, JanusCEvaluate t r) => JanusCEvaluate t (p -> r) where
   jcevalCont ::
@@ -608,14 +664,16 @@ prepareRawJanusCUnit ::
   IO (String, [String], [String])
 prepareRawJanusCUnit reqFeatures name prog = do
   let pt = Proxy @t
-      funcs = jcparamWith reqFeatures name 0 (pure []) prog
-      cSource = cTargetBanner pt reqFeatures <> renderJCProgram name funcs
+      mangledName = jcMangledSymbol @t @r (Proxy @r) name
+      funcs = jcparamWith reqFeatures mangledName 0 (pure []) prog
+      cSource = cTargetBanner pt reqFeatures <> renderJCProgram mangledName funcs
   (cflags, ldflags) <- cTargetBuildFlags pt reqFeatures funcs
   pure (cSource, cflags, ldflags)
 
 showRawJanusCWith :: forall t r. (JanusCParam t r) => CTargetFeatures t -> String -> r -> String
 showRawJanusCWith fs name a =
-  let jcs = jcparamWith fs name 0 (pure []) a
+  let mangledName = jcMangledSymbol @t @r (Proxy @r) name
+      jcs = jcparamWith fs mangledName 0 (pure []) a
       banner = cTargetBanner (Proxy @t) fs
       sep = "\n" <> replicate 80 '-' <> "\n"
    in banner <> foldMap ((<> sep) . renderJCFunc) jcs
@@ -643,10 +701,11 @@ acquireRawJanusCNamedWith name reqFeatures config a = do
   let pt = Proxy @t
   ensureCTargetAdmitted pt reqFeatures
   let dir = config ^. cBuildConfigCacheDir
-      funcs = jcparamWith reqFeatures name 0 (pure []) a
+      mangledName = jcMangledSymbol @t @r (Proxy @r) name
+      funcs = jcparamWith reqFeatures mangledName 0 (pure []) a
   (extraCFlags, extraLDFlags) <- cTargetBuildFlags pt reqFeatures funcs
   files <- writeJanusCFiles JC dir funcs
-  dlFPtr <- acquireJanusCFunPtrWithConfig config extraCFlags extraLDFlags files name
+  dlFPtr <- acquireJanusCFunPtrWithConfig config extraCFlags extraLDFlags files mangledName
   pure (jcevalCont ($ []) dlFPtr a, dlFPtr)
 
 acquireRawJanusCWith ::

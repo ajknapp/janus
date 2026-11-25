@@ -28,6 +28,8 @@ module Janus.CSE
     CSETargetReturn (..),
     CSEParam (..),
     CSEParamMonad,
+    CSEFixParam (..),
+    CSEFixMonRet (..),
     CSEFix (..),
 
     -- * Algorithmic Common Subexpression Elimination Pass

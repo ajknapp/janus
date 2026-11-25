@@ -83,7 +83,7 @@ import Janus.CSE.Types
 import Janus.Command.Ref (CmdRef (..))
 import Janus.Command.TicToc (Tic (..), Toc (..))
 import Janus.Control.Reader.Base (ExpNewtype (..))
-import Janus.Data.HKD (HKD (..))
+import Janus.Data.HKD (HKD (..), PtrOf (..))
 import Janus.Data.Tensor (Tensor (..), TensorBounds (..))
 import Janus.Expression.SIMD (ExpSIMD, SIMDShape, Wide)
 import Janus.SPMD.Typed (SPMDTyped (..))
@@ -552,6 +552,12 @@ registerBlock :: ScopeId -> Block m e -> State (BuildState e) ()
 registerBlock sid blk =
   mapM_ (uncurry (registerItem sid)) (zip [0 ..] (toList blk))
 
+recordHArgVarDefs :: HArgs (VarId e) ts -> ScopeId -> Int -> State (BuildState e) ()
+recordHArgVarDefs HNil _ _ = pure ()
+recordHArgVarDefs (HCons vid rest) sid itemIdx = do
+  recordVarDef (vidKey vid) sid itemIdx
+  recordHArgVarDefs rest sid itemIdx
+
 registerItem :: ScopeId -> Int -> ScopeItem m e -> State (BuildState e) ()
 registerItem sid idx item =
   let site = UseSite sid idx
@@ -595,9 +601,9 @@ registerItem sid idx item =
             registerBlock sDef defBlk
             addExhaustiveGroup sid (caseScopes <> [sDef])
           StmCUDAAsk _ -> pure ()
-          StmFixCall vid _ args -> do
+          StmFixCall vids _ args -> do
             registerHArgsAt site args
-            recordVarDef (vidKey vid) sid (idx + 1)
+            recordHArgVarDefs vids sid (idx + 1)
         ItemWithRefPtr _ vid innerBlk -> do
           sInner <- allocScope sid idx SKBlock
           addUncondChild sid sInner
@@ -1502,8 +1508,11 @@ instantiateOptTree sub baseCounter countUsed tree
             StmRange l u vid b -> StmRange (remapExp l) (remapExp u) (remapVid vid) (remapBlk b)
             StmSwitch tag cs defB -> StmSwitch (remapExp tag) [(k, remapBlk b) | (k, b) <- cs] (remapBlk defB)
             StmCUDAAsk ti -> StmCUDAAsk (mapCUDAThreadInfo remapVid ti)
-            StmFixCall vid mfd args ->
-              StmFixCall (remapVid vid) mfd (runIdentity (mapHArgsM (Identity . remapExp) args))
+            StmFixCall vids mfd args ->
+              StmFixCall
+                (runIdentity (mapHArgsM (Identity . remapVid) vids))
+                mfd
+                (runIdentity (mapHArgsM (Identity . remapExp) args))
 
           remapTree :: ProgTree m e r -> ProgTree m e r
           remapTree = \case
@@ -1651,6 +1660,35 @@ instance (CSEHKD sub e) => GCSEHKD e (K1 i (sub (CSEExp e))) (K1 i (sub e)) wher
      in (n1, K1 sFormal, \(K1 sAct) -> bindS sAct)
   gBindTargetHKD n0 (K1 sTgt) = bindTargetCSEHKD @sub @e n0 sTgt
 
+instance (CSETyped e (Ptr a)) => GCSEHKD e (K1 i (PtrOf (CSEExp e) a)) (K1 i (PtrOf e a)) where
+  gTraverseCSEHKD fn (K1 (PtrOf p)) = K1 . PtrOf <$> fn p
+  gMapCSEHKD fn (K1 (PtrOf p)) = K1 (PtrOf (fn p))
+  gAllocFormalHKD n =
+    let tr = TR.typeRep @(Ptr a)
+        cap = BindDirect @e @(Ptr a)
+        vk = VarParam n
+        vid = VarId vk tr (Just cap)
+     in (n + 1, K1 (PtrOf (mkExpVar vid)), \(K1 (PtrOf act)) -> addExpParamSubst vk tr cap act)
+  gBindTargetHKD n (K1 (PtrOf val)) =
+    (n + 1, [(VarParam n, SomeTargetVal (TR.typeRep @(Ptr a)) val)])
+
+instance
+  ( Generic (sub (PtrOf (CSEExp e))),
+    Generic (sub (PtrOf e)),
+    GCSEHKD e (Rep (sub (PtrOf (CSEExp e)))) (Rep (sub (PtrOf e)))
+  ) =>
+  GCSEHKD e (K1 i (sub (PtrOf (CSEExp e)))) (K1 i (sub (PtrOf e)))
+  where
+  gTraverseCSEHKD fn (K1 s) =
+    K1 . to <$> gTraverseCSEHKD @e @(Rep (sub (PtrOf (CSEExp e)))) @(Rep (sub (PtrOf e))) fn (from s)
+  gMapCSEHKD fn (K1 s) =
+    K1 (to (gMapCSEHKD @e @(Rep (sub (PtrOf (CSEExp e)))) @(Rep (sub (PtrOf e))) fn (from s)))
+  gAllocFormalHKD n0 =
+    let (n1, repS, bindS) = gAllocFormalHKD @e @(Rep (sub (PtrOf (CSEExp e)))) @(Rep (sub (PtrOf e))) n0
+     in (n1, K1 (to repS), \(K1 sAct) -> bindS (from sAct))
+  gBindTargetHKD n0 (K1 sTgt) =
+    gBindTargetHKD @e @(Rep (sub (PtrOf (CSEExp e)))) @(Rep (sub (PtrOf e))) n0 (from sTgt)
+
 -- | Map a 'CSEExp' element type to the corresponding target @e@ element type,
 -- unwrapping 'SIMDVector' and 'SIMDMask' (including inside 'SIMDPair') from
 -- @'CSEExp' e@ to @e@ while leaving all other types unchanged.
@@ -1700,6 +1738,16 @@ instance (GCSETraverse e f, GCSETraverse e g) => GCSETraverse e (f :*: g) where
 instance GCSETraverse e (K1 i (CSEExp e a)) where
   gTraverseCSEReturn fn (K1 x) = K1 <$> fn x
 
+instance GCSETraverse e (K1 i (PtrOf (CSEExp e) a)) where
+  gTraverseCSEReturn fn (K1 (PtrOf p)) = K1 . PtrOf <$> fn p
+
+instance
+  (Generic (sub (PtrOf (CSEExp e))), GCSETraverse e (Rep (sub (PtrOf (CSEExp e))))) =>
+  GCSETraverse e (K1 i (sub (PtrOf (CSEExp e))))
+  where
+  gTraverseCSEReturn fn (K1 s) =
+    K1 . to <$> gTraverseCSEReturn @e @(Rep (sub (PtrOf (CSEExp e)))) fn (from s)
+
 class GCSEMap (e :: K.Type -> K.Type) (repCSE :: K.Type -> K.Type) (repTgt :: K.Type -> K.Type) where
   gMapCSEReturn :: (forall a. CSEExp e a -> e a) -> repCSE p -> repTgt p
 
@@ -1712,6 +1760,19 @@ instance (GCSEMap e fCSE fTgt, GCSEMap e gCSE gTgt) => GCSEMap e (fCSE :*: gCSE)
 
 instance GCSEMap e (K1 i (CSEExp e a)) (K1 i (e a)) where
   gMapCSEReturn fn (K1 x) = K1 (fn x)
+
+instance GCSEMap e (K1 i (PtrOf (CSEExp e) a)) (K1 i (PtrOf e a)) where
+  gMapCSEReturn fn (K1 (PtrOf p)) = K1 (PtrOf (fn p))
+
+instance
+  ( Generic (sub (PtrOf (CSEExp e))),
+    Generic (sub (PtrOf e)),
+    GCSEMap e (Rep (sub (PtrOf (CSEExp e)))) (Rep (sub (PtrOf e)))
+  ) =>
+  GCSEMap e (K1 i (sub (PtrOf (CSEExp e)))) (K1 i (sub (PtrOf e)))
+  where
+  gMapCSEReturn fn (K1 s) =
+    K1 (to (gMapCSEReturn @e @(Rep (sub (PtrOf (CSEExp e)))) @(Rep (sub (PtrOf e))) fn (from s)))
 
 -- | Types that can be returned from a 'CSEM' computation, exposing all
 -- 'CSEExp' leaves to the enclosing block's CSE pass.
@@ -1744,6 +1805,9 @@ class (CSEReturn e res) => CSETargetReturn (e :: K.Type -> K.Type) (res :: K.Typ
     CSETargetVal e res
   interpretCSEReturn eval x =
     to (gMapCSEReturn @e @(Rep res) @(Rep (CSETargetVal e res)) eval (from x))
+
+instance CSEReturn e (HArgs (CSEExp e) ts) where
+  traverseCSEReturn = mapHArgsM
 
 instance CSEReturn e () where
   traverseCSEReturn _ () = pure ()
@@ -1952,6 +2016,17 @@ instance {-# OVERLAPPABLE #-} (CSETyped e a, TargetExpElem e a ~ a) => CSEExpPar
      in (n + 1, mkExpVar vid, \actual -> addExpParamSubst vk tr cap actual)
   cseBindTargetExpParam n val =
     (n + 1, [(VarParam n, SomeTargetVal (TR.typeRep @a) val)])
+
+instance {-# OVERLAPPING #-} CSEExpParamLeaf e (Ptr ()) where
+  cseLeafBindCap = BindVoidPtr @e
+  cseAllocExpParam n =
+    let tr = TR.typeRep @(Ptr ())
+        cap = BindVoidPtr @e
+        vk = VarParam n
+        vid = VarId vk tr (Just cap)
+     in (n + 1, mkExpVar vid, \actual -> addExpParamSubst vk tr cap actual)
+  cseBindTargetExpParam n val =
+    (n + 1, [(VarParam n, SomeTargetVal (TR.typeRep @(Ptr ())) val)])
 
 instance
   {-# OVERLAPPING #-}

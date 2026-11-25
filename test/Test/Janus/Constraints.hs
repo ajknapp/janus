@@ -4,6 +4,7 @@
 {-# LANGUAGE DerivingStrategies #-}
 {-# LANGUAGE FlexibleContexts #-}
 {-# LANGUAGE FlexibleInstances #-}
+{-# LANGUAGE GADTs #-}
 {-# LANGUAGE MultiParamTypeClasses #-}
 {-# LANGUAGE ScopedTypeVariables #-}
 {-# LANGUAGE StandaloneDeriving #-}
@@ -17,6 +18,7 @@ import Data.Complex (Complex)
 import Data.Functor.Identity (Identity (..))
 import Data.Int (Int16, Int32, Int64, Int8)
 import Data.List (isInfixOf)
+import Data.Proxy (Proxy (..))
 import Data.Word (Word16, Word32, Word64, Word8)
 import Foreign.C (CBool, CChar, CDouble, CFloat, CInt, CSize, withCString)
 import Foreign.Marshal.Array (peekArray, withArray)
@@ -85,6 +87,7 @@ import Janus.Expression.Let (ExpLet (..))
 import Janus.Expression.Math (ExpComplex (..), FMA (..), Hypot (..))
 import Janus.Expression.MurmurHash (murmurHash)
 import Janus.Expression.Ord (ExpOrd (..))
+import Janus.Fix (ExpFix (..))
 import System.Directory (removeFile)
 import System.Environment (lookupEnv)
 import System.FilePath ((</>))
@@ -231,141 +234,163 @@ multiContainerKernel :: forall m e. (CmdJanus m e) => e Int64 -> m (e Double)
 multiContainerKernel seed = do
   tracker <- newAllocTracker
   rec <- newRecycler dynamicAlloc 16
-  let alloc = statsAlloc tracker (recyclingAlloc rec dynamicAlloc)
+  let mkAlloc tr rc =
+        localAlloc "mc_alloc" (statsAlloc (AllocTracker tr) (recyclingAlloc (Recycler rc) dynamicAlloc))
+      alloc = mkAlloc (unAllocTracker tracker) (unRecycler rec)
   ar <- newArena alloc 4096
-  let scratchAlloc = arenaAlloc ar alloc
 
-  -- 1. DynVec (Scalar Double) + DynVec (SoA SampleRec)
-  dvScalar <- DV.new @Double alloc
-  dvSoA <- DV.new @(SoA SampleRec) alloc
-  _ <-
-    runDrain
-      (DV.drainAppendDynVec alloc dvScalar)
-      (streamM (rangeS 0 6) (\i -> pure (toFloating (seed + i) * 1.25)))
-  _ <-
-    runDrain
-      (DV.drainAppendDynVec alloc dvSoA)
-      ( streamM (rangeS (0 :: e Int64) 6) $ \i ->
-          pure
-            SampleRec
-              { srTag = toIntegral i,
-                srWeight = toFloating (i + 1) * 2.0
-              }
+  -- Phase A: DynVec (Scalar Double), DynVec (SoA SampleRec), & SmallVec 8 Int32
+  vPhase <-
+    localFunArgsM
+      "mc_phase_vecs"
+      ( \_ (LACons pTr (LACons pRc (LACons sd LANil))) -> do
+          let al = localAlloc "mc_alloc" (statsAlloc (AllocTracker pTr) (recyclingAlloc (Recycler pRc) dynamicAlloc))
+          dvScalar <- DV.new @Double al
+          dvSoA <- DV.new @(SoA SampleRec) al
+          _ <-
+            runDrain
+              (DV.drainAppendDynVec al dvScalar)
+              (streamM (rangeS 0 6) (\i -> pure (toFloating (sd + i) * 1.25)))
+          _ <-
+            runDrain
+              (DV.drainAppendDynVec al dvSoA)
+              ( streamM (rangeS (0 * sd) 6) $ \i ->
+                  pure
+                    SampleRec
+                      { srTag = toIntegral i,
+                        srWeight = toFloating (i + 1) * 2.0
+                      }
+              )
+          sDvScalar <- runDrain drainSum (DV.stream dvScalar)
+          sDvSoA <- runDrain drainSum (srWeight <$> DV.stream dvSoA)
+          sv <- SV.new @8 @Int32 al
+          _ <-
+            runDrain
+              (SV.drainAppendSmallVec al sv)
+              (streamM (rangeS (0 * sd + 1) 11) (\i -> pure (toIntegral i)))
+          (_, svPopped) <- SV.pop 0 sv
+          svLen <- SV.len sv
+          SV.free al sv
+          DV.free al dvSoA
+          DV.free al dvScalar
+          pure (sDvScalar + sDvSoA + toFloating svPopped + toFloating svLen)
       )
-  sDvScalar <- runDrain drainSum (DV.stream dvScalar)
-  sDvSoA <- runDrain drainSum (srWeight <$> DV.stream dvSoA)
+      (LACons (unAllocTracker tracker) (LACons (unRecycler rec) (LACons seed LANil)))
 
-  -- 2. SmallVec 8 Int32 (inline -> heap growth)
-  sv <- SV.new @8 @Int32 alloc
-  _ <-
-    runDrain
-      (SV.drainAppendSmallVec alloc sv)
-      (streamM (rangeS (1 :: e Int64) 11) (\i -> pure (toIntegral i :: e Int32)))
-  (_, svPopped) <- SV.pop 0 sv
-  svLen <- SV.len sv
+  -- Phase B: HashMap Int64 Double & BTreeMap Word64 Float
+  mPhase <-
+    localFunArgsM
+      "mc_phase_maps"
+      ( \_ (LACons pTr (LACons pRc LANil)) -> do
+          let al = localAlloc "mc_alloc" (statsAlloc (AllocTracker pTr) (recyclingAlloc (Recycler pRc) dynamicAlloc))
+          hm <- HM.new @Int64 @Double al
+          HM.insert al hm 10 3.5
+          HM.insert al hm 20 6.5
+          HM.insertWith al hm (+) 10 1.5
+          (hmFound, hmVal) <- HM.lookup 0.0 hm 10
 
-  -- 3. HashMap Int64 Double
-  hm <- HM.new @Int64 @Double alloc
-  HM.insert alloc hm 10 3.5
-  HM.insert alloc hm 20 6.5
-  HM.insertWith alloc hm (+) 10 1.5
-  (hmFound, hmVal) <- HM.lookup 0.0 hm 10
+          btm <- BTM.new @Word64 @Float al
+          BTM.insert al btm 100 4.25
+          BTM.insert al btm 50 2.75
+          BTM.insert al btm 150 8.0
+          (btmFound, btmVal) <- BTM.lookup 0.0 btm 50
 
-  -- 4. BTreeMap Word64 Float
-  btm <- BTM.new @Word64 @Float alloc
-  BTM.insert alloc btm 100 4.25
-  BTM.insert alloc btm 50 2.75
-  BTM.insert alloc btm 150 8.0
-  (btmFound, btmVal) <- BTM.lookup 0.0 btm 50
+          BTM.free al btm
+          HM.free al hm
+          pure (ifThenElse (hmFound `land` btmFound) (hmVal + toFloating btmVal) (-999999.0))
+      )
+      (LACons (unAllocTracker tracker) (LACons (unRecycler rec) LANil))
 
-  -- 5. LruCache Int32 Int64
-  lru <- LRU.new @Int32 @Int64 alloc 4
-  LRU.insert lru 1 100
-  LRU.insert lru 2 200
-  (lruFound, lruVal) <- LRU.lookup 0 lru 1
+  -- Phase C: LruCache, BitSet, BloomFilter, & DisjointSet
+  sPhase <-
+    localFunArgsM
+      "mc_phase_sets"
+      ( \_ (LACons pTr (LACons pRc LANil)) -> do
+          let al = localAlloc "mc_alloc" (statsAlloc (AllocTracker pTr) (recyclingAlloc (Recycler pRc) dynamicAlloc))
+          lru <- LRU.new @Int32 @Int64 al 4
+          LRU.insert lru 1 100
+          LRU.insert lru 2 200
+          (lruFound, lruVal) <- LRU.lookup 0 lru 1
 
-  -- 6. BitSet & BloomFilter Double & DisjointSet
-  bs <- BS.new alloc
-  _ <- BS.setBit alloc bs 3
-  _ <- BS.setBit alloc bs 67
-  bsCnt <- BS.popcount bs
+          bs <- BS.new al
+          _ <- BS.setBit al bs 3
+          _ <- BS.setBit al bs 67
+          bsCnt <- BS.popcount bs
 
-  bf <- BF.newWithBlocksSeeded @Double alloc 2 0x12345678
-  BF.insert bf 42.5
-  bfHit <- BF.mightContain bf 42.5
+          bf <- BF.newWithBlocksSeeded @Double al 2 0x12345678
+          BF.insert bf 42.5
+          bfHit <- BF.mightContain bf 42.5
 
-  ds <- DS.new alloc 6
-  _ <- DS.union ds 0 1
-  _ <- DS.union ds 1 2
-  dsConn <- DS.sameSet ds 0 2
-  dsSets <- DS.numSets ds
+          ds <- DS.new al 6
+          _ <- DS.union ds 0 1
+          _ <- DS.union ds 1 2
+          dsConn <- DS.sameSet ds 0 2
+          dsSets <- DS.numSets ds
 
-  -- 7. Interner (interning bytes from temporary arena buffer)
-  interner <- IN.new alloc
-  strBuf <- allocTypedArray @Word8 scratchAlloc 4
-  M.pokeElemOff strBuf 65 0
-  M.pokeElemOff strBuf 66 1
-  M.pokeElemOff strBuf 67 2
-  M.pokeElemOff strBuf 68 3
-  sym1 <- IN.internBytes alloc interner strBuf 4
-  sym2 <- IN.internBytes alloc interner strBuf 4
-  let symSame = symbolEq sym1 sym2
-  freeTypedArray @Word8 scratchAlloc strBuf 4
+          DS.free al ds
+          BF.free al bf
+          BS.free al bs
+          LRU.free al lru
+          pure
+            ( ifThenElse
+                (lruFound `land` bfHit `land` dsConn)
+                (toFloating lruVal + toFloating bsCnt + toFloating dsSets)
+                (-999999.0)
+            )
+      )
+      (LACons (unAllocTracker tracker) (LACons (unRecycler rec) LANil))
 
-  -- 8. IntrusiveList over custom `ListItem` HKD struct
-  il <- IL.new alloc liHookSpec
-  n1 <- allocStruct @(CStruct ListItem) alloc
-  M.poke (getPtrOf (liValue (projectPtrs n1))) 11
-  IL.initNodeHook il n1
-  IL.pushBackNode il n1
-  n2 <- allocStruct @(CStruct ListItem) alloc
-  M.poke (getPtrOf (liValue (projectPtrs n2))) 29
-  IL.initNodeHook il n2
-  IL.pushBackNode il n2
-  ilSum <-
-    runDrain drainSum $
-      streamM (IL.nodePtrStream il) $ \p ->
-        M.peek (getPtrOf (liValue (projectPtrs p)))
+  -- Phase D: Interner (with Arena scratchAlloc) & IntrusiveList over custom `ListItem`
+  iPhase <-
+    localFunArgsM
+      "mc_phase_intrusive"
+      ( \_ (LACons pTr (LACons pRc (LACons pAr LANil))) -> do
+          let al = localAlloc "mc_alloc" (statsAlloc (AllocTracker pTr) (recyclingAlloc (Recycler pRc) dynamicAlloc))
+              scAl = localAlloc "mc_scratch" (arenaAlloc (Arena pAr) al)
+          interner <- IN.new al
+          strBuf <- allocTypedArray @Word8 scAl 4
+          M.pokeElemOff strBuf 65 0
+          M.pokeElemOff strBuf 66 1
+          M.pokeElemOff strBuf 67 2
+          M.pokeElemOff strBuf 68 3
+          sym1 <- IN.internBytes al interner strBuf 4
+          sym2 <- IN.internBytes al interner strBuf 4
+          let symSame = symbolEq sym1 sym2
+          freeTypedArray @Word8 scAl strBuf 4
 
-  -- Clean up all containers & derived allocators and verify zero leaked bytes!
-  IL.freeAllNodesAndSpine alloc il
-  IN.free alloc interner
-  DS.free alloc ds
-  BF.free alloc bf
-  BS.free alloc bs
-  LRU.free alloc lru
-  BTM.free alloc btm
-  HM.free alloc hm
-  SV.free alloc sv
-  DV.free alloc dvSoA
-  DV.free alloc dvScalar
+          il <- IL.new al liHookSpec
+          n1 <- allocStruct @(CStruct ListItem) al
+          M.poke (getPtrOf (liValue (projectPtrs n1))) 11
+          IL.initNodeHook il n1
+          IL.pushBackNode il n1
+          n2 <- allocStruct @(CStruct ListItem) al
+          M.poke (getPtrOf (liValue (projectPtrs n2))) 29
+          IL.initNodeHook il n2
+          IL.pushBackNode il n2
+          ilSum <-
+            runDrain drainSum $
+              streamM (IL.nodePtrStream il) $ \p ->
+                M.peek (getPtrOf (liValue (projectPtrs p)))
+
+          IL.freeAllNodesAndSpine al il
+          IN.free al interner
+          pure (ifThenElse symSame (toFloating ilSum) (-999999.0))
+      )
+      (LACons (unAllocTracker tracker) (LACons (unRecycler rec) (LACons (unArena ar) LANil)))
+
   destroyArena alloc ar
   destroyRecycler dynamicAlloc rec
-
   snap <- readAllocSnapshot tracker
   freeAllocTracker tracker
 
   let allChecksOk =
-        hmFound
-          `land` btmFound
-          `land` lruFound
-          `land` bfHit
-          `land` dsConn
-          `land` symSame
+        (vPhase `gt` (-100000.0))
+          `land` (mPhase `gt` (-100000.0))
+          `land` (sPhase `gt` (-100000.0))
+          `land` (iPhase `gt` (-100000.0))
           `land` (snapLiveBlocks snap `eq` 0)
           `land` (snapLiveBytes snap `eq` 0)
-      total =
-        sDvScalar
-          + sDvSoA
-          + toFloating svPopped
-          + toFloating svLen
-          + hmVal
-          + (toFloating btmVal :: e Double)
-          + toFloating lruVal
-          + toFloating bsCnt
-          + toFloating dsSets
-          + toFloating ilSum
-  pure (ifThenElse allChecksOk total (-999999.0))
+  pure (ifThenElse allChecksOk (vPhase + mPhase + sPhase + iPhase) (-999999.0))
 
 unit_cmd_janus_multi_container_all_backends :: IO ()
 unit_cmd_janus_multi_container_all_backends = do
@@ -439,25 +464,34 @@ unit_cmd_janus_io_format_parity = do
 -- 4. Polymorphic Element & Key Helpers (`ExpInt`, `ExpFloat`, `CmdElem`, `*LayoutCtx`)
 --------------------------------------------------------------------------------
 
-polyIntMix :: forall a e. (ExpJanus e, ExpInt e a) => e a -> e a -> e Int64
-polyIntMix a b =
-  let x = (a + b) `ieor` (a `lshift` 1)
-      y = x `quotient` 2
-   in ifThenElse (toBool y) (toIntegral y) 0
+polyIntMix :: forall a e. (ExpJanus e, ExpInt e a, ExpFix e (e a -> e a -> e Int64)) => e a -> e a -> e Int64
+polyIntMix =
+  fun (Proxy @e) "poly_int_mix" $ \_ a b ->
+    let x = (a + b) `ieor` (a `lshift` 1)
+        y = x `quotient` 2
+     in ifThenElse (toBool y) (toIntegral y) 0
 
-polyFloatMix :: forall a e. (ExpJanus e, ExpFloat e a) => e a -> e a -> e Double
-polyFloatMix a b =
-  toFloating (fma a b (hypot a b))
+polyFloatMix :: forall a e. (ExpJanus e, ExpFloat e a, ExpFix e (e a -> e a -> e Double)) => e a -> e a -> e Double
+polyFloatMix =
+  fun (Proxy @e) "poly_float_mix" $ \_ a b ->
+    toFloating (fma a b (hypot a b))
 
-polySwapElems :: forall a m e. (CmdJanus m e, CmdElem m e a) => e (Ptr a) -> e Int64 -> e Int64 -> m ()
-polySwapElems arr i j =
-  whenM_ (i `ne` j) $ do
-    vi <- M.peekElemOff arr i
-    vj <- M.peekElemOff arr j
-    tmpRef <- newRef vi
-    M.pokeElemOff arr vj i
-    readRef tmpRef >>= \t -> M.pokeElemOff arr t j
-    writeRef tmpRef vj
+polySwapElems ::
+  forall a m e.
+  (CmdJanus m e, CmdElem m e a, ExpFix e (e (Ptr a) -> e Int64 -> e Int64 -> m ())) =>
+  e (Ptr a) ->
+  e Int64 ->
+  e Int64 ->
+  m ()
+polySwapElems =
+  fun (Proxy @e) "poly_swap_elems" $ \_ arr i j ->
+    whenM_ (i `ne` j) $ do
+      vi <- M.peekElemOff arr i
+      vj <- M.peekElemOff arr j
+      tmpRef <- newRef vi
+      M.pokeElemOff arr vj i
+      readRef tmpRef >>= \t -> M.pokeElemOff arr t j
+      writeRef tmpRef vj
 
 polyCountUniqueHashed :: forall k m e. (HashLayoutCtx m e k) => Stream m (Elem e k) -> m (e Int64)
 polyCountUniqueHashed s = do
@@ -473,7 +507,20 @@ polyCountUniqueOrdered s = do
   FS.free dynamicAlloc fs
   pure n
 
-polyElemKernel :: forall m e. (CmdJanus m e) => e (Ptr Double) -> m (e Double)
+polyElemKernel ::
+  forall m e.
+  ( CmdJanus m e,
+    ExpFix e (e Int16 -> e Int16 -> e Int64),
+    ExpFix e (e Word32 -> e Word32 -> e Int64),
+    ExpFix e (e CInt -> e CInt -> e Int64),
+    ExpFix e (e Float -> e Float -> e Double),
+    ExpFix e (e Double -> e Double -> e Double),
+    ExpFix e (e CDouble -> e CDouble -> e Double),
+    ExpFix e (e (Ptr Double) -> e Int64 -> e Int64 -> m ()),
+    ExpFix e (e Int64 -> m (e Int64))
+  ) =>
+  e (Ptr Double) ->
+  m (e Double)
 polyElemKernel dblArr = do
   let m1 = polyIntMix @Int16 12 7
       m2 = polyIntMix @Word32 100 55
@@ -483,19 +530,31 @@ polyElemKernel dblArr = do
       f3 = polyFloatMix @CDouble 3.0 4.0
   polySwapElems @Double dblArr 0 1
 
-  let scalarDupS = streamM (rangeS (0 :: e Int64) 8) (\i -> pure (i `remainder` 3))
-      structDupS =
-        streamM (rangeS (0 :: e Int64) 8) $ \i ->
-          pure
-            SampleRec
-              { srTag = toIntegral (i `remainder` 4),
-                srWeight = 1.5
-              }
-  uhScalar <- polyCountUniqueHashed @Int64 scalarDupS
-  uoScalar <- polyCountUniqueOrdered @Int64 scalarDupS
-  uhStruct <- polyCountUniqueHashed @(AoS SampleRec) structDupS
-  uoStruct <- polyCountUniqueOrdered @(AoS SampleRec) structDupS
-  let intTotal = m1 + m2 + m3 + uhScalar * 10 + uoScalar * 100 + uhStruct * 1000 + uoStruct * 10000
+  let countScalarDup :: e Int64 -> m (e Int64)
+      countScalarDup =
+        fun (Proxy @e) "count_scalar_dup" $ \_ n -> do
+          let scalarDupS = streamM (rangeS 0 n) (\i -> pure (i `remainder` 3))
+          uhScalar <- polyCountUniqueHashed @Int64 scalarDupS
+          uoScalar <- polyCountUniqueOrdered @Int64 scalarDupS
+          pure (uhScalar * 10 + uoScalar * 100)
+
+      countStructDup :: e Int64 -> m (e Int64)
+      countStructDup =
+        fun (Proxy @e) "count_struct_dup" $ \_ n -> do
+          let structDupS =
+                streamM (rangeS 0 n) $ \i ->
+                  pure
+                    SampleRec
+                      { srTag = toIntegral (i `remainder` 4),
+                        srWeight = 1.5
+                      }
+          uhStruct <- polyCountUniqueHashed @(AoS SampleRec) structDupS
+          uoStruct <- polyCountUniqueOrdered @(AoS SampleRec) structDupS
+          pure (uhStruct * 1000 + uoStruct * 10000)
+
+  sDup <- countScalarDup 8
+  stDup <- countStructDup 8
+  let intTotal = m1 + m2 + m3 + sDup + stDup
   pure (toFloating intTotal + f1 + f2 + f3)
 
 unit_polymorphic_element_and_key_helpers :: IO ()

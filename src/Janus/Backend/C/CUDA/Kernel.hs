@@ -40,7 +40,7 @@ import Janus.Command.IO
 import Janus.Command.Range
 import Janus.Command.Ref
 import Janus.Command.While
-import Janus.Constraints (CmdJanus, CmdJanusIO, ExpJanus)
+import Janus.Constraints (CmdJanus, CmdJanusIO, CmdLocalFun (..), ExpJanus)
 import Janus.Data.HKD (ExpPtrWord (..), ExpStructPtr (..))
 import Janus.Expression.Bits
 import Janus.Expression.Bool
@@ -54,6 +54,18 @@ import Janus.Expression.Let
 import Janus.Expression.Math
 import Janus.Expression.MurmurHash
 import Janus.Expression.Ord
+import Janus.Fix
+  ( ExpFix (..),
+    JanusCFix (..),
+    JanusCFixElem,
+    JanusCFixField (..),
+    JanusCFixMonRet (..),
+    JanusCFixParam (..),
+    jfix,
+    jfixLocalArgsM,
+    jfixLocalArgsM_,
+    mapLocalArgs,
+  )
 import Language.C.Quote as C
 
 deriving via JanusC a instance (JanusLitC a, Num a) => Num (JanusCUDA a)
@@ -218,6 +230,77 @@ instance CmdRange JanusCUDAM JanusCUDA where
 
 instance CmdWhile JanusCUDAM JanusCUDA where
   whileM i f = JanusCUDAM $ lift $ whileM (getJanusCUDA i) (runJanusCUDAM . f . JanusCUDARef)
+
+instance (JanusCFixElem a) => JanusCFixField PortableC (JanusCUDA a) where
+  jcfixFieldTypes pt _ = jcfixFieldTypes pt (Proxy @(JanusC a))
+  jcfixFieldElemCTypes pt _ = jcfixFieldElemCTypes pt (Proxy @(JanusC a))
+  jcfixFieldExtractExps pt (JanusCUDA x) = jcfixFieldExtractExps pt x
+  jcfixFieldMakeParams pt n0 =
+    let (n1, mp, x) = jcfixFieldMakeParams @PortableC @(JanusC a) pt n0
+     in (n1, mp, JanusCUDA x)
+  jcfixFieldRebuild pt es0 =
+    let (x, es1) = jcfixFieldRebuild @PortableC @(JanusC a) pt es0
+     in (JanusCUDA x, es1)
+
+instance (JanusCFixElem a) => JanusCFixParam PortableC (JanusCUDA a) where
+  jcfixParamTypes pt _ = jcfixParamTypes pt (Proxy @(JanusC a))
+  jcfixExtractArgs pt (JanusCUDA x) = jcfixExtractArgs pt x
+  jcfixMakeFormal pt n0 =
+    let (n1, mp, x) = jcfixMakeFormal @PortableC @(JanusC a) pt n0
+     in (n1, mp, JanusCUDA x)
+
+instance (JanusCFixElem a) => JanusCFixMonRet PortableC (JanusCUDA a) where
+  jcfixRetTypes pt _ = jcfixRetTypes pt (Proxy @(JanusC a))
+  jcfixRetElemCTypes pt _ = jcfixRetElemCTypes pt (Proxy @(JanusC a))
+  jcfixExtractRetExps pt (JanusCUDA x) = jcfixExtractRetExps pt x
+  jcfixRebuildRet pt es0 =
+    let (x, es1) = jcfixRebuildRet @PortableC @(JanusC a) pt es0
+     in (JanusCUDA x, es1)
+
+instance (JanusCFixElem a) => JanusCFix PortableC (JanusCUDA a) where
+  jcfixSigTypes _ = jcfixSigTypes @PortableC @(JanusC a) (Proxy @(JanusC a))
+  jcfun name argsM paramsM n (JanusCUDA body) =
+    JanusCUDA (jcfun name argsM paramsM n body)
+  jcfake _ name argsM =
+    JanusCUDA (jcfake (Proxy @(JanusC a)) name argsM)
+
+instance (JanusCFixMonRet PortableC res) => JanusCFix PortableC (JanusCUDAM res) where
+  jcfixSigTypes _ = jcfixSigTypes @PortableC @(JanusCM res) (Proxy @(JanusCM res))
+  jcfun name argsM paramsM n act =
+    JanusCUDAM (lift (jcfun name argsM paramsM n (runJanusCUDAM act)))
+  jcfake _ name argsM =
+    JanusCUDAM (lift (jcfake (Proxy @(JanusCM res)) name argsM))
+
+instance (JanusCFix PortableC r) => ExpFix JanusCUDA r where
+  fun _ = jfix
+
+instance CmdLocalFun JanusCUDAM JanusCUDA where
+  emitLocalFunArgsM name step args =
+    JanusCUDAM $
+      lift $
+        JanusCUDA
+          <$> jfixLocalArgsM
+            name
+            ( \selfC argsC ->
+                runJanusCUDAM $
+                  getJanusCUDA
+                    <$> step
+                      (\a -> JanusCUDAM (lift (JanusCUDA <$> selfC (mapLocalArgs getJanusCUDA a))))
+                      (mapLocalArgs JanusCUDA argsC)
+            )
+            (mapLocalArgs getJanusCUDA args)
+  emitLocalFunArgsM_ name step args =
+    JanusCUDAM $
+      lift $
+        jfixLocalArgsM_
+          name
+          ( \selfC argsC ->
+              runJanusCUDAM $
+                step
+                  (\a -> JanusCUDAM (lift (selfC (mapLocalArgs getJanusCUDA a))))
+                  (mapLocalArgs JanusCUDA argsC)
+          )
+          (mapLocalArgs getJanusCUDA args)
 
 instance ExpJanus JanusCUDA
 

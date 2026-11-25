@@ -71,7 +71,7 @@ import Data.Int (Int64)
 import qualified Data.Kind as K
 import Data.Loc (noLoc)
 import Data.Proxy (Proxy (..))
-import Data.Typeable (Typeable, typeRep)
+import Data.Typeable (TypeRep, Typeable, typeRep)
 import qualified Data.Vector as V
 import Data.Word (Word64, Word8)
 import Foreign.LibFFI (Arg, argPtr, callFFI, retPtr, retVoid)
@@ -87,6 +87,12 @@ import Janus.Expression.Bits (ExpBits (..))
 import Janus.Expression.Cast (ExpPtrCast (..))
 import Janus.FFI.Arg (FFIArg (..), THParamMode (..), THParamSpec (..), typeRepToTHType)
 import Janus.FFI.Ret (THRetEffect (..), THRetMode (..), THRetSpec (..))
+import Janus.Fix
+  ( GJanusCFixLeaves (..),
+    JanusCFixField (..),
+    JanusCFixMonRet (..),
+    JanusCFixParam (..),
+  )
 import Janus.Typed (JanusTyped, KnownJanusType)
 import Language.C.Quote
   ( ArraySize (ArraySize),
@@ -885,6 +891,8 @@ instance
     k (argPtr (coerceToVoidPtr @hHs @pointee valHs) : prevArgs)
   jcTHParamSpecs _ =
     [mkPtrHandleTHParamSpec @pointee @hHs (Proxy @hHs)]
+  jcArgSignatureTypes _ =
+    [typeRep (Proxy @(Ptr pointee))]
 
 instance
   (JanusCTyped pointee, Typeable hHs, Coercible (Ptr pointee) hHs) =>
@@ -897,6 +905,8 @@ instance
     pure (coerceFromVoidPtr @hHs @pointee raw)
   jcTHValRetSpec _ eff _ =
     mkPtrHandleTHRetSpec @pointee @hHs eff (Proxy @hHs) (Proxy @pointee)
+  jcRetSignatureTypes _ _ =
+    [typeRep (Proxy @(Ptr pointee))]
 
 --------------------------------------------------------------------------------
 -- Generic Multi-Field HKD Wrapper (`HKD d e`) for Arbitrary HKD Records
@@ -905,11 +915,54 @@ instance
 newtype HKD (d :: (K.Type -> K.Type) -> K.Type) (e :: K.Type -> K.Type) = HKD
   { unHKD :: d e
   }
+  deriving stock (Generic)
+
+instance (JanusCTyped a) => JanusCFixField t (PtrOf (JanusCT t) a) where
+  jcfixFieldTypes pt _ = jcfixFieldTypes pt (Proxy @(JanusCT t (Ptr a)))
+  jcfixFieldElemCTypes pt _ = jcfixFieldElemCTypes pt (Proxy @(JanusCT t (Ptr a)))
+  jcfixFieldExtractExps pt (PtrOf p) = jcfixFieldExtractExps pt p
+  jcfixFieldMakeParams pt n0 =
+    let (n1, mp, p) = jcfixFieldMakeParams @t @(JanusCT t (Ptr a)) pt n0
+     in (n1, mp, PtrOf p)
+  jcfixFieldRebuild pt es0 =
+    let (p, es1) = jcfixFieldRebuild @t @(JanusCT t (Ptr a)) pt es0
+     in (PtrOf p, es1)
+
+instance
+  (Generic (sub (PtrOf (JanusCT t))), GJanusCFixLeaves t (Rep (sub (PtrOf (JanusCT t))))) =>
+  JanusCFixField t (sub (PtrOf (JanusCT t)))
+  where
+  jcfixFieldTypes pt _ = gFixLeafTypes pt (Proxy @(Rep (sub (PtrOf (JanusCT t)))))
+  jcfixFieldElemCTypes pt _ = gFixLeafCTypes pt (Proxy @(Rep (sub (PtrOf (JanusCT t)))))
+  jcfixFieldExtractExps pt s = gFixExtractExps pt (from s)
+  jcfixFieldMakeParams pt n0 =
+    let (n1, mp, repS) = gFixMakeParams @t @(Rep (sub (PtrOf (JanusCT t)))) pt n0
+     in (n1, mp, to repS)
+  jcfixFieldRebuild pt es0 =
+    let (repS, es1) = gFixRebuild @t @(Rep (sub (PtrOf (JanusCT t)))) pt es0
+     in (to repS, es1)
+
+instance
+  (Generic (d (JanusCT t)), GJanusCFixLeaves t (Rep (d (JanusCT t)))) =>
+  JanusCFixParam t (HKD d (JanusCT t))
+
+instance
+  (Generic (d (JanusCT t)), GJanusCFixLeaves t (Rep (d (JanusCT t)))) =>
+  JanusCFixMonRet t (HKD d (JanusCT t))
+
+instance
+  (Generic (sub (PtrOf (JanusCT t))), GJanusCFixLeaves t (Rep (sub (PtrOf (JanusCT t))))) =>
+  JanusCFixParam t (PtrStruct sub (JanusCT t))
+
+instance
+  (Generic (sub (PtrOf (JanusCT t))), GJanusCFixLeaves t (Rep (sub (PtrOf (JanusCT t))))) =>
+  JanusCFixMonRet t (PtrStruct sub (JanusCT t))
 
 class JanusHKD (d :: (K.Type -> K.Type) -> K.Type) where
   hkdEmitArg :: forall t. Proxy t -> Int -> (Int, JanusCM [Param], d (JanusCT t))
   hkdPackArgs :: d Identity -> [Arg] -> [Arg]
   hkdDummy :: forall t. d (JanusCT t)
+  hkdSignatureTypes :: Proxy d -> [TypeRep]
 
   default hkdEmitArg ::
     forall t.
@@ -934,15 +987,23 @@ class JanusHKD (d :: (K.Type -> K.Type) -> K.Type) where
     d (JanusCT t)
   hkdDummy = to (gDummy @t @(Rep (d Identity)) @(Rep (d (JanusCT t))))
 
+  default hkdSignatureTypes ::
+    (GHKDLeaves PortableC (Rep (d Identity)) (Rep (d JanusC))) =>
+    Proxy d ->
+    [TypeRep]
+  hkdSignatureTypes _ = gSignatureTypes @PortableC @(Rep (d Identity)) @(Rep (d JanusC))
+
 class GHKDLeaves (t :: K.Type) (rId :: K.Type -> K.Type) (rCT :: K.Type -> K.Type) where
   gEmitArg :: Int -> (Int, JanusCM [Param], rCT p)
   gPackArgs :: rId p -> [Arg] -> [Arg]
   gDummy :: rCT p
+  gSignatureTypes :: [TypeRep]
 
 instance (GHKDLeaves t fId fCT) => GHKDLeaves t (M1 i c fId) (M1 i c fCT) where
   gEmitArg n = let (n', mp, r) = gEmitArg @t @fId @fCT n in (n', mp, M1 r)
   gPackArgs (M1 x) acc = gPackArgs @t @fId @fCT x acc
   gDummy = M1 (gDummy @t @fId @fCT)
+  gSignatureTypes = gSignatureTypes @t @fId @fCT
 
 instance
   (GHKDLeaves t fId fCT, GHKDLeaves t gId gCT) =>
@@ -956,6 +1017,7 @@ instance
     let acc1 = gPackArgs @t @fId @fCT fx acc
      in gPackArgs @t @gId @gCT gx acc1
   gDummy = gDummy @t @fId @fCT :*: gDummy @t @gId @gCT
+  gSignatureTypes = gSignatureTypes @t @fId @fCT <> gSignatureTypes @t @gId @gCT
 
 instance (JanusCTyped a, FFIArg a) => GHKDLeaves t (K1 i (Identity a)) (K1 i (JanusCT t a)) where
   gEmitArg n =
@@ -967,11 +1029,13 @@ instance (JanusCTyped a, FFIArg a) => GHKDLeaves t (K1 i (Identity a)) (K1 i (Ja
      in (n + 1, mp, K1 v)
   gPackArgs (K1 (Identity x)) acc = arg x : acc
   gDummy = K1 (JanusCT (pure (RVal (Var (Id "this_is_a_bug_if_you_see_this" noLoc) noLoc))))
+  gSignatureTypes = [typeRep (Proxy @a)]
 
 instance (JanusHKD sub) => GHKDLeaves t (K1 i (sub Identity)) (K1 i (sub (JanusCT t))) where
   gEmitArg n = let (n', mp, s) = hkdEmitArg @sub (Proxy @t) n in (n', mp, K1 s)
   gPackArgs (K1 s) acc = hkdPackArgs s acc
   gDummy = K1 (hkdDummy @sub @t)
+  gSignatureTypes = hkdSignatureTypes (Proxy @sub)
 
 type instance JanusCHost (HKD d (JanusCT _)) = d Identity
 
@@ -983,3 +1047,4 @@ instance (JanusHKD d) => JanusCArg t (HKD d (JanusCT t)) where
   jcWithHostArg _ valHs prevArgs k = k (hkdPackArgs valHs prevArgs)
   jcTHParamSpecs _ =
     error "Janus.Backend.C.TH: multi-parameter by-value HKD records are not supported in TH splices; pass Ptr (CStruct d) or a container handle"
+  jcArgSignatureTypes _ = hkdSignatureTypes (Proxy @d)

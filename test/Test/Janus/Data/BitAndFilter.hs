@@ -39,6 +39,7 @@ import Janus.Data.BloomFilter (BloomFilter)
 import qualified Janus.Data.BloomFilter as BF
 import Janus.Data.XorFilter (XorFilter)
 import qualified Janus.Data.XorFilter as XF
+import Janus.Fix (fun)
 import System.Environment (lookupEnv)
 import Test.Tasty (TestTree, testGroup, withResource)
 import Test.Tasty.Hedgehog (testProperty)
@@ -526,25 +527,56 @@ cMutateAndProbeBitFilter ::
   LinuxX86_64CCSE Int64 ->
   LinuxX86_64CMCSE (LinuxX86_64CCSE Int64)
 cMutateAndProbeBitFilter bs bt bf xf n = do
-  tmpBs <- BS.new dynamicAlloc
-  runDrain
-    ( drainForEach $ \i -> do
-        _ <- BS.setBit dynamicAlloc tmpBs (i * 7)
-        _ <- BT.insert bt (i * 13)
-        BF.insert bf (i * 19 + 3)
-    )
-    (rangeS (0 :: LinuxX86_64CCSE Int64) n)
-  BS.spmdUnionInto (Proxy @8) dynamicAlloc bs tmpBs
-  BS.free dynamicAlloc tmpBs
+  let bsPhase ::
+        BitSet LinuxX86_64CCSE ->
+        LinuxX86_64CCSE Int64 ->
+        LinuxX86_64CMCSE (LinuxX86_64CCSE Int64)
+      bsPhase =
+        fun (Proxy @LinuxX86_64CCSE) "bf_bs_phase" $ \_ bs' n' -> do
+          tmpBs <- BS.new dynamicAlloc
+          runDrain
+            (drainForEach (\i -> BS.setBit dynamicAlloc tmpBs (i * 7) >> pure ()))
+            (rangeS (0 :: LinuxX86_64CCSE Int64) n')
+          BS.spmdUnionInto (Proxy @8) dynamicAlloc bs' tmpBs
+          BS.free dynamicAlloc tmpBs
+          BS.popcount bs'
 
-  bsCnt <- BS.popcount bs
-  btSum <- runDrain drainSum (BT.stream bt)
-  bfHits <-
-    runDrain (drainCountWhere id) $
-      streamM (rangeS (0 :: LinuxX86_64CCSE Int64) n) (\i -> BF.mightContain bf (i * 19 + 3))
-  xfHits <-
-    runDrain (drainCountWhere id) $
-      streamM (rangeS (0 :: LinuxX86_64CCSE Int64) n) (\i -> XF.mightContain xf (i * 5 + 1))
+      btPhase ::
+        BitTree LinuxX86_64CCSE ->
+        LinuxX86_64CCSE Int64 ->
+        LinuxX86_64CMCSE (LinuxX86_64CCSE Int64)
+      btPhase =
+        fun (Proxy @LinuxX86_64CCSE) "bf_bt_phase" $ \_ bt' n' -> do
+          runDrain
+            (drainForEach (\i -> BT.insert bt' (i * 13) >> pure ()))
+            (rangeS (0 :: LinuxX86_64CCSE Int64) n')
+          runDrain drainSum (BT.stream bt')
+
+      bloomPhase ::
+        BloomFilter LinuxX86_64CCSE Int64 ->
+        LinuxX86_64CCSE Int64 ->
+        LinuxX86_64CMCSE (LinuxX86_64CCSE Int64)
+      bloomPhase =
+        fun (Proxy @LinuxX86_64CCSE) "bf_bloom_phase" $ \_ bf' n' -> do
+          runDrain
+            (drainForEach (\i -> BF.insert bf' (i * 19 + 3)))
+            (rangeS (0 :: LinuxX86_64CCSE Int64) n')
+          runDrain (drainCountWhere id) $
+            streamM (rangeS (0 :: LinuxX86_64CCSE Int64) n') (\i -> BF.mightContain bf' (i * 19 + 3))
+
+      xorPhase ::
+        XorFilter LinuxX86_64CCSE Int64 ->
+        LinuxX86_64CCSE Int64 ->
+        LinuxX86_64CMCSE (LinuxX86_64CCSE Int64)
+      xorPhase =
+        fun (Proxy @LinuxX86_64CCSE) "bf_xor_phase" $ \_ xf' n' ->
+          runDrain (drainCountWhere id) $
+            streamM (rangeS (0 :: LinuxX86_64CCSE Int64) n') (\i -> XF.mightContain xf' (i * 5 + 1))
+
+  bsCnt <- bsPhase bs n
+  btSum <- btPhase bt n
+  bfHits <- bloomPhase bf n
+  xfHits <- xorPhase xf n
   pure (bsCnt + btSum + bfHits * 1000 + xfHits * 10000)
 
 cBuildXorFilterInC ::

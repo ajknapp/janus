@@ -10,6 +10,7 @@ import Control.Monad (forM, forM_)
 import Control.Monad.IO.Class (liftIO)
 import Data.Functor.Identity (Identity (..))
 import Data.Int (Int64)
+import Data.Proxy (Proxy (..))
 import Data.Word (Word8)
 import Foreign.Ptr (Ptr, nullPtr, ptrToWordPtr)
 import qualified Foreign.Storable as Storable
@@ -23,6 +24,7 @@ import Janus.Command.Memory (CmdStorable (peek, poke))
 import Janus.Control.Drain (drainSum, runDrain)
 import Janus.Control.Stream (rangeS, streamM)
 import Janus.Expression.Cast (ExpPtrCast (..))
+import Janus.Fix (fun)
 import System.Environment (lookupEnv)
 import Test.Tasty (TestTree, testGroup)
 import Test.Tasty.HUnit ((@?=))
@@ -237,29 +239,43 @@ check_composable_fallback_segregate_pool_monotonic = property $ do
 cCompositeAllocKernel :: JanusCCSE Int64 -> JanusCMCSE (JanusCCSE Int64)
 cCompositeAllocKernel n = do
   tracker <- newAllocTracker
-  let root = statsAlloc tracker dynamicAlloc
+  let root = localAlloc "alloc_root" (statsAlloc tracker dynamicAlloc)
   fb <- newFixedBufAligned root 256 16
   ar <- newArenaAligned root 1024 16
   mp <- newPoolAligned root 64 32 16
-  let policy =
-        fallbackAlloc
-          (fixedAlloc fb)
-          (segregateAlloc 64 (poolAlloc mp root) (arenaAlloc ar root))
+
+  let drainStep ::
+        AllocTracker JanusCCSE ->
+        FixedBuf JanusCCSE ->
+        Arena JanusCCSE ->
+        MemPool JanusCCSE ->
+        JanusCCSE Int64 ->
+        JanusCMCSE (JanusCCSE Int64)
+      drainStep =
+        fun (Proxy @JanusCCSE) "composite_drain_step" $ \_ trk fb' ar' mp' i -> do
+          let root' = localAlloc "alloc_root" (statsAlloc trk dynamicAlloc)
+              policy =
+                localAlloc
+                  "alloc_composite"
+                  ( fallbackAlloc
+                      (fixedAlloc fb')
+                      (segregateAlloc 64 (poolAlloc mp' root') (arenaAlloc ar' root'))
+                  )
+          vpSmall <- allocBytes policy 32
+          vpLarge <- allocBytesAligned policy 160 64
+          let pSmall = fromVoidPtr vpSmall :: JanusCCSE (Ptr Int64)
+              pLarge = fromVoidPtr vpLarge :: JanusCCSE (Ptr Int64)
+          poke pSmall (i + 1)
+          poke pLarge (i * 2)
+          v1 <- peek pSmall
+          v2 <- peek pLarge
+          freeBytes policy vpSmall 32
+          freeBytes policy vpLarge 160
+          pure (v1 + v2)
 
   total <-
     runDrain drainSum $
-      streamM (rangeS 0 n) $ \i -> do
-        vpSmall <- allocBytes policy 32
-        vpLarge <- allocBytesAligned policy 160 64
-        let pSmall = fromVoidPtr vpSmall :: JanusCCSE (Ptr Int64)
-            pLarge = fromVoidPtr vpLarge :: JanusCCSE (Ptr Int64)
-        poke pSmall (i + 1)
-        poke pLarge (i * 2)
-        v1 <- peek pSmall
-        v2 <- peek pLarge
-        freeBytes policy vpSmall 32
-        freeBytes policy vpLarge 160
-        pure (v1 + v2)
+      streamM (rangeS 0 n) (drainStep tracker fb ar mp)
 
   destroyFixedBuf root fb
   destroyPool root mp

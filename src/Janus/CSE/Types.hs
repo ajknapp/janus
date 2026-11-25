@@ -61,6 +61,11 @@ module Janus.CSE.Types
 
     -- * Heterogeneous Argument Lists
     HArgs (..),
+    HParamTypes (..),
+    hargsParamTypes,
+    eqHParamTypes,
+    HRetSpec (..),
+    hretParamTypes,
     hargsDigests,
     hargsFreeVars,
     hargsHasTrapOrFix,
@@ -91,6 +96,7 @@ module Janus.CSE.Types
     ProgTree (..),
     CSEM (..),
     allocSSAId,
+    allocHRetVars,
     emitStm,
     emitEffectVal,
     emitEffectUnit,
@@ -121,6 +127,7 @@ import qualified Data.Sequence as Seq
 import qualified Data.Set as Set
 import qualified Data.Text as Text
 import qualified Data.Text.Encoding as Text
+import Data.Type.Equality ((:~:) (Refl), testEquality)
 import Data.Typeable (Typeable, typeRepFingerprint)
 import Data.Word (Word16, Word32, Word64, Word8)
 import Foreign.C (CFile, CInt, CString)
@@ -564,6 +571,30 @@ data HArgs (f :: K.Type -> K.Type) (ts :: [K.Type]) where
   HNil :: HArgs f '[]
   HCons :: !(f t) -> !(HArgs f ts) -> HArgs f (t ': ts)
 
+data HParamTypes (params :: [K.Type]) where
+  HPTNil :: HParamTypes '[]
+  HPTCons :: !(TR.TypeRep p) -> !(HParamTypes ps) -> HParamTypes (p ': ps)
+
+hargsParamTypes :: HArgs (VarId e) params -> HParamTypes params
+hargsParamTypes HNil = HPTNil
+hargsParamTypes (HCons (VarId _ tr _) rest) = HPTCons tr (hargsParamTypes rest)
+
+eqHParamTypes :: HParamTypes as -> HParamTypes bs -> Maybe (as :~: bs)
+eqHParamTypes HPTNil HPTNil = Just Refl
+eqHParamTypes (HPTCons t1 ts1) (HPTCons t2 ts2) = do
+  Refl <- testEquality t1 t2
+  Refl <- eqHParamTypes ts1 ts2
+  pure Refl
+eqHParamTypes _ _ = Nothing
+
+data HRetSpec (e :: K.Type -> K.Type) (rets :: [K.Type]) where
+  HRSNil :: HRetSpec e '[]
+  HRSCons :: !(TR.TypeRep r) -> !(BindCap e r) -> !(HRetSpec e rs) -> HRetSpec e (r ': rs)
+
+hretParamTypes :: HRetSpec e rets -> HParamTypes rets
+hretParamTypes HRSNil = HPTNil
+hretParamTypes (HRSCons tr _ rest) = HPTCons tr (hretParamTypes rest)
+
 mapHArgsM ::
   (Applicative m) =>
   (forall x. f x -> m (g x)) ->
@@ -600,15 +631,14 @@ data PureFunDef (e :: K.Type -> K.Type) (params :: [K.Type]) (ret :: K.Type) = P
     pfdEmitTarget :: ((HArgs e params -> e ret) -> (HArgs e params -> e ret)) -> HArgs e params -> e ret
   }
 
--- | Monadic local recursive function descriptor created by 'Janus.Fix.fun'.
-data MonadicFunDef (m :: K.Type -> K.Type) (e :: K.Type -> K.Type) (params :: [K.Type]) (ret :: K.Type) = MonadicFunDef
+-- | Monadic local recursive function descriptor created by 'Janus.Fix.fun' or 'Janus.Constraints.localFunArgsM'.
+data MonadicFunDef (m :: K.Type -> K.Type) (e :: K.Type -> K.Type) (params :: [K.Type]) (rets :: [K.Type]) = MonadicFunDef
   { mfdKey :: !Digest,
     mfdName :: !String,
     mfdParams :: !(HArgs (VarId e) params),
-    mfdRetType :: !(TR.TypeRep ret),
-    mfdRetBind :: !(BindCap e ret),
-    mfdBody :: CSEM m e (CSEExp e ret),
-    mfdEmitTarget :: ((HArgs e params -> m (e ret)) -> (HArgs e params -> m (e ret))) -> HArgs e params -> m (e ret)
+    mfdRetSpec :: !(HRetSpec e rets),
+    mfdBody :: CSEM m e (HArgs (CSEExp e) rets),
+    mfdEmitTarget :: ((HArgs e params -> m (HArgs e rets)) -> (HArgs e params -> m (HArgs e rets))) -> HArgs e params -> m (HArgs e rets)
   }
 
 -- | Pure Janus expression AST supporting deterministic structural CSE.
@@ -1082,12 +1112,12 @@ data Stm (m :: K.Type -> K.Type) (e :: K.Type -> K.Type) where
     -- | Record of variable identifiers receiving each @blockIdx@/@blockDim@/@threadIdx@/@gridDim@ coordinate.
     !(CUDAThreadInfo (VarId e)) ->
     Stm m e
-  -- | Effectful call to a monadic local recursive function defined via 'Janus.Fix.fun'.
+  -- | Effectful call to a monadic local recursive function defined via 'Janus.Fix.fun' or 'Janus.Constraints.localFunArgsM'.
   StmFixCall ::
-    -- | Fresh 'VarSSA' identifier receiving the call's return value.
-    !(VarId e ret) ->
+    -- | Fresh 'VarSSA' identifiers receiving the call's return values (empty for void calls).
+    !(HArgs (VarId e) rets) ->
     -- | Descriptor of the monadic recursive function being invoked.
-    !(MonadicFunDef m e params ret) ->
+    !(MonadicFunDef m e params rets) ->
     -- | Pure argument expressions passed to this call.
     !(HArgs (CSEExp e) params) ->
     Stm m e
@@ -1257,6 +1287,11 @@ instance MonadFix (CSEM m e) where
 allocSSAId :: TR.TypeRep a -> Maybe (BindCap e a) -> CSEM m e (VarId e a)
 allocSSAId tr mbCap = CSEM $ \_ n ->
   (n + 1, ProgLinear Seq.empty (VarId (VarSSA n) tr mbCap))
+
+allocHRetVars :: HRetSpec e rets -> CSEM m e (HArgs (VarId e) rets)
+allocHRetVars HRSNil = pure HNil
+allocHRetVars (HRSCons tr cap rest) =
+  HCons <$> allocSSAId tr (Just cap) <*> allocHRetVars rest
 
 emitStm :: Stm m e -> CSEM m e ()
 emitStm stm = CSEM $ \_ n ->

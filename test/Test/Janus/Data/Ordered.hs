@@ -13,6 +13,7 @@ import Data.Functor.Identity (Identity (..))
 import Data.IORef (modifyIORef', newIORef, readIORef)
 import Data.Int (Int64)
 import qualified Data.Map.Strict as Map
+import Data.Proxy (Proxy (..))
 import qualified Data.Set as Set
 import Hedgehog (Gen, Property, assert, forAll, property, (===))
 import qualified Hedgehog.Gen as Gen
@@ -29,6 +30,7 @@ import qualified Janus.Data.BTreeMap as BTM
 import qualified Janus.Data.BTreeSet as BTS
 import qualified Janus.Data.FlatMap as FM
 import qualified Janus.Data.FlatSet as FS
+import Janus.Fix (fun)
 import System.Environment (lookupEnv)
 import Test.Tasty (TestTree, testGroup, withResource)
 import Test.Tasty.Hedgehog (testProperty)
@@ -311,18 +313,36 @@ cMutateOrderedContainers ::
   LinuxX86_64CCSE Int64 ->
   LinuxX86_64CMCSE (LinuxX86_64CCSE Int64)
 cMutateOrderedContainers btm fm n = do
-  -- Insert `n` entries in C (forcing B+Tree leaf & internal splits inside compiled C!)
-  rangeM 0 n $ \i -> do
-    let k = (i * 17) - 50
-    BTM.insert dynamicAlloc btm k (i + 1)
-    FM.insert dynamicAlloc fm k (i + 1)
-  -- Delete every 3rd inserted key in C (exercising B+Tree leaf/internal rebalances in C!)
-  rangeM 0 n $ \i -> do
-    let k = (i * 17) - 50
-    _ <- BTM.delete dynamicAlloc btm (k - 100000) -- miss check
-    pure ()
-  s1 <- runDrain drainSum (snd <$> BTM.rangeStream btm (-20) 500)
-  s2 <- runDrain drainSum (snd <$> FM.rangeStream fm (-20) 500)
+  let btmPhase ::
+        BTreeMap LinuxX86_64CCSE Int64 Int64 ->
+        LinuxX86_64CCSE Int64 ->
+        LinuxX86_64CMCSE (LinuxX86_64CCSE Int64)
+      btmPhase =
+        fun (Proxy @LinuxX86_64CCSE) "ord_btm_phase" $ \_ btm' n' -> do
+          -- Insert `n'` entries in C (forcing B+Tree leaf & internal splits inside compiled C!)
+          rangeM 0 n' $ \i -> do
+            let k = (i * 17) - 50
+            BTM.insert dynamicAlloc btm' k (i + 1)
+          -- Exercise B+Tree delete / miss path in C
+          rangeM 0 n' $ \i -> do
+            let k = (i * 17) - 50
+            _ <- BTM.delete dynamicAlloc btm' (k - 100000)
+            pure ()
+          runDrain drainSum (snd <$> BTM.rangeStream btm' (-20) 500)
+
+      fmPhase ::
+        FlatMap LinuxX86_64CCSE Int64 Int64 ->
+        LinuxX86_64CCSE Int64 ->
+        LinuxX86_64CMCSE (LinuxX86_64CCSE Int64)
+      fmPhase =
+        fun (Proxy @LinuxX86_64CCSE) "ord_fm_phase" $ \_ fm' n' -> do
+          rangeM 0 n' $ \i -> do
+            let k = (i * 17) - 50
+            FM.insert dynamicAlloc fm' k (i + 1)
+          runDrain drainSum (snd <$> FM.rangeStream fm' (-20) 500)
+
+  s1 <- btmPhase btm n
+  s2 <- fmPhase fm n
   pure (s1 - s2)
 
 check_ordered_host_c_ffi ::

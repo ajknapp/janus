@@ -37,6 +37,7 @@ module Janus.Backend.C
     JanusCCSEParam,
     JanusCCSEEvaluate,
     JanusCCSEEval,
+    janusCMangledSymbol,
     mkCTargetFeatureMap,
 
     -- * CSE-Backed Compilation, Inspection & Evaluation Entrypoints
@@ -183,6 +184,9 @@ instance
   JanusCCSEEvaluate t (p -> r)
 
 type JanusCCSEEval r = JanusCEval (CSETarget r)
+
+janusCMangledSymbol :: forall t r. (JanusCCSEParam t r) => Proxy r -> String -> String
+janusCMangledSymbol _ = jcMangledSymbol @t @(CSETarget r) (Proxy @(CSETarget r))
 
 mkCTargetFeatureMap :: forall t. (JanusCTarget t) => CTargetFeatures t -> TargetFeatureMap
 mkCTargetFeatureMap fs = DHM.singleton (cTargetFeatureKey (Proxy @t)) (Identity fs)

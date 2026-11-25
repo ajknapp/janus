@@ -22,6 +22,12 @@ import Foreign.C (CChar)
 import Hedgehog (Property, forAll, property, (===))
 import qualified Hedgehog.Gen as Gen
 import qualified Hedgehog.Range as Range
+import Janus.Alloc
+  ( AllocTracker (..),
+    FixedBuf (..),
+    Recycler (..),
+    localAlloc,
+  )
 import Janus.Alloc.Policy
   ( CmdAlloc,
     destroyFixedBuf,
@@ -41,6 +47,7 @@ import Janus.Alloc.Stats
     newAllocTracker,
     readAllocSnapshot,
   )
+import Janus.Constraints (LocalArgs (..), localFunArgsM, localFunArgsM_)
 import Janus.Backend.C (JanusCCSE, JanusCMCSE, PortableC, showJanusC, withJanusC)
 import Janus.Backend.C.Build (CBuildConfig, cBuildConfigCacheDir, defaultCBuildConfig)
 import Janus.Backend.C.LinuxX86_64 (LinuxX86_64, LinuxX86_64CCSE, LinuxX86_64CMCSE)
@@ -323,7 +330,7 @@ polymorphicBenchKernel ::
   (ScalarBuf Int64 (Bench KernelChoice e), ScalarBuf Int64 (Bench KernelChoice e)) ->
   Bench KernelChoice e Int64 ->
   BenchT KernelChoice m e (Bench KernelChoice e Int64)
-polymorphicBenchKernel (inputBuf@(ScalarBuf rawPtr), sinkBuf) len = do
+polymorphicBenchKernel (ScalarBuf rawPtr, sinkBuf) len = do
   algo <- choose algoPiece
   unroll <- choose unrollPiece
 
@@ -335,31 +342,44 @@ polymorphicBenchKernel (inputBuf@(ScalarBuf rawPtr), sinkBuf) len = do
 
   -- Phase 1: "prepare" named timer using DynVec inside BenchT
   namedTic "prepare"
-  dv <- DV.withCapacity @Int64 dynamicAlloc 8
-  DV.push dynamicAlloc dv (mixStep 3)
-  DV.push dynamicAlloc dv 10
-  prepSum <- runDrain drainSum (DV.stream dv)
-  DV.free dynamicAlloc dv
+  prepSum <-
+    localFunArgsM
+      "bench_prep_dv"
+      ( \_ (LACons mVal LANil) -> do
+          dv <- DV.withCapacity @Int64 dynamicAlloc 8
+          DV.push dynamicAlloc dv mVal
+          DV.push dynamicAlloc dv 10
+          s <- runDrain drainSum (DV.stream dv)
+          DV.free dynamicAlloc dv
+          pure s
+      )
+      (LACons (mixStep 3) LANil)
   namedToc "prepare"
 
   -- Phase 2: "compute" named timer (fast single-pass SPMD vs serial data-dependent chains)
   let runSerialChain :: Int64 -> BenchT KernelChoice m e (Bench KernelChoice e Int64)
-      runSerialChain passes = do
-        sumRef <- newRef (0 :: Bench KernelChoice e Int64)
-        rangeM 0 len $ \i -> do
-          v <- readBuf inputBuf i
-          cur <- readRef sumRef
-          writeRef sumRef (cur + v)
-        chainRef <- newRef (1 :: Bench KernelChoice e Int64)
-        rangeM 0 (fromIntegral passes) $ \p ->
-          rangeM 0 len $ \i -> do
-            v <- readBuf inputBuf i
-            st <- readRef chainRef
-            writeRef chainRef ((st * 2862933555777941757) + (v `ieor` p) + 3037000493)
-        baseSum <- readRef sumRef
-        sink <- readRef chainRef
-        -- Keep `sink` live so `-O3 -flto` must execute the full serial dependency chain
-        pure (baseSum + ifThenElse (sink `eq` 0x7fffffffffffffff) 1 0)
+      runSerialChain passes =
+        localFunArgsM
+          "bench_serial_chain"
+          ( \_ (LACons pIn (LACons n (LACons nPasses LANil))) -> do
+              let inB = ScalarBuf pIn
+              sumRef <- newRef 0
+              rangeM 0 n $ \i -> do
+                v <- readBuf inB i
+                cur <- readRef sumRef
+                writeRef sumRef (cur + v)
+              chainRef <- newRef 1
+              rangeM 0 nPasses $ \p ->
+                rangeM 0 n $ \i -> do
+                  v <- readBuf inB i
+                  st <- readRef chainRef
+                  writeRef chainRef ((st * 2862933555777941757) + (v `ieor` p) + 3037000493)
+              baseSum <- readRef sumRef
+              sink <- readRef chainRef
+              -- Keep `sink` live so `-O3 -flto` must execute the full serial dependency chain
+              pure (baseSum + ifThenElse (sink `eq` 0x7fffffffffffffff) 1 0)
+          )
+          (LACons rawPtr (LACons len (LACons (fromIntegral passes :: Bench KernelChoice e Int64) LANil)))
 
   totalRef <- newRef prepSum
   withNamedTimer "compute" $
@@ -683,46 +703,70 @@ withBufReallocKernel = do
   tracker <- newAllocTracker
   fb <- newFixedBuf dynamicAlloc 192
   rec <- newRecycler dynamicAlloc 8
-  let composite =
-        statsAlloc
-          tracker
-          ( segregateAlloc
-              256
-              (fallbackAlloc (fixedAlloc fb) (recyclingAlloc rec dynamicAlloc))
-              dynamicAlloc
-          )
 
   -- 1. Multi-stage `reallocScopedBuf`:
   --    cap 8 (64B, FixedBuf) -> 16 (128B, FixedBuf in-place)
   --    -> 32 (256B, spills to Recycling) -> 128 (1024B, crosses Segregate to largeA)
   --    -> 256 (2048B inside rangeM conditional)
   sumVal <-
-    withBuf @Int64 composite 8 $ \sb -> do
-      rangeM 0 8 $ \i -> writeScopedBuf sb i (i + 1)
-      _ <- reallocScopedBuf sb 16 8
-      rangeM 8 16 $ \i -> writeScopedBuf sb i (i + 1)
-      _ <- reallocScopedBuf sb 32 16
-      rangeM 16 32 $ \i -> writeScopedBuf sb i (i + 1)
-      _ <- reallocScopedBuf sb 128 32
-      rangeM 32 128 $ \i -> writeScopedBuf sb i (i + 1)
-      rangeM 128 256 $ \i -> do
-        curCap <- scopedBufCap sb
-        whenM_ (i `ge` curCap) $ do
-          _ <- reallocScopedBuf sb 256 128
-          pure ()
-        writeScopedBuf sb i (i + 1)
-      accRef <- newRef (0 :: e Int64)
-      rangeM 0 256 $ \i -> do
-        v <- readScopedBuf sb i
-        cur <- readRef accRef
-        writeRef accRef (cur + v)
-      readRef accRef
+    localFunArgsM
+      "bench_withbuf_multistage"
+      ( \_ (LACons pTr (LACons pFb (LACons pRc LANil))) -> do
+          let composite =
+                localAlloc
+                  "bench_composite"
+                  ( statsAlloc
+                      (AllocTracker pTr)
+                      ( segregateAlloc
+                          256
+                          (fallbackAlloc (fixedAlloc (FixedBuf pFb)) (recyclingAlloc (Recycler pRc) dynamicAlloc))
+                          dynamicAlloc
+                      )
+                  )
+          withBuf @Int64 composite 8 $ \sb -> do
+            rangeM 0 8 $ \i -> writeScopedBuf sb i (i + 1)
+            _ <- reallocScopedBuf sb 16 8
+            rangeM 8 16 $ \i -> writeScopedBuf sb i (i + 1)
+            _ <- reallocScopedBuf sb 32 16
+            rangeM 16 32 $ \i -> writeScopedBuf sb i (i + 1)
+            _ <- reallocScopedBuf sb 128 32
+            rangeM 32 128 $ \i -> writeScopedBuf sb i (i + 1)
+            rangeM 128 256 $ \i -> do
+              curCap <- scopedBufCap sb
+              whenM_ (i `ge` curCap) $ do
+                _ <- reallocScopedBuf sb 256 128
+                pure ()
+              writeScopedBuf sb i (i + 1)
+            accRef <- newRef 0
+            rangeM 0 256 $ \i -> do
+              v <- readScopedBuf sb i
+              cur <- readRef accRef
+              writeRef accRef (cur + v)
+            readRef accRef
+      )
+      (LACons (unAllocTracker tracker) (LACons (unFixedBuf fb) (LACons (unRecycler rec) LANil)))
 
   -- 2. Shrink-to-zero (`reallocScopedBuf sb 0 0`) inside `withBuf` must not double-free
-  withBuf @Int64 composite 16 $ \sb2 -> do
-    writeScopedBuf sb2 0 42
-    _ <- reallocScopedBuf sb2 0 0
-    pure ()
+  localFunArgsM_
+    "bench_withbuf_shrink0"
+    ( \_ (LACons pTr (LACons pFb (LACons pRc LANil))) -> do
+        let composite =
+              localAlloc
+                "bench_composite"
+                ( statsAlloc
+                    (AllocTracker pTr)
+                    ( segregateAlloc
+                        256
+                        (fallbackAlloc (fixedAlloc (FixedBuf pFb)) (recyclingAlloc (Recycler pRc) dynamicAlloc))
+                        dynamicAlloc
+                    )
+                )
+        withBuf @Int64 composite 16 $ \sb2 -> do
+          writeScopedBuf sb2 0 42
+          _ <- reallocScopedBuf sb2 0 0
+          pure ()
+    )
+    (LACons (unAllocTracker tracker) (LACons (unFixedBuf fb) (LACons (unRecycler rec) LANil)))
 
   snap1 <- readAllocSnapshot tracker
   destroyRecycler dynamicAlloc rec
@@ -733,18 +777,25 @@ withBufReallocKernel = do
   --    preserve original `(oldBuf, oldCap)` and still free it on `withBuf` exit
   tracker2 <- newAllocTracker
   tinyFb <- newFixedBuf dynamicAlloc 128
-  let tinyPolicy = statsAlloc tracker2 (fixedAlloc tinyFb)
+  let mProxy :: forall f a. f a -> Proxy f
+      mProxy _ = Proxy
   oomCheckVal <-
-    withBuf @Int64 tinyPolicy 4 $ \sb3 -> do
-      writeScopedBuf sb3 0 777
-      failedBuf <- reallocScopedBuf sb3 10000 4
-      v0 <- readScopedBuf sb3 0
-      capAfterFail <- scopedBufCap sb3
-      pure $
-        ifThenElse
-          (isNullBuf @Int64 (Proxy @m) failedBuf `land` (capAfterFail `eq` 4))
-          v0
-          (-999999)
+    localFunArgsM
+      "bench_withbuf_oom"
+      ( \self args@(LACons pTr2 (LACons pFb2 LANil)) -> do
+          let tinyPolicy = localAlloc "bench_tiny" (statsAlloc (AllocTracker pTr2) (fixedAlloc (FixedBuf pFb2)))
+          withBuf @Int64 tinyPolicy 4 $ \sb3 -> do
+            writeScopedBuf sb3 0 777
+            failedBuf <- reallocScopedBuf sb3 10000 4
+            v0 <- readScopedBuf sb3 0
+            capAfterFail <- scopedBufCap sb3
+            pure $
+              ifThenElse
+                (isNullBuf @Int64 (mProxy (self args)) failedBuf `land` (capAfterFail `eq` 4))
+                v0
+                (-999999)
+      )
+      (LACons (unAllocTracker tracker2) (LACons (unFixedBuf tinyFb) LANil))
   snap2 <- readAllocSnapshot tracker2
   destroyFixedBuf dynamicAlloc tinyFb
   freeAllocTracker tracker2

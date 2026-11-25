@@ -1,9 +1,12 @@
 {-# LANGUAGE ConstraintKinds #-}
 {-# LANGUAGE DataKinds #-}
 {-# LANGUAGE FlexibleContexts #-}
+{-# LANGUAGE GADTs #-}
 {-# LANGUAGE KindSignatures #-}
+{-# LANGUAGE LambdaCase #-}
 {-# LANGUAGE ScopedTypeVariables #-}
 {-# LANGUAGE TypeApplications #-}
+{-# LANGUAGE TypeOperators #-}
 
 module Janus.Alloc.Policy
   ( -- * Composable Allocation Policy Datatype (Never a Typeclass)
@@ -20,6 +23,7 @@ module Janus.Alloc.Policy
     fallbackAlloc,
     segregateAlloc,
     statsAlloc,
+    localAlloc,
 
     -- * Core Byte-Level Allocation Operations
     allocBytes,
@@ -85,7 +89,7 @@ import Janus.Command.Memory
   )
 import Janus.Command.Cond (ifThenElseM_, whenM_)
 import Janus.Command.Ref (newRef, readRef, writeRef)
-import Janus.Constraints (CmdJanus)
+import Janus.Constraints (CmdJanus, LocalArgs (..), localFunArgsM, localFunArgsM_)
 import Janus.Data.HKD (CStruct, getPtrOf, projectPtrs)
 import Janus.Expression.Bool (ExpBool (..))
 import Janus.Expression.Cast (ExpPtrCast (..))
@@ -108,6 +112,7 @@ data Alloc (e :: K.Type -> K.Type)
   | AllocFallback !(Alloc e) !(Alloc e)
   | AllocSegregate !(e Int64) !(Alloc e) !(Alloc e)
   | AllocStats !(AllocTracker e) !(Alloc e)
+  | AllocLocal !String !(Alloc e)
 
 dynamicAlloc :: Alloc e
 dynamicAlloc = AllocDynamic
@@ -135,6 +140,131 @@ segregateAlloc = AllocSegregate
 
 statsAlloc :: AllocTracker e -> Alloc e -> Alloc e
 statsAlloc = AllocStats
+
+-- | Opt-in combinator that outlines @alloc@, @realloc@, @free@, @ownsPtr@, and
+-- @resetAlloc@ operations on the wrapped policy into @static@ local C functions
+-- instead of inlining the policy tree at every call site.
+localAlloc :: String -> Alloc e -> Alloc e
+localAlloc name (AllocLocal _ inner) = AllocLocal name inner
+localAlloc name inner = AllocLocal name inner
+
+--------------------------------------------------------------------------------
+-- GADT Policy Spine Reification for `AllocLocal`
+--------------------------------------------------------------------------------
+
+data PolicyShape (tail :: [K.Type]) (out :: [K.Type]) where
+  PSDynamic :: PolicyShape tail tail
+  PSFixed :: PolicyShape tail (Ptr (CStruct FixedBufSpine) ': tail)
+  PSMonotonic :: !(PolicyShape tail mid) -> PolicyShape tail (Ptr (CStruct MonotonicSpine) ': mid)
+  PSArena :: !(PolicyShape tail mid) -> PolicyShape tail (Ptr (CStruct ArenaSpine) ': mid)
+  PSPool :: !(PolicyShape tail mid) -> PolicyShape tail (Ptr (CStruct MemPoolSpine) ': mid)
+  PSRecycling :: !(PolicyShape tail mid) -> PolicyShape tail (Ptr (CStruct RecyclerSpine) ': mid)
+  PSFallback :: !(PolicyShape mid out) -> !(PolicyShape tail mid) -> PolicyShape tail out
+  PSSegregate :: !(PolicyShape mid out) -> !(PolicyShape tail mid) -> PolicyShape tail (Int64 ': out)
+  PSStats :: !(PolicyShape tail mid) -> PolicyShape tail (Ptr (CStruct AllocTrackerSpine) ': mid)
+  PSLocal :: !String -> !(PolicyShape tail out) -> PolicyShape tail out
+
+data SomeReifiedPolicy (e :: K.Type -> K.Type) (tail :: [K.Type]) where
+  SomeReifiedPolicy ::
+    !String ->
+    !(PolicyShape tail out) ->
+    !(LocalArgs e tail -> LocalArgs e out) ->
+    SomeReifiedPolicy e tail
+
+reifyPolicy :: forall e tail. Alloc e -> SomeReifiedPolicy e tail
+reifyPolicy = \case
+  AllocDynamic ->
+    SomeReifiedPolicy "D" PSDynamic id
+  AllocFixed (FixedBuf p) ->
+    SomeReifiedPolicy "F" PSFixed (LACons p)
+  AllocMonotonic (Monotonic p) inner ->
+    case reifyPolicy @e @tail inner of
+      SomeReifiedPolicy tag sh prep ->
+        SomeReifiedPolicy ("M_" <> tag) (PSMonotonic sh) (LACons p . prep)
+  AllocArena (Arena p) inner ->
+    case reifyPolicy @e @tail inner of
+      SomeReifiedPolicy tag sh prep ->
+        SomeReifiedPolicy ("A_" <> tag) (PSArena sh) (LACons p . prep)
+  AllocPool (MemPool p) inner ->
+    case reifyPolicy @e @tail inner of
+      SomeReifiedPolicy tag sh prep ->
+        SomeReifiedPolicy ("P_" <> tag) (PSPool sh) (LACons p . prep)
+  AllocRecycling (Recycler p) inner ->
+    case reifyPolicy @e @tail inner of
+      SomeReifiedPolicy tag sh prep ->
+        SomeReifiedPolicy ("R_" <> tag) (PSRecycling sh) (LACons p . prep)
+  AllocFallback p1 p2 ->
+    case reifyPolicy @e @tail p2 of
+      SomeReifiedPolicy tag2 (sh2 :: PolicyShape tail mid) prep2 ->
+        case reifyPolicy @e @mid p1 of
+          SomeReifiedPolicy tag1 sh1 prep1 ->
+            SomeReifiedPolicy
+              ("FB_" <> tag1 <> "_" <> tag2)
+              (PSFallback sh1 sh2)
+              (prep1 . prep2)
+  AllocSegregate thr p1 p2 ->
+    case reifyPolicy @e @tail p2 of
+      SomeReifiedPolicy tag2 (sh2 :: PolicyShape tail mid) prep2 ->
+        case reifyPolicy @e @mid p1 of
+          SomeReifiedPolicy tag1 sh1 prep1 ->
+            SomeReifiedPolicy
+              ("SG_" <> tag1 <> "_" <> tag2)
+              (PSSegregate sh1 sh2)
+              (LACons thr . prep1 . prep2)
+  AllocStats (AllocTracker p) inner ->
+    case reifyPolicy @e @tail inner of
+      SomeReifiedPolicy tag sh prep ->
+        SomeReifiedPolicy ("ST_" <> tag) (PSStats sh) (LACons p . prep)
+  AllocLocal nm inner ->
+    case reifyPolicy @e @tail inner of
+      SomeReifiedPolicy tag sh prep ->
+        SomeReifiedPolicy ("L_" <> nm <> "_" <> tag) (PSLocal nm sh) prep
+
+rebuildPolicy :: PolicyShape tail out -> LocalArgs e out -> (Alloc e, LocalArgs e tail)
+rebuildPolicy sh args = case sh of
+  PSDynamic ->
+    (AllocDynamic, args)
+  PSFixed ->
+    case args of
+      LACons p rest -> (AllocFixed (FixedBuf p), rest)
+  PSMonotonic sub ->
+    case args of
+      LACons p rest ->
+        let (inner, rest') = rebuildPolicy sub rest
+         in (AllocMonotonic (Monotonic p) inner, rest')
+  PSArena sub ->
+    case args of
+      LACons p rest ->
+        let (inner, rest') = rebuildPolicy sub rest
+         in (AllocArena (Arena p) inner, rest')
+  PSPool sub ->
+    case args of
+      LACons p rest ->
+        let (inner, rest') = rebuildPolicy sub rest
+         in (AllocPool (MemPool p) inner, rest')
+  PSRecycling sub ->
+    case args of
+      LACons p rest ->
+        let (inner, rest') = rebuildPolicy sub rest
+         in (AllocRecycling (Recycler p) inner, rest')
+  PSFallback sh1 sh2 ->
+    let (a1, mid) = rebuildPolicy sh1 args
+        (a2, rest) = rebuildPolicy sh2 mid
+     in (AllocFallback a1 a2, rest)
+  PSSegregate sh1 sh2 ->
+    case args of
+      LACons thr rest0 ->
+        let (a1, mid) = rebuildPolicy sh1 rest0
+            (a2, rest) = rebuildPolicy sh2 mid
+         in (AllocSegregate thr a1 a2, rest)
+  PSStats sub ->
+    case args of
+      LACons p rest ->
+        let (inner, rest') = rebuildPolicy sub rest
+         in (AllocStats (AllocTracker p) inner, rest')
+  PSLocal nm sub ->
+    let (inner, rest) = rebuildPolicy sub args
+     in (AllocLocal nm inner, rest)
 
 -- | Allocate @sz@ bytes using the policy's configured default alignment
 -- (64 bytes for 'AllocDynamic' and default-constructed derived allocators;
@@ -180,6 +310,17 @@ allocBytesAligned policy sz reqAlign = case policy of
     vp <- allocBytesAligned inner sz reqAlign
     statsRecordAlloc tracker vp sz
     pure vp
+  AllocLocal name inner ->
+    case reifyPolicy @e @'[Int64, Int64] inner of
+      SomeReifiedPolicy shapeTag sh prep ->
+        toVoidPtr
+          <$> localFunArgsM @m @e @_ @(Ptr Word8)
+            (name <> "_alloc_" <> shapeTag)
+            ( \_ allArgs ->
+                let (inner0, LACons sz0 (LACons al0 LANil)) = rebuildPolicy sh allArgs
+                 in fromVoidPtr <$> allocBytesAligned inner0 sz0 al0
+            )
+            (prep (LACons sz (LACons reqAlign LANil)))
 
 allocZeroed :: (CmdAlloc m e) => Alloc e -> e Int64 -> m (e (Ptr ()))
 allocZeroed alloc sz = allocZeroedAligned alloc sz 1
@@ -319,6 +460,17 @@ reallocBytesAligned policy oldPtr oldSz newSz reqAlign = case policy of
           )
       )
     toVoidPtr <$> readRef outRef
+  AllocLocal name inner ->
+    case reifyPolicy @e @'[Ptr Word8, Int64, Int64, Int64] inner of
+      SomeReifiedPolicy shapeTag sh prep ->
+        toVoidPtr
+          <$> localFunArgsM @m @e @_ @(Ptr Word8)
+            (name <> "_realloc_" <> shapeTag)
+            ( \_ allArgs ->
+                let (inner0, LACons op0 (LACons osz0 (LACons nsz0 (LACons al0 LANil)))) = rebuildPolicy sh allArgs
+                 in fromVoidPtr <$> reallocBytesAligned inner0 (toVoidPtr op0) osz0 nsz0 al0
+            )
+            (prep (LACons (fromVoidPtr oldPtr :: e (Ptr Word8)) (LACons oldSz (LACons newSz (LACons reqAlign LANil)))))
 
 freeBytes ::
   forall m e.
@@ -327,6 +479,16 @@ freeBytes ::
   e (Ptr ()) ->
   e Int64 ->
   m ()
+freeBytes (AllocLocal name inner) ptr oldSz =
+  case reifyPolicy @e @'[Ptr Word8, Int64] inner of
+    SomeReifiedPolicy shapeTag sh prep ->
+      localFunArgsM_
+        (name <> "_free_" <> shapeTag)
+        ( \_ allArgs ->
+            let (inner0, LACons p0 (LACons osz0 LANil)) = rebuildPolicy sh allArgs
+             in freeBytes inner0 (toVoidPtr p0) osz0
+        )
+        (prep (LACons (fromVoidPtr ptr :: e (Ptr Word8)) (LACons oldSz LANil)))
 freeBytes policy ptr oldSz =
   whenM_ (lnot (isNullVoidPtr ptr)) $ case policy of
     AllocDynamic ->
@@ -389,8 +551,19 @@ ownsPtr policy ptr = case policy of
     readRef resRef
   AllocStats _ inner ->
     ownsPtr inner ptr
+  AllocLocal name inner ->
+    case reifyPolicy @e @'[Ptr Word8] inner of
+      SomeReifiedPolicy shapeTag sh prep ->
+        localFunArgsM
+          (name <> "_owns_" <> shapeTag)
+          ( \_ allArgs ->
+              let (inner0, LACons p0 LANil) = rebuildPolicy sh allArgs
+               in ownsPtr inner0 (toVoidPtr p0)
+          )
+          (prep (LACons (fromVoidPtr ptr :: e (Ptr Word8)) LANil))
 
 resetAlloc ::
+  forall m e.
   (CmdAlloc m e) =>
   Alloc e ->
   m ()
@@ -404,6 +577,16 @@ resetAlloc policy = case policy of
   AllocFallback primary secondary -> resetAlloc primary >> resetAlloc secondary
   AllocSegregate _ smallA largeA -> resetAlloc smallA >> resetAlloc largeA
   AllocStats tracker inner -> resetAlloc inner >> resetAllocTracker tracker
+  AllocLocal name inner ->
+    case reifyPolicy @e @'[] inner of
+      SomeReifiedPolicy shapeTag sh prep ->
+        localFunArgsM_
+          (name <> "_reset_" <> shapeTag)
+          ( \_ allArgs ->
+              let (inner0, LANil) = rebuildPolicy sh allArgs
+               in resetAlloc inner0
+          )
+          (prep LANil)
 
 --------------------------------------------------------------------------------
 -- Typed Allocation Helpers

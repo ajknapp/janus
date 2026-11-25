@@ -40,6 +40,7 @@ import Janus.Control.Stream (Stream, rangeS, statefulS, streamM)
 import Janus.Data
 import Janus.Expression.Cast (ExpBoolCast (..))
 import Janus.Expression.Cond (ExpCond (..))
+import Janus.Fix (fun)
 import qualified Janus.Data.BTreeMap as BTM
 import qualified Janus.Data.BTreeSet as BTS
 import qualified Janus.Data.BitSet as BS
@@ -649,25 +650,52 @@ cMultiContainerSPMDKernel ::
   POOL.Pool LinuxX86_64CCSE Int64 ->
   LinuxX86_64CMCSE (LinuxX86_64CCSE Int64)
 cMultiContainerSPMDKernel bs dv hm ev pool = do
-  -- 1. In-place SoA DynVec update gated by lane-gather BitSet membership (`testBitsSPMD`)!
-  DV.foreachSPMD (Proxy @4) dv $ \idx (Vec2 x y) -> do
-    active <- BS.testBitsSPMD bs idx
-    pure (Vec2 (ifThenElse active (x + y) x) (y * 2))
-  -- 2. Masked HashMap value doubling in SIMD
-  HM.foreachValuesSPMD (Proxy @4) hm (\_ v -> pure (v * 2))
-  -- 3. Bitmask-gated Pool increment in SIMD
-  POOL.foreachOccupiedSPMD (Proxy @4) pool (\_ v -> pure (v + 7))
-  -- 4. Vectorized BitSet popcount + EytzingerVec batch membership count in SIMD
-  pc <- BS.spmdPopcount (Proxy @4) bs
-  evHits <-
-    runDrain drainSum $
-      streamM (rangeS (0 :: LinuxX86_64CCSE Int64) 4) $ \g -> do
-        let qGang = spmdAlignedUnitStride (g * 4)
-        m <- withSPMD (Proxy @4) (EV.memberSPMD (Proxy @4) ev qGang)
-        pure (gangReduceAdd (fromBool m :: SPMD 4 LinuxX86_64CCSE Int64))
-  hmSum <- gangReduceAdd <$> HM.foldValuesSPMD (Proxy @4) hm 0 (\acc _ v -> pure (acc + v))
-  poolSum <- gangReduceAdd <$> POOL.foldOccupiedSPMD (Proxy @4) pool 0 (\acc _ v -> pure (acc + v))
-  pure (pc + evHits * 100 + hmSum + poolSum)
+  let dvPhase ::
+        BS.BitSet LinuxX86_64CCSE ->
+        DV.DynVec LinuxX86_64CCSE (SoA Vec2) ->
+        LinuxX86_64CMCSE ()
+      dvPhase =
+        fun (Proxy @LinuxX86_64CCSE) "spmd_dv_phase" $ \_ bs' dv' ->
+          DV.foreachSPMD (Proxy @4) dv' $ \idx (Vec2 x y) -> do
+            active <- BS.testBitsSPMD bs' idx
+            pure (Vec2 (ifThenElse active (x + y) x) (y * 2))
+
+      hmPhase ::
+        HM.HashMap LinuxX86_64CCSE Int64 Int64 ->
+        LinuxX86_64CMCSE (LinuxX86_64CCSE Int64)
+      hmPhase =
+        fun (Proxy @LinuxX86_64CCSE) "spmd_hm_phase" $ \_ hm' -> do
+          HM.foreachValuesSPMD (Proxy @4) hm' (\_ v -> pure (v * 2))
+          gangReduceAdd <$> HM.foldValuesSPMD (Proxy @4) hm' 0 (\acc _ v -> pure (acc + v))
+
+      poolPhase ::
+        POOL.Pool LinuxX86_64CCSE Int64 ->
+        LinuxX86_64CMCSE (LinuxX86_64CCSE Int64)
+      poolPhase =
+        fun (Proxy @LinuxX86_64CCSE) "spmd_pool_phase" $ \_ pool' -> do
+          POOL.foreachOccupiedSPMD (Proxy @4) pool' (\_ v -> pure (v + 7))
+          gangReduceAdd <$> POOL.foldOccupiedSPMD (Proxy @4) pool' 0 (\acc _ v -> pure (acc + v))
+
+      bsEvPhase ::
+        BS.BitSet LinuxX86_64CCSE ->
+        EV.EytzingerVec LinuxX86_64CCSE Int64 ->
+        LinuxX86_64CMCSE (LinuxX86_64CCSE Int64)
+      bsEvPhase =
+        fun (Proxy @LinuxX86_64CCSE) "spmd_bs_ev_phase" $ \_ bs' ev' -> do
+          pc <- BS.spmdPopcount (Proxy @4) bs'
+          evHits <-
+            runDrain drainSum $
+              streamM (rangeS (0 :: LinuxX86_64CCSE Int64) 4) $ \g -> do
+                let qGang = spmdAlignedUnitStride (g * 4)
+                m <- withSPMD (Proxy @4) (EV.memberSPMD (Proxy @4) ev' qGang)
+                pure (gangReduceAdd (fromBool m :: SPMD 4 LinuxX86_64CCSE Int64))
+          pure (pc + evHits * 100)
+
+  dvPhase bs dv
+  hmSum <- hmPhase hm
+  poolSum <- poolPhase pool
+  bsEvVal <- bsEvPhase bs ev
+  pure (bsEvVal + hmSum + poolSum)
 
 check_spmd_containers_compiled_c_ffi ::
   IO

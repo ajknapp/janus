@@ -41,6 +41,7 @@ import Data.Coerce (Coercible, coerce)
 import Data.Function (fix)
 import Data.Functor.Identity (Identity (..))
 import qualified Data.Kind as K
+import Data.Proxy (Proxy (..))
 import Data.Semilattice.Join (Join (..))
 import Data.Semilattice.Lower (Lower (..))
 import Data.Semilattice.Meet (Meet (..))
@@ -48,7 +49,7 @@ import Data.Semilattice.Upper (Upper (..))
 import Data.Typeable (Typeable)
 import Foreign.Storable (Storable)
 import GHC.Float (expm1, log1p)
-import Janus.Backend.C.Raw (JanusCT (..), JanusCTyped (..), RVal (..))
+import Janus.Backend.C.Raw (JanusCMT, JanusCT (..), JanusCTyped (..), RVal (..))
 import Janus.Backend.C.CUDA.Types (CUDADejaFu (..), CUDAIO (..), CmdSync (..), JanusCUDA (..))
 import Janus.Command.Case (CmdCase (..))
 import Janus.Command.Cond (CmdCond (..))
@@ -67,7 +68,7 @@ import Janus.Command.Range (CmdRange (..))
 import Janus.Command.Ref (Cell (..), CmdRef (..), RefCell (..))
 import Janus.Command.TicToc (CmdTicToc (..), Tic (..), Toc (..))
 import Janus.Command.While (CmdWhile (..))
-import Janus.Constraints (CmdJanus, CmdJanusIO, ExpJanus)
+import Janus.Constraints (CmdJanus, CmdJanusIO, CmdLocalFun (..), ExpJanus)
 import Janus.Data.HKD (ExpPtrWord (..), ExpStructPtr (..))
 import Janus.Expression.Bits (ExpBits (..))
 import Janus.Expression.Bool (ExpBool (..))
@@ -87,7 +88,16 @@ import Janus.Expression.Math (ExpComplex (..), FMA (..), Hypot (..))
 import Janus.Expression.MurmurHash (ExpMurmurHash (..))
 import Janus.Expression.Ord (ExpOrd (..))
 import Janus.Expression.SIMD
-import Janus.Fix (ExpFix (..), JanusCFix (..), jfix)
+import Janus.Fix
+  ( ExpFix (..),
+    JanusCFix (..),
+    JanusCFixElem,
+    JanusCFixField (..),
+    JanusCFixMonRet (..),
+    JanusCFixParam (..),
+    jfix,
+    mapLocalArgs,
+  )
 import Janus.SPMD.Types (ExpPair (..))
 import Janus.Typed (JanusTyped, KnownJanusType)
 
@@ -109,6 +119,27 @@ type instance JanusTyped (ReaderExp r e) = JanusTyped e
 instance (KnownJanusType e a) => KnownJanusType (ReaderExp r e) a
 
 instance (ExpJanus e) => ExpJanus (ReaderExp r e)
+
+instance (Monad m, CmdLocalFun m e) => CmdLocalFun (ReaderT r m) (ReaderExp r e) where
+  emitLocalFunArgsM name step args =
+    ReaderT $ \env ->
+      ReaderExp
+        <$> emitLocalFunArgsM @m @e
+          name
+          ( \self rawArgs ->
+              let selfR rArgs = ReaderT $ \_ -> ReaderExp <$> self (mapLocalArgs getReaderExp rArgs)
+               in getReaderExp <$> runReaderT (step selfR (mapLocalArgs ReaderExp rawArgs)) env
+          )
+          (mapLocalArgs getReaderExp args)
+  emitLocalFunArgsM_ name step args =
+    ReaderT $ \env ->
+      emitLocalFunArgsM_ @m @e
+        name
+        ( \self rawArgs ->
+            let selfR rArgs = ReaderT $ \_ -> self (mapLocalArgs getReaderExp rArgs)
+             in runReaderT (step selfR (mapLocalArgs ReaderExp rawArgs)) env
+        )
+        (mapLocalArgs getReaderExp args)
 
 instance (CmdJanus m e) => CmdJanus (ReaderT r m) (ReaderExp r e)
 
@@ -269,17 +300,45 @@ instance ExpFix (ReaderExp r Identity) fn where
   fun _ _ = fix
   {-# INLINE fun #-}
 
-instance (Typeable r, Typeable t, JanusCTyped a) => JanusCFix (ReaderExp r (JanusCT t) a) where
+instance (JanusCFixElem a) => JanusCFixField t (ReaderExp r (JanusCT t) a) where
+  jcfixFieldTypes pt _ = jcfixFieldTypes pt (Proxy @(JanusCT t a))
+  jcfixFieldElemCTypes pt _ = jcfixFieldElemCTypes pt (Proxy @(JanusCT t a))
+  jcfixFieldExtractExps pt (ReaderExp x) = jcfixFieldExtractExps pt x
+  jcfixFieldMakeParams pt n0 =
+    let (n1, mp, x) = jcfixFieldMakeParams @t @(JanusCT t a) pt n0
+     in (n1, mp, ReaderExp x)
+  jcfixFieldRebuild pt es0 =
+    let (x, es1) = jcfixFieldRebuild @t @(JanusCT t a) pt es0
+     in (ReaderExp x, es1)
+
+instance (JanusCFixElem a) => JanusCFixParam t (ReaderExp r (JanusCT t) a) where
+  jcfixParamTypes pt _ = jcfixParamTypes pt (Proxy @(JanusCT t a))
+  jcfixExtractArgs pt (ReaderExp x) = jcfixExtractArgs pt x
+  jcfixMakeFormal pt n0 =
+    let (n1, mp, x) = jcfixMakeFormal @t @(JanusCT t a) pt n0
+     in (n1, mp, ReaderExp x)
+
+instance (JanusCFixElem a) => JanusCFixMonRet t (ReaderExp r (JanusCT t) a) where
+  jcfixRetTypes pt _ = jcfixRetTypes pt (Proxy @(JanusCT t a))
+  jcfixRetElemCTypes pt _ = jcfixRetElemCTypes pt (Proxy @(JanusCT t a))
+  jcfixExtractRetExps pt (ReaderExp x) = jcfixExtractRetExps pt x
+  jcfixRebuildRet pt es0 =
+    let (x, es1) = jcfixRebuildRet @t @(JanusCT t a) pt es0
+     in (ReaderExp x, es1)
+
+instance (JanusCFixElem a) => JanusCFix t (ReaderExp r (JanusCT t) a) where
+  jcfixSigTypes _ = jcfixSigTypes @t @(JanusCT t a) (Proxy @(JanusCT t a))
   jcfun name args params n (ReaderExp body) = ReaderExp (jcfun name args params n body)
-  jcfake name args (ReaderExp body) = ReaderExp (jcfake name args body)
+  jcfake _ name args = ReaderExp (jcfake (Proxy @(JanusCT t a)) name args)
 
-instance (Typeable r, Typeable t, JanusCTyped a, JanusCFix fn) => JanusCFix (ReaderExp r (JanusCT t) a -> fn) where
-  jcfun name args params n body (ReaderExp x) =
-    jcfun name args params n (body . ReaderExp) x
-  jcfake name args f (ReaderExp x) =
-    jcfake name args (f . ReaderExp) x
+instance (JanusCFixMonRet t res) => JanusCFix t (ReaderT r (JanusCMT t) res) where
+  jcfixSigTypes _ = jcfixSigTypes @t @(JanusCMT t res) (Proxy @(JanusCMT t res))
+  jcfun name args params n body =
+    ReaderT $ \env -> jcfun name args params n (runReaderT body env)
+  jcfake _ name args =
+    ReaderT $ \_ -> jcfake (Proxy @(JanusCMT t res)) name args
 
-instance (JanusCFix fn) => ExpFix (ReaderExp r (JanusCT t)) fn where
+instance (JanusCFix t fn) => ExpFix (ReaderExp r (JanusCT t)) fn where
   fun _ = jfix
 
 --------------------------------------------------------------------------------

@@ -27,6 +27,14 @@ import Janus.Expression.Extract (ExpExtract (..))
 import Janus.Expression.SIMD
 import Janus.FFI.Arg (THParamMode (..), THParamSpec (..), natToTHType, typeRepToTHType)
 import Janus.FFI.Ret (THRetEffect (..), THRetMode (..), THRetSpec (..))
+import Janus.Fix
+  ( ExpFix (..),
+    JanusCFix (..),
+    JanusCFixElem,
+    JanusCFixMonRet (..),
+    JanusCFixParam (..),
+    jfix,
+  )
 import Janus.SPMD.Typed
 import Janus.SPMD.Types
 import qualified Language.Haskell.TH as TH
@@ -283,6 +291,7 @@ instance
   jcWithHostArg _ xs prevArgs cont =
     jcWithABIArg (Proxy @t) (spmdRawFromList @n @(JanusCT t) @a xs) (\av -> cont (av : prevArgs))
   jcTHParamSpecs _ = [spmdTHParamSpec @t @n @a]
+  jcArgSignatureTypes _ = [typeRep (Proxy @(SPMDRep n (JanusCT t) a))]
 
 instance
   ( Typeable t,
@@ -300,6 +309,7 @@ instance
     spmdRawToList @n @(JanusCT t) @a
       <$> jcCallABIRet pt (Proxy @(SPMDRep n (JanusCT t) a)) fp args
   jcTHValRetSpec _ eff _ = spmdTHRetSpec @t @n @a eff
+  jcRetSignatureTypes _ _ = [typeRep (Proxy @(SPMDRep n (JanusCT t) a))]
 
 instance
   ( JanusCTarget t,
@@ -315,6 +325,7 @@ instance
   jcparamWith fs name k mparams x =
     jcparamWith fs name k mparams (spmdMaterialize @n @(JanusCT t) @a (runSPMD x))
   jcTHSpec _ = ([], spmdTHRetSpec @t @n @a THRetPure)
+  jcSignatureTypes _ = ([], [typeRep (Proxy @(SPMDRep n (JanusCT t) a))])
 
 instance
   ( JanusCTarget t,
@@ -338,6 +349,7 @@ instance
   jcparamWith fs name k mparams act =
     jcparamWith fs name k mparams (runSPMDM act)
   jcTHSpec _ = ([], jcTHValRetSpec (Proxy @t) THRetIO (Proxy @res))
+  jcSignatureTypes _ = ([], jcRetSignatureTypes (Proxy @t) (Proxy @res))
 
 instance
   (JanusCTarget t, JanusCValRet t res) =>
@@ -345,3 +357,56 @@ instance
   where
   jcevalCont withArgs dlFPtr act =
     jcevalCont @t @(JanusCMT t res) withArgs dlFPtr (runSPMDM act)
+
+--------------------------------------------------------------------------------
+-- 15. `JanusCFix` & `ExpFix` Support for `SPMD` and `SPMDM` on `JanusCT t`
+--------------------------------------------------------------------------------
+
+instance
+  (SPMDTyped n (JanusCT t) a, JanusCFixElem (SPMDRep n (JanusCT t) a)) =>
+  JanusCFixParam t (SPMD n (JanusCT t) a)
+  where
+  jcfixParamTypes pt _ = jcfixParamTypes pt (Proxy @(JanusCT t (SPMDRep n (JanusCT t) a)))
+  jcfixExtractArgs pt x =
+    jcfixExtractArgs pt (spmdMaterialize @n @(JanusCT t) @a (runSPMD x))
+  jcfixMakeFormal pt n0 =
+    let (n1, mp, rawFormal) = jcfixMakeFormal @t @(JanusCT t (SPMDRep n (JanusCT t) a)) pt n0
+     in (n1, mp, SPMD (pure (spmdDematerialize @n @(JanusCT t) @a rawFormal)))
+
+instance
+  (SPMDTyped n (JanusCT t) a, JanusCFixElem (SPMDRep n (JanusCT t) a)) =>
+  JanusCFixMonRet t (SPMD n (JanusCT t) a)
+  where
+  jcfixRetTypes pt _ = jcfixRetTypes pt (Proxy @(JanusCT t (SPMDRep n (JanusCT t) a)))
+  jcfixRetElemCTypes pt _ = jcfixRetElemCTypes pt (Proxy @(JanusCT t (SPMDRep n (JanusCT t) a)))
+  jcfixExtractRetExps pt x =
+    jcfixExtractRetExps pt (spmdMaterialize @n @(JanusCT t) @a (runSPMD x))
+  jcfixRebuildRet pt es0 =
+    let (rawR, es1) = jcfixRebuildRet @t @(JanusCT t (SPMDRep n (JanusCT t) a)) pt es0
+     in (SPMD (pure (spmdDematerialize @n @(JanusCT t) @a rawR)), es1)
+
+instance
+  (SPMDTyped n (JanusCT t) a, JanusCFixElem (SPMDRep n (JanusCT t) a)) =>
+  JanusCFix t (SPMD n (JanusCT t) a)
+  where
+  jcfixSigTypes _ = jcfixSigTypes @t @(JanusCT t (SPMDRep n (JanusCT t) a)) (Proxy @(JanusCT t (SPMDRep n (JanusCT t) a)))
+  jcfun name argsM paramsM n body =
+    let rawBody = spmdMaterialize @n @(JanusCT t) @a (runSPMD body)
+        rawRes = jcfun name argsM paramsM n rawBody
+     in SPMD (pure (spmdDematerialize @n @(JanusCT t) @a rawRes))
+  jcfake _ name argsM =
+    let rawRes = jcfake (Proxy @(JanusCT t (SPMDRep n (JanusCT t) a))) name argsM
+     in SPMD (pure (spmdDematerialize @n @(JanusCT t) @a rawRes))
+
+instance
+  (JanusCFixMonRet t res) =>
+  JanusCFix t (SPMDM n (JanusCMT t) (JanusCT t) res)
+  where
+  jcfixSigTypes _ = jcfixSigTypes @t @(JanusCMT t res) (Proxy @(JanusCMT t res))
+  jcfun name argsM paramsM n act =
+    liftSPMD (jcfun name argsM paramsM n (runSPMDM act))
+  jcfake _ name argsM =
+    liftSPMD (jcfake (Proxy @(JanusCMT t res)) name argsM)
+
+instance (JanusCFix t r) => ExpFix (SPMD n (JanusCT t)) r where
+  fun _ = jfix

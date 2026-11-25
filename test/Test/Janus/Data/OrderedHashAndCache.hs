@@ -44,6 +44,7 @@ import qualified Janus.Data.IndexSet as IS
 import Janus.Data.Layout (SoA)
 import Janus.Data.LruCache (LruCache)
 import qualified Janus.Data.LruCache as LRU
+import Janus.Fix (fun)
 import System.Environment (lookupEnv)
 import Test.Tasty (TestTree, testGroup, withResource)
 import Test.Tasty.Hedgehog (testProperty)
@@ -697,19 +698,55 @@ cMutateOrderedAndCaches ::
   LinuxX86_64CCSE Int64 ->
   LinuxX86_64CMCSE (LinuxX86_64CCSE Int64)
 cMutateOrderedAndCaches im is cc lru n = do
-  runDrain
-    ( drainForEach $ \i -> do
-        IM.insertWith dynamicAlloc im (+) i (i * 10 + 1)
-        _ <- IS.insert dynamicAlloc is (i * 2)
-        CC.insert cc i (i * 5)
-        LRU.insert lru i (i * 7)
-    )
-    (rangeS 0 n)
-  IM.foreachScalarValuesSPMD (Proxy @4) im (\_ v -> pure (v * 2))
-  s1 <- runDrain drainSum (IM.valuesS im)
-  s2 <- runDrain drainSum (IS.stream is)
-  s3 <- runDrain drainSum (CC.valuesS cc)
-  s4 <- runDrain drainSum (LRU.mruValuesS lru)
+  let imPhase ::
+        IndexMap LinuxX86_64CCSE Int64 Int64 ->
+        LinuxX86_64CCSE Int64 ->
+        LinuxX86_64CMCSE (LinuxX86_64CCSE Int64)
+      imPhase =
+        fun (Proxy @LinuxX86_64CCSE) "ohc_im_phase" $ \_ im' n' -> do
+          runDrain
+            (drainForEach (\i -> IM.insertWith dynamicAlloc im' (+) i (i * 10 + 1)))
+            (rangeS 0 n')
+          IM.foreachScalarValuesSPMD (Proxy @4) im' (\_ v -> pure (v * 2))
+          runDrain drainSum (IM.valuesS im')
+
+      isPhase ::
+        IndexSet LinuxX86_64CCSE Int64 ->
+        LinuxX86_64CCSE Int64 ->
+        LinuxX86_64CMCSE (LinuxX86_64CCSE Int64)
+      isPhase =
+        fun (Proxy @LinuxX86_64CCSE) "ohc_is_phase" $ \_ is' n' -> do
+          runDrain
+            (drainForEach (\i -> IS.insert dynamicAlloc is' (i * 2) >> pure ()))
+            (rangeS 0 n')
+          runDrain drainSum (IS.stream is')
+
+      ccPhase ::
+        ClockCache LinuxX86_64CCSE Int64 Int64 ->
+        LinuxX86_64CCSE Int64 ->
+        LinuxX86_64CMCSE (LinuxX86_64CCSE Int64)
+      ccPhase =
+        fun (Proxy @LinuxX86_64CCSE) "ohc_cc_phase" $ \_ cc' n' -> do
+          runDrain
+            (drainForEach (\i -> CC.insert cc' i (i * 5)))
+            (rangeS 0 n')
+          runDrain drainSum (CC.valuesS cc')
+
+      lruPhase ::
+        LruCache LinuxX86_64CCSE Int64 Int64 ->
+        LinuxX86_64CCSE Int64 ->
+        LinuxX86_64CMCSE (LinuxX86_64CCSE Int64)
+      lruPhase =
+        fun (Proxy @LinuxX86_64CCSE) "ohc_lru_phase" $ \_ lru' n' -> do
+          runDrain
+            (drainForEach (\i -> LRU.insert lru' i (i * 7)))
+            (rangeS 0 n')
+          runDrain drainSum (LRU.mruValuesS lru')
+
+  s1 <- imPhase im n
+  s2 <- isPhase is n
+  s3 <- ccPhase cc n
+  s4 <- lruPhase lru n
   pure (s1 + s2 + s3 + s4)
 
 check_ordered_and_cache_host_c_ffi ::

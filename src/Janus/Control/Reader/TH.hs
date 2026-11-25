@@ -26,6 +26,7 @@ import Control.Monad.Reader (ReaderT (..))
 import Data.Coerce (coerce)
 import Data.Function (fix)
 import Data.Functor.Identity (Identity)
+import Data.Proxy (Proxy (..))
 import Data.Semilattice.Join (Join (..))
 import Data.Semilattice.Lower (Lower (..))
 import Data.Semilattice.Meet (Meet (..))
@@ -52,7 +53,7 @@ import Janus.Command.Range (CmdRange (..))
 import Janus.Command.Ref (Cell (..), CmdRef (..), RefCell (..))
 import Janus.Command.TicToc (CmdTicToc (..), Tic (..), Toc (..))
 import Janus.Command.While (CmdWhile (..))
-import Janus.Constraints (CmdJanus, CmdJanusIO, ExpJanus)
+import Janus.Constraints (CmdJanus, CmdJanusIO, CmdLocalFun (..), ExpJanus)
 import Janus.Control.Reader.Base
 import Janus.Control.Reader.Gang ()
 import Janus.Expression.Bits (ExpBits (..))
@@ -69,7 +70,16 @@ import Janus.Expression.Math (ExpComplex (..), FMA (..), Hypot (..))
 import Janus.Expression.MurmurHash (ExpMurmurHash (..))
 import Janus.Expression.Ord (ExpOrd (..))
 import Janus.Expression.SIMD
-import Janus.Fix (ExpFix (..), JanusCFix (..), jfix)
+import Janus.Fix
+  ( ExpFix (..),
+    JanusCFix (..),
+    JanusCFixElem,
+    JanusCFixField (..),
+    JanusCFixMonRet (..),
+    JanusCFixParam (..),
+    jfix,
+    mapLocalArgs,
+  )
 import Janus.SPMD.Gang
   ( CmdOptimalGang (..),
     OptimalGangCaps (..),
@@ -600,6 +610,27 @@ deriveJanusReader spec = do
 
       instance (ExpJanus $eQ) => ExpJanus $eTyQ
 
+      instance (Monad $mQ, CmdLocalFun $mQ $eQ) => CmdLocalFun $mTyQ $eTyQ where
+        emitLocalFunArgsM name step args =
+          $mkM $
+            $mkE
+              <$> emitLocalFunArgsM @($rMonQ) @($rExpQ)
+                name
+                ( \selfR rArgs ->
+                    let selfWrap wArgs = $mkM ($mkE <$> selfR (mapLocalArgs (\x -> $unE x) wArgs))
+                     in (\x -> $unE x) <$> $unM (step selfWrap (mapLocalArgs $mkE rArgs))
+                )
+                (mapLocalArgs (\x -> $unE x) args)
+        emitLocalFunArgsM_ name step args =
+          $mkM $
+            emitLocalFunArgsM_ @($rMonQ) @($rExpQ)
+              name
+              ( \selfR rArgs ->
+                  let selfWrap wArgs = $mkM (selfR (mapLocalArgs (\x -> $unE x) wArgs))
+                   in $unM (step selfWrap (mapLocalArgs $mkE rArgs))
+              )
+              (mapLocalArgs (\x -> $unE x) args)
+
       instance (CmdJanus $mQ $eQ) => CmdJanus $mTyQ $eTyQ
 
       instance (CmdJanusIO $mQ $eQ) => CmdJanusIO $mTyQ $eTyQ
@@ -670,23 +701,26 @@ deriveJanusReader spec = do
 
   -- 2. ExpFix / JanusCFix instances for Identity and JanusCT t
   fnVar <- TH.newName "fn"
+  resVar <- TH.newName "res"
   tVar <- TH.newName "t"
   let fnQ = TH.varT fnVar
+      resQ = TH.varT resVar
       tQ = TH.varT tVar
 
   (_, _, eIdTy, _, _) <- jrsInstantiate spec [t|IO|] [t|Identity|]
-  (envCTTy, _, eCTTy, _, ctExtraTypeables) <- jrsInstantiate spec [t|JanusCMT $tQ|] [t|JanusCT $tQ|]
+  (envCTTy, mCTTy, eCTTy, _, ctExtraTypeables) <- jrsInstantiate spec [t|JanusCMT $tQ|] [t|JanusCT $tQ|]
   let eIdTyQ = pure eIdTy
+      mCTTyQ = pure mCTTy
       eCTTyQ = pure eCTTy
       envCTTyQ = pure envCTTy
       ctCxtBasePreds =
         ctExtraTypeables
-          <> [ TH.AppT (TH.ConT ''Typeable) (TH.VarT tVar),
-               TH.AppT (TH.ConT ''JanusCTyped) (TH.VarT aVar),
-               TH.AppT (TH.ConT ''Typeable) envCTTy
+          <> [ TH.AppT (TH.ConT ''JanusCFixElem) (TH.VarT aVar)
              ]
-      ctCxtArrPreds =
-        ctCxtBasePreds <> [TH.AppT (TH.ConT ''JanusCFix) (TH.VarT fnVar)]
+      ctCxtMonPreds =
+        ctExtraTypeables
+          <> [ TH.AppT (TH.AppT (TH.ConT ''JanusCFixMonRet) (TH.VarT tVar)) (TH.VarT resVar)
+             ]
 
   fixQuotes <-
     [d|
@@ -694,26 +728,57 @@ deriveJanusReader spec = do
         fun _ _ = fix
         {-# INLINE fun #-}
 
-      instance JanusCFix ($eCTTyQ $aQ) where
+      instance JanusCFixField $tQ ($eCTTyQ $aQ) where
+        jcfixFieldTypes pt _ = jcfixFieldTypes pt (Proxy @(ReaderExp $envCTTyQ (JanusCT $tQ) $aQ))
+        jcfixFieldElemCTypes pt _ = jcfixFieldElemCTypes pt (Proxy @(ReaderExp $envCTTyQ (JanusCT $tQ) $aQ))
+        jcfixFieldExtractExps pt x = jcfixFieldExtractExps pt ($unE x :: ReaderExp $envCTTyQ (JanusCT $tQ) $aQ)
+        jcfixFieldMakeParams pt n0 =
+          let (n1, mp, r) = jcfixFieldMakeParams @($tQ) @(ReaderExp $envCTTyQ (JanusCT $tQ) $aQ) pt n0
+           in (n1, mp, $mkE r)
+        jcfixFieldRebuild pt es0 =
+          let (r, es1) = jcfixFieldRebuild @($tQ) @(ReaderExp $envCTTyQ (JanusCT $tQ) $aQ) pt es0
+           in ($mkE r, es1)
+
+      instance JanusCFixParam $tQ ($eCTTyQ $aQ) where
+        jcfixParamTypes pt _ = jcfixParamTypes pt (Proxy @(ReaderExp $envCTTyQ (JanusCT $tQ) $aQ))
+        jcfixExtractArgs pt x = jcfixExtractArgs pt ($unE x :: ReaderExp $envCTTyQ (JanusCT $tQ) $aQ)
+        jcfixMakeFormal pt n0 =
+          let (n1, mp, r) = jcfixMakeFormal @($tQ) @(ReaderExp $envCTTyQ (JanusCT $tQ) $aQ) pt n0
+           in (n1, mp, $mkE r)
+
+      instance JanusCFixMonRet $tQ ($eCTTyQ $aQ) where
+        jcfixRetTypes pt _ = jcfixRetTypes pt (Proxy @(ReaderExp $envCTTyQ (JanusCT $tQ) $aQ))
+        jcfixRetElemCTypes pt _ = jcfixRetElemCTypes pt (Proxy @(ReaderExp $envCTTyQ (JanusCT $tQ) $aQ))
+        jcfixExtractRetExps pt x = jcfixExtractRetExps pt ($unE x :: ReaderExp $envCTTyQ (JanusCT $tQ) $aQ)
+        jcfixRebuildRet pt es0 =
+          let (r, es1) = jcfixRebuildRet @($tQ) @(ReaderExp $envCTTyQ (JanusCT $tQ) $aQ) pt es0
+           in ($mkE r, es1)
+
+      instance JanusCFix $tQ ($eCTTyQ $aQ) where
+        jcfixSigTypes _ = jcfixSigTypes @($tQ) @(ReaderExp $envCTTyQ (JanusCT $tQ) $aQ) (Proxy @(ReaderExp $envCTTyQ (JanusCT $tQ) $aQ))
         jcfun name args params n body =
           $mkE (jcfun name args params n ($unE body :: ReaderExp $envCTTyQ (JanusCT $tQ) $aQ))
-        jcfake name args body =
-          $mkE (jcfake name args ($unE body :: ReaderExp $envCTTyQ (JanusCT $tQ) $aQ))
+        jcfake _ name args =
+          $mkE (jcfake (Proxy @(ReaderExp $envCTTyQ (JanusCT $tQ) $aQ)) name args)
 
-      instance JanusCFix ($eCTTyQ $aQ -> $fnQ) where
-        jcfun name args params n body x =
-          jcfun name args params n (body . $mkE) ($unE x :: ReaderExp $envCTTyQ (JanusCT $tQ) $aQ)
-        jcfake name args f x =
-          jcfake name args (f . $mkE) ($unE x :: ReaderExp $envCTTyQ (JanusCT $tQ) $aQ)
+      instance JanusCFix $tQ ($mCTTyQ $resQ) where
+        jcfixSigTypes _ = jcfixSigTypes @($tQ) @(ReaderT $envCTTyQ (JanusCMT $tQ) $resQ) (Proxy @(ReaderT $envCTTyQ (JanusCMT $tQ) $resQ))
+        jcfun name args params n body =
+          $mkM (jcfun name args params n ($unM body :: ReaderT $envCTTyQ (JanusCMT $tQ) $resQ))
+        jcfake _ name args =
+          $mkM (jcfake (Proxy @(ReaderT $envCTTyQ (JanusCMT $tQ) $resQ)) name args)
 
-      instance (JanusCFix $fnQ) => ExpFix $eCTTyQ $fnQ where
+      instance (JanusCFix $tQ $fnQ) => ExpFix $eCTTyQ $fnQ where
         fun _ = jfix
       |]
   let fixDecs = case fixQuotes of
-        [dId, TH.InstanceD ov1 _ hd1 b1, TH.InstanceD ov2 _ hd2 b2, dCT] ->
+        [dId, TH.InstanceD ov0 _ hd0 b0, TH.InstanceD ov1 _ hd1 b1, TH.InstanceD ov2 _ hd2 b2, TH.InstanceD ov3 _ hd3 b3, TH.InstanceD ov4 _ hd4 b4, dCT] ->
           [ dId,
+            TH.InstanceD ov0 ctCxtBasePreds hd0 b0,
             TH.InstanceD ov1 ctCxtBasePreds hd1 b1,
-            TH.InstanceD ov2 ctCxtArrPreds hd2 b2,
+            TH.InstanceD ov2 ctCxtBasePreds hd2 b2,
+            TH.InstanceD ov3 ctCxtBasePreds hd3 b3,
+            TH.InstanceD ov4 ctCxtMonPreds hd4 b4,
             dCT
           ]
         other -> other

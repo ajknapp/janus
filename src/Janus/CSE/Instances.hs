@@ -1,5 +1,6 @@
 {-# LANGUAGE AllowAmbiguousTypes #-}
 {-# LANGUAGE DataKinds #-}
+{-# LANGUAGE DefaultSignatures #-}
 {-# LANGUAGE FlexibleContexts #-}
 {-# LANGUAGE FlexibleInstances #-}
 {-# LANGUAGE FunctionalDependencies #-}
@@ -9,6 +10,7 @@
 {-# LANGUAGE LambdaCase #-}
 {-# LANGUAGE MultiParamTypeClasses #-}
 {-# LANGUAGE OverloadedStrings #-}
+{-# LANGUAGE RankNTypes #-}
 {-# LANGUAGE ScopedTypeVariables #-}
 {-# LANGUAGE TypeApplications #-}
 {-# LANGUAGE TypeFamilies #-}
@@ -19,7 +21,12 @@
 -- | Janus expression, SIMD, fixpoint, reference, memory, I/O, and control-flow
 -- typeclass instances for @('CSEM' m e, 'CSEExp' e)@.
 module Janus.CSE.Instances
-  ( CSEFix (..),
+  ( CSEFixField (..),
+    GCSEFixLeaves (..),
+    CSEFixParam (..),
+    CSEFixMonRet (..),
+    CSEFixRets,
+    CSEFix (..),
     CSEFixLeafBuilder (..),
   )
 where
@@ -42,11 +49,14 @@ import Data.Typeable (Typeable)
 import Data.Word (Word32, Word64, Word8)
 import Foreign.C (CFile, CInt, CString)
 import Foreign.Ptr (Ptr)
+import Foreign.Storable (Storable)
 import GHC.Float (expm1, log1p)
-import GHC.TypeNats (natVal)
+import GHC.Generics
+import GHC.TypeNats (KnownNat, natVal)
 import Janus.Backend.C.CUDA.Types (CUDAThreadInfo (..), CmdSync (..), mapCUDAThreadInfo)
+import Janus.Backend.C.Raw (JanusCTyped)
 import Janus.CSE.Interpret (interpretCSEExp)
-import Janus.CSE.Optimize (SomeCSEExp (..), cseExp, cseM)
+import Janus.CSE.Optimize (CSEExpParamLeaf (..), SomeCSEExp (..), TargetExpElem, cseExp, cseM)
 import Janus.CSE.Types
 import Janus.Command.Case (CmdCase (..))
 import Janus.Command.Cond (CmdCond (..))
@@ -65,9 +75,9 @@ import Janus.Command.Range (CmdRange (..))
 import Janus.Command.Ref (Cell (..), CmdRef (..), RefCell (..))
 import Janus.Command.TicToc (CmdTicToc (..), Tic (..), Toc (..))
 import Janus.Command.While (CmdWhile (..))
-import Janus.Constraints (CmdJanus, CmdJanusIO, ExpJanus)
+import Janus.Constraints (CmdJanus, CmdJanusIO, CmdLocalFun (..), ExpJanus, LocalArgs (..), withJanusType)
 import Janus.Control.Reader.Base (ExpNewtype (..), ReaderExp (..))
-import Janus.Data.HKD (ExpPtrWord (..), ExpStructPtr (..))
+import Janus.Data.HKD (ExpPtrWord (..), ExpStructPtr (..), HKD (..), PtrOf (..), PtrStruct (..))
 import Janus.Expression.Bits (ExpBits (..))
 import Janus.Expression.Bool (ExpBool (..))
 import Janus.Expression.Cast
@@ -86,7 +96,8 @@ import Janus.Expression.MurmurHash (ExpMurmurHash (..))
 import Janus.Expression.Ord (ExpOrd (..))
 import Janus.Expression.SIMD
 import Janus.Fix (ExpFix (..))
-import Janus.SPMD.Types (ExpPair (..), SIMDPair)
+import Janus.SPMD.Typed (SPMDTyped (..))
+import Janus.SPMD.Types (ExpPair (..), SIMDPair, SPMD (..), SPMDM, SPMDRep, liftSPMD, runSPMD, runSPMDM)
 import Janus.Typed (KnownJanusType)
 import qualified Type.Reflection as TR
 
@@ -549,62 +560,737 @@ instance (ExpPair e) => ExpPair (CSEExp e) where
 -- Local Recursive Functions (`CSEFix` & `ExpFix`)
 --------------------------------------------------------------------------------
 
+class CSEFixField (e :: K.Type -> K.Type) (fieldCSE :: K.Type) | fieldCSE -> e where
+  type CSEFixFieldTarget fieldCSE :: K.Type
+  type CSEFixFieldPrepend e fieldCSE (tail :: [K.Type]) :: [K.Type]
+  cseFixFieldTypes :: Proxy e -> Proxy fieldCSE -> [TR.SomeTypeRep]
+  cseFixFieldRetSpec :: HRetSpec e tail -> HRetSpec e (CSEFixFieldPrepend e fieldCSE tail)
+  cseFixFieldAlloc ::
+    Digest ->
+    Int ->
+    HArgs (VarId e) tail ->
+    (Int, HArgs (VarId e) (CSEFixFieldPrepend e fieldCSE tail), fieldCSE)
+  cseFixFieldExtract :: fieldCSE -> HArgs (CSEExp e) tail -> HArgs (CSEExp e) (CSEFixFieldPrepend e fieldCSE tail)
+  cseFixFieldRebuild :: HArgs (CSEExp e) (CSEFixFieldPrepend e fieldCSE tail) -> (fieldCSE, HArgs (CSEExp e) tail)
+  cseFixFieldConsumeTarget ::
+    (CSETargetExp e) =>
+    HArgs e (CSEFixFieldPrepend e fieldCSE tail) ->
+    (CSEFixFieldTarget fieldCSE, HArgs e tail)
+  cseFixFieldPrependTarget ::
+    (CSETargetExp e) =>
+    CSEFixFieldTarget fieldCSE ->
+    HArgs e tail ->
+    HArgs e (CSEFixFieldPrepend e fieldCSE tail)
+
+instance (CSEExpParamLeaf e a, Typeable a) => CSEFixField e (CSEExp e a) where
+  type CSEFixFieldTarget (CSEExp e a) = e (TargetExpElem e a)
+  type CSEFixFieldPrepend e (CSEExp e a) tail = a ': tail
+  cseFixFieldTypes _ _ = [TR.SomeTypeRep (TR.typeRep @a)]
+  cseFixFieldRetSpec rest = HRSCons (TR.typeRep @a) (cseLeafBindCap @e @a) rest
+  cseFixFieldAlloc fk idx rest =
+    let vid = VarId (VarLocalFun fk idx) (TR.typeRep @a) (Just (cseLeafBindCap @e @a))
+     in (idx + 1, HCons vid rest, mkExpVar vid)
+  cseFixFieldExtract x rest = HCons x rest
+  cseFixFieldRebuild (HCons x rest) = (x, rest)
+  cseFixFieldConsumeTarget (HCons v rest) = (coerceExpNewtype v, rest)
+  cseFixFieldPrependTarget tgt rest = HCons (coerceExpNewtype tgt) rest
+
+instance (CSETyped e (Ptr a)) => CSEFixField e (PtrOf (CSEExp e) a) where
+  type CSEFixFieldTarget (PtrOf (CSEExp e) a) = PtrOf e a
+  type CSEFixFieldPrepend e (PtrOf (CSEExp e) a) tail = Ptr a ': tail
+  cseFixFieldTypes _ _ = [TR.SomeTypeRep (TR.typeRep @(Ptr a))]
+  cseFixFieldRetSpec rest = HRSCons (TR.typeRep @(Ptr a)) (BindDirect @e @(Ptr a)) rest
+  cseFixFieldAlloc fk idx rest =
+    let vid = VarId (VarLocalFun fk idx) (TR.typeRep @(Ptr a)) (Just (BindDirect @e @(Ptr a)))
+     in (idx + 1, HCons vid rest, PtrOf (mkExpVar vid))
+  cseFixFieldExtract (PtrOf p) rest = HCons p rest
+  cseFixFieldRebuild (HCons p rest) = (PtrOf p, rest)
+  cseFixFieldConsumeTarget (HCons v rest) = (PtrOf v, rest)
+  cseFixFieldPrependTarget (PtrOf tgt) rest = HCons tgt rest
+
+instance
+  ( Generic (sub (PtrOf (CSEExp e))),
+    Generic (sub (PtrOf e)),
+    GCSEFixLeaves e (Rep (sub (PtrOf (CSEExp e)))) (Rep (sub (PtrOf e)))
+  ) =>
+  CSEFixField e (sub (PtrOf (CSEExp e)))
+  where
+  type CSEFixFieldTarget (sub (PtrOf (CSEExp e))) = sub (PtrOf e)
+  type CSEFixFieldPrepend e (sub (PtrOf (CSEExp e))) tail = GCSEFixPrepend e (Rep (sub (PtrOf (CSEExp e)))) tail
+  cseFixFieldTypes pe _ = gFixTypes @e @(Rep (sub (PtrOf (CSEExp e)))) @(Rep (sub (PtrOf e))) pe
+  cseFixFieldRetSpec = gFixRetSpec @e @(Rep (sub (PtrOf (CSEExp e)))) @(Rep (sub (PtrOf e)))
+  cseFixFieldAlloc fk idx0 rest =
+    let (idx1, vids, repF) = gFixAlloc @e @(Rep (sub (PtrOf (CSEExp e)))) @(Rep (sub (PtrOf e))) fk idx0 rest
+     in (idx1, vids, to repF)
+  cseFixFieldExtract s = gFixExtract @e @(Rep (sub (PtrOf (CSEExp e)))) @(Rep (sub (PtrOf e))) (from s)
+  cseFixFieldRebuild hs0 =
+    let (repS, hs1) = gFixRebuild @e @(Rep (sub (PtrOf (CSEExp e)))) @(Rep (sub (PtrOf e))) hs0
+     in (to repS, hs1)
+  cseFixFieldConsumeTarget hs0 =
+    let (repT, hs1) = gFixConsumeTarget @e @(Rep (sub (PtrOf (CSEExp e)))) @(Rep (sub (PtrOf e))) hs0
+     in (to repT, hs1)
+  cseFixFieldPrependTarget s =
+    gFixPrependTarget @e @(Rep (sub (PtrOf (CSEExp e)))) @(Rep (sub (PtrOf e))) (from s)
+
+instance
+  ( Generic (sub (CSEExp e)),
+    Generic (sub e),
+    GCSEFixLeaves e (Rep (sub (CSEExp e))) (Rep (sub e))
+  ) =>
+  CSEFixField e (sub (CSEExp e))
+  where
+  type CSEFixFieldTarget (sub (CSEExp e)) = sub e
+  type CSEFixFieldPrepend e (sub (CSEExp e)) tail = GCSEFixPrepend e (Rep (sub (CSEExp e))) tail
+  cseFixFieldTypes pe _ = gFixTypes @e @(Rep (sub (CSEExp e))) @(Rep (sub e)) pe
+  cseFixFieldRetSpec = gFixRetSpec @e @(Rep (sub (CSEExp e))) @(Rep (sub e))
+  cseFixFieldAlloc fk idx0 rest =
+    let (idx1, vids, repF) = gFixAlloc @e @(Rep (sub (CSEExp e))) @(Rep (sub e)) fk idx0 rest
+     in (idx1, vids, to repF)
+  cseFixFieldExtract s = gFixExtract @e @(Rep (sub (CSEExp e))) @(Rep (sub e)) (from s)
+  cseFixFieldRebuild hs0 =
+    let (repS, hs1) = gFixRebuild @e @(Rep (sub (CSEExp e))) @(Rep (sub e)) hs0
+     in (to repS, hs1)
+  cseFixFieldConsumeTarget hs0 =
+    let (repT, hs1) = gFixConsumeTarget @e @(Rep (sub (CSEExp e))) @(Rep (sub e)) hs0
+     in (to repT, hs1)
+  cseFixFieldPrependTarget s =
+    gFixPrependTarget @e @(Rep (sub (CSEExp e))) @(Rep (sub e)) (from s)
+
+class GCSEFixLeaves (e :: K.Type -> K.Type) (repCSE :: K.Type -> K.Type) (repTgt :: K.Type -> K.Type) where
+  type GCSEFixPrepend e repCSE (tail :: [K.Type]) :: [K.Type]
+  gFixTypes :: Proxy e -> [TR.SomeTypeRep]
+  gFixRetSpec :: HRetSpec e tail -> HRetSpec e (GCSEFixPrepend e repCSE tail)
+  gFixAlloc ::
+    Digest ->
+    Int ->
+    HArgs (VarId e) tail ->
+    (Int, HArgs (VarId e) (GCSEFixPrepend e repCSE tail), repCSE p)
+  gFixExtract :: repCSE p -> HArgs (CSEExp e) tail -> HArgs (CSEExp e) (GCSEFixPrepend e repCSE tail)
+  gFixRebuild :: HArgs (CSEExp e) (GCSEFixPrepend e repCSE tail) -> (repCSE p, HArgs (CSEExp e) tail)
+  gFixConsumeTarget :: (CSETargetExp e) => HArgs e (GCSEFixPrepend e repCSE tail) -> (repTgt p, HArgs e tail)
+  gFixPrependTarget :: (CSETargetExp e) => repTgt p -> HArgs e tail -> HArgs e (GCSEFixPrepend e repCSE tail)
+
+instance (GCSEFixLeaves e fCSE fTgt) => GCSEFixLeaves e (M1 i c fCSE) (M1 i c fTgt) where
+  type GCSEFixPrepend e (M1 i c fCSE) tail = GCSEFixPrepend e fCSE tail
+  gFixTypes pe = gFixTypes @e @fCSE @fTgt pe
+  gFixRetSpec = gFixRetSpec @e @fCSE @fTgt
+  gFixAlloc fk idx0 rest =
+    let (idx1, vids, fVal) = gFixAlloc @e @fCSE @fTgt fk idx0 rest
+     in (idx1, vids, M1 fVal)
+  gFixExtract (M1 x) = gFixExtract @e @fCSE @fTgt x
+  gFixRebuild hs0 =
+    let (x, hs1) = gFixRebuild @e @fCSE @fTgt hs0
+     in (M1 x, hs1)
+  gFixConsumeTarget hs0 =
+    let (x, hs1) = gFixConsumeTarget @e @fCSE @fTgt hs0
+     in (M1 x, hs1)
+  gFixPrependTarget (M1 x) = gFixPrependTarget @e @fCSE @fTgt x
+
+instance GCSEFixLeaves e U1 U1 where
+  type GCSEFixPrepend e U1 tail = tail
+  gFixTypes _ = []
+  gFixRetSpec = id
+  gFixAlloc _ idx rest = (idx, rest, U1)
+  gFixExtract U1 = id
+  gFixRebuild hs = (U1, hs)
+  gFixConsumeTarget hs = (U1, hs)
+  gFixPrependTarget U1 = id
+
+instance
+  (GCSEFixLeaves e fCSE fTgt, GCSEFixLeaves e gCSE gTgt) =>
+  GCSEFixLeaves e (fCSE :*: gCSE) (fTgt :*: gTgt)
+  where
+  type GCSEFixPrepend e (fCSE :*: gCSE) tail = GCSEFixPrepend e fCSE (GCSEFixPrepend e gCSE tail)
+  gFixTypes pe = gFixTypes @e @fCSE @fTgt pe <> gFixTypes @e @gCSE @gTgt pe
+  gFixRetSpec = gFixRetSpec @e @fCSE @fTgt . gFixRetSpec @e @gCSE @gTgt
+  gFixAlloc fk idx0 rest =
+    let (idx1, fVids, fVal) = gFixAlloc @e @fCSE @fTgt fk idx0 gVids
+        (idx2, gVids, gVal) = gFixAlloc @e @gCSE @gTgt fk idx1 rest
+     in (idx2, fVids, fVal :*: gVal)
+  gFixExtract (fx :*: gx) = gFixExtract @e @fCSE @fTgt fx . gFixExtract @e @gCSE @gTgt gx
+  gFixRebuild hs0 =
+    let (fx, hs1) = gFixRebuild @e @fCSE @fTgt hs0
+        (gx, hs2) = gFixRebuild @e @gCSE @gTgt hs1
+     in (fx :*: gx, hs2)
+  gFixConsumeTarget hs0 =
+    let (fx, hs1) = gFixConsumeTarget @e @fCSE @fTgt hs0
+        (gx, hs2) = gFixConsumeTarget @e @gCSE @gTgt hs1
+     in (fx :*: gx, hs2)
+  gFixPrependTarget (fx :*: gx) =
+    gFixPrependTarget @e @fCSE @fTgt fx . gFixPrependTarget @e @gCSE @gTgt gx
+
+instance
+  (CSEFixField e fieldCSE, CSEFixFieldTarget fieldCSE ~ fieldTgt) =>
+  GCSEFixLeaves e (K1 i fieldCSE) (K1 i fieldTgt)
+  where
+  type GCSEFixPrepend e (K1 i fieldCSE) tail = CSEFixFieldPrepend e fieldCSE tail
+  gFixTypes pe = cseFixFieldTypes pe (Proxy @fieldCSE)
+  gFixRetSpec = cseFixFieldRetSpec @e @fieldCSE
+  gFixAlloc fk idx0 rest =
+    let (idx1, vids, x) = cseFixFieldAlloc @e @fieldCSE fk idx0 rest
+     in (idx1, vids, K1 x)
+  gFixExtract (K1 x) = cseFixFieldExtract @e @fieldCSE x
+  gFixRebuild hs0 =
+    let (x, hs1) = cseFixFieldRebuild @e @fieldCSE hs0
+     in (K1 x, hs1)
+  gFixConsumeTarget hs0 =
+    let (x, hs1) = cseFixFieldConsumeTarget @e @fieldCSE hs0
+     in (K1 x, hs1)
+  gFixPrependTarget (K1 x) = cseFixFieldPrependTarget @e @fieldCSE x
+
+class CSEFixParam (e :: K.Type -> K.Type) (p :: K.Type) where
+  type CSEFixParamTarget e p :: K.Type
+  type CSEFixParamPrepend e p (tail :: [K.Type]) :: [K.Type]
+  type CSEFixParamPrepend e p tail = GCSEFixPrepend e (Rep p) tail
+
+  cseFixParamTypes :: Proxy e -> Proxy p -> [TR.SomeTypeRep]
+  default cseFixParamTypes ::
+    (GCSEFixLeaves e (Rep p) (Rep (CSEFixParamTarget e p))) =>
+    Proxy e ->
+    Proxy p ->
+    [TR.SomeTypeRep]
+  cseFixParamTypes pe _ = gFixTypes @e @(Rep p) @(Rep (CSEFixParamTarget e p)) pe
+
+  cseFixAllocParam ::
+    Digest ->
+    Int ->
+    HArgs (VarId e) tail ->
+    (Int, HArgs (VarId e) (CSEFixParamPrepend e p tail), p)
+  default cseFixAllocParam ::
+    ( Generic p,
+      GCSEFixLeaves e (Rep p) (Rep (CSEFixParamTarget e p)),
+      CSEFixParamPrepend e p tail ~ GCSEFixPrepend e (Rep p) tail
+    ) =>
+    Digest ->
+    Int ->
+    HArgs (VarId e) tail ->
+    (Int, HArgs (VarId e) (CSEFixParamPrepend e p tail), p)
+  cseFixAllocParam fk idx0 rest =
+    let (idx1, vids, repP) = gFixAlloc @e @(Rep p) @(Rep (CSEFixParamTarget e p)) fk idx0 rest
+     in (idx1, vids, to repP)
+
+  cseFixExtractParam :: p -> HArgs (CSEExp e) tail -> HArgs (CSEExp e) (CSEFixParamPrepend e p tail)
+  default cseFixExtractParam ::
+    ( Generic p,
+      GCSEFixLeaves e (Rep p) (Rep (CSEFixParamTarget e p)),
+      CSEFixParamPrepend e p tail ~ GCSEFixPrepend e (Rep p) tail
+    ) =>
+    p ->
+    HArgs (CSEExp e) tail ->
+    HArgs (CSEExp e) (CSEFixParamPrepend e p tail)
+  cseFixExtractParam x = gFixExtract @e @(Rep p) @(Rep (CSEFixParamTarget e p)) (from x)
+
+  cseFixConsumeParamTarget ::
+    (CSETargetExp e) =>
+    HArgs e (CSEFixParamPrepend e p tail) ->
+    (CSEFixParamTarget e p, HArgs e tail)
+  default cseFixConsumeParamTarget ::
+    ( CSETargetExp e,
+      Generic (CSEFixParamTarget e p),
+      GCSEFixLeaves e (Rep p) (Rep (CSEFixParamTarget e p)),
+      CSEFixParamPrepend e p tail ~ GCSEFixPrepend e (Rep p) tail
+    ) =>
+    HArgs e (CSEFixParamPrepend e p tail) ->
+    (CSEFixParamTarget e p, HArgs e tail)
+  cseFixConsumeParamTarget hs0 =
+    let (repT, hs1) = gFixConsumeTarget @e @(Rep p) @(Rep (CSEFixParamTarget e p)) hs0
+     in (to repT, hs1)
+
+  cseFixPrependParamTarget ::
+    (CSETargetExp e) =>
+    CSEFixParamTarget e p ->
+    HArgs e tail ->
+    HArgs e (CSEFixParamPrepend e p tail)
+  default cseFixPrependParamTarget ::
+    ( CSETargetExp e,
+      Generic (CSEFixParamTarget e p),
+      GCSEFixLeaves e (Rep p) (Rep (CSEFixParamTarget e p)),
+      CSEFixParamPrepend e p tail ~ GCSEFixPrepend e (Rep p) tail
+    ) =>
+    CSEFixParamTarget e p ->
+    HArgs e tail ->
+    HArgs e (CSEFixParamPrepend e p tail)
+  cseFixPrependParamTarget tgt =
+    gFixPrependTarget @e @(Rep p) @(Rep (CSEFixParamTarget e p)) (from tgt)
+
+instance (CSEExpParamLeaf e a, Typeable a) => CSEFixParam e (CSEExp e a) where
+  type CSEFixParamTarget e (CSEExp e a) = e (TargetExpElem e a)
+  type CSEFixParamPrepend e (CSEExp e a) tail = a ': tail
+  cseFixParamTypes _ _ = [TR.SomeTypeRep (TR.typeRep @a)]
+  cseFixAllocParam fk idx rest =
+    let vid = VarId (VarLocalFun fk idx) (TR.typeRep @a) (Just (cseLeafBindCap @e @a))
+     in (idx + 1, HCons vid rest, mkExpVar vid)
+  cseFixExtractParam x rest = HCons x rest
+  cseFixConsumeParamTarget (HCons v rest) = (coerceExpNewtype v, rest)
+  cseFixPrependParamTarget tgt rest = HCons (coerceExpNewtype tgt) rest
+
+instance CSEFixParam e () where
+  type CSEFixParamTarget e () = ()
+  type CSEFixParamPrepend e () tail = tail
+  cseFixParamTypes _ _ = []
+  cseFixAllocParam _ idx rest = (idx, rest, ())
+  cseFixExtractParam () = id
+  cseFixConsumeParamTarget hs = ((), hs)
+  cseFixPrependParamTarget () = id
+
+instance (CSEFixParam e p1, CSEFixParam e p2) => CSEFixParam e (p1, p2) where
+  type CSEFixParamTarget e (p1, p2) = (CSEFixParamTarget e p1, CSEFixParamTarget e p2)
+  type CSEFixParamPrepend e (p1, p2) tail = CSEFixParamPrepend e p1 (CSEFixParamPrepend e p2 tail)
+  cseFixParamTypes pe _ = cseFixParamTypes pe (Proxy @p1) <> cseFixParamTypes pe (Proxy @p2)
+  cseFixAllocParam fk idx0 rest =
+    let (idx1, vids1, f1) = cseFixAllocParam @e @p1 fk idx0 vids2
+        (idx2, vids2, f2) = cseFixAllocParam @e @p2 fk idx1 rest
+     in (idx2, vids1, (f1, f2))
+  cseFixExtractParam (a, b) = cseFixExtractParam @e @p1 a . cseFixExtractParam @e @p2 b
+  cseFixConsumeParamTarget hs0 =
+    let (t1, hs1) = cseFixConsumeParamTarget @e @p1 hs0
+        (t2, hs2) = cseFixConsumeParamTarget @e @p2 hs1
+     in ((t1, t2), hs2)
+  cseFixPrependParamTarget (t1, t2) =
+    cseFixPrependParamTarget @e @p1 t1 . cseFixPrependParamTarget @e @p2 t2
+
+instance (CSEFixParam e p1, CSEFixParam e p2, CSEFixParam e p3) => CSEFixParam e (p1, p2, p3) where
+  type CSEFixParamTarget e (p1, p2, p3) = (CSEFixParamTarget e p1, CSEFixParamTarget e p2, CSEFixParamTarget e p3)
+  type
+    CSEFixParamPrepend e (p1, p2, p3) tail =
+      CSEFixParamPrepend e p1 (CSEFixParamPrepend e p2 (CSEFixParamPrepend e p3 tail))
+  cseFixParamTypes pe _ =
+    cseFixParamTypes pe (Proxy @p1) <> cseFixParamTypes pe (Proxy @p2) <> cseFixParamTypes pe (Proxy @p3)
+  cseFixAllocParam fk idx0 rest =
+    let (idx1, vids1, f1) = cseFixAllocParam @e @p1 fk idx0 vids2
+        (idx2, vids2, f2) = cseFixAllocParam @e @p2 fk idx1 vids3
+        (idx3, vids3, f3) = cseFixAllocParam @e @p3 fk idx2 rest
+     in (idx3, vids1, (f1, f2, f3))
+  cseFixExtractParam (a, b, c) =
+    cseFixExtractParam @e @p1 a . cseFixExtractParam @e @p2 b . cseFixExtractParam @e @p3 c
+  cseFixConsumeParamTarget hs0 =
+    let (t1, hs1) = cseFixConsumeParamTarget @e @p1 hs0
+        (t2, hs2) = cseFixConsumeParamTarget @e @p2 hs1
+        (t3, hs3) = cseFixConsumeParamTarget @e @p3 hs2
+     in ((t1, t2, t3), hs3)
+  cseFixPrependParamTarget (t1, t2, t3) =
+    cseFixPrependParamTarget @e @p1 t1
+      . cseFixPrependParamTarget @e @p2 t2
+      . cseFixPrependParamTarget @e @p3 t3
+
+instance
+  (CSEFixParam e p1, CSEFixParam e p2, CSEFixParam e p3, CSEFixParam e p4) =>
+  CSEFixParam e (p1, p2, p3, p4)
+  where
+  type
+    CSEFixParamTarget e (p1, p2, p3, p4) =
+      (CSEFixParamTarget e p1, CSEFixParamTarget e p2, CSEFixParamTarget e p3, CSEFixParamTarget e p4)
+  type
+    CSEFixParamPrepend e (p1, p2, p3, p4) tail =
+      CSEFixParamPrepend e p1 (CSEFixParamPrepend e p2 (CSEFixParamPrepend e p3 (CSEFixParamPrepend e p4 tail)))
+  cseFixParamTypes pe _ =
+    cseFixParamTypes pe (Proxy @p1)
+      <> cseFixParamTypes pe (Proxy @p2)
+      <> cseFixParamTypes pe (Proxy @p3)
+      <> cseFixParamTypes pe (Proxy @p4)
+  cseFixAllocParam fk idx0 rest =
+    let (idx1, vids1, f1) = cseFixAllocParam @e @p1 fk idx0 vids2
+        (idx2, vids2, f2) = cseFixAllocParam @e @p2 fk idx1 vids3
+        (idx3, vids3, f3) = cseFixAllocParam @e @p3 fk idx2 vids4
+        (idx4, vids4, f4) = cseFixAllocParam @e @p4 fk idx3 rest
+     in (idx4, vids1, (f1, f2, f3, f4))
+  cseFixExtractParam (a, b, c, d) =
+    cseFixExtractParam @e @p1 a
+      . cseFixExtractParam @e @p2 b
+      . cseFixExtractParam @e @p3 c
+      . cseFixExtractParam @e @p4 d
+  cseFixConsumeParamTarget hs0 =
+    let (t1, hs1) = cseFixConsumeParamTarget @e @p1 hs0
+        (t2, hs2) = cseFixConsumeParamTarget @e @p2 hs1
+        (t3, hs3) = cseFixConsumeParamTarget @e @p3 hs2
+        (t4, hs4) = cseFixConsumeParamTarget @e @p4 hs3
+     in ((t1, t2, t3, t4), hs4)
+  cseFixPrependParamTarget (t1, t2, t3, t4) =
+    cseFixPrependParamTarget @e @p1 t1
+      . cseFixPrependParamTarget @e @p2 t2
+      . cseFixPrependParamTarget @e @p3 t3
+      . cseFixPrependParamTarget @e @p4 t4
+
+instance
+  ( KnownNat n,
+    Typeable n,
+    Typeable a,
+    SPMDTyped n (CSEExp e) a,
+    SPMDTyped n e a,
+    CSEExpParamLeaf e (SPMDRep n (CSEExp e) a),
+    TargetExpElem e (SPMDRep n (CSEExp e) a) ~ SPMDRep n e a,
+    Typeable (SPMDRep n (CSEExp e) a)
+  ) =>
+  CSEFixParam e (SPMD n (CSEExp e) a)
+  where
+  type CSEFixParamTarget e (SPMD n (CSEExp e) a) = SPMD n e a
+  type CSEFixParamPrepend e (SPMD n (CSEExp e) a) tail = SPMDRep n (CSEExp e) a ': tail
+  cseFixParamTypes _ _ =
+    [ TR.SomeTypeRep (TR.typeRep @n),
+      TR.SomeTypeRep (TR.typeRep @a),
+      TR.SomeTypeRep (TR.typeRep @(SPMDRep n (CSEExp e) a))
+    ]
+  cseFixAllocParam fk idx rest =
+    let tr = TR.typeRep @(SPMDRep n (CSEExp e) a)
+        cap = cseLeafBindCap @e @(SPMDRep n (CSEExp e) a)
+        vid = VarId (VarLocalFun fk idx) tr (Just cap)
+     in (idx + 1, HCons vid rest, SPMD (pure (spmdDematerialize @n @(CSEExp e) @a (mkExpVar vid))))
+  cseFixExtractParam x rest =
+    HCons (spmdMaterialize @n @(CSEExp e) @a (runSPMD x)) rest
+  cseFixConsumeParamTarget (HCons v rest) =
+    (SPMD (pure (spmdDematerialize @n @e @a (coerceExpNewtype v))), rest)
+  cseFixPrependParamTarget tgt rest =
+    HCons (coerceExpNewtype (spmdMaterialize @n @e @a (runSPMD tgt))) rest
+
+instance
+  ( Generic (d (CSEExp e)),
+    Generic (d e),
+    GCSEFixLeaves e (Rep (d (CSEExp e))) (Rep (d e))
+  ) =>
+  CSEFixParam e (HKD d (CSEExp e))
+  where
+  type CSEFixParamTarget e (HKD d (CSEExp e)) = HKD d e
+
+instance
+  ( Generic (sub (PtrOf (CSEExp e))),
+    Generic (sub (PtrOf e)),
+    GCSEFixLeaves e (Rep (sub (PtrOf (CSEExp e)))) (Rep (sub (PtrOf e)))
+  ) =>
+  CSEFixParam e (PtrStruct sub (CSEExp e))
+  where
+  type CSEFixParamTarget e (PtrStruct sub (CSEExp e)) = PtrStruct sub e
+
+class CSEFixMonRet (e :: K.Type -> K.Type) (res :: K.Type) where
+  type CSEFixRetTarget e res :: K.Type
+  type CSEFixRetPrepend e res (tail :: [K.Type]) :: [K.Type]
+  type CSEFixRetPrepend e res tail = GCSEFixPrepend e (Rep res) tail
+
+  cseFixRetTypes :: Proxy e -> Proxy res -> [TR.SomeTypeRep]
+  default cseFixRetTypes ::
+    (GCSEFixLeaves e (Rep res) (Rep (CSEFixRetTarget e res))) =>
+    Proxy e ->
+    Proxy res ->
+    [TR.SomeTypeRep]
+  cseFixRetTypes pe _ = gFixTypes @e @(Rep res) @(Rep (CSEFixRetTarget e res)) pe
+
+  cseFixRetSpec :: HRetSpec e tail -> HRetSpec e (CSEFixRetPrepend e res tail)
+  default cseFixRetSpec ::
+    ( GCSEFixLeaves e (Rep res) (Rep (CSEFixRetTarget e res)),
+      CSEFixRetPrepend e res tail ~ GCSEFixPrepend e (Rep res) tail
+    ) =>
+    HRetSpec e tail ->
+    HRetSpec e (CSEFixRetPrepend e res tail)
+  cseFixRetSpec = gFixRetSpec @e @(Rep res) @(Rep (CSEFixRetTarget e res))
+
+  cseFixExtractRet :: res -> HArgs (CSEExp e) tail -> HArgs (CSEExp e) (CSEFixRetPrepend e res tail)
+  default cseFixExtractRet ::
+    ( Generic res,
+      GCSEFixLeaves e (Rep res) (Rep (CSEFixRetTarget e res)),
+      CSEFixRetPrepend e res tail ~ GCSEFixPrepend e (Rep res) tail
+    ) =>
+    res ->
+    HArgs (CSEExp e) tail ->
+    HArgs (CSEExp e) (CSEFixRetPrepend e res tail)
+  cseFixExtractRet x = gFixExtract @e @(Rep res) @(Rep (CSEFixRetTarget e res)) (from x)
+
+  cseFixRebuildRet :: HArgs (CSEExp e) (CSEFixRetPrepend e res tail) -> (res, HArgs (CSEExp e) tail)
+  default cseFixRebuildRet ::
+    ( Generic res,
+      GCSEFixLeaves e (Rep res) (Rep (CSEFixRetTarget e res)),
+      CSEFixRetPrepend e res tail ~ GCSEFixPrepend e (Rep res) tail
+    ) =>
+    HArgs (CSEExp e) (CSEFixRetPrepend e res tail) ->
+    (res, HArgs (CSEExp e) tail)
+  cseFixRebuildRet hs0 =
+    let (repR, hs1) = gFixRebuild @e @(Rep res) @(Rep (CSEFixRetTarget e res)) hs0
+     in (to repR, hs1)
+
+  cseFixHArgsToTarget ::
+    (CSETargetExp e) =>
+    HArgs e (CSEFixRetPrepend e res tail) ->
+    (CSEFixRetTarget e res, HArgs e tail)
+  default cseFixHArgsToTarget ::
+    ( CSETargetExp e,
+      Generic (CSEFixRetTarget e res),
+      GCSEFixLeaves e (Rep res) (Rep (CSEFixRetTarget e res)),
+      CSEFixRetPrepend e res tail ~ GCSEFixPrepend e (Rep res) tail
+    ) =>
+    HArgs e (CSEFixRetPrepend e res tail) ->
+    (CSEFixRetTarget e res, HArgs e tail)
+  cseFixHArgsToTarget hs0 =
+    let (repT, hs1) = gFixConsumeTarget @e @(Rep res) @(Rep (CSEFixRetTarget e res)) hs0
+     in (to repT, hs1)
+
+  cseFixTargetToHArgs ::
+    (CSETargetExp e) =>
+    CSEFixRetTarget e res ->
+    HArgs e tail ->
+    HArgs e (CSEFixRetPrepend e res tail)
+  default cseFixTargetToHArgs ::
+    ( CSETargetExp e,
+      Generic (CSEFixRetTarget e res),
+      GCSEFixLeaves e (Rep res) (Rep (CSEFixRetTarget e res)),
+      CSEFixRetPrepend e res tail ~ GCSEFixPrepend e (Rep res) tail
+    ) =>
+    CSEFixRetTarget e res ->
+    HArgs e tail ->
+    HArgs e (CSEFixRetPrepend e res tail)
+  cseFixTargetToHArgs tgt =
+    gFixPrependTarget @e @(Rep res) @(Rep (CSEFixRetTarget e res)) (from tgt)
+
+type CSEFixRets e res = CSEFixRetPrepend e res '[]
+
+instance CSEFixMonRet e () where
+  type CSEFixRetTarget e () = ()
+  type CSEFixRetPrepend e () tail = tail
+  cseFixRetTypes _ _ = []
+  cseFixRetSpec = id
+  cseFixExtractRet () = id
+  cseFixRebuildRet hs = ((), hs)
+  cseFixHArgsToTarget hs = ((), hs)
+  cseFixTargetToHArgs () = id
+
+instance (CSEExpParamLeaf e a, Typeable a) => CSEFixMonRet e (CSEExp e a) where
+  type CSEFixRetTarget e (CSEExp e a) = e (TargetExpElem e a)
+  type CSEFixRetPrepend e (CSEExp e a) tail = a ': tail
+  cseFixRetTypes _ _ = [TR.SomeTypeRep (TR.typeRep @a)]
+  cseFixRetSpec rest = HRSCons (TR.typeRep @a) (cseLeafBindCap @e @a) rest
+  cseFixExtractRet x rest = HCons x rest
+  cseFixRebuildRet (HCons x rest) = (x, rest)
+  cseFixHArgsToTarget (HCons v rest) = (coerceExpNewtype v, rest)
+  cseFixTargetToHArgs tgt rest = HCons (coerceExpNewtype tgt) rest
+
+instance (CSEFixMonRet e r1, CSEFixMonRet e r2) => CSEFixMonRet e (r1, r2) where
+  type CSEFixRetTarget e (r1, r2) = (CSEFixRetTarget e r1, CSEFixRetTarget e r2)
+  type CSEFixRetPrepend e (r1, r2) tail = CSEFixRetPrepend e r1 (CSEFixRetPrepend e r2 tail)
+  cseFixRetTypes pe _ = cseFixRetTypes pe (Proxy @r1) <> cseFixRetTypes pe (Proxy @r2)
+  cseFixRetSpec = cseFixRetSpec @e @r1 . cseFixRetSpec @e @r2
+  cseFixExtractRet (a, b) = cseFixExtractRet @e @r1 a . cseFixExtractRet @e @r2 b
+  cseFixRebuildRet hs0 =
+    let (a, hs1) = cseFixRebuildRet @e @r1 hs0
+        (b, hs2) = cseFixRebuildRet @e @r2 hs1
+     in ((a, b), hs2)
+  cseFixHArgsToTarget hs0 =
+    let (t1, hs1) = cseFixHArgsToTarget @e @r1 hs0
+        (t2, hs2) = cseFixHArgsToTarget @e @r2 hs1
+     in ((t1, t2), hs2)
+  cseFixTargetToHArgs (t1, t2) =
+    cseFixTargetToHArgs @e @r1 t1 . cseFixTargetToHArgs @e @r2 t2
+
+instance (CSEFixMonRet e r1, CSEFixMonRet e r2, CSEFixMonRet e r3) => CSEFixMonRet e (r1, r2, r3) where
+  type CSEFixRetTarget e (r1, r2, r3) = (CSEFixRetTarget e r1, CSEFixRetTarget e r2, CSEFixRetTarget e r3)
+  type
+    CSEFixRetPrepend e (r1, r2, r3) tail =
+      CSEFixRetPrepend e r1 (CSEFixRetPrepend e r2 (CSEFixRetPrepend e r3 tail))
+  cseFixRetTypes pe _ =
+    cseFixRetTypes pe (Proxy @r1) <> cseFixRetTypes pe (Proxy @r2) <> cseFixRetTypes pe (Proxy @r3)
+  cseFixRetSpec = cseFixRetSpec @e @r1 . cseFixRetSpec @e @r2 . cseFixRetSpec @e @r3
+  cseFixExtractRet (a, b, c) =
+    cseFixExtractRet @e @r1 a . cseFixExtractRet @e @r2 b . cseFixExtractRet @e @r3 c
+  cseFixRebuildRet hs0 =
+    let (a, hs1) = cseFixRebuildRet @e @r1 hs0
+        (b, hs2) = cseFixRebuildRet @e @r2 hs1
+        (c, hs3) = cseFixRebuildRet @e @r3 hs2
+     in ((a, b, c), hs3)
+  cseFixHArgsToTarget hs0 =
+    let (t1, hs1) = cseFixHArgsToTarget @e @r1 hs0
+        (t2, hs2) = cseFixHArgsToTarget @e @r2 hs1
+        (t3, hs3) = cseFixHArgsToTarget @e @r3 hs2
+     in ((t1, t2, t3), hs3)
+  cseFixTargetToHArgs (t1, t2, t3) =
+    cseFixTargetToHArgs @e @r1 t1
+      . cseFixTargetToHArgs @e @r2 t2
+      . cseFixTargetToHArgs @e @r3 t3
+
+instance
+  (CSEFixMonRet e r1, CSEFixMonRet e r2, CSEFixMonRet e r3, CSEFixMonRet e r4) =>
+  CSEFixMonRet e (r1, r2, r3, r4)
+  where
+  type
+    CSEFixRetTarget e (r1, r2, r3, r4) =
+      (CSEFixRetTarget e r1, CSEFixRetTarget e r2, CSEFixRetTarget e r3, CSEFixRetTarget e r4)
+  type
+    CSEFixRetPrepend e (r1, r2, r3, r4) tail =
+      CSEFixRetPrepend e r1 (CSEFixRetPrepend e r2 (CSEFixRetPrepend e r3 (CSEFixRetPrepend e r4 tail)))
+  cseFixRetTypes pe _ =
+    cseFixRetTypes pe (Proxy @r1)
+      <> cseFixRetTypes pe (Proxy @r2)
+      <> cseFixRetTypes pe (Proxy @r3)
+      <> cseFixRetTypes pe (Proxy @r4)
+  cseFixRetSpec = cseFixRetSpec @e @r1 . cseFixRetSpec @e @r2 . cseFixRetSpec @e @r3 . cseFixRetSpec @e @r4
+  cseFixExtractRet (a, b, c, d) =
+    cseFixExtractRet @e @r1 a
+      . cseFixExtractRet @e @r2 b
+      . cseFixExtractRet @e @r3 c
+      . cseFixExtractRet @e @r4 d
+  cseFixRebuildRet hs0 =
+    let (a, hs1) = cseFixRebuildRet @e @r1 hs0
+        (b, hs2) = cseFixRebuildRet @e @r2 hs1
+        (c, hs3) = cseFixRebuildRet @e @r3 hs2
+        (d, hs4) = cseFixRebuildRet @e @r4 hs3
+     in ((a, b, c, d), hs4)
+  cseFixHArgsToTarget hs0 =
+    let (t1, hs1) = cseFixHArgsToTarget @e @r1 hs0
+        (t2, hs2) = cseFixHArgsToTarget @e @r2 hs1
+        (t3, hs3) = cseFixHArgsToTarget @e @r3 hs2
+        (t4, hs4) = cseFixHArgsToTarget @e @r4 hs3
+     in ((t1, t2, t3, t4), hs4)
+  cseFixTargetToHArgs (t1, t2, t3, t4) =
+    cseFixTargetToHArgs @e @r1 t1
+      . cseFixTargetToHArgs @e @r2 t2
+      . cseFixTargetToHArgs @e @r3 t3
+      . cseFixTargetToHArgs @e @r4 t4
+
+instance
+  ( KnownNat n,
+    Typeable n,
+    Typeable a,
+    SPMDTyped n (CSEExp e) a,
+    SPMDTyped n e a,
+    CSEExpParamLeaf e (SPMDRep n (CSEExp e) a),
+    TargetExpElem e (SPMDRep n (CSEExp e) a) ~ SPMDRep n e a,
+    Typeable (SPMDRep n (CSEExp e) a)
+  ) =>
+  CSEFixMonRet e (SPMD n (CSEExp e) a)
+  where
+  type CSEFixRetTarget e (SPMD n (CSEExp e) a) = SPMD n e a
+  type CSEFixRetPrepend e (SPMD n (CSEExp e) a) tail = SPMDRep n (CSEExp e) a ': tail
+  cseFixRetTypes _ _ =
+    [ TR.SomeTypeRep (TR.typeRep @n),
+      TR.SomeTypeRep (TR.typeRep @a),
+      TR.SomeTypeRep (TR.typeRep @(SPMDRep n (CSEExp e) a))
+    ]
+  cseFixRetSpec rest =
+    HRSCons (TR.typeRep @(SPMDRep n (CSEExp e) a)) (cseLeafBindCap @e @(SPMDRep n (CSEExp e) a)) rest
+  cseFixExtractRet x rest =
+    HCons (spmdMaterialize @n @(CSEExp e) @a (runSPMD x)) rest
+  cseFixRebuildRet (HCons v rest) =
+    (SPMD (pure (spmdDematerialize @n @(CSEExp e) @a v)), rest)
+  cseFixHArgsToTarget (HCons v rest) =
+    (SPMD (pure (spmdDematerialize @n @e @a (coerceExpNewtype v))), rest)
+  cseFixTargetToHArgs tgt rest =
+    HCons (coerceExpNewtype (spmdMaterialize @n @e @a (runSPMD tgt))) rest
+
+instance
+  ( Generic (d (CSEExp e)),
+    Generic (d e),
+    GCSEFixLeaves e (Rep (d (CSEExp e))) (Rep (d e))
+  ) =>
+  CSEFixMonRet e (HKD d (CSEExp e))
+  where
+  type CSEFixRetTarget e (HKD d (CSEExp e)) = HKD d e
+
+instance
+  ( Generic (sub (PtrOf (CSEExp e))),
+    Generic (sub (PtrOf e)),
+    GCSEFixLeaves e (Rep (sub (PtrOf (CSEExp e)))) (Rep (sub (PtrOf e)))
+  ) =>
+  CSEFixMonRet e (PtrStruct sub (CSEExp e))
+  where
+  type CSEFixRetTarget e (PtrStruct sub (CSEExp e)) = PtrStruct sub e
+
 class CSEFix (e :: K.Type -> K.Type) (r :: K.Type) | r -> e where
-  type CSEFixTarget r :: K.Type
-  type CSEFixParams r :: [K.Type]
-  type CSEFixLeaf r :: K.Type
-  type CSEFixTargetLeaf r :: K.Type
-  cseAllocFixParams :: Digest -> Int -> (HArgs (VarId e) (CSEFixParams r), r -> CSEFixLeaf r)
-  cseMakeFixStub :: (HArgs (CSEExp e) (CSEFixParams r) -> CSEFixLeaf r) -> r
-  cseCurryFixTarget :: (HArgs e (CSEFixParams r) -> CSEFixTargetLeaf r) -> CSEFixTarget r
-  cseUncurryFixTarget :: CSEFixTarget r -> HArgs e (CSEFixParams r) -> CSEFixTargetLeaf r
+  type CSEFixTarget e r :: K.Type
+  type CSEFixParams e r :: [K.Type]
+  type CSEFixLeaf e r :: K.Type
+  type CSEFixTargetLeaf e r :: K.Type
+  cseFixSigTypes :: Proxy e -> Proxy r -> ([TR.SomeTypeRep], [TR.SomeTypeRep])
+  cseAllocFixParams :: Digest -> Int -> (HArgs (VarId e) (CSEFixParams e r), r -> CSEFixLeaf e r)
+  cseMakeFixStub :: (HArgs (CSEExp e) (CSEFixParams e r) -> CSEFixLeaf e r) -> r
+  cseCurryFixTarget :: (CSETargetExp e) => (HArgs e (CSEFixParams e r) -> CSEFixTargetLeaf e r) -> CSEFixTarget e r
+  cseUncurryFixTarget :: (CSETargetExp e) => CSEFixTarget e r -> HArgs e (CSEFixParams e r) -> CSEFixTargetLeaf e r
 
-instance (CSETyped e b) => CSEFix e (CSEExp e b) where
-  type CSEFixTarget (CSEExp e b) = e b
-  type CSEFixParams (CSEExp e b) = '[]
-  type CSEFixLeaf (CSEExp e b) = CSEExp e b
-  type CSEFixTargetLeaf (CSEExp e b) = e b
+instance (CSEExpParamLeaf e b, Typeable b) => CSEFix e (CSEExp e b) where
+  type CSEFixTarget e (CSEExp e b) = e (TargetExpElem e b)
+  type CSEFixParams e (CSEExp e b) = '[]
+  type CSEFixLeaf e (CSEExp e b) = CSEExp e b
+  type CSEFixTargetLeaf e (CSEExp e b) = e b
+  cseFixSigTypes _ _ = ([], [TR.SomeTypeRep (TR.typeRep @b)])
   cseAllocFixParams _ _ = (HNil, id)
   cseMakeFixStub mkLeaf = mkLeaf HNil
-  cseCurryFixTarget k = k HNil
-  cseUncurryFixTarget v HNil = v
+  cseCurryFixTarget k = coerceExpNewtype (k HNil)
+  cseUncurryFixTarget v HNil = coerceExpNewtype v
 
-instance (CSETyped e b) => CSEFix e (CSEM m e (CSEExp e b)) where
-  type CSEFixTarget (CSEM m e (CSEExp e b)) = m (e b)
-  type CSEFixParams (CSEM m e (CSEExp e b)) = '[]
-  type CSEFixLeaf (CSEM m e (CSEExp e b)) = CSEM m e (CSEExp e b)
-  type CSEFixTargetLeaf (CSEM m e (CSEExp e b)) = m (e b)
+instance
+  ( KnownNat n,
+    Typeable n,
+    Typeable b,
+    SPMDTyped n (CSEExp e) b,
+    SPMDTyped n e b,
+    CSEExpParamLeaf e (SPMDRep n (CSEExp e) b),
+    TargetExpElem e (SPMDRep n (CSEExp e) b) ~ SPMDRep n e b,
+    Typeable (SPMDRep n (CSEExp e) b)
+  ) =>
+  CSEFix e (SPMD n (CSEExp e) b)
+  where
+  type CSEFixTarget e (SPMD n (CSEExp e) b) = SPMD n e b
+  type CSEFixParams e (SPMD n (CSEExp e) b) = '[]
+  type CSEFixLeaf e (SPMD n (CSEExp e) b) = SPMD n (CSEExp e) b
+  type CSEFixTargetLeaf e (SPMD n (CSEExp e) b) = e (SPMDRep n (CSEExp e) b)
+  cseFixSigTypes _ _ =
+    ( [],
+      [ TR.SomeTypeRep (TR.typeRep @n),
+        TR.SomeTypeRep (TR.typeRep @b),
+        TR.SomeTypeRep (TR.typeRep @(SPMDRep n (CSEExp e) b))
+      ]
+    )
   cseAllocFixParams _ _ = (HNil, id)
   cseMakeFixStub mkLeaf = mkLeaf HNil
-  cseCurryFixTarget k = k HNil
-  cseUncurryFixTarget v HNil = v
+  cseCurryFixTarget k = SPMD (pure (spmdDematerialize @n @e @b (coerceExpNewtype (k HNil))))
+  cseUncurryFixTarget v HNil = coerceExpNewtype (spmdMaterialize @n @e @b (runSPMD v))
 
-instance (CSETyped e a, CSEFix e r) => CSEFix e (CSEExp e a -> r) where
-  type CSEFixTarget (CSEExp e a -> r) = e a -> CSEFixTarget r
-  type CSEFixParams (CSEExp e a -> r) = a ': CSEFixParams r
-  type CSEFixLeaf (CSEExp e a -> r) = CSEFixLeaf r
-  type CSEFixTargetLeaf (CSEExp e a -> r) = CSEFixTargetLeaf r
-  cseAllocFixParams funKey idx =
-    let vid = VarId (VarLocalFun funKey idx) (TR.typeRep @a) (Just (BindDirect @e @a))
-        (restVids, peelRest) = cseAllocFixParams @e @r funKey (idx + 1)
-     in (HCons vid restVids, \fn -> peelRest (fn (mkExpVar vid)))
+instance (Functor m, CSEFixMonRet e res) => CSEFix e (CSEM m e res) where
+  type CSEFixTarget e (CSEM m e res) = m (CSEFixRetTarget e res)
+  type CSEFixParams e (CSEM m e res) = '[]
+  type CSEFixLeaf e (CSEM m e res) = CSEM m e res
+  type CSEFixTargetLeaf e (CSEM m e res) = m (HArgs e (CSEFixRets e res))
+  cseFixSigTypes pe _ = ([], cseFixRetTypes pe (Proxy @res))
+  cseAllocFixParams _ _ = (HNil, id)
+  cseMakeFixStub mkLeaf = mkLeaf HNil
+  cseCurryFixTarget k = fst . cseFixHArgsToTarget @e @res @'[] <$> k HNil
+  cseUncurryFixTarget act HNil = (\t -> cseFixTargetToHArgs @e @res @'[] t HNil) <$> act
+
+instance (Monad m, CSEFixMonRet e res) => CSEFix e (SPMDM n (CSEM m e) (CSEExp e) res) where
+  type CSEFixTarget e (SPMDM n (CSEM m e) (CSEExp e) res) = SPMDM n m e (CSEFixRetTarget e res)
+  type CSEFixParams e (SPMDM n (CSEM m e) (CSEExp e) res) = '[]
+  type CSEFixLeaf e (SPMDM n (CSEM m e) (CSEExp e) res) = SPMDM n (CSEM m e) (CSEExp e) res
+  type CSEFixTargetLeaf e (SPMDM n (CSEM m e) (CSEExp e) res) = m (HArgs e (CSEFixRets e res))
+  cseFixSigTypes pe _ = ([], cseFixRetTypes pe (Proxy @res))
+  cseAllocFixParams _ _ = (HNil, id)
+  cseMakeFixStub mkLeaf = mkLeaf HNil
+  cseCurryFixTarget k = liftSPMD (fst . cseFixHArgsToTarget @e @res @'[] <$> k HNil)
+  cseUncurryFixTarget act HNil = (\t -> cseFixTargetToHArgs @e @res @'[] t HNil) <$> runSPMDM act
+
+instance (CSEFixParam e p, CSEFix e r) => CSEFix e (p -> r) where
+  type CSEFixTarget e (p -> r) = CSEFixParamTarget e p -> CSEFixTarget e r
+  type CSEFixParams e (p -> r) = CSEFixParamPrepend e p (CSEFixParams e r)
+  type CSEFixLeaf e (p -> r) = CSEFixLeaf e r
+  type CSEFixTargetLeaf e (p -> r) = CSEFixTargetLeaf e r
+  cseFixSigTypes pe _ =
+    let (inRest, outTys) = cseFixSigTypes pe (Proxy @r)
+     in (cseFixParamTypes pe (Proxy @p) <> inRest, outTys)
+  cseAllocFixParams funKey idx0 =
+    let (idx1, allVids, formalP) = cseFixAllocParam @e @p funKey idx0 restVids
+        (restVids, peelRest) = cseAllocFixParams @e @r funKey idx1
+     in (allVids, \fn -> peelRest (fn formalP))
   cseMakeFixStub mkLeaf =
-    \arg -> cseMakeFixStub @e @r (\restArgs -> mkLeaf (HCons arg restArgs))
+    \arg -> cseMakeFixStub @e @r (\restArgs -> mkLeaf (cseFixExtractParam @e @p arg restArgs))
   cseCurryFixTarget k =
-    \x -> cseCurryFixTarget @e @r (\xs -> k (HCons x xs))
-  cseUncurryFixTarget fn (HCons x xs) =
-    cseUncurryFixTarget @e @r (fn x) xs
+    \x -> cseCurryFixTarget @e @r (\xs -> k (cseFixPrependParamTarget @e @p x xs))
+  cseUncurryFixTarget fn allArgs =
+    let (x, restArgs) = cseFixConsumeParamTarget @e @p allArgs
+     in cseUncurryFixTarget @e @r (fn x) restArgs
 
 class CSEFixLeafBuilder (e :: K.Type -> K.Type) (r :: K.Type) where
   cseBuildLeaf ::
     Digest ->
     String ->
     HArgs (VarId e) params ->
-    (((HArgs e params -> CSEFixTargetLeaf r) -> HArgs e params -> CSEFixTargetLeaf r) -> HArgs e params -> CSEFixTargetLeaf r) ->
-    CSEFixLeaf r ->
-    (HArgs (CSEExp e) params -> CSEFixLeaf r)
+    (((HArgs e params -> CSEFixTargetLeaf e r) -> HArgs e params -> CSEFixTargetLeaf e r) -> HArgs e params -> CSEFixTargetLeaf e r) ->
+    CSEFixLeaf e r ->
+    (HArgs (CSEExp e) params -> CSEFixLeaf e r)
 
-instance (CSETyped e b) => CSEFixLeafBuilder e (CSEExp e b) where
+instance (CSEExpParamLeaf e b, Typeable b) => CSEFixLeafBuilder e (CSEExp e b) where
   cseBuildLeaf funKey name formalParams emitWithTarget rawBody =
     let pfd =
           PureFunDef
@@ -612,46 +1298,85 @@ instance (CSETyped e b) => CSEFixLeafBuilder e (CSEExp e b) where
               pfdName = name,
               pfdParams = formalParams,
               pfdRetType = TR.typeRep @b,
-              pfdRetBind = BindDirect @e @b,
+              pfdRetBind = cseLeafBindCap @e @b,
               pfdBody = cseExp rawBody,
               pfdEmitTarget = emitWithTarget
             }
      in mkExpFixCall pfd
 
-instance (CSETyped e b) => CSEFixLeafBuilder e (CSEM m e (CSEExp e b)) where
+instance
+  ( SPMDTyped n (CSEExp e) b,
+    CSEExpParamLeaf e (SPMDRep n (CSEExp e) b),
+    Typeable (SPMDRep n (CSEExp e) b)
+  ) =>
+  CSEFixLeafBuilder e (SPMD n (CSEExp e) b)
+  where
   cseBuildLeaf funKey name formalParams emitWithTarget rawBody =
-    let mfd =
+    let rawRepBody = spmdMaterialize @n @(CSEExp e) @b (runSPMD rawBody)
+        pfd =
+          PureFunDef
+            { pfdKey = funKey,
+              pfdName = name,
+              pfdParams = formalParams,
+              pfdRetType = TR.typeRep @(SPMDRep n (CSEExp e) b),
+              pfdRetBind = cseLeafBindCap @e @(SPMDRep n (CSEExp e) b),
+              pfdBody = cseExp rawRepBody,
+              pfdEmitTarget = emitWithTarget
+            }
+     in \callArgs -> SPMD (pure (spmdDematerialize @n @(CSEExp e) @b (mkExpFixCall pfd callArgs)))
+
+instance (CSEFixMonRet e res) => CSEFixLeafBuilder e (CSEM m e res) where
+  cseBuildLeaf funKey name formalParams emitWithTarget rawBody =
+    let retSpec = cseFixRetSpec @e @res HRSNil
+        rawHBody = (\r -> cseFixExtractRet @e @res r HNil) <$> rawBody
+        mfd =
           MonadicFunDef
             { mfdKey = funKey,
               mfdName = name,
               mfdParams = formalParams,
-              mfdRetType = TR.typeRep @b,
-              mfdRetBind = BindDirect @e @b,
-              mfdBody = cseM rawBody,
+              mfdRetSpec = retSpec,
+              mfdBody = cseM rawHBody,
               mfdEmitTarget = emitWithTarget
             }
      in \callArgs -> do
-          vid <- allocSSAId (TR.typeRep @b) (Just (BindDirect @e @b))
-          emitStm (StmFixCall vid mfd callArgs)
-          pure (mkExpVar vid)
+          vids <- allocHRetVars retSpec
+          emitStm (StmFixCall vids mfd callArgs)
+          let varExps = runIdentity (mapHArgsM (Identity . mkExpVar) vids)
+              (res, HNil) = cseFixRebuildRet @e @res @'[] varExps
+           in pure res
 
-instance (CSEFixLeafBuilder e r) => CSEFixLeafBuilder e (CSEExp e a -> r) where
+instance (CSEFixMonRet e res) => CSEFixLeafBuilder e (SPMDM n (CSEM m e) (CSEExp e) res) where
+  cseBuildLeaf funKey name formalParams emitWithTarget rawBody =
+    let innerBuilder =
+          cseBuildLeaf
+            @e
+            @(CSEM m e res)
+            funKey
+            name
+            formalParams
+            emitWithTarget
+            (runSPMDM rawBody)
+     in liftSPMD . innerBuilder
+
+instance (CSEFixLeafBuilder e r) => CSEFixLeafBuilder e (p -> r) where
   cseBuildLeaf = cseBuildLeaf @e @r
 
 instance
-  ( Typeable (CSEFixTarget r),
+  ( CSETargetExp e,
     CSEFix e r,
     CSEFixLeafBuilder e r,
-    ExpFix e (CSEFixTarget r)
+    ExpFix e (CSEFixTarget e r)
   ) =>
   ExpFix (CSEExp e) r
   where
   fun _ name stepFn =
-    let funKey =
-          mkNodeDigest
-            "ExpFix"
-            [encodeStr name, encodeTypeRep (TR.typeRep @(CSEFixTarget r))]
-            []
+    let (inTrs, outTrs) = cseFixSigTypes (Proxy @e) (Proxy @r)
+        sigImms =
+          encodeStr name
+            : encodeInt (length inTrs)
+            : map encodeSomeTypeRep inTrs
+            <> (encodeInt (length outTrs) : map encodeSomeTypeRep outTrs)
+        funKey = mkNodeDigest "ExpFix" sigImms []
         (formalParams, peelFn) = cseAllocFixParams @e @r funKey 0
         emitWithTarget step targetArgs =
           let targetCurried =
@@ -664,6 +1389,9 @@ instance
         selfStub = cseMakeFixStub @e @r callBuilder
         rawBody = peelFn (stepFn selfStub)
      in selfStub
+
+instance (ExpFix (CSEExp e) r) => ExpFix (SPMD n (CSEExp e)) r where
+  fun _ = fun (Proxy @(CSEExp e))
 
 class ReaderCSEFix (env :: K.Type) (e :: K.Type -> K.Type) (fn :: K.Type) | fn -> env e where
   type ReaderCSEFixInner fn :: K.Type
@@ -1392,6 +2120,127 @@ instance (CmdRef m e, KnownJanusType e a, Typeable a) => RefCell (CSEM m e) (CSE
     pure (Cell (readRef ref) (writeRef ref))
 
 instance (ExpJanus e) => ExpJanus (CSEExp e)
+
+localArgsSomeTypeReps :: LocalArgs f ts -> [TR.SomeTypeRep]
+localArgsSomeTypeReps LANil = []
+localArgsSomeTypeReps (LACons (_ :: f a) rest) =
+  TR.SomeTypeRep (TR.typeRep @a) : localArgsSomeTypeReps rest
+
+allocLocalArgsCSE ::
+  forall e ts.
+  (ExpJanus e) =>
+  Digest ->
+  Int ->
+  LocalArgs (CSEExp e) ts ->
+  (HArgs (VarId e) ts, LocalArgs (CSEExp e) ts)
+allocLocalArgsCSE _ _ LANil = (HNil, LANil)
+allocLocalArgsCSE fk idx (LACons (_ :: CSEExp e a) rest) =
+  withJanusType @a @e $
+    let tr = TR.typeRep @a
+        cap = BindDirect @e @a
+        vid = VarId (VarLocalFun fk idx) tr (Just cap)
+        (restVids, restFormalLA) = allocLocalArgsCSE @e fk (idx + 1) rest
+     in (HCons vid restVids, LACons (mkExpVar vid) restFormalLA)
+
+localArgsToHArgs :: LocalArgs f ts -> HArgs f ts
+localArgsToHArgs LANil = HNil
+localArgsToHArgs (LACons x rest) = HCons x (localArgsToHArgs rest)
+
+hArgsToLocalArgs :: LocalArgs proxy ts -> HArgs f ts -> LocalArgs f ts
+hArgsToLocalArgs LANil HNil = LANil
+hArgsToLocalArgs (LACons _ restProxy) (HCons x xs) =
+  LACons x (hArgsToLocalArgs restProxy xs)
+
+instance (CmdJanus m e) => CmdLocalFun (CSEM m e) (CSEExp e) where
+  emitLocalFunArgsM ::
+    forall ts b.
+    (Typeable b, Storable b, JanusCTyped b) =>
+    String ->
+    ((LocalArgs (CSEExp e) ts -> CSEM m e (CSEExp e b)) -> LocalArgs (CSEExp e) ts -> CSEM m e (CSEExp e b)) ->
+    LocalArgs (CSEExp e) ts ->
+    CSEM m e (CSEExp e b)
+  emitLocalFunArgsM name step actualArgs =
+    withJanusType @b @e $ do
+      let inTrs = localArgsSomeTypeReps actualArgs
+          trB = TR.typeRep @b
+          capB = BindDirect @e @b
+          sigImms =
+            encodeStr name
+              : encodeInt (length inTrs)
+              : map encodeSomeTypeRep inTrs
+              <> [encodeInt 1, encodeTypeRep trB]
+          funKey = mkNodeDigest "LocalFunM" sigImms []
+          (formalVids, formalLocalArgs) = allocLocalArgsCSE @e funKey 0 actualArgs
+          retSpec = HRSCons trB capB HRSNil
+          selfStub callLocalArgs = do
+            let callHArgs = localArgsToHArgs callLocalArgs
+            vid <- allocSSAId trB (Just capB)
+            emitStm (StmFixCall (HCons vid HNil) mfd callHArgs)
+            pure (mkExpVar vid)
+          rawHBody = (\r -> HCons r HNil) <$> step selfStub formalLocalArgs
+          emitTarget stepH tgtHArgs = do
+            resVal <-
+              emitLocalFunArgsM @m @e
+                name
+                ( \selfTgt formalTgtLA -> do
+                    let selfH hArgs = (\v -> HCons v HNil) <$> selfTgt (hArgsToLocalArgs actualArgs hArgs)
+                    hsOut <- stepH selfH (localArgsToHArgs formalTgtLA)
+                    case hsOut of
+                      HCons r HNil -> pure r
+                )
+                (hArgsToLocalArgs actualArgs tgtHArgs)
+            pure (HCons resVal HNil)
+          mfd =
+            MonadicFunDef
+              { mfdKey = funKey,
+                mfdName = name,
+                mfdParams = formalVids,
+                mfdRetSpec = retSpec,
+                mfdBody = cseM rawHBody,
+                mfdEmitTarget = emitTarget
+              }
+      selfStub actualArgs
+
+  emitLocalFunArgsM_ ::
+    forall ts.
+    String ->
+    ((LocalArgs (CSEExp e) ts -> CSEM m e ()) -> LocalArgs (CSEExp e) ts -> CSEM m e ()) ->
+    LocalArgs (CSEExp e) ts ->
+    CSEM m e ()
+  emitLocalFunArgsM_ name step actualArgs = do
+    let inTrs = localArgsSomeTypeReps actualArgs
+        sigImms =
+          encodeStr name
+            : encodeInt (length inTrs)
+            : map encodeSomeTypeRep inTrs
+            <> [encodeInt 0]
+        funKey = mkNodeDigest "LocalFunM_" sigImms []
+        (formalVids, formalLocalArgs) = allocLocalArgsCSE @e funKey 0 actualArgs
+        selfStub callLocalArgs = do
+          let callHArgs = localArgsToHArgs callLocalArgs
+          emitStm (StmFixCall HNil mfd callHArgs)
+        rawHBody = HNil <$ step selfStub formalLocalArgs
+        emitTarget stepH tgtHArgs = do
+          emitLocalFunArgsM_ @m @e
+            name
+            ( \selfTgt formalTgtLA -> do
+                let selfH hArgs = HNil <$ selfTgt (hArgsToLocalArgs actualArgs hArgs)
+                hsOut <- stepH selfH (localArgsToHArgs formalTgtLA)
+                case hsOut of
+                  HNil -> pure ()
+            )
+            (hArgsToLocalArgs actualArgs tgtHArgs)
+          pure HNil
+        mfd =
+          MonadicFunDef
+            { mfdKey = funKey,
+              mfdName = name,
+              mfdParams = formalVids,
+              mfdRetSpec = HRSNil,
+              mfdBody = cseM rawHBody,
+              mfdEmitTarget = emitTarget
+            }
+    selfStub actualArgs
 
 instance (CmdJanus m e) => CmdJanus (CSEM m e) (CSEExp e)
 

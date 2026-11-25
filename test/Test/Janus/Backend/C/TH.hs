@@ -17,7 +17,7 @@ import Foreign.Ptr (Ptr)
 import Hedgehog (Property, assert, forAll, property, (===))
 import qualified Hedgehog.Gen as Gen
 import qualified Hedgehog.Range as Range
-import Janus.Backend.C (JanusCCSE, compileJanusCNamed, prepareJanusCUnit)
+import Janus.Backend.C (JanusCCSE, PortableC, compileJanusCNamed, janusCMangledSymbol, prepareJanusCUnit)
 import Janus.Backend.C.Build
   ( buildCachedJanusObject,
     cBuildConfigCFlags,
@@ -61,8 +61,10 @@ import Test.Tasty.Hedgehog (testProperty)
 -- Statically Compiled & Linked Janus Functions (Top-Level & Expression Splices)
 --------------------------------------------------------------------------------
 
--- Entry point explicitly named "fac", matching internal ExpFix helper name "fac"
+-- Entry point explicitly named "fac", matching internal ExpFix helper name "fac",
+-- plus a second polymorphic specialization (@Int32) sharing the same C base name "fac"
 $(declareJanusC Unsafe "fac" (facPoly @JanusCCSE @Int64))
+$(declareJanusCAs Unsafe "fac" "facI32" (facPoly @JanusCCSE @Int32))
 
 -- Safe ccall with multiple specializations of polymorphic ExpFix helper in one TU
 $(declareJanusC Safe "th_double_fac_sum" doubleFacSum)
@@ -189,6 +191,13 @@ unit_th_ast_safety_and_fastpath = do
   assertBool "uppercase Haskell var rejected" (isLeft (checkHsVarName "UpperVar"))
   assertBool "Haskell keyword rejected" (isLeft (checkHsVarName "foreign"))
 
+  -- 4. Type-hash mangling produces deterministic, distinct C symbols per polymorphic instantiation
+  let symI64 = janusCTHMangledSymbol (Proxy @(JanusCCSE Int64 -> JanusCCSE Int64)) "fac"
+      symI32 = janusCTHMangledSymbol (Proxy @(JanusCCSE Int32 -> JanusCCSE Int32)) "fac"
+      dynI64 = janusCMangledSymbol @PortableC (Proxy @(JanusCCSE Int64 -> JanusCCSE Int64)) "fac"
+  symI64 @?= dynI64
+  assertBool "Int32 and Int64 instantiations get distinct mangled C symbols" (symI64 /= symI32)
+
 type Sx86Vec8F =
   LinuxX86_64CCSE (SIMDVector LinuxX86_64CCSE 8 Float) ->
   LinuxX86_64CCSE (SIMDVector LinuxX86_64CCSE 8 Float) ->
@@ -199,6 +208,7 @@ unit_th_janus_c_execution :: IO ()
 unit_th_janus_c_execution = do
   th_const_42 @?= 42
   fac 10 @?= 3628800
+  facI32 7 @?= 5040
   th_double_fac_sum (5 :: Int32) (6 :: Int64) @?= (120 + 720)
   th_affine_unsafe 3 7 5 @?= 26
   th_affine_safe 3 7 5 @?= 26
@@ -208,8 +218,9 @@ unit_th_janus_c_execution = do
   th_custom_cflags_sub 10.5 3.25 @?= 7.25
   splicedInlineMul 6 7 @?= 42
 
-  -- Cross-module static object linking without helper symbol collisions
+  -- Cross-module static object linking without helper or entry symbol collisions
   THOther.th_other_fac 8 @?= 40320
+  THOther.th_other_fac_i32 6 @?= 720
   THOther.splicedOtherCube 4 @?= 64
 
   -- Pointer mutation (Unsafe) & concurrent Safe ccall execution

@@ -156,6 +156,7 @@ class JanusCTH r where
   type JanusCTHEval r :: K.Type
   janusCTHPrepare :: CBuildConfig -> String -> r -> IO (String, [String])
   janusCTHSpec :: Proxy r -> ([THParamSpec], THRetSpec)
+  janusCTHMangledSymbol :: Proxy r -> String -> String
 
 instance (JanusCCSEParam t r) => JanusCTH r where
   type JanusCTHEval r = JanusCCSEEval r
@@ -164,6 +165,7 @@ instance (JanusCCSEParam t r) => JanusCTH r where
     (cSrc, cflags, _ldflags) <- prepareJanusCUnit fs cSymName prog
     pure (cSrc, cflags)
   janusCTHSpec _ = jcTHSpec @t @(CSETarget r) (Proxy @(CSETarget r))
+  janusCTHMangledSymbol _ = jcMangledSymbol @t @(CSETarget r) (Proxy @(CSETarget r))
 
 --------------------------------------------------------------------------------
 -- Identifier Validation, Object Linking, & Declaration Generation
@@ -394,9 +396,10 @@ compileAndBuildDecls ::
   Q [Dec]
 compileAndBuildDecls config safety cSymName hsName prog = do
   validateCSymbolName cSymName
+  let mangledSym = janusCTHMangledSymbol (Proxy @r) cSymName
   (cSource, extraCFlags) <- runIO (janusCTHPrepare config cSymName prog)
   linkJanusCObject config extraCFlags cSource
-  buildForeignAndWrapperDecls safety cSymName hsName (janusCTHSpec (Proxy @r))
+  buildForeignAndWrapperDecls safety mangledSym hsName (janusCTHSpec (Proxy @r))
 
 --------------------------------------------------------------------------------
 -- Public Template Haskell Splices

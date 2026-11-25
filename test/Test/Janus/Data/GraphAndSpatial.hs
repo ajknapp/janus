@@ -18,6 +18,7 @@ import Data.Int (Int64)
 import qualified Data.IntMap.Strict as IntMap
 import qualified Data.IntSet as IntSet
 import Data.List (sort)
+import Data.Proxy (Proxy (..))
 import qualified Data.Sequence as Seq
 import Hedgehog (Gen, Property, assert, forAll, property, (===))
 import qualified Hedgehog.Gen as Gen
@@ -41,6 +42,7 @@ import qualified Janus.Data.EytzingerVec as EV
 import Janus.Data.FlatIntervalMap (FlatIntervalMap (..))
 import qualified Janus.Data.FlatIntervalMap as FIM
 import Janus.Expression.Ord (ExpOrd (ge))
+import Janus.Fix (fun)
 import System.Environment (lookupEnv)
 import Test.Tasty (TestTree, testGroup, withResource)
 import Test.Tasty.Hedgehog (testProperty)
@@ -545,21 +547,51 @@ cGraphAndSpatialKernel ::
   LinuxX86_64CCSE Int64 ->
   LinuxX86_64CMCSE (LinuxX86_64CCSE Int64)
 cGraphAndSpatialKernel ds g ev fim target qLo qHi = do
-  nDs <- DS.numElements ds
-  whenM_ (nDs `ge` 2) $ do
-    _ <- DS.union ds 0 (nDs - 1)
-    pure ()
-  setsAfter <- DS.numSets ds
+  let dsPhase ::
+        DisjointSet LinuxX86_64CCSE ->
+        LinuxX86_64CMCSE (LinuxX86_64CCSE Int64)
+      dsPhase =
+        fun (Proxy @LinuxX86_64CCSE) "gs_ds_phase" $ \_ ds' -> do
+          nDs <- DS.numElements ds'
+          whenM_ (nDs `ge` 2) $ do
+            _ <- DS.union ds' 0 (nDs - 1)
+            pure ()
+          DS.numSets ds'
 
-  dists <- CSR.bfsDistances dynamicAlloc g 0
-  distSum <- runDrain drainSum (DV.stream dists)
-  DV.free dynamicAlloc dists
+      csrPhase ::
+        CsrGraph LinuxX86_64CCSE Int64 ->
+        LinuxX86_64CMCSE (LinuxX86_64CCSE Int64)
+      csrPhase =
+        fun (Proxy @LinuxX86_64CCSE) "gs_csr_phase" $ \_ g' -> do
+          dists <- CSR.bfsDistances dynamicAlloc g' 0
+          distSum <- runDrain drainSum (DV.stream dists)
+          DV.free dynamicAlloc dists
+          pure distSum
 
-  (_, geVal) <- EV.lookupGE (-1000) ev target
-  evSum <- runDrain drainSum (EV.inOrderStream ev)
+      evPhase ::
+        EytzingerVec LinuxX86_64CCSE Int64 ->
+        LinuxX86_64CCSE Int64 ->
+        LinuxX86_64CMCSE (LinuxX86_64CCSE Int64)
+      evPhase =
+        fun (Proxy @LinuxX86_64CCSE) "gs_ev_phase" $ \_ ev' tgt -> do
+          (_, geVal) <- EV.lookupGE (-1000) ev' tgt
+          evSum <- runDrain drainSum (EV.inOrderStream ev')
+          pure (geVal + evSum)
 
-  ovValSum <- runDrain drainSum ((\(_, _, v) -> v) <$> FIM.overlappingStream fim qLo qHi)
-  pure (setsAfter + distSum + geVal + evSum + ovValSum)
+      fimPhase ::
+        FlatIntervalMap LinuxX86_64CCSE Int64 Int64 ->
+        LinuxX86_64CCSE Int64 ->
+        LinuxX86_64CCSE Int64 ->
+        LinuxX86_64CMCSE (LinuxX86_64CCSE Int64)
+      fimPhase =
+        fun (Proxy @LinuxX86_64CCSE) "gs_fim_phase" $ \_ fim' lo hi ->
+          runDrain drainSum ((\(_, _, v) -> v) <$> FIM.overlappingStream fim' lo hi)
+
+  setsAfter <- dsPhase ds
+  distSum <- csrPhase g
+  evTot <- evPhase ev target
+  ovValSum <- fimPhase fim qLo qHi
+  pure (setsAfter + distSum + evTot + ovValSum)
 
 check_graph_spatial_host_c_ffi ::
   IO

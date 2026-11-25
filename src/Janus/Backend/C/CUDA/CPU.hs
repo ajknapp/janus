@@ -18,6 +18,7 @@ import Control.Monad.Reader (MonadReader (..), ReaderT (..))
 import Data.Bits (Bits)
 import Data.Coerce (coerce)
 import Data.Complex (Complex)
+import Data.Function (fix)
 import Data.Functor.Identity (Identity (..))
 import Data.Int (Int64)
 import Data.Proxy (Proxy)
@@ -36,7 +37,7 @@ import Janus.Command.Range
 import Janus.Command.Ref
 import Janus.Command.TicToc
 import Janus.Command.While
-import Janus.Constraints (CmdJanus, CmdJanusIO, ExpJanus)
+import Janus.Constraints (CmdJanus, CmdJanusIO, CmdLocalFun (..), ExpJanus)
 import Janus.Data.HKD (ExpPtrWord (..), ExpStructPtr (..))
 import Janus.Expression.Bits
 import Janus.Expression.Cast
@@ -49,6 +50,7 @@ import Janus.Expression.Let
 import Janus.Expression.Math
 import Janus.Expression.MurmurHash
 import Janus.Expression.Ord
+import Janus.Fix (ExpFix (..))
 import Janus.Typed (JanusTyped)
 import Test.DejaFu.Conc (ConcIO)
 
@@ -267,6 +269,16 @@ $( let mkCUDACPUBackend expTy monadTy refTy baseM =
              tic = coerce (cudaTic @($baseM))
              toc :: $monadTy (Toc $expTy)
              toc = coerce (cudaToc @($baseM))
+
+           instance ExpFix $expTy r where
+             fun _ _ = fix
+             {-# INLINE fun #-}
+
+           instance CmdLocalFun $monadTy $expTy where
+             emitLocalFunArgsM _ = fix
+             {-# INLINE emitLocalFunArgsM #-}
+             emitLocalFunArgsM_ _ = fix
+             {-# INLINE emitLocalFunArgsM_ #-}
 
            instance ExpJanus $expTy
 

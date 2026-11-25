@@ -208,7 +208,7 @@ benchmarkChoicesJanusWithSetup cfg outDir space setup teardown benchBody = do
           nWarmup = max 0 (benchWarmupIters cfg)
           nWarmupE = fromIntegral nWarmup :: e Int64
           totalCellsE = fromIntegral (numImpls * maxSlots) :: e Int64
-          curSamplesCapE = fromIntegral (maxSlots * nSamples) :: e Int64
+          curSamplesCapE = fromIntegral (numImpls * maxSlots * nSamples) :: e Int64
           choiceCols = choiceHeaderColumns @c
           hasChoiceCols = not (null choiceCols)
           headerCols = choiceCols <> ["timing", "ci_lower", "ci_upper"]
@@ -222,7 +222,7 @@ benchmarkChoicesJanusWithSetup cfg outDir space setup teardown benchBody = do
 
       withBuf @Word64 dynamicAlloc 1 $ \startScratchSB ->
         withBuf @Double dynamicAlloc curSamplesCapE $ \curSamplesSB ->
-          withBuf @Int64 dynamicAlloc maxSlotsE $ \slotSampleCountsSB ->
+          withBuf @Int64 dynamicAlloc totalCellsE $ \slotSampleCountsSB ->
             withBuf @Double dynamicAlloc totalCellsE $ \estTimingsSB ->
               withBuf @Double dynamicAlloc totalCellsE $ \estLowersSB ->
                 withBuf @Double dynamicAlloc totalCellsE $ \estUppersSB ->
@@ -240,15 +240,17 @@ benchmarkChoicesJanusWithSetup cfg outDir space setup teardown benchBody = do
                         sortIdxs <- scopedBuf sortIdxsSB
 
                         rangeM 0 totalCellsE $ \idx -> do
+                          writeBuf slotSampleCounts idx 0
                           writeBuf estTimings idx 0.0
                           writeBuf estLowers idx 0.0
                           writeBuf estUppers idx 0.0
                           writeBuf slotRecorded idx 0
 
-                        -- Execute warmup, batched timing, and Bayesian bootstrap for each combination k
+                        -- Execute warmup and batched sample collection for each combination k
                         let runOneImpl :: Int -> ChoiceSelection c -> m ()
                             runOneImpl kIdx sel = do
                               let kE = fromIntegral kIdx :: e Int64
+                                  baseCell = kE * maxSlotsE
                                   env =
                                     BenchEnv
                                       { _benchChoices = selChoices sel,
@@ -266,9 +268,6 @@ benchmarkChoicesJanusWithSetup cfg outDir space setup teardown benchBody = do
                                 resetTimerIterAccumulators tc
                                 rangeM 0 batchB $ \_ -> stepOnce
 
-                              rangeM 0 maxSlotsE $ \s ->
-                                writeBuf slotSampleCounts s 0
-
                               -- Sample collection batches
                               rangeM 0 nSamplesE $ \sIdx -> do
                                 resetTimerIterAccumulators tc
@@ -280,9 +279,9 @@ benchmarkChoicesJanusWithSetup cfg outDir space setup teardown benchBody = do
                                 let rawDelta = ifThenElse (t1 `ge` t0Loaded) (t1 - t0Loaded) 0
                                     netOverall = max' 0.0 (toFloating rawDelta - timerOverhead)
                                     perCallOverall = netOverall / batchBF
-                                writeBuf curSamplesBuf sIdx perCallOverall
-                                c0 <- readBuf slotSampleCounts 0
-                                writeBuf slotSampleCounts 0 (c0 + 1)
+                                writeBuf curSamplesBuf (baseCell * nSamplesE + sIdx) perCallOverall
+                                c0 <- readBuf slotSampleCounts baseCell
+                                writeBuf slotSampleCounts baseCell (c0 + 1)
 
                                 numUsed <- peek (tcCountPtr tc)
                                 rangeM 1 numUsed $ \slot -> do
@@ -294,26 +293,28 @@ benchmarkChoicesJanusWithSetup cfg outDir space setup teardown benchBody = do
                                             0.0
                                             (toFloating del - toFloating cnt * timerOverhead)
                                         perCallSlot = netSlot / batchBF
-                                    curCnt <- readBuf slotSampleCounts slot
-                                    writeBuf curSamplesBuf (slot * nSamplesE + curCnt) perCallSlot
-                                    writeBuf slotSampleCounts slot (curCnt + 1)
-
-                              -- Compute Bayesian posterior summaries for "overall" and active named timers
-                              numUsedAfter <- peek (tcCountPtr tc)
-                              rangeM 0 numUsedAfter $ \slot -> do
-                                cnt <- readBuf slotSampleCounts slot
-                                whenM_ (cnt `gt` 0) $ do
-                                  let slotSubBuf = ScalarBuf (ptrIndex curSamplesPtr (slot * nSamplesE))
-                                      cellIdx = kE * maxSlotsE + slot
-                                  est <- estimateTimingPosterior cfg rngRef slotSubBuf cnt
-                                  writeBuf estTimings cellIdx (estTiming est)
-                                  writeBuf estLowers cellIdx (estCiLower est)
-                                  writeBuf estUppers cellIdx (estCiUpper est)
-                                  writeBuf slotRecorded cellIdx 1
+                                        cellIdx = baseCell + slot
+                                    curCnt <- readBuf slotSampleCounts cellIdx
+                                    writeBuf curSamplesBuf (cellIdx * nSamplesE + curCnt) perCallSlot
+                                    writeBuf slotSampleCounts cellIdx (curCnt + 1)
 
                               runBenchT env (teardown res)
 
                         sequence_ [runOneImpl k sel | (k, sel) <- zip [0 ..] selections]
+
+                        -- Compute Bayesian posterior summaries for "overall" and active named timers
+                        numUsedAfter <- peek (tcCountPtr tc)
+                        rangeM 0 numImplsE $ \kE ->
+                          rangeM 0 numUsedAfter $ \slot -> do
+                            let cellIdx = kE * maxSlotsE + slot
+                            cnt <- readBuf slotSampleCounts cellIdx
+                            whenM_ (cnt `gt` 0) $ do
+                              let slotSubBuf = ScalarBuf (ptrIndex curSamplesPtr (cellIdx * nSamplesE))
+                              est <- estimateTimingPosterior cfg rngRef slotSubBuf cnt
+                              writeBuf estTimings cellIdx (estTiming est)
+                              writeBuf estLowers cellIdx (estCiLower est)
+                              writeBuf estUppers cellIdx (estCiUpper est)
+                              writeBuf slotRecorded cellIdx 1
 
                         -- Sort active implementations ascending (fastest first) and emit CSV per timer
                         bestOverallIdxRef <- newRef (0 :: e Int64)
