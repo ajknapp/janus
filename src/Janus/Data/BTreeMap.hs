@@ -91,6 +91,7 @@ import Janus.Backend.C
 import Janus.Command.Cond (ifThenElseM_, whenM_)
 import Janus.Command.Memory (CmdStorable (..), ExpPtr (..), ExpSized (..))
 import Janus.Command.Ref (RefCell, newRef, readRef, writeRef)
+import Janus.Constraints (KnownJanusType)
 import Janus.Control.Drain (Drain (..), drainFoldM, drainForEach, drain_, runDrain)
 import Janus.Control.Step (Step (..))
 import Janus.Control.Stream
@@ -102,7 +103,7 @@ import Janus.Control.Stream
     unfoldWhileM,
     unionSortedByS,
   )
-import Janus.Data.FlatMap (OrdKey (..))
+import Janus.Data.FlatMap (InlineOrdLayoutCtx, OrdKey (..))
 import Janus.Data.HKD
 import Janus.Data.Layout
 import Janus.Data.Sort (lowerBoundBuf, upperBoundBuf)
@@ -118,7 +119,6 @@ import Janus.SPMD
     uniform,
     withSPMD,
   )
-import Janus.Typed (JanusTyped)
 import Prelude hiding (lookup)
 
 -- | Branching factor @B = 8@: non-root nodes store @[7 .. 15]@ keys; internal nodes store @[8 .. 16]@ children.
@@ -189,46 +189,33 @@ deriving stock instance Eq (BTreeMap Identity k v)
 deriving stock instance Show (BTreeMap Identity k v)
 
 type BTreeMapCtx m e k v =
-  ( InlineLayoutCtx BTreeMaxKeys m e k,
-    InlineLayoutCtx BTreeMaxKeys m e v,
-    OrdKey e k,
-    Typeable k,
-    Typeable v,
-    JanusTyped e (FixedArray BTreeMaxChildren (Ptr Word8)),
-    ExpSized e (CStruct (BTreeInternal k)),
-    JanusTyped e (CStruct (BTreeInternal k)),
-    ExpSized e (CStruct (BTreeLeaf k v)),
-    JanusTyped e (CStruct (BTreeLeaf k v)),
-    ExpSized e (CStruct (BTreeMapSpine k v)),
-    JanusTyped e (CStruct (BTreeMapSpine k v))
+  ( InlineOrdLayoutCtx BTreeMaxKeys m e k,
+    InlineLayoutCtx BTreeMaxKeys m e v
   )
 
 asInternal ::
   forall k e.
-  (ExpPtrCast e, JanusTyped e Word8, JanusTyped e (CStruct (BTreeInternal k))) =>
+  (ExpPtrCast e, KnownJanusType e Word8, KnownJanusType e (CStruct (BTreeInternal k))) =>
   e (Ptr Word8) ->
   e (Ptr (CStruct (BTreeInternal k)))
 asInternal p = fromVoidPtr (toVoidPtr p)
 
 asLeaf ::
   forall k v e.
-  (ExpPtrCast e, JanusTyped e Word8, JanusTyped e (CStruct (BTreeLeaf k v))) =>
+  (ExpPtrCast e, KnownJanusType e Word8, KnownJanusType e (CStruct (BTreeLeaf k v))) =>
   e (Ptr Word8) ->
   e (Ptr (CStruct (BTreeLeaf k v)))
 asLeaf p = fromVoidPtr (toVoidPtr p)
 
 toRawNode ::
-  (ExpPtrCast e, JanusTyped e a, JanusTyped e Word8) =>
+  (ExpPtrCast e, KnownJanusType e a, KnownJanusType e Word8) =>
   e (Ptr a) ->
   e (Ptr Word8)
 toRawNode p = fromVoidPtr (toVoidPtr p)
 
 internalKeysBuf ::
   forall k m e.
-  ( InlineLayoutCtx BTreeMaxKeys m e k,
-    Typeable k,
-    JanusTyped e (FixedArray BTreeMaxChildren (Ptr Word8))
-  ) =>
+  (InlineLayoutCtx BTreeMaxKeys m e k) =>
   e (Ptr (CStruct (BTreeInternal k))) ->
   m (Buf k e)
 internalKeysBuf pInt =
@@ -240,10 +227,10 @@ internalChildrenPtr ::
     ExpPtrCast e,
     Typeable k,
     JanusStruct (InlineBuf BTreeMaxKeys k),
-    JanusTyped e Int64,
-    JanusTyped e (CStruct (InlineBuf BTreeMaxKeys k)),
-    JanusTyped e (Ptr Word8),
-    JanusTyped e (FixedArray BTreeMaxChildren (Ptr Word8))
+    KnownJanusType e Int64,
+    KnownJanusType e (CStruct (InlineBuf BTreeMaxKeys k)),
+    KnownJanusType e (Ptr Word8),
+    KnownJanusType e (FixedArray BTreeMaxChildren (Ptr Word8))
   ) =>
   e (Ptr (CStruct (BTreeInternal k))) ->
   e (Ptr (Ptr Word8))
@@ -424,7 +411,7 @@ descendToLeaf (BTreeMap hdr) target = do
 
 lookup ::
   forall k v s m e.
-  (BTreeMapCtx m e k v, Elem e v ~ e s, JanusTyped e s) =>
+  (BTreeMapCtx m e k v, Elem e v ~ e s, KnownJanusType e s) =>
   e s ->
   BTreeMap e k v ->
   Elem e k ->
@@ -535,7 +522,7 @@ withLookupGE bm@(BTreeMap hdr) target onMiss onHit = do
 
 lookupGE ::
   forall k v ks vs m e.
-  (BTreeMapCtx m e k v, Elem e k ~ e ks, Elem e v ~ e vs, JanusTyped e ks, JanusTyped e vs) =>
+  (BTreeMapCtx m e k v, Elem e k ~ e ks, Elem e v ~ e vs, KnownJanusType e ks, KnownJanusType e vs) =>
   e ks ->
   e vs ->
   BTreeMap e k v ->
@@ -596,7 +583,7 @@ withLookupLE bm@(BTreeMap hdr) target onMiss onHit = do
 
 lookupLE ::
   forall k v ks vs m e.
-  (BTreeMapCtx m e k v, Elem e k ~ e ks, Elem e v ~ e vs, JanusTyped e ks, JanusTyped e vs) =>
+  (BTreeMapCtx m e k v, Elem e k ~ e ks, Elem e v ~ e vs, KnownJanusType e ks, KnownJanusType e vs) =>
   e ks ->
   e vs ->
   BTreeMap e k v ->
@@ -912,11 +899,7 @@ ifThenElseInt64 cond tAct fAct = do
 
 removeParentSepAndRightChild ::
   forall k m e.
-  ( InlineLayoutCtx BTreeMaxKeys m e k,
-    Typeable k,
-    JanusTyped e (FixedArray BTreeMaxChildren (Ptr Word8)),
-    JanusTyped e (CStruct (BTreeInternal k))
-  ) =>
+  (InlineLayoutCtx BTreeMaxKeys m e k) =>
   e (Ptr (CStruct (BTreeInternal k))) ->
   e Int64 ->
   m ()

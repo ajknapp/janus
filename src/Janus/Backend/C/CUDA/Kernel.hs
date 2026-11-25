@@ -2,6 +2,7 @@
 {-# LANGUAGE DerivingVia #-}
 {-# LANGUAGE FlexibleContexts #-}
 {-# LANGUAGE FlexibleInstances #-}
+{-# LANGUAGE InstanceSigs #-}
 {-# LANGUAGE MultiParamTypeClasses #-}
 {-# LANGUAGE ScopedTypeVariables #-}
 {-# LANGUAGE StandaloneDeriving #-}
@@ -22,7 +23,7 @@ import Data.Complex (Complex)
 import Data.Functor.Identity (Identity (..))
 import Data.Loc (noLoc)
 import Data.Proxy (Proxy (..))
-import Foreign.C (withCString)
+import Foreign.C (CDouble, CFloat, withCString)
 import Foreign.Marshal.Alloc (alloca, free, mallocBytes)
 import Foreign.Ptr (Ptr, castPtr, nullPtr, plusPtr)
 import Foreign.Storable (Storable (alignment, peek, poke, pokeElemOff, sizeOf))
@@ -39,6 +40,8 @@ import Janus.Command.IO
 import Janus.Command.Range
 import Janus.Command.Ref
 import Janus.Command.While
+import Janus.Constraints (CmdJanus, CmdJanusIO, ExpJanus)
+import Janus.Data.HKD (ExpPtrWord (..), ExpStructPtr (..))
 import Janus.Expression.Bits
 import Janus.Expression.Bool
 import Janus.Expression.Cast
@@ -55,15 +58,29 @@ import Language.C.Quote as C
 
 deriving via JanusC a instance (JanusLitC a, Num a) => Num (JanusCUDA a)
 
+deriving via JanusC a instance (JanusLitC a, Bounded a) => Bounded (JanusCUDA a)
+
 deriving via JanusC a instance (JanusLitC a, Fractional a) => Fractional (JanusCUDA a)
 
 deriving via JanusC Float instance Floating (JanusCUDA Float)
 
 deriving via JanusC Double instance Floating (JanusCUDA Double)
 
+deriving via JanusC CFloat instance Floating (JanusCUDA CFloat)
+
+deriving via JanusC CDouble instance Floating (JanusCUDA CDouble)
+
 deriving via JanusC (Complex Float) instance Floating (JanusCUDA (Complex Float))
 
 deriving via JanusC (Complex Double) instance Floating (JanusCUDA (Complex Double))
+
+instance ExpComplex JanusCUDA Float where
+  rePart = coerce (rePart @JanusC @Float)
+  imPart = coerce (imPart @JanusC @Float)
+
+instance ExpComplex JanusCUDA Double where
+  rePart = coerce (rePart @JanusC @Double)
+  imPart = coerce (imPart @JanusC @Double)
 
 deriving via JanusC instance ExpBool JanusCUDA
 
@@ -88,6 +105,13 @@ instance (ExpIntegralCast JanusC a b) => ExpIntegralCast JanusCUDA a b where
 deriving via JanusC instance ExpCond JanusCUDA
 
 deriving via JanusC instance ExpPtrCast JanusCUDA
+
+instance ExpPtrWord JanusCUDA where
+  ptrToWord64Expr (JanusCUDA p) = JanusCUDA (ptrToWord64Expr p)
+  word64ToPtrExpr (JanusCUDA w) = JanusCUDA (word64ToPtrExpr w)
+
+instance ExpStructPtr JanusCUDA where
+  structFieldPtr (JanusCUDA p) off fname = JanusCUDA (structFieldPtr p off fname)
 
 instance (ExpEq JanusC a) => ExpEq JanusCUDA a where
   eq = coerce (eq @JanusC @a)
@@ -133,11 +157,24 @@ instance M.CmdMem JanusCUDAM JanusCUDA where
   realloc p n = JanusCUDAM $ lift $ coerce (M.realloc @JanusCM @JanusC) p n
   free p = JanusCUDAM $ lift $ coerce (M.free @JanusCM @JanusC) p
 
+instance M.CmdDynamicAligned JanusCUDAM JanusCUDA where
+  alignedMalloc sz al = JanusCUDAM $ lift $ coerce (M.alignedMalloc @JanusCM @JanusC) sz al
+
+instance M.CmdMemCopy JanusCUDAM JanusCUDA where
+  cmdMemcpy dst src n = JanusCUDAM $ lift $ coerce (M.cmdMemcpy @JanusCM @JanusC) dst src n
+  cmdMemmove dst src n = JanusCUDAM $ lift $ coerce (M.cmdMemmove @JanusCM @JanusC) dst src n
+  cmdMemset dst val n = JanusCUDAM $ lift $ coerce (M.cmdMemset @JanusCM @JanusC) dst val n
+
 instance (M.ExpSized JanusCUDA a, JanusCTyped a) => M.CmdStorable JanusCUDAM JanusCUDA a where
   peek p = JanusCUDAM $ lift $ coerce (M.peek @JanusCM @JanusC @a) p
   poke p a = JanusCUDAM $ lift $ coerce (M.poke @JanusCM @JanusC @a) p a
   peekElemOff p n = JanusCUDAM $ lift $ coerce (M.peekElemOff @JanusCM @JanusC @a) p n
   pokeElemOff p a n = JanusCUDAM $ lift $ coerce (M.pokeElemOff @JanusCM @JanusC @a) p a n
+
+instance (JanusCTyped a) => M.CmdRefPtr JanusCUDAM JanusCUDA a where
+  withRefPtr (JanusCUDARef r) f =
+    JanusCUDAM $ ReaderT $ \env ->
+      M.withRefPtr r (\p -> runReaderT (getJanusCUDAM (f (JanusCUDA p))) env)
 
 instance CmdCase JanusCUDAM JanusCUDA where
   switchCase_ tag cases def = JanusCUDAM $ lift $ switchCase_ (getJanusCUDA tag) (fmap (\(i, m) -> (i, runJanusCUDAM m)) cases) (runJanusCUDAM def)
@@ -168,11 +205,25 @@ instance CmdRef JanusCUDAM JanusCUDA where
   readRef (JanusCUDARef r) = JanusCUDAM $ lift $ JanusCUDA <$> readRef r
   writeRef (JanusCUDARef r) (JanusCUDA a) = JanusCUDAM $ lift $ writeRef r a
 
+instance (JanusCTyped a) => RefCell JanusCUDAM JanusCUDA (JanusCUDA a) where
+  newCell x = do
+    r <- newRef x
+    pure (Cell (readRef r) (writeRef r))
+  newCell' = do
+    r <- newRef'
+    pure (Cell (readRef r) (writeRef r))
+
 instance CmdRange JanusCUDAM JanusCUDA where
   rangeM l u f = JanusCUDAM $ lift $ rangeM (getJanusCUDA l) (getJanusCUDA u) (runJanusCUDAM . f . JanusCUDA)
 
 instance CmdWhile JanusCUDAM JanusCUDA where
   whileM i f = JanusCUDAM $ lift $ whileM (getJanusCUDA i) (runJanusCUDAM . f . JanusCUDARef)
+
+instance ExpJanus JanusCUDA
+
+instance CmdJanus JanusCUDAM JanusCUDA
+
+instance CmdJanusIO JanusCUDAM JanusCUDA
 
 --------------------------------------------------------------------------------
 

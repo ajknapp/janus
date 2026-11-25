@@ -55,13 +55,14 @@ import Janus.Alloc.Policy
   )
 import Janus.Backend.C
 import Janus.Command.Cond (ifThenElseM_, whenM_)
-import Janus.Command.Memory (CmdMemCopy (..), CmdStorable (..), ExpPtr (..), ExpSized (..), janusSIMDAlignment)
+import Janus.Command.Memory (CmdMemCopy (..), CmdStorable (..), ExpPtr (..), janusSIMDAlignment)
 import Janus.Command.Ref (CmdRef, letM, newRef, readRef, writeRef)
+import Janus.Constraints (KnownJanusType)
 import Janus.Control.Drain (Drain (..), drainFoldM, drainForEach, drain_, runDrain)
 import Janus.Control.Stream (Stream, rangeS, reverseRangeS, unfoldWhileM)
 import Janus.Data.HKD
-import Janus.Data.HashMap (HashKey (..))
-import Janus.Data.Layout (Elem, ScalarBuf (..), StorageLayout)
+import Janus.Data.HashMap (HashFilterCtx, HashKey (..))
+import Janus.Data.Layout (Elem, ScalarBuf (..))
 import Janus.Data.Sort (sortBuf)
 import Janus.Expression.Bits (ExpBits (..))
 import Janus.Expression.Bool (ExpBool (..))
@@ -79,7 +80,6 @@ import Janus.SPMD
     uniform,
     uniformAlignedPtr,
   )
-import Janus.Typed (JanusTyped)
 
 --------------------------------------------------------------------------------
 -- XorFilter Spine & Handle
@@ -110,17 +110,7 @@ deriving stock instance Eq (XorFilter Identity k)
 
 deriving stock instance Show (XorFilter Identity k)
 
-type XorFilterCtx m e k =
-  ( CmdAlloc m e,
-    StorageLayout k,
-    HashKey e k,
-    Typeable k,
-    ExpPtr e Word64,
-    JanusTyped e (Ptr Word64),
-    CmdStorable m e (Ptr Word64),
-    ExpSized e (CStruct (XorFilterSpine k)),
-    JanusTyped e (CStruct (XorFilterSpine k))
-  )
+type XorFilterCtx m e k = HashFilterCtx m e k
 
 --------------------------------------------------------------------------------
 -- 3-Partite Lemire FastRange Indexing + 8-Bit Fingerprint Extraction
@@ -134,7 +124,7 @@ xorPositionsAndFpI64 ::
     ExpIntegralCast e Int64 Word64,
     ExpIntegralCast e Word64 Int64,
     Num (e Int64),
-    JanusTyped e Int64
+    KnownJanusType e Int64
   ) =>
   e Word64 ->
   e Int64 ->

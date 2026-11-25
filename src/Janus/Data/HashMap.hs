@@ -20,6 +20,8 @@ module Janus.Data.HashMap
   ( -- * HashKey Class (Powered by MurmurHash, Supporting Scalars & HKD Records)
     HashKey (..),
     GHashStruct (..),
+    HashFilterCtx,
+    HashLayoutCtx,
 
     -- * SwissTable Flat Open-Addressing HashMap Spine & Handle
     HashMapSpine (..),
@@ -73,7 +75,8 @@ import Data.Proxy (Proxy (..))
 import Data.Typeable (Typeable)
 import Data.Word (Word16, Word32, Word64, Word8)
 import Foreign.C.Types
-  ( CChar,
+  ( CBool,
+    CChar,
     CDouble,
     CFloat,
     CInt,
@@ -100,8 +103,9 @@ import Janus.Alloc.Policy
   )
 import Janus.Backend.C
 import Janus.Command.Cond (ifThenElseM_, whenM_)
-import Janus.Command.Memory (CmdMemCopy (..), CmdStorable (..), ExpPtr (..), ExpSized (..), janusSIMDAlignment)
+import Janus.Command.Memory (CmdMemCopy (..), CmdStorable (..), ExpPtr (..), janusSIMDAlignment)
 import Janus.Command.Ref (letM, newRef, readRef, writeRef)
+import Janus.Constraints (CmdJanus, KnownJanusType)
 import Janus.Control.Drain (Drain (..), drainFind, drainFirst, drainForEach, drainLength, drain_, runDrain)
 import Janus.Control.Step (Step (..))
 import Janus.Control.Stream
@@ -132,7 +136,6 @@ import Janus.SPMD
     uniformAlignedPtr,
     withSPMD,
   )
-import Janus.Typed (JanusTyped)
 import Prelude hiding (lookup)
 
 --------------------------------------------------------------------------------
@@ -150,6 +153,7 @@ instance (ExpMurmurHash e (e (TY)), ExpEq e (TY)) => HashKey e (TY) where { \
 }
 
 INST_HASH_SCALAR(Bool)
+INST_HASH_SCALAR(CBool)
 INST_HASH_SCALAR(Int8)
 INST_HASH_SCALAR(Int16)
 INST_HASH_SCALAR(Int32)
@@ -304,15 +308,11 @@ deriving stock instance Eq (HashMap Identity k v)
 
 deriving stock instance Show (HashMap Identity k v)
 
-type HashMapCtx m e k v =
-  ( LayoutCtx m e k,
-    LayoutCtx m e v,
-    HashKey e k,
-    Typeable k,
-    Typeable v,
-    ExpSized e (CStruct (HashMapSpine k v)),
-    JanusTyped e (CStruct (HashMapSpine k v))
-  )
+type HashFilterCtx m e k = (CmdJanus m e, StorageLayout k, Typeable k, HashKey e k)
+
+type HashLayoutCtx m e k = (LayoutCtx m e k, HashKey e k)
+
+type HashMapCtx m e k v = (HashLayoutCtx m e k, LayoutCtx m e v)
 
 new ::
   forall k v m e.
@@ -652,7 +652,7 @@ member hm key = fst <$> findSlot hm key
 
 lookup ::
   forall k v s m e.
-  (HashMapCtx m e k v, Elem e v ~ e s, JanusTyped e s) =>
+  (HashMapCtx m e k v, Elem e v ~ e s, KnownJanusType e s) =>
   e s ->
   HashMap e k v ->
   Elem e k ->
@@ -687,7 +687,7 @@ withLookup hm@(HashMap hdr) key onMiss onHit = do
 
 lookupPtrScalar ::
   forall k v m e.
-  (HashMapCtx m e k v, Buf v ~ ScalarBuf v, ExpPtr e v, JanusTyped e (Ptr v)) =>
+  (HashMapCtx m e k v, Buf v ~ ScalarBuf v, ExpPtr e v, KnownJanusType e (Ptr v)) =>
   HashMap e k v ->
   Elem e k ->
   m (e (Ptr v))

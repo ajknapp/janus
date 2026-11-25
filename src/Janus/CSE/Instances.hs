@@ -65,6 +65,7 @@ import Janus.Command.Range (CmdRange (..))
 import Janus.Command.Ref (Cell (..), CmdRef (..), RefCell (..))
 import Janus.Command.TicToc (CmdTicToc (..), Tic (..), Toc (..))
 import Janus.Command.While (CmdWhile (..))
+import Janus.Constraints (CmdJanus, CmdJanusIO, ExpJanus)
 import Janus.Control.Reader.Base (ExpNewtype (..))
 import Janus.Data.HKD (ExpPtrWord (..), ExpStructPtr (..))
 import Janus.Expression.Bits (ExpBits (..))
@@ -87,6 +88,7 @@ import Janus.Expression.Ord (ExpOrd (..))
 import Janus.Expression.SIMD
 import Janus.Fix (ExpFix (..))
 import Janus.SPMD.Types (ExpPair (..), SIMDPair)
+import Janus.Typed (KnownJanusType)
 import qualified Type.Reflection as TR
 
 --------------------------------------------------------------------------------
@@ -413,7 +415,7 @@ instance (ExpSized e a, Typeable a) => ExpSized (CSEExp e) a where
       (Just (TR.typeRep @Int64, BindInt64))
       (alignOf p)
 
-instance (ExpPtr e a, CSETyped e a) => ExpPtr (CSEExp e) a where
+instance (ExpPtr e a, KnownJanusType e a, Typeable a) => ExpPtr (CSEExp e) a where
   nullPtr =
     mkExpLit
       "ExpPtr.nullPtr"
@@ -1362,13 +1364,19 @@ instance (CmdRef m e) => CmdRef (CSEM m e) (CSEExp e) where
     pure (mkExpVar vid)
   writeRef ref val = emitStm (StmWriteRef ref val)
 
-instance (CmdRef m e, CSETyped e a) => RefCell (CSEM m e) (CSEExp e) (CSEExp e a) where
+instance (CmdRef m e, KnownJanusType e a, Typeable a) => RefCell (CSEM m e) (CSEExp e) (CSEExp e a) where
   newCell x = do
     ref <- newRef x
     pure (Cell (readRef ref) (writeRef ref))
   newCell' = do
     ref <- newRef'
     pure (Cell (readRef ref) (writeRef ref))
+
+instance (ExpJanus e) => ExpJanus (CSEExp e)
+
+instance (CmdJanus m e) => CmdJanus (CSEM m e) (CSEExp e)
+
+instance (CmdJanusIO m e) => CmdJanusIO (CSEM m e) (CSEExp e)
 
 runBranchTree ::
   Int ->
@@ -1459,7 +1467,7 @@ instance (CmdMemCopy m e) => CmdMemCopy (CSEM m e) (CSEExp e) where
       (HCons dst (HCons val (HCons n HNil)))
       (\(HCons vd (HCons vv (HCons vn HNil))) -> cmdMemset vd vv vn)
 
-instance (CmdStorable m e a, CSETyped e a) => CmdStorable (CSEM m e) (CSEExp e) a where
+instance (CmdStorable m e a, Typeable a) => CmdStorable (CSEM m e) (CSEExp e) a where
   peek p =
     emitEffectVal
       (TR.typeRep @a)
@@ -1481,7 +1489,7 @@ instance (CmdStorable m e a, CSETyped e a) => CmdStorable (CSEM m e) (CSEExp e) 
       (HCons p (HCons val (HCons idx HNil)))
       (\(HCons vp (HCons vv (HCons vi HNil))) -> pokeElemOff vp vv vi)
 
-instance (CmdRefPtr m e a, CSETyped e a) => CmdRefPtr (CSEM m e) (CSEExp e) a where
+instance (CmdRefPtr m e a, Typeable a) => CmdRefPtr (CSEM m e) (CSEExp e) a where
   withRefPtr ref bodyFn = CSEM $ \n0 ->
     let vid = VarId (VarSSA n0) (TR.typeRep @(Ptr a)) (Just (BindPtrOf (BindDirect @e @a)))
         (n1, innerTree) = unCSEM (bodyFn (mkExpVar vid)) (n0 + 1)

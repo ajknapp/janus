@@ -7,6 +7,8 @@ module Janus.Expression.Eq where
 
 import Data.Functor.Identity
 import qualified Data.Set as Set
+import Foreign.C (CBool)
+import Foreign.Ptr (Ptr)
 import Janus.Backend.C
 import Janus.Typed
 import Language.C.Quote
@@ -23,6 +25,14 @@ instance (Eq a) => ExpEq Identity a where
   ne a b = (/=) <$> a <*> b
 
 instance ExpEq (JanusCT t) Bool where
+  eq = janusCBoolBinOp Eq
+  ne = janusCBoolBinOp Ne
+
+instance ExpEq (JanusCT t) CBool where
+  eq = janusCBoolBinOp Eq
+  ne = janusCBoolBinOp Ne
+
+instance ExpEq (JanusCT t) (Ptr a) where
   eq = janusCBoolBinOp Eq
   ne = janusCBoolBinOp Ne
 

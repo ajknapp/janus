@@ -32,7 +32,7 @@ import Janus.Expression.Let (ExpLet (..))
 import Janus.Expression.SIMD
 import Janus.SPMD.Raw
 import Janus.SPMD.Types
-import Janus.Typed (JanusTyped)
+import Janus.Typed (JanusTyped, KnownJanusType)
 
 --------------------------------------------------------------------------------
 -- 9. Int64 & Ptr Provenance Materialization
@@ -401,3 +401,5 @@ instance
   spmdFromVoidPtr = spmdFromVoidPtrByLayout @l @n @e @a (Proxy @l)
 
 type instance JanusTyped (SPMD n e) = SPMDTyped n e
+
+instance (SPMDTyped n e a) => KnownJanusType (SPMD n e) a

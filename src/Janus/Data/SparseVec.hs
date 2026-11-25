@@ -79,8 +79,9 @@ import Janus.Alloc.Policy
   )
 import Janus.Backend.C
 import Janus.Command.Cond (ifThenElseM_, whenM_)
-import Janus.Command.Memory (CmdStorable (..), ExpPtr (..), ExpSized (..))
+import Janus.Command.Memory (CmdStorable (..), ExpPtr (..))
 import Janus.Command.Ref (letM, newRef, readRef, writeRef)
+import Janus.Constraints (KnownJanusType, withJanusType)
 import Janus.Control.Drain (Drain (..), drainFind, drainForEach, drainSum, runDrain)
 import Janus.Control.Stream (Stream, filterMapS, iterateS, rangeS, streamM, withStreamSetup)
 import Janus.Data.HKD
@@ -105,7 +106,6 @@ import Janus.SPMD
     withSPMD,
     withSPMDMasked,
   )
-import Janus.Typed (JanusTyped)
 import Prelude hiding (lookup)
 
 data SparseVecSpine a f = SparseVecSpine
@@ -129,15 +129,7 @@ deriving stock instance Eq (SparseVec Identity a)
 
 deriving stock instance Show (SparseVec Identity a)
 
-type SparseVecCtx m e a =
-  ( LayoutCtx m e a,
-    Typeable a,
-    ExpPtr e Int64,
-    JanusTyped e (Ptr Int64),
-    CmdStorable m e (Ptr Int64),
-    ExpSized e (CStruct (SparseVecSpine a)),
-    JanusTyped e (CStruct (SparseVecSpine a))
-  )
+type SparseVecCtx m e a = LayoutCtx m e a
 
 new ::
   forall a m e.
@@ -269,7 +261,7 @@ member sv idx = fst <$> findDenseSlot sv idx
 
 lookup ::
   forall a s m e.
-  (SparseVecCtx m e a, Elem e a ~ e s, JanusTyped e s) =>
+  (SparseVecCtx m e a, Elem e a ~ e s, KnownJanusType e s) =>
   e s ->
   SparseVec e a ->
   e Int64 ->
@@ -371,11 +363,12 @@ delete sv@(SparseVec hdr) idx = do
 -- dense arrays and O(1)-probes the denser vector via Briggs-Torczon lookup!
 sparseDot ::
   forall a s m e.
-  (SparseVecCtx m e a, Elem e a ~ e s, JanusTyped e s, Num (e s)) =>
+  (SparseVecCtx m e a, Elem e a ~ e s, KnownJanusType e s, Num (e s)) =>
   SparseVec e a ->
   SparseVec e a ->
   m (e s)
-sparseDot x@(SparseVec px) y@(SparseVec py) = do
+sparseDot x@(SparseVec px) y@(SparseVec py) =
+  withJanusType @(CStruct (SparseVecSpine a)) @e $ do
   nx <- size x
   ny <- size y
   let wx = ptrToWord64Expr px

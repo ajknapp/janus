@@ -77,8 +77,9 @@ import Janus.Alloc.Policy
   )
 import Janus.Backend.C
 import Janus.Command.Cond (ifThenElseM_, whenM_)
-import Janus.Command.Memory (CmdStorable (..), ExpPtr (..), ExpSized (..))
+import Janus.Command.Memory (CmdStorable (..), ExpPtr (..))
 import Janus.Command.Ref (letM, newRef, readRef, writeRef)
+import Janus.Constraints (KnownJanusType)
 import Janus.Control.Drain (Drain (..), drainFind, drainForEach, runDrain)
 import Janus.Control.Stream (Stream, indexedS, iterateS, rangeS, reverseRangeS, streamM, withStreamSetup)
 import Janus.Data.HKD
@@ -89,7 +90,6 @@ import Janus.Expression.Cond (ExpCond (..))
 import Janus.Expression.Eq (ExpEq (..))
 import Janus.Expression.Ord (ExpOrd (..), min')
 import Janus.SPMD (SPMD, SPMDM, SPMDTyped, uniform, withSPMD)
-import Janus.Typed (JanusTyped)
 
 -- | Spine struct for 'StableVec'.
 -- Allocates fixed-size chunks of @2^logChunk@ elements that NEVER move or reallocate.
@@ -116,17 +116,7 @@ deriving stock instance Show (StableVec logChunk Identity a)
 -- | Default pointer-stable vector with @2^6 = 64@-element chunks.
 type StableVec64 = StableVec 6
 
-type StableVecCtx k m e a =
-  ( LayoutCtx m e a,
-    KnownNat k,
-    Typeable k,
-    Typeable a,
-    ExpPtr e (CStruct (Buf a)),
-    JanusTyped e (Ptr (CStruct (Buf a))),
-    CmdStorable m e (Ptr (CStruct (Buf a))),
-    ExpSized e (CStruct (StableVecSpine k a)),
-    JanusTyped e (CStruct (StableVecSpine k a))
-  )
+type StableVecCtx k m e a = (KnownNat k, Typeable k, LayoutCtx m e a)
 
 chunkParams :: forall k. (KnownNat k) => Proxy k -> (Int64, Int64, Int64)
 chunkParams pk =
@@ -251,7 +241,7 @@ push alloc sv@(StableVec hdr) val = do
 
 pop ::
   forall k a s m e.
-  (StableVecCtx k m e a, Elem e a ~ e s, JanusTyped e s) =>
+  (StableVecCtx k m e a, Elem e a ~ e s, KnownJanusType e s) =>
   e s ->
   StableVec k e a ->
   m (e Bool, e s)

@@ -67,6 +67,7 @@ library
                       Janus.Command.Ref
                       Janus.Command.TicToc
                       Janus.Command.While
+                      Janus.Constraints
                       Janus.Control.CSV
                       Janus.Control.Drain
                       Janus.Control.Fold
@@ -242,7 +243,8 @@ test-suite janus-test
     default-language: Haskell2010
 
     -- Modules included in this executable, other than Main.
-    other-modules:    Test.Janus.Fix
+    other-modules:    Test.Janus.Constraints
+                      Test.Janus.Fix
                       Test.Janus.CSE
                       Test.Janus.CSEDefs
                       Test.Janus.Bench

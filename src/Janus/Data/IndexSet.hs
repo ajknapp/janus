@@ -86,10 +86,10 @@ import Janus.Command.Memory
   ( CmdMemCopy (..),
     CmdStorable (..),
     ExpPtr (..),
-    ExpSized (..),
     janusSIMDAlignment,
   )
 import Janus.Command.Ref (letM, newRef, readRef, writeRef)
+import Janus.Constraints (KnownJanusType)
 import Janus.Control.Drain (Drain (..), drainAll, drainFind, drainFirst, drainForEach, drain_, runDrain)
 import Janus.Control.Stream
   ( Stream,
@@ -103,7 +103,7 @@ import Janus.Control.Stream
   )
 import Janus.Data.FlatMap (OrdKey (..))
 import Janus.Data.HKD
-import Janus.Data.HashMap (HashKey (..), probeGroupsS, swarBitsS, swarOccupiedSlotsS)
+import Janus.Data.HashMap (HashKey (..), HashLayoutCtx, probeGroupsS, swarBitsS, swarOccupiedSlotsS)
 import Janus.Data.Layout
 import Janus.Data.Sort (sortBufBy)
 import Janus.Expression.Bits (ExpBits (..))
@@ -122,7 +122,6 @@ import Janus.SPMD
     uniform,
     uniformAlignedPtr,
   )
-import Janus.Typed (JanusTyped)
 
 --------------------------------------------------------------------------------
 -- SwissTable Control Byte & 8-Byte SWAR Helpers
@@ -224,15 +223,7 @@ deriving stock instance Eq (IndexSet Identity k)
 
 deriving stock instance Show (IndexSet Identity k)
 
-type IndexSetCtx m e k =
-  ( LayoutCtx m e k,
-    HashKey e k,
-    Typeable k,
-    JanusTyped e (Ptr Int64),
-    CmdStorable m e (Ptr Int64),
-    ExpSized e (CStruct (IndexSetSpine k)),
-    JanusTyped e (CStruct (IndexSetSpine k))
-  )
+type IndexSetCtx m e k = HashLayoutCtx m e k
 
 --------------------------------------------------------------------------------
 -- Lifecycle, Queries, & Capacity Management
@@ -582,7 +573,7 @@ insert alloc is@(IndexSet hdr) key = do
 
 popBack ::
   forall k ks m e.
-  (IndexSetCtx m e k, Elem e k ~ e ks, JanusTyped e ks) =>
+  (IndexSetCtx m e k, Elem e k ~ e ks, KnownJanusType e ks) =>
   e ks ->
   IndexSet e k ->
   m (e Bool, e ks)

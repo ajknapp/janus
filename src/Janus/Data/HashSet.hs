@@ -69,12 +69,13 @@ import Janus.Alloc.Policy
   )
 import Janus.Backend.C
 import Janus.Command.Cond (ifThenElseM_, whenM_)
-import Janus.Command.Memory (CmdMemCopy (..), CmdStorable (..), ExpPtr (..), ExpSized (..), janusSIMDAlignment)
+import Janus.Command.Memory (CmdMemCopy (..), CmdStorable (..), ExpPtr (..), janusSIMDAlignment)
 import Janus.Command.Ref (letM, newRef, readRef, writeRef)
+import Janus.Constraints (withJanusType)
 import Janus.Control.Drain (Drain (..), drainAll, drainFind, drainFirst, drainForEach, drainLength, drain_, runDrain)
 import Janus.Control.Stream (Stream (..), filterMapS, iterateS, streamM, unfoldWhileM, withStreamSetup)
 import Janus.Data.HKD
-import Janus.Data.HashMap (HashKey (..), probeGroupsS, swarBitsS, swarOccupiedSlotsS)
+import Janus.Data.HashMap (HashKey (..), HashLayoutCtx, probeGroupsS, swarBitsS, swarOccupiedSlotsS)
 import Janus.Data.Layout
 import Janus.Expression.Bits (ExpBits (..))
 import Janus.Expression.Bool (ExpBool (..))
@@ -93,7 +94,6 @@ import Janus.SPMD
     uniformAlignedPtr,
     withSPMD,
   )
-import Janus.Typed (JanusTyped)
 
 ctrlEmptyByte :: Word8
 ctrlEmptyByte = 0x80
@@ -152,13 +152,7 @@ deriving stock instance Eq (HashSet Identity k)
 
 deriving stock instance Show (HashSet Identity k)
 
-type HashSetCtx m e k =
-  ( LayoutCtx m e k,
-    HashKey e k,
-    Typeable k,
-    ExpSized e (CStruct (HashSetSpine k)),
-    JanusTyped e (CStruct (HashSetSpine k))
-  )
+type HashSetCtx m e k = HashLayoutCtx m e k
 
 new ::
   forall k m e.
@@ -543,18 +537,19 @@ intersectionS ::
   HashSet e k ->
   Stream m (Elem e k)
 intersectionS a@(HashSet pa) b@(HashSet pb) =
-  withStreamSetup
-    ((,) <$> size a <*> size b)
-    $ \(na, nb) ->
-      let wa = ptrToWord64Expr pa
-          wb = ptrToWord64Expr pb
-          smaller :: HashSet e k
-          smaller = HashSet (word64ToPtrExpr (ifThenElse (na `le` nb) wa wb))
-          larger :: HashSet e k
-          larger = HashSet (word64ToPtrExpr (ifThenElse (na `le` nb) wb wa))
-       in filterMapS
-            (\x -> (\ok -> (ok, x)) <$> member larger x)
-            (stream smaller)
+  withJanusType @(CStruct (HashSetSpine k)) @e $
+    withStreamSetup
+      ((,) <$> size a <*> size b)
+      $ \(na, nb) ->
+        let wa = ptrToWord64Expr pa
+            wb = ptrToWord64Expr pb
+            smaller :: HashSet e k
+            smaller = HashSet (word64ToPtrExpr (ifThenElse (na `le` nb) wa wb))
+            larger :: HashSet e k
+            larger = HashSet (word64ToPtrExpr (ifThenElse (na `le` nb) wb wa))
+         in filterMapS
+              (\x -> (\ok -> (ok, x)) <$> member larger x)
+              (stream smaller)
 
 differenceS ::
   (HashSetCtx m e k) =>

@@ -78,8 +78,9 @@ import GHC.TypeNats (KnownNat, Nat, natVal)
 import Janus.Alloc.Policy (Alloc, allocStruct, freeStruct)
 import Janus.Backend.C
 import Janus.Command.Cond (ifThenElseM_, whenM_)
-import Janus.Command.Memory (CmdStorable (..), ExpSized (..), allocaAligned)
+import Janus.Command.Memory (CmdStorable (..), allocaAligned)
 import Janus.Command.Ref (letM, newRef, readRef, writeRef)
+import Janus.Constraints (KnownJanusType)
 import Janus.Control.Drain (Drain (..), drainFind, drainForEach, runDrain)
 import Janus.Control.Stream (Stream, indexedS, iterateS, rangeS, reverseRangeS, streamM, withStreamSetup)
 import Janus.Data.HKD
@@ -90,7 +91,6 @@ import Janus.Expression.Cond (ExpCond (..))
 import Janus.Expression.Eq (ExpEq (..))
 import Janus.Expression.Ord (ExpOrd (..))
 import Janus.SPMD (SPMD, SPMDM, SPMDTyped, withSPMD)
-import Janus.Typed (JanusTyped)
 
 -- | Spine struct embedding @n@ inline elements directly inside the struct.
 -- While @svsLen <= n@ (and no larger 'reserve' has been requested), @svsIsHeap == 0@
@@ -122,14 +122,7 @@ deriving stock instance Eq (SmallVec n Identity a)
 
 deriving stock instance Show (SmallVec n Identity a)
 
-type SmallVecCtx n m e a =
-  ( InlineLayoutCtx n m e a,
-    KnownNat n,
-    Typeable n,
-    Typeable a,
-    ExpSized e (CStruct (SmallVecSpine n a)),
-    JanusTyped e (CStruct (SmallVecSpine n a))
-  )
+type SmallVecCtx n m e a = InlineLayoutCtx n m e a
 
 initSmallVecSpine ::
   forall n a m e.
@@ -268,7 +261,7 @@ push alloc sv@(SmallVec hdr) val = do
 
 pop ::
   forall n a s m e.
-  (SmallVecCtx n m e a, Elem e a ~ e s, JanusTyped e s) =>
+  (SmallVecCtx n m e a, Elem e a ~ e s, KnownJanusType e s) =>
   e s ->
   SmallVec n e a ->
   m (e Bool, e s)
@@ -309,7 +302,7 @@ withPop (SmallVec hdr) onEmpty onElem = do
 
 peekBack ::
   forall n a s m e.
-  (SmallVecCtx n m e a, Elem e a ~ e s, JanusTyped e s) =>
+  (SmallVecCtx n m e a, Elem e a ~ e s, KnownJanusType e s) =>
   e s ->
   SmallVec n e a ->
   m (e Bool, e s)

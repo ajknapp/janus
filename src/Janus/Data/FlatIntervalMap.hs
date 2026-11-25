@@ -65,7 +65,7 @@ import Janus.Alloc.Policy
   )
 import Janus.Backend.C
 import Janus.Command.Cond (ifThenElseM_, whenM_)
-import Janus.Command.Memory (CmdStorable (..), ExpSized (..))
+import Janus.Command.Memory (CmdStorable (..))
 import Janus.Command.Ref (letM, newRef, readRef, writeRef)
 import Janus.Control.Drain
   ( Drain (..),
@@ -88,7 +88,7 @@ import Janus.Control.Stream
     withStreamSetup,
   )
 import qualified Janus.Data.DynVec as DV
-import Janus.Data.FlatMap (OrdKey (..))
+import Janus.Data.FlatMap (OrdKey (..), OrdLayoutCtx)
 import Janus.Data.HKD
 import Janus.Data.Layout
 import Janus.Expression.Bits (ExpBits (..))
@@ -108,7 +108,6 @@ import Janus.SPMD
     withSPMD,
     withSPMDMasked,
   )
-import Janus.Typed (JanusTyped)
 
 -- | Spine struct for pointer-free implicit augmented interval map ('FlatIntervalMap').
 --
@@ -139,17 +138,7 @@ deriving stock instance Eq (FlatIntervalMap Identity k v)
 
 deriving stock instance Show (FlatIntervalMap Identity k v)
 
-type FlatIntervalMapCtx m e k v =
-  ( LayoutCtx m e k,
-    LayoutCtx m e v,
-    OrdKey e k,
-    Typeable k,
-    Typeable v,
-    ExpSized e (CStruct (FlatIntervalMapSpine k v)),
-    JanusTyped e (CStruct (FlatIntervalMapSpine k v)),
-    DV.DynVecCtx m e k,
-    DV.DynVecCtx m e v
-  )
+type FlatIntervalMapCtx m e k v = (OrdLayoutCtx m e k, LayoutCtx m e v)
 
 -- | Bulk-construct a 'FlatIntervalMap' from a 'Stream' of closed intervals @(lo, hi, val)@
 -- (ignoring empty intervals with @hi < lo@). Sorts stably by @(lo, hi, arrivalIndex)@ in

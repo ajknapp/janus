@@ -63,7 +63,6 @@ import Foreign.Ptr (Ptr)
 import GHC.Generics (Generic)
 import Janus.Alloc.Policy
   ( Alloc,
-    CmdAlloc,
     allocStruct,
     freeStruct,
     freeTypedArray,
@@ -71,8 +70,9 @@ import Janus.Alloc.Policy
   )
 import Janus.Backend.C
 import Janus.Command.Cond (whenM_)
-import Janus.Command.Memory (CmdStorable (..), ExpPtr (..), ExpSized (..))
+import Janus.Command.Memory (CmdStorable (..), ExpPtr (..))
 import Janus.Command.Ref (newRef, readRef, writeRef)
+import Janus.Constraints (CmdJanus, withJanusType)
 import Janus.Control.Drain (Drain (..), drainFind, drainForEach, runDrain)
 import Janus.Control.Stream (Stream, filterMapS, iterateS, rangeS, reverseRangeS, streamM, withStreamSetup)
 import Janus.Data.HKD
@@ -90,7 +90,6 @@ import Janus.SPMD
     uniform,
     uniformAlignedPtr,
   )
-import Janus.Typed (JanusTyped)
 
 -- | Spine struct for Briggs-Torczon 'SparseSet'.
 -- Note: @spsSparse@ NEVER needs zero-initialization; @x@ is live iff
@@ -121,14 +120,7 @@ deriving stock instance Show (SparseSet Identity)
 
 instance JanusHKD SparseSet
 
-type SparseSetCtx m e =
-  ( CmdAlloc m e,
-    ExpPtr e Int64,
-    JanusTyped e (Ptr Int64),
-    CmdStorable m e (Ptr Int64),
-    ExpSized e (CStruct SparseSetSpine),
-    JanusTyped e (CStruct SparseSetSpine)
-  )
+type SparseSetCtx m e = CmdJanus m e
 
 new ::
   forall m e.
@@ -325,14 +317,15 @@ intersectionS ::
   SparseSet e ->
   Stream m (e Int64)
 intersectionS a@(SparseSet pa) b@(SparseSet pb) =
-  withStreamSetup
-    ((,) <$> size a <*> size b)
-    $ \(na, nb) ->
-      let wa = ptrToWord64Expr pa
-          wb = ptrToWord64Expr pb
-          smaller = SparseSet (word64ToPtrExpr (ifThenElse (na `le` nb) wa wb))
-          larger = SparseSet (word64ToPtrExpr (ifThenElse (na `le` nb) wb wa))
-       in filterMapS (\x -> (\ok -> (ok, x)) <$> member larger x) (stream smaller)
+  withJanusType @(CStruct SparseSetSpine) @e $
+    withStreamSetup
+      ((,) <$> size a <*> size b)
+      $ \(na, nb) ->
+        let wa = ptrToWord64Expr pa
+            wb = ptrToWord64Expr pb
+            smaller = SparseSet (word64ToPtrExpr (ifThenElse (na `le` nb) wa wb))
+            larger = SparseSet (word64ToPtrExpr (ifThenElse (na `le` nb) wb wa))
+         in filterMapS (\x -> (\ok -> (ok, x)) <$> member larger x) (stream smaller)
 
 differenceS ::
   (SparseSetCtx m e) =>

@@ -15,6 +15,7 @@ import Data.Functor.Identity
 import Data.Loc
 import qualified Data.Set as Set
 import Data.Typeable
+import Foreign.C (CBool)
 import Foreign.Ptr
 import Janus.Backend.C
 import Janus.Typed
@@ -46,7 +47,7 @@ $( let inst t =
              fromBool = janusCUnsafeCast
              toBool = janusCUnsafeCast
            |]
-       tys = Set.toList (foldl1 Set.union [janusSignedIntTypes, janusUnsignedIntTypes, janusFloatTypes])
+       tys = Set.toList (Set.insert ''CBool (foldl1 Set.union [janusSignedIntTypes, janusUnsignedIntTypes, janusFloatTypes]))
     in traverse (fmap (!! 0) . inst . pure . ConT) tys
  )
 

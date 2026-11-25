@@ -76,10 +76,10 @@ import Janus.Command.Cond (ifThenElseM_, whenM_)
 import Janus.Command.Memory
   ( CmdMemCopy (..),
     CmdStorable (..),
-    ExpSized (..),
     janusSIMDAlignment,
   )
 import Janus.Command.Ref (letM, newRef, readRef, writeRef)
+import Janus.Constraints (KnownJanusType)
 import Janus.Control.Drain (Drain (..), drainFind, drainFirst, drainForEach, drainLength, runDrain)
 import Janus.Control.Stream
   ( Stream,
@@ -90,7 +90,7 @@ import Janus.Control.Stream
     withStreamSetup,
   )
 import Janus.Data.HKD
-import Janus.Data.HashMap (HashKey (..), probeGroupsS, swarBitsS)
+import Janus.Data.HashMap (HashKey (..), HashLayoutCtx, probeGroupsS, swarBitsS)
 import Janus.Data.Layout
 import Janus.Expression.Bits (ExpBits (..))
 import Janus.Expression.Bool (ExpBool (..))
@@ -106,7 +106,6 @@ import Janus.SPMD
     uniformAlignedPtr,
     withSPMD,
   )
-import Janus.Typed (JanusTyped)
 import Prelude hiding (lookup)
 
 --------------------------------------------------------------------------------
@@ -254,19 +253,7 @@ deriving stock instance Eq (ClockCache Identity k v)
 
 deriving stock instance Show (ClockCache Identity k v)
 
-type ClockCacheCtx m e k v =
-  ( LayoutCtx m e k,
-    LayoutCtx m e v,
-    HashKey e k,
-    Typeable k,
-    Typeable v,
-    JanusTyped e (Ptr Int64),
-    CmdStorable m e (Ptr Int64),
-    JanusTyped e (Ptr Word64),
-    CmdStorable m e (Ptr Word64),
-    ExpSized e (CStruct (ClockCacheSpine k v)),
-    JanusTyped e (CStruct (ClockCacheSpine k v))
-  )
+type ClockCacheCtx m e k v = (HashLayoutCtx m e k, LayoutCtx m e v)
 
 --------------------------------------------------------------------------------
 -- Lifecycle & Queries
@@ -493,7 +480,7 @@ containsKey cc key = (\(ok, _, _) -> ok) <$> findSlotAndDense cc key
 -- | Read key's value if present WITHOUT modifying its second-chance reference bit.
 peekKey ::
   forall k v s m e.
-  (ClockCacheCtx m e k v, Elem e v ~ e s, JanusTyped e s) =>
+  (ClockCacheCtx m e k v, Elem e v ~ e s, KnownJanusType e s) =>
   e s ->
   ClockCache e k v ->
   Elem e k ->
@@ -528,7 +515,7 @@ withPeekKey cc@(ClockCache hdr) key onMiss onHit = do
 -- | Lookup @key@, setting its second-chance reference bit (only if currently @0@) on hit.
 lookup ::
   forall k v s m e.
-  (ClockCacheCtx m e k v, Elem e v ~ e s, JanusTyped e s) =>
+  (ClockCacheCtx m e k v, Elem e v ~ e s, KnownJanusType e s) =>
   e s ->
   ClockCache e k v ->
   Elem e k ->

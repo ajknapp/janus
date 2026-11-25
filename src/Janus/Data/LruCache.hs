@@ -76,11 +76,10 @@ import Janus.Command.Cond (ifThenElseM_, whenM_)
 import Janus.Command.Memory
   ( CmdMemCopy (..),
     CmdStorable (..),
-    ExpPtr,
-    ExpSized (..),
     janusSIMDAlignment,
   )
 import Janus.Command.Ref (letM, newRef, readRef, writeRef)
+import Janus.Constraints (KnownJanusType)
 import Janus.Control.Drain (Drain (..), drainFind, drainFirst, drainForEach, drainLength, runDrain)
 import Janus.Control.Stream
   ( Stream,
@@ -92,7 +91,7 @@ import Janus.Control.Stream
     withStreamSetup,
   )
 import Janus.Data.HKD
-import Janus.Data.HashMap (HashKey (..), probeGroupsS, swarBitsS)
+import Janus.Data.HashMap (HashKey (..), HashLayoutCtx, probeGroupsS, swarBitsS)
 import Janus.Data.Layout
 import Janus.Expression.Bits (ExpBits (..))
 import Janus.Expression.Bool (ExpBool (..))
@@ -109,7 +108,6 @@ import Janus.SPMD
     uniformAlignedPtr,
     withSPMD,
   )
-import Janus.Typed (JanusTyped)
 import Prelude hiding (lookup)
 
 --------------------------------------------------------------------------------
@@ -231,20 +229,7 @@ deriving stock instance Eq (LruCache Identity k v)
 
 deriving stock instance Show (LruCache Identity k v)
 
-type LruCacheCtx m e k v =
-  ( LayoutCtx m e k,
-    LayoutCtx m e v,
-    HashKey e k,
-    Typeable k,
-    Typeable v,
-    ExpPtr e Int32,
-    JanusTyped e (Ptr Int32),
-    CmdStorable m e (Ptr Int32),
-    JanusTyped e (Ptr Int64),
-    CmdStorable m e (Ptr Int64),
-    ExpSized e (CStruct (LruCacheSpine k v)),
-    JanusTyped e (CStruct (LruCacheSpine k v))
-  )
+type LruCacheCtx m e k v = (HashLayoutCtx m e k, LayoutCtx m e v)
 
 --------------------------------------------------------------------------------
 -- Recency List & Free-List Helpers
@@ -550,7 +535,7 @@ containsKey lru key = (\(ok, _, _) -> ok) <$> findSlotAndDense lru key
 -- | Read key's value if present WITHOUT promoting the entry in the recency list.
 peekKey ::
   forall k v s m e.
-  (LruCacheCtx m e k v, Elem e v ~ e s, JanusTyped e s) =>
+  (LruCacheCtx m e k v, Elem e v ~ e s, KnownJanusType e s) =>
   e s ->
   LruCache e k v ->
   Elem e k ->
@@ -585,7 +570,7 @@ withPeekKey lru@(LruCache hdr) key onMiss onHit = do
 -- | Lookup @key@ in O(1), promoting it to @lcsMru@ on hit.
 lookup ::
   forall k v s m e.
-  (LruCacheCtx m e k v, Elem e v ~ e s, JanusTyped e s) =>
+  (LruCacheCtx m e k v, Elem e v ~ e s, KnownJanusType e s) =>
   e s ->
   LruCache e k v ->
   Elem e k ->

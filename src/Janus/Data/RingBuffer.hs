@@ -75,8 +75,9 @@ import GHC.Generics (Generic)
 import Janus.Alloc.Policy (Alloc, allocStruct, freeStruct)
 import Janus.Backend.C
 import Janus.Command.Cond (ifThenElseM_, whenM_)
-import Janus.Command.Memory (CmdStorable (..), ExpSized (..))
+import Janus.Command.Memory (CmdStorable (..))
 import Janus.Command.Ref (letM, newRef, readRef, writeRef)
+import Janus.Constraints (KnownJanusType)
 import Janus.Command.While (whileM)
 import Janus.Control.Drain (Drain (..), drainFind, drainForEach, runDrain)
 import Janus.Control.Step (Step (..))
@@ -90,7 +91,6 @@ import Janus.Expression.Cond (ExpCond (..))
 import Janus.Expression.Eq (ExpEq (..))
 import Janus.Expression.Ord (ExpOrd (..))
 import Janus.SPMD (SPMD, SPMDM, SPMDTyped, withSPMD)
-import Janus.Typed (JanusTyped)
 
 -- | Spine struct for 'RingBuffer'.
 -- Uses unmasked monotonically increasing 64-bit cursors @rbsReadPos@ and @rbsWritePos@
@@ -115,12 +115,7 @@ deriving stock instance Eq (RingBuffer Identity a)
 
 deriving stock instance Show (RingBuffer Identity a)
 
-type RingBufferCtx m e a =
-  ( LayoutCtx m e a,
-    Typeable a,
-    ExpSized e (CStruct (RingBufferSpine a)),
-    JanusTyped e (CStruct (RingBufferSpine a))
-  )
+type RingBufferCtx m e a = LayoutCtx m e a
 
 -- | Allocate a bounded 'RingBuffer' whose capacity is rounded up to the next power of 2 @>= max 1 minCap@.
 new ::
@@ -242,7 +237,7 @@ pushOverwrite_ rb val = do
 
 tryPop ::
   forall a s m e.
-  (RingBufferCtx m e a, Elem e a ~ e s, JanusTyped e s) =>
+  (RingBufferCtx m e a, Elem e a ~ e s, KnownJanusType e s) =>
   e s ->
   RingBuffer e a ->
   m (e Bool, e s)
@@ -287,7 +282,7 @@ withPop (RingBuffer hdr) onEmpty onElem = do
 
 peekFront ::
   forall a s m e.
-  (RingBufferCtx m e a, Elem e a ~ e s, JanusTyped e s) =>
+  (RingBufferCtx m e a, Elem e a ~ e s, KnownJanusType e s) =>
   e s ->
   RingBuffer e a ->
   m (e Bool, e s)
@@ -327,7 +322,7 @@ withPeekFront (RingBuffer hdr) onEmpty onElem = do
 
 peekBack ::
   forall a s m e.
-  (RingBufferCtx m e a, Elem e a ~ e s, JanusTyped e s) =>
+  (RingBufferCtx m e a, Elem e a ~ e s, KnownJanusType e s) =>
   e s ->
   RingBuffer e a ->
   m (e Bool, e s)

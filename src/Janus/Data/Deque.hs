@@ -75,8 +75,9 @@ import GHC.Generics (Generic)
 import Janus.Alloc.Policy (Alloc, allocStruct, freeStruct)
 import Janus.Backend.C
 import Janus.Command.Cond (ifThenElseM_, whenM_)
-import Janus.Command.Memory (CmdStorable (..), ExpSized (..))
+import Janus.Command.Memory (CmdStorable (..))
 import Janus.Command.Ref (letM, newRef, readRef, writeRef)
+import Janus.Constraints (KnownJanusType)
 import Janus.Control.Drain (Drain (..), drainFind, drainForEach, runDrain)
 import Janus.Control.Stream (Stream, indexedS, iterateS, rangeS, reverseRangeS, streamM, withStreamSetup)
 import Janus.Data.HKD
@@ -87,7 +88,6 @@ import Janus.Expression.Cond (ExpCond (..))
 import Janus.Expression.Eq (ExpEq (..))
 import Janus.Expression.Ord (ExpOrd (..))
 import Janus.SPMD (SPMD, SPMDM, SPMDTyped, withSPMD)
-import Janus.Typed (JanusTyped)
 
 -- | Spine struct for 'Deque'.
 -- @dqsCap@ is always @0@ or a power of 2 @>= 8@, so index wrapping uses @(idx & (cap - 1))@.
@@ -110,12 +110,7 @@ deriving stock instance Eq (Deque Identity a)
 
 deriving stock instance Show (Deque Identity a)
 
-type DequeCtx m e a =
-  ( LayoutCtx m e a,
-    Typeable a,
-    ExpSized e (CStruct (DequeSpine a)),
-    JanusTyped e (CStruct (DequeSpine a))
-  )
+type DequeCtx m e a = LayoutCtx m e a
 
 new ::
   forall a m e.
@@ -249,7 +244,7 @@ pushFront alloc dq@(Deque hdr) val = do
 
 popFront ::
   forall a s m e.
-  (DequeCtx m e a, Elem e a ~ e s, JanusTyped e s) =>
+  (DequeCtx m e a, Elem e a ~ e s, KnownJanusType e s) =>
   e s ->
   Deque e a ->
   m (e Bool, e s)
@@ -294,7 +289,7 @@ withPopFront (Deque hdr) onEmpty onElem = do
 
 popBack ::
   forall a s m e.
-  (DequeCtx m e a, Elem e a ~ e s, JanusTyped e s) =>
+  (DequeCtx m e a, Elem e a ~ e s, KnownJanusType e s) =>
   e s ->
   Deque e a ->
   m (e Bool, e s)
@@ -341,7 +336,7 @@ withPopBack (Deque hdr) onEmpty onElem = do
 
 peekFront ::
   forall a s m e.
-  (DequeCtx m e a, Elem e a ~ e s, JanusTyped e s) =>
+  (DequeCtx m e a, Elem e a ~ e s, KnownJanusType e s) =>
   e s ->
   Deque e a ->
   m (e Bool, e s)
@@ -379,7 +374,7 @@ withPeekFront (Deque hdr) onEmpty onElem = do
 
 peekBack ::
   forall a s m e.
-  (DequeCtx m e a, Elem e a ~ e s, JanusTyped e s) =>
+  (DequeCtx m e a, Elem e a ~ e s, KnownJanusType e s) =>
   e s ->
   Deque e a ->
   m (e Bool, e s)

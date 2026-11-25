@@ -52,6 +52,7 @@ import Janus.Command.Range (CmdRange (..))
 import Janus.Command.Ref (Cell (..), CmdRef (..), RefCell (..))
 import Janus.Command.TicToc (CmdTicToc (..), Tic (..), Toc (..))
 import Janus.Command.While (CmdWhile (..))
+import Janus.Constraints (CmdJanus, CmdJanusIO, ExpJanus)
 import Janus.Control.Reader.Base
 import Janus.Control.Reader.Gang ()
 import Janus.Expression.Bits (ExpBits (..))
@@ -75,7 +76,7 @@ import Janus.SPMD.Gang
     dispatchOptimalGang,
     liftWrapperTypedChain,
   )
-import Janus.Typed (JanusTyped)
+import Janus.Typed (KnownJanusType)
 import qualified Language.Haskell.TH as TH
 
 -- | Specification describing how a custom @Reader@-backed monad/expression/ref
@@ -595,7 +596,15 @@ deriveJanusReader spec = do
         readRef ref = $mkM ($mkE <$> readRef ($unRef ref))
         writeRef ref x = $mkM (writeRef ($unRef ref) ($unE x))
 
-      instance (CmdRef $mQ $eQ, JanusTyped $eQ $aQ) => RefCell $mTyQ $eTyQ ($eTyQ $aQ) where
+      instance (KnownJanusType $eQ $aQ) => KnownJanusType $eTyQ $aQ
+
+      instance (ExpJanus $eQ) => ExpJanus $eTyQ
+
+      instance (CmdJanus $mQ $eQ) => CmdJanus $mTyQ $eTyQ
+
+      instance (CmdJanusIO $mQ $eQ) => CmdJanusIO $mTyQ $eTyQ
+
+      instance (CmdRef $mQ $eQ, KnownJanusType $eQ $aQ) => RefCell $mTyQ $eTyQ ($eTyQ $aQ) where
         newCell x = do
           ref <- newRef x
           pure (Cell (readRef ref) (writeRef ref))

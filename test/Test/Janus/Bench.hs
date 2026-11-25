@@ -37,12 +37,11 @@ import Janus.Alloc.Policy
   )
 import Janus.Alloc.Stats
   ( AllocSnapshot (..),
-    AllocTrackerSpine,
     freeAllocTracker,
     newAllocTracker,
     readAllocSnapshot,
   )
-import Janus.Backend.C (JanusC, JanusCM, JanusCTyped, PortableC, showJanusC, withJanusC)
+import Janus.Backend.C (JanusC, JanusCM, PortableC, showJanusC, withJanusC)
 import Janus.Backend.C.Build (CBuildConfig, cBuildConfigCacheDir, defaultCBuildConfig)
 import Janus.Backend.C.LinuxX86_64 (LinuxX86_64, LinuxX86_64C, LinuxX86_64CM)
 import Janus.Bench
@@ -61,7 +60,6 @@ import Janus.Control.Drain (drainSum, runDrain)
 import Janus.Control.Reader (ReaderExp (..))
 import Janus.Control.Stream (Stream)
 import qualified Janus.Data.DynVec as DV
-import Janus.Data.HKD (CStruct)
 import Janus.Data.Layout (ScalarBuf (..), allocBuf, freeBuf, isNullBuf, readBuf, writeBuf)
 import Janus.Expression.Bits (ExpBits (..))
 import Janus.Expression.Bool (ExpBool (..))
@@ -679,9 +677,7 @@ unit_reader_t_direct_and_choose_via_ask = do
 
 withBufReallocKernel ::
   forall m e.
-  ( CmdBenchStats m e,
-    JanusCTyped (CStruct AllocTrackerSpine)
-  ) =>
+  (CmdBenchStats m e) =>
   m (e Int64)
 withBufReallocKernel = do
   tracker <- newAllocTracker

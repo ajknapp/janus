@@ -13,8 +13,6 @@
 -- @('CSEM' m e, 'CSEExp' e)@, isolated in a @-O0@ module for fast compilation.
 module Janus.CSE.Gang () where
 
-import Data.Complex (Complex)
-import Data.Constraint (Dict (..))
 import Data.Proxy (Proxy (..))
 import Janus.CSE.Instances ()
 import Janus.CSE.Types (CSEExp, CSEM (..), CSESIMDTarget, ProgTree (..))
@@ -23,7 +21,6 @@ import Janus.SPMD.Gang
     OptimalGangCaps (..),
     dispatchOptimalGang,
     liftStepTypedChain,
-    proveTyped,
   )
 import qualified Type.Reflection as TR
 
@@ -34,12 +31,7 @@ instance
   optimalGangCaps =
     case optimalGangCaps @m @e of
       OptimalGangCaps ch ->
-        case ( proveTyped @e @e @Bool ch,
-               proveTyped @e @e @(Complex Float) ch,
-               proveTyped @e @e @(Complex Double) ch
-             ) of
-          (Dict, Dict, Dict) ->
-            OptimalGangCaps (liftStepTypedChain @(CSEExp e) @e ch)
+        OptimalGangCaps (liftStepTypedChain @(CSEExp e) @e ch)
   withOptimalGang (pa :: Proxy a) k = CSEM $ \n0 ->
     let caps = optimalGangCaps @(CSEM m e) @(CSEExp e)
         (n1, t2) = unCSEM (dispatchOptimalGang caps 2 pa k) n0

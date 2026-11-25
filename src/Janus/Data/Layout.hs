@@ -50,6 +50,7 @@ module Janus.Data.Layout
     writeScopedBuf,
     reallocScopedBuf,
     freeScopedBuf,
+    StructCtx,
     LayoutCtx,
     InlineLayoutCtx,
     peekBufStruct,
@@ -147,6 +148,7 @@ import Janus.Command.Memory
   )
 import Janus.Command.Cond (ifThenElseM_, whenM_)
 import Janus.Command.Ref (letM, newRef, readRef, writeRef)
+import Janus.Constraints (CmdJanus, KnownJanusType)
 import Janus.Control.Drain (Drain, drainForEach, drainIndexed, drain_, runDrain)
 import Janus.Control.Stream (Stream, rangeS, reverseRangeS, streamM)
 import Janus.Data.HKD
@@ -173,7 +175,6 @@ import Janus.SPMD
     withSPMD,
     withSPMDMasked,
   )
-import Janus.Typed (JanusTyped)
 
 --------------------------------------------------------------------------------
 -- Layout Mode Phantom Tags & Type-Level Arithmetic
@@ -497,13 +498,19 @@ withBuf alloc initCap k = do
   freeBuf @a alloc finalB finalCap
   pure res
 
+type StructCtx m e s =
+  ( CmdJanus m e,
+    JanusStruct s,
+    KnownJanusType e (CStruct s),
+    KnownJanusType e (Ptr (CStruct s))
+  )
+
 type LayoutCtx m e a =
-  ( StorageLayout a,
-    CmdAlloc m e,
+  ( CmdJanus m e,
+    StorageLayout a,
+    Typeable a,
     LayoutElemCtx m e a,
     JanusStruct (Buf a),
-    ExpSized e (CStruct (Buf a)),
-    JanusTyped e (CStruct (Buf a)),
     Generic (Buf a (PtrOf e)),
     Generic (Buf a e),
     GJanusStructProject e (Rep (Buf a Identity)) (Rep (Buf a (PtrOf e))),
@@ -511,11 +518,11 @@ type LayoutCtx m e a =
   )
 
 type InlineLayoutCtx n m e a =
-  ( LayoutCtx m e a,
+  ( KnownNat n,
+    Typeable n,
+    LayoutCtx m e a,
     LayoutInlineCtx n m e a,
-    JanusStruct (InlineBuf n a),
-    ExpSized e (CStruct (InlineBuf n a)),
-    JanusTyped e (CStruct (InlineBuf n a))
+    JanusStruct (InlineBuf n a)
   )
 
 peekBufStruct ::
@@ -562,8 +569,8 @@ type ScalarElemCtx m e a =
   ( CmdStorable m e a,
     ExpSized e a,
     ExpPtr e a,
-    JanusTyped e a,
-    JanusTyped e (Ptr a),
+    KnownJanusType e a,
+    KnownJanusType e (Ptr a),
     CmdStorable m e (Ptr a),
     Typeable a,
     Storable.Storable (Ptr a),
@@ -576,7 +583,7 @@ type ScalarInlineCtx n e a =
     Typeable (Max1 n),
     Storable.Storable a,
     JanusCTyped a,
-    JanusTyped e (FixedArray (Max1 n) a)
+    KnownJanusType e (FixedArray (Max1 n) a)
   )
 
 scalarNullBuf :: (ExpPtr e a) => ScalarBuf a e
@@ -665,8 +672,8 @@ scalarInlineAsBuf ::
     Typeable a,
     Storable.Storable a,
     JanusCTyped a,
-    JanusTyped e a,
-    JanusTyped e (FixedArray (Max1 n) a)
+    KnownJanusType e a,
+    KnownJanusType e (FixedArray (Max1 n) a)
   ) =>
   e (Ptr (CStruct (InlineScalar n a))) ->
   m (ScalarBuf a e)
@@ -861,7 +868,7 @@ instance
     CmdStorable m e a,
     ExpSized e a,
     ExpPtr e a,
-    JanusTyped e a
+    KnownJanusType e a
   ) =>
   GSoAColumns m e (K1 i (PtrOf e a)) (K1 i (e a))
   where
@@ -911,7 +918,7 @@ instance (GInlineToSoA n e fTile fPtr, GInlineToSoA n e gTile gPtr) => GInlineTo
   gInlineToSoA (fx :*: gx) = gInlineToSoA @n @e fx :*: gInlineToSoA @n @e gx
 
 instance
-  (ExpPtrCast e, JanusTyped e a, JanusTyped e (FixedArray n a)) =>
+  (ExpPtrCast e, KnownJanusType e a, KnownJanusType e (FixedArray n a)) =>
   GInlineToSoA n e (K1 i (TileField n (PtrOf e) a)) (K1 i (PtrOf e a))
   where
   gInlineToSoA (K1 (TileField (PtrOf pArr))) = K1 (PtrOf (fixedArrayElemPtr pArr))
@@ -938,7 +945,7 @@ type SoAInlineCtx n e s =
     Typeable n,
     Typeable (Max1 n),
     JanusStruct (TileStruct (Max1 n) s),
-    JanusTyped e (CStruct (TileStruct (Max1 n) s)),
+    KnownJanusType e (CStruct (TileStruct (Max1 n) s)),
     Generic (TileStruct (Max1 n) s (PtrOf e)),
     Generic (s (TileField (Max1 n) (PtrOf e))),
     Coercible (TileStruct (Max1 n) s (PtrOf e)) (s (TileField (Max1 n) (PtrOf e))),
@@ -1111,8 +1118,8 @@ instance
   ( Monad m,
     CmdStorable m e a,
     ExpPtrCast e,
-    JanusTyped e a,
-    JanusTyped e (FixedArray w a)
+    KnownJanusType e a,
+    KnownJanusType e (FixedArray w a)
   ) =>
   GTileLane w m e (K1 i (TileField w (PtrOf e) a)) (K1 i (e a))
   where
@@ -1132,7 +1139,7 @@ instance
   gReadTileLane (K1 subT) lane = K1 . to <$> gReadTileLane @w @m @e (from subT) lane
   gWriteTileLane (K1 subT) lane (K1 subV) = gWriteTileLane @w @m @e (from subT) lane (from subV)
 
-tileCountExpr :: forall w e. (KnownNat w, ExpBits e Int64, ExpCond e, ExpOrd e Int64, JanusTyped e Int64, Num (e Int64)) => Proxy w -> e Int64 -> e Int64
+tileCountExpr :: forall w e. (KnownNat w, ExpBits e Int64, ExpCond e, ExpOrd e Int64, KnownJanusType e Int64, Num (e Int64)) => Proxy w -> e Int64 -> e Int64
 tileCountExpr pw cap =
   let wInt = fromIntegral (natVal pw) :: Int
       sh = fromIntegral (countTrailingZeros wInt) :: Int64
@@ -1164,7 +1171,7 @@ type AoSoAInlineCtx n w e s =
   ( KnownNat (CeilDiv n w),
     Typeable n,
     Typeable (CeilDiv n w),
-    JanusTyped e (FixedArray (CeilDiv n w) (CStruct (TileStruct w s)))
+    KnownJanusType e (FixedArray (CeilDiv n w) (CStruct (TileStruct w s)))
   )
 
 readTilePtrLane ::
@@ -1366,10 +1373,10 @@ type SOAOAElemCtx w m e outer =
     Generic (outer Identity),
     Generic (outer e),
     ExpPtr e (Ptr Word8),
-    JanusTyped e (Ptr (Ptr Word8)),
+    KnownJanusType e (Ptr (Ptr Word8)),
     CmdStorable m e (Ptr (Ptr Word8)),
     ExpSized e (CStruct (SOAOABuf w outer)),
-    JanusTyped e (CStruct (SOAOABuf w outer)),
+    KnownJanusType e (CStruct (SOAOABuf w outer)),
     GSOAOAGroups w m e (Rep (outer Identity)) (Rep (outer e))
   )
 
@@ -1384,7 +1391,7 @@ type SOAOAInlineCtx n w e outer =
     Typeable n,
     Typeable (SOAOAInlineBytes n w outer),
     Typeable (Max1 (SOAOAInlineBytes n w outer)),
-    JanusTyped e (FixedArray (Max1 (SOAOAInlineBytes n w outer)) Word8)
+    KnownJanusType e (FixedArray (Max1 (SOAOAInlineBytes n w outer)) Word8)
   )
 
 soaoaDirBytesInt :: forall outer. (KnownNat (CountGroups outer)) => Proxy outer -> Int
@@ -1394,7 +1401,7 @@ soaoaDirBytesInt _ =
 soaoaStreamPtrAt ::
   forall w sub outer m e.
   ( CmdAlloc m e,
-    JanusTyped e (CStruct (TileStruct w sub))
+    KnownJanusType e (CStruct (TileStruct w sub))
   ) =>
   SOAOABuf w outer e ->
   e Int64 ->
@@ -1708,8 +1715,8 @@ instance
     SPMDLayout w (Ptr a) ~ 'LPtr a,
     ExpPtrCast e,
     Num (e Int64),
-    JanusTyped e a,
-    JanusTyped e (FixedArray w a)
+    KnownJanusType e a,
+    KnownJanusType e (FixedArray w a)
   ) =>
   GTileSPMD w m e (K1 i (TileField w (PtrOf e) a)) (K1 i (SPMD w e a))
   where
@@ -1894,8 +1901,8 @@ instance
     ExpPtrCast e,
     ExpStructPtr e,
     Num (e Int64),
-    JanusTyped e Word8,
-    JanusTyped e (CStruct (TileStruct w sub)),
+    KnownJanusType e Word8,
+    KnownJanusType e (CStruct (TileStruct w sub)),
     JanusStruct (TileStruct w sub),
     Generic (TileStruct w sub (PtrOf e)),
     Generic (sub (TileField w (PtrOf e))),

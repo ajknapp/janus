@@ -5,7 +5,9 @@
 {-# LANGUAGE DerivingStrategies #-}
 {-# LANGUAGE DerivingVia #-}
 {-# LANGUAGE FlexibleContexts #-}
+{-# LANGUAGE FlexibleInstances #-}
 {-# LANGUAGE GeneralizedNewtypeDeriving #-}
+{-# LANGUAGE MultiParamTypeClasses #-}
 {-# LANGUAGE RecordWildCards #-}
 {-# LANGUAGE StandaloneDeriving #-}
 {-# LANGUAGE TemplateHaskell #-}
@@ -143,3 +145,9 @@ type instance JanusTyped JanusCUDA = JanusCTyped
 type instance JanusTyped CUDAIO = IdConstraint
 
 type instance JanusTyped CUDADejaFu = IdConstraint
+
+instance (JanusCTyped a) => KnownJanusType JanusCUDA a
+
+instance KnownJanusType CUDAIO a
+
+instance KnownJanusType CUDADejaFu a

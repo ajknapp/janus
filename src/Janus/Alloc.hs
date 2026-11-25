@@ -1,6 +1,9 @@
 module Janus.Alloc
   ( module Janus.Alloc.Policy,
     module Janus.Alloc.Stats,
+    ExpJanus,
+    CmdJanus,
+    CmdJanusIO,
     FixedBuf (..),
     withFixedBuf,
     withFixedBufAligned,
@@ -21,3 +24,4 @@ import Janus.Alloc.Policy
 import Janus.Alloc.Pool (MemPool (..))
 import Janus.Alloc.Recycling (Recycler (..))
 import Janus.Alloc.Stats
+import Janus.Constraints (CmdJanus, CmdJanusIO, ExpJanus)

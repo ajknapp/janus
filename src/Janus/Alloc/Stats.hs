@@ -37,8 +37,8 @@ import Janus.Expression.Bool (ExpBool (..))
 import Janus.Expression.Cast (ExpPtrCast (..))
 import Janus.Expression.Cond (ExpCond (..))
 import Janus.Expression.Ord (ExpOrd (..))
+import Janus.Constraints (KnownJanusType, withJanusType)
 import Janus.Data.HKD
-import Janus.Typed (JanusTyped)
 
 data AllocTrackerSpine f = AllocTrackerSpine
   { atsLiveBlocks :: !(f Int64),
@@ -81,17 +81,21 @@ deriving stock instance Show (AllocSnapshot Identity)
 
 newAllocTracker ::
   forall m e.
-  (CmdAllocBase m e, ExpSized e (CStruct AllocTrackerSpine), JanusCTyped (CStruct AllocTrackerSpine)) =>
+  (CmdAllocBase m e) =>
   m (AllocTracker e)
-newAllocTracker = do
-  vp <- calloc 1 (sizeOf (Proxy @(CStruct AllocTrackerSpine)))
-  pure (AllocTracker (fromVoidPtr vp))
+newAllocTracker =
+  withJanusType @(CStruct AllocTrackerSpine) @e $ do
+    vp <- calloc 1 (sizeOf (Proxy @(CStruct AllocTrackerSpine)))
+    pure (AllocTracker (fromVoidPtr vp))
 
 freeAllocTracker ::
-  (CmdMem m e, ExpPtrCast e, JanusTyped e (CStruct AllocTrackerSpine)) =>
+  forall m e.
+  (CmdMem m e, ExpPtrCast e, KnownJanusType e (CStruct AllocTrackerSpine)) =>
   AllocTracker e ->
   m ()
-freeAllocTracker (AllocTracker p) = free (toVoidPtr p)
+freeAllocTracker (AllocTracker p) =
+  withJanusType @(CStruct AllocTrackerSpine) @e $
+    free (toVoidPtr p)
 
 withAllocTracker :: (AllocTracker Identity -> IO a) -> IO a
 withAllocTracker k =

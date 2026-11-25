@@ -71,14 +71,14 @@ import Janus.Alloc.Policy
   )
 import Janus.Backend.C
 import Janus.Command.Cond (whenM_)
-import Janus.Command.Memory (CmdMemCopy (..), CmdStorable (..), ExpPtr (..), ExpSized (..), janusSIMDAlignment)
+import Janus.Command.Memory (CmdMemCopy (..), CmdStorable (..), janusSIMDAlignment)
 import Janus.Command.Ref (letM, newRef, readRef, writeRef)
 import Janus.Control.Drain (Drain (..), drainFind, drainForEach, drainLast, drainSum, runDrain)
 import Janus.Control.Stream (Stream, iterateS, rangeS, streamM, unfoldWhileM)
 import Janus.Data.BitSet (popcountWord64)
 import Janus.Data.HKD
-import Janus.Data.HashMap (HashKey (..))
-import Janus.Data.Layout (Elem, ScalarBuf (..), StorageLayout, foldBufSPMD, foreachBufSPMD)
+import Janus.Data.HashMap (HashFilterCtx, HashKey (..))
+import Janus.Data.Layout (Elem, ScalarBuf (..), foldBufSPMD, foreachBufSPMD)
 import Janus.Expression.Bits (ExpBits (..))
 import Janus.Expression.Bool (ExpBool (..))
 import Janus.Expression.Cast (ExpFloatingCast (..), ExpIntegralCast (..), ExpPtrCast (..))
@@ -99,7 +99,6 @@ import Janus.SPMD
     uniformAlignedPtr,
     withSPMD,
   )
-import Janus.Typed (JanusTyped)
 
 --------------------------------------------------------------------------------
 -- 8 Distinct Odd 64-Bit Multipliers (1 Bit Per Word64 Lane of 64B Cache Line)
@@ -147,21 +146,7 @@ deriving stock instance Eq (BloomFilter Identity k)
 
 deriving stock instance Show (BloomFilter Identity k)
 
-type BloomFilterCtx m e k =
-  ( CmdAlloc m e,
-    StorageLayout k,
-    HashKey e k,
-    Typeable k,
-    ExpPtr e Word64,
-    JanusTyped e (Ptr Word64),
-    CmdStorable m e (Ptr Word64),
-    Floating (e Double),
-    ExpOrd e Double,
-    ExpFloatingCast e Int64 Double,
-    JanusTyped e Double,
-    ExpSized e (CStruct (BloomFilterSpine k)),
-    JanusTyped e (CStruct (BloomFilterSpine k))
-  )
+type BloomFilterCtx m e k = HashFilterCtx m e k
 
 --------------------------------------------------------------------------------
 -- Lifecycle & Queries
@@ -357,12 +342,7 @@ estimatedPopcount (BloomFilter hdr) = do
 
 estimateFromSetBits ::
   forall m e.
-  ( CmdAlloc m e,
-    Floating (e Double),
-    ExpOrd e Double,
-    ExpFloatingCast e Int64 Double,
-    JanusTyped e Double
-  ) =>
+  (CmdAlloc m e) =>
   e Int64 ->
   e Int64 ->
   m (e Int64)

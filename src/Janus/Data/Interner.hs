@@ -70,7 +70,6 @@ import Foreign.Ptr (Ptr)
 import GHC.Generics (Generic)
 import Janus.Alloc.Policy
   ( Alloc,
-    CmdAlloc,
     allocBytesAligned,
     allocStruct,
     allocTypedArray,
@@ -90,6 +89,7 @@ import Janus.Command.Memory
     withAlignedArray,
   )
 import Janus.Command.Ref (newRef, readRef, writeRef)
+import Janus.Constraints (CmdJanus, KnownJanusType)
 import Janus.Control.Drain (Drain, drainAll, drainFind, drainFirst, drainForEach, runDrain)
 import Janus.Control.Stream
   ( Stream,
@@ -108,7 +108,7 @@ import Janus.Expression.Bool (ExpBool (..))
 import Janus.Expression.Cast (ExpIntegralCast (..), ExpPtrCast (..))
 import Janus.Expression.Cond (ExpCond (..))
 import Janus.Expression.Eq (ExpEq (..))
-import Janus.Expression.MurmurHash (CmdHashBytes, defaultHashSalt, hashBytesWithSalt)
+import Janus.Expression.MurmurHash (defaultHashSalt, hashBytesWithSalt)
 import Janus.Expression.Ord (ExpOrd (..))
 import Janus.SPMD
   ( SPMD,
@@ -120,7 +120,6 @@ import Janus.SPMD
     uniformAlignedPtr,
     withSPMD,
   )
-import Janus.Typed (JanusTyped)
 
 --------------------------------------------------------------------------------
 -- Compact 32-Bit Symbol Handle
@@ -196,26 +195,7 @@ deriving stock instance Show (Interner Identity)
 
 instance JanusHKD Interner
 
-type InternerCtx m e =
-  ( CmdAlloc m e,
-    CmdHashBytes m e,
-    ExpPtr e Word32,
-    JanusTyped e (Ptr Word32),
-    CmdStorable m e (Ptr Word32),
-    ExpPtr e Int64,
-    JanusTyped e (Ptr Int64),
-    CmdStorable m e (Ptr Int64),
-    ExpPtr e Word64,
-    JanusTyped e (Ptr Word64),
-    CmdStorable m e (Ptr Word64),
-    ExpPtr e (Ptr Word8),
-    JanusTyped e (Ptr (Ptr Word8)),
-    CmdStorable m e (Ptr (Ptr Word8)),
-    ExpSized e (CStruct InternerSlabHdr),
-    JanusTyped e (CStruct InternerSlabHdr),
-    ExpSized e (CStruct InternerSpine),
-    JanusTyped e (CStruct InternerSpine)
-  )
+type InternerCtx m e = CmdJanus m e
 
 ctrlEmptyByte :: Word8
 ctrlEmptyByte = 0x80
@@ -254,7 +234,7 @@ maxLoadForCap :: (ExpBits e Int64, Num (e Int64)) => e Int64 -> e Int64
 maxLoadForCap cap = cap - (cap `rshift` 3)
 
 asSlabHdr ::
-  (ExpPtrCast e, JanusTyped e Word8, JanusTyped e (CStruct InternerSlabHdr)) =>
+  (ExpPtrCast e, KnownJanusType e Word8, KnownJanusType e (CStruct InternerSlabHdr)) =>
   e (Ptr Word8) ->
   e (Ptr (CStruct InternerSlabHdr))
 asSlabHdr p = fromVoidPtr (toVoidPtr p)

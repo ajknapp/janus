@@ -107,9 +107,10 @@ import qualified Data.ByteString.Base16 as B16
 import qualified Data.ByteString.Builder as BSB
 import qualified Data.ByteString.Char8 as BS8
 import Data.Coerce (Coercible, coerce)
+import Data.Complex (Complex)
 import Data.Constraint (Dict (..))
 import Data.Functor.Identity (Identity (..))
-import Data.Int (Int32, Int64)
+import Data.Int (Int16, Int32, Int64, Int8)
 import qualified Data.Kind as K
 import Data.Proxy (Proxy (..))
 import Data.Ratio (denominator, numerator)
@@ -118,7 +119,7 @@ import qualified Data.Set as Set
 import qualified Data.Text as Text
 import qualified Data.Text.Encoding as Text
 import Data.Typeable (Typeable, typeRepFingerprint)
-import Data.Word (Word32, Word64)
+import Data.Word (Word16, Word32, Word64, Word8)
 import Foreign.C (CFile, CInt, CString)
 import Foreign.Ptr (Ptr)
 import Foreign.Storable (Storable)
@@ -147,7 +148,7 @@ import Janus.Expression.Let (ExpLet (..))
 import Janus.Expression.SIMD (ExpSIMD (..), HostSIMDMask (..), HostSIMDValue (..), SIMDElem, SIMDShape)
 import Janus.SPMD.Gang (CmdOptimalGang)
 import Janus.SPMD.Types (SIMDPair, VoidPtr (..))
-import Janus.Typed (JanusTyped, TypeableTyped)
+import Janus.Typed (JanusTyped, KnownJanusType, TypeableTyped)
 import qualified Type.Reflection as TR
 
 --------------------------------------------------------------------------------
@@ -270,7 +271,26 @@ data SIMDMaskWitness (e :: K.Type -> K.Type) (n :: Nat) (a :: K.Type) where
 -- so method-polymorphic SIMD ops ('Janus.Expression.SIMD.vbitcast',
 -- 'Janus.Expression.SIMD.vcvt', 'Janus.Expression.SIMD.vnarrowSat',
 -- 'Janus.Expression.SIMD.vdp4aVecS') can be bound by CSE across all backends.
-class (ExpNewtype e, ExpSIMD e, Typeable e) => CSESIMDTarget (e :: K.Type -> K.Type) where
+class
+  ( ExpNewtype e,
+    ExpSIMD e,
+    Typeable e,
+    KnownJanusType e Bool,
+    KnownJanusType e Int8,
+    KnownJanusType e Word8,
+    KnownJanusType e Int16,
+    KnownJanusType e Word16,
+    KnownJanusType e Int32,
+    KnownJanusType e Word32,
+    KnownJanusType e Int64,
+    KnownJanusType e Word64,
+    KnownJanusType e Float,
+    KnownJanusType e Double,
+    KnownJanusType e (Complex Float),
+    KnownJanusType e (Complex Double)
+  ) =>
+  CSESIMDTarget (e :: K.Type -> K.Type)
+  where
   cseSIMDVecWitness :: (SIMDShape n a) => SIMDVecWitness e n a
   cseSIMDMaskWitness :: (SIMDShape n a) => SIMDMaskWitness e n a
 
@@ -721,6 +741,8 @@ data CSEExp (e :: K.Type -> K.Type) (a :: K.Type) where
     CSEExp e a
 
 type instance JanusTyped (CSEExp e) = CSETyped e
+
+instance (KnownJanusType e a, Typeable a) => KnownJanusType (CSEExp e) a
 
 expMeta :: CSEExp e a -> ExpMeta e a
 expMeta = \case

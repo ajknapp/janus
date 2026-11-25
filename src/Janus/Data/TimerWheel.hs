@@ -69,11 +69,13 @@ import Janus.Backend.C
 import Janus.Command.Cond (ifThenElseM_, whenM_)
 import Janus.Command.Memory (CmdStorable (..), ExpPtr (..), ExpSized (..))
 import Janus.Command.Ref (newRef, readRef, writeRef)
+import Janus.Constraints (ExpJanus, KnownJanusType, withJanusType)
 import Janus.Control.Drain (Drain, drainFoldM, drainForEach, runDrain)
 import Janus.Control.Step (Step (..))
 import Janus.Control.Stream (Stream, rangeS, statefulS, unfoldWhileM)
 import Janus.Data.HKD
 import Janus.Data.IntrusiveList (RawListHook (..))
+import Janus.Data.Layout (StructCtx)
 import Janus.Expression.Bits (ExpBits (..))
 import Janus.Expression.Bool (ExpBool (..))
 import Janus.Expression.Cast (ExpIntegralCast (..), ExpPtrCast (..))
@@ -81,7 +83,6 @@ import Janus.Expression.Cond (ExpCond (..))
 import Janus.Expression.Eq (ExpEq (..))
 import Janus.Expression.Integral (ExpIntegral (..))
 import Janus.Expression.Ord (ExpOrd (..))
-import Janus.Typed (JanusTyped)
 
 type TimerWheelLevels = 4
 
@@ -151,32 +152,9 @@ deriving stock instance Show (TimerWheel s Identity)
 
 instance JanusHKD (TimerWheel s)
 
-type TimerWheelSpineCtx e =
-  ( ExpStructPtr e,
-    ExpPtrCast e,
-    ExpPtr e Word8,
-    ExpSized e (CStruct RawListHook),
-    JanusTyped e Word8,
-    JanusTyped e Int64,
-    JanusTyped e Word64,
-    JanusTyped e (CStruct RawListHook),
-    JanusTyped e (FixedArray TimerWheelBuckets (CStruct RawListHook)),
-    JanusTyped e (FixedArray TimerWheelLevels Word64),
-    JanusTyped e (CStruct TimerWheelSpine),
-    Num (e Int64)
-  )
+type TimerWheelSpineCtx e = ExpJanus e
 
-type TimerWheelCtx m e s =
-  ( CmdAllocBase m e,
-    TimerWheelSpineCtx e,
-    Typeable s,
-    JanusStruct s,
-    ExpPtr e (CStruct s),
-    ExpSized e (CStruct s),
-    JanusTyped e (CStruct s),
-    JanusTyped e (Ptr (CStruct s)),
-    CmdStorable m e (Ptr (CStruct s))
-  )
+type TimerWheelCtx m e s = StructCtx m e s
 
 --------------------------------------------------------------------------------
 -- Internal Pointer, Bitmask, & Circular-Sentinel Helpers
@@ -184,7 +162,7 @@ type TimerWheelCtx m e s =
 
 -- | Branchless 6-step count-trailing-zeros for a non-zero @Word64@ (zero bit-shifts!).
 ctzWord64 ::
-  (ExpBits e Word64, ExpCond e, ExpEq e Word64, JanusTyped e Word64, Num (e Word64)) =>
+  (ExpBits e Word64, ExpCond e, ExpEq e Word64, KnownJanusType e Word64, Num (e Word64)) =>
   e Word64 ->
   e Word64
 ctzWord64 m =
@@ -198,17 +176,19 @@ ctzWord64 m =
    in b5 + b4 + b3 + b2 + b1 + b0
 
 asListHookPtr ::
-  (ExpPtrCast e, JanusTyped e Word8, JanusTyped e (CStruct RawListHook)) =>
+  (ExpPtrCast e, KnownJanusType e Word8, KnownJanusType e (CStruct RawListHook)) =>
   e (Ptr Word8) ->
   e (Ptr (CStruct RawListHook))
 asListHookPtr p = fromVoidPtr (toVoidPtr p)
 
 bucketsBaseRaw ::
+  forall e.
   (TimerWheelSpineCtx e) =>
   e (Ptr (CStruct TimerWheelSpine)) ->
   e (Ptr Word8)
 bucketsBaseRaw hdr =
-  fromVoidPtr (toVoidPtr (getPtrOf (twsBuckets (projectPtrs hdr))))
+  withJanusType @(FixedArray TimerWheelBuckets (CStruct RawListHook)) @e $
+    fromVoidPtr (toVoidPtr (getPtrOf (twsBuckets (projectPtrs hdr))))
 
 bucketRawPtr ::
   (TimerWheelSpineCtx e) =>
@@ -219,11 +199,13 @@ bucketRawPtr hdr linearIdx =
   ptrAdd (bucketsBaseRaw hdr) (linearIdx * sizeOf (Proxy @(CStruct RawListHook)))
 
 overflowRawPtr ::
+  forall e.
   (TimerWheelSpineCtx e) =>
   e (Ptr (CStruct TimerWheelSpine)) ->
   e (Ptr Word8)
 overflowRawPtr hdr =
-  fromVoidPtr (toVoidPtr (getPtrOf (twsOverflow (projectPtrs hdr))))
+  withJanusType @(CStruct RawListHook) @e $
+    fromVoidPtr (toVoidPtr (getPtrOf (twsOverflow (projectPtrs hdr))))
 
 occElemPtr ::
   (TimerWheelSpineCtx e) =>
@@ -263,7 +245,7 @@ peekHookDeadline hookOff deadlineOff pHookRaw = do
   peek pDeadline
 
 initSelfSentinel ::
-  (CmdAllocBase m e, JanusTyped e (CStruct RawListHook)) =>
+  (CmdAllocBase m e) =>
   e (Ptr Word8) ->
   m ()
 initSelfSentinel sentRaw = do
@@ -272,7 +254,7 @@ initSelfSentinel sentRaw = do
   poke (getPtrOf (rlhNext sf)) sentRaw
 
 linkListHookBetween ::
-  (CmdAllocBase m e, JanusTyped e (CStruct RawListHook)) =>
+  (CmdAllocBase m e) =>
   e (Ptr Word8) ->
   e (Ptr Word8) ->
   e (Ptr Word8) ->
@@ -288,7 +270,7 @@ linkListHookBetween prevRaw nextRaw nodeHookRaw = do
 
 pushBackBucket ::
   forall m e.
-  (CmdAllocBase m e, JanusTyped e (CStruct RawListHook)) =>
+  (CmdAllocBase m e) =>
   e (Ptr Word64) ->
   e Int64 ->
   e Word64 ->
@@ -357,7 +339,7 @@ placeHookAtTick hdr curTick hookOff deadlineOff nodeHookRaw = do
 -- and reset @sentRaw@ to an empty circular self-loop BEFORE returning the detached head!
 detachSentinelChain ::
   forall m e.
-  (CmdAllocBase m e, JanusTyped e (CStruct RawListHook)) =>
+  (CmdAllocBase m e) =>
   e (Ptr Word8) ->
   m (e (Ptr Word8))
 detachSentinelChain sentRaw = do
@@ -373,7 +355,7 @@ detachSentinelChain sentRaw = do
   readRef outRef
 
 walkDetachedHooksS ::
-  (CmdAllocBase m e, JanusTyped e (CStruct RawListHook)) =>
+  (CmdAllocBase m e) =>
   e (Ptr Word8) ->
   Stream m (e (Ptr Word8))
 walkDetachedHooksS headRaw =
@@ -497,7 +479,7 @@ nextWakeOrCascadeTick hdr curTick = do
 -- | Allocate and initialize a 4-level x 64-slot 'TimerWheel' starting at @startTick@.
 new ::
   forall s m e.
-  (TimerWheelCtx m e s, CmdAlloc m e, ExpSized e (CStruct TimerWheelSpine)) =>
+  (TimerWheelCtx m e s) =>
   Alloc e ->
   TimerSpec s ->
   e Word64 ->
@@ -521,7 +503,7 @@ new alloc (TimerSpec hookOff deadlineOff) startTick = do
 
 -- | Free ONLY the timer wheel spine (leaving any timer nodes untouched).
 freeWheelSpine ::
-  (TimerWheelCtx m e s, CmdAlloc m e, ExpSized e (CStruct TimerWheelSpine)) =>
+  (TimerWheelCtx m e s) =>
   Alloc e ->
   TimerWheel s e ->
   m ()
@@ -530,7 +512,7 @@ freeWheelSpine alloc (TimerWheel hdr) = freeStruct alloc hdr
 -- | Unlink and free every currently scheduled timer node via @alloc@, then free the wheel spine.
 freeAllTimersAndSpine ::
   forall s m e.
-  (TimerWheelCtx m e s, CmdAlloc m e, ExpSized e (CStruct TimerWheelSpine)) =>
+  (TimerWheelCtx m e s) =>
   Alloc e ->
   TimerWheel s e ->
   m ()
@@ -553,7 +535,6 @@ allocTimerNode ::
   ( CmdAlloc m e,
     JanusStruct s,
     ExpSized e (CStruct s),
-    JanusTyped e (CStruct s),
     Generic (s (PtrOf e)),
     Generic (s e),
     GJanusStructProject e (Rep (s Identity)) (Rep (s (PtrOf e))),
@@ -568,7 +549,7 @@ allocTimerNode alloc val = do
   pure p
 
 freeTimerNode ::
-  (CmdAlloc m e, ExpSized e (CStruct s), JanusTyped e (CStruct s)) =>
+  (CmdAlloc m e, ExpSized e (CStruct s)) =>
   Alloc e ->
   e (Ptr (CStruct s)) ->
   m ()

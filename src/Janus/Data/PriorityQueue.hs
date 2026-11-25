@@ -84,8 +84,9 @@ import GHC.Generics (Generic)
 import Janus.Alloc.Policy (Alloc, allocStruct, freeStruct)
 import Janus.Backend.C
 import Janus.Command.Cond (ifThenElseM_, whenM_)
-import Janus.Command.Memory (CmdStorable (..), ExpSized (..))
+import Janus.Command.Memory (CmdStorable (..))
 import Janus.Command.Ref (letM, newRef, readRef, writeRef)
+import Janus.Constraints (KnownJanusType)
 import Janus.Control.Drain (Drain (..), drainFind, drainForEach, drain_, runDrain)
 import Janus.Control.Step (Step (..))
 import Janus.Control.Stream
@@ -97,7 +98,7 @@ import Janus.Control.Stream
     unfoldWhileM,
     withStreamSetup,
   )
-import Janus.Data.FlatMap (OrdKey (..))
+import Janus.Data.FlatMap (OrdKey (..), OrdLayoutCtx)
 import Janus.Data.HKD
 import Janus.Data.Layout
 import Janus.Expression.Bits (ExpBits (..))
@@ -106,7 +107,6 @@ import Janus.Expression.Cond (ExpCond (..))
 import Janus.Expression.Eq (ExpEq (..))
 import Janus.Expression.Ord (ExpOrd (..))
 import Janus.SPMD (SPMD, SPMDM, SPMDTyped)
-import Janus.Typed (JanusTyped)
 
 --------------------------------------------------------------------------------
 -- 4-ary Key-Value Min-Priority Queue
@@ -134,15 +134,7 @@ deriving stock instance Eq (PriorityQueue Identity k v)
 
 deriving stock instance Show (PriorityQueue Identity k v)
 
-type PriorityQueueCtx m e k v =
-  ( LayoutCtx m e k,
-    LayoutCtx m e v,
-    OrdKey e k,
-    Typeable k,
-    Typeable v,
-    ExpSized e (CStruct (PriorityQueueSpine k v)),
-    JanusTyped e (CStruct (PriorityQueueSpine k v))
-  )
+type PriorityQueueCtx m e k v = (OrdLayoutCtx m e k, LayoutCtx m e v)
 
 new ::
   forall k v m e.
@@ -322,8 +314,8 @@ peekMin ::
   ( PriorityQueueCtx m e k v,
     Elem e k ~ e sk,
     Elem e v ~ e sv,
-    JanusTyped e sk,
-    JanusTyped e sv
+    KnownJanusType e sk,
+    KnownJanusType e sv
   ) =>
   e sk ->
   e sv ->
@@ -369,8 +361,8 @@ popMin ::
   ( PriorityQueueCtx m e k v,
     Elem e k ~ e sk,
     Elem e v ~ e sv,
-    JanusTyped e sk,
-    JanusTyped e sv
+    KnownJanusType e sk,
+    KnownJanusType e sv
   ) =>
   e sk ->
   e sv ->
@@ -438,8 +430,8 @@ pushPopMin ::
   ( PriorityQueueCtx m e k v,
     Elem e k ~ e sk,
     Elem e v ~ e sv,
-    JanusTyped e sk,
-    JanusTyped e sv
+    KnownJanusType e sk,
+    KnownJanusType e sv
   ) =>
   PriorityQueue e k v ->
   e sk ->
@@ -557,13 +549,7 @@ deriving stock instance Eq (MinHeap Identity k)
 
 deriving stock instance Show (MinHeap Identity k)
 
-type MinHeapCtx m e k =
-  ( LayoutCtx m e k,
-    OrdKey e k,
-    Typeable k,
-    ExpSized e (CStruct (MinHeapSpine k)),
-    JanusTyped e (CStruct (MinHeapSpine k))
-  )
+type MinHeapCtx m e k = OrdLayoutCtx m e k
 
 newMinHeap ::
   forall k m e.
@@ -719,7 +705,7 @@ pushMinHeap alloc mh@(MinHeap hdr) key = do
 
 peekMinHeap ::
   forall k sk m e.
-  (MinHeapCtx m e k, Elem e k ~ e sk, JanusTyped e sk) =>
+  (MinHeapCtx m e k, Elem e k ~ e sk, KnownJanusType e sk) =>
   e sk ->
   MinHeap e k ->
   m (e Bool, e sk)
@@ -751,7 +737,7 @@ withPeekMinHeap (MinHeap hdr) onEmpty onMin = do
 
 popMinHeap ::
   forall k sk m e.
-  (MinHeapCtx m e k, Elem e k ~ e sk, JanusTyped e sk) =>
+  (MinHeapCtx m e k, Elem e k ~ e sk, KnownJanusType e sk) =>
   e sk ->
   MinHeap e k ->
   m (e Bool, e sk)

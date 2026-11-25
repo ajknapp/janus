@@ -93,8 +93,9 @@ import GHC.TypeNats (natVal)
 import Janus.Alloc.Policy (Alloc, allocStruct, freeStruct)
 import Janus.Backend.C
 import Janus.Command.Cond (ifThenElseM_, whenM_)
-import Janus.Command.Memory (CmdStorable (..), ExpPtr (..), ExpSized (..))
+import Janus.Command.Memory (CmdStorable (..), ExpPtr (..))
 import Janus.Command.Ref (letM, newRef, readRef, writeRef)
+import Janus.Constraints (KnownJanusType)
 import Janus.Control.Drain (Drain (..), drainFind, drainForEach, runDrain)
 import Janus.Control.Stream (Stream, indexedS, iterateS, rangeS, reverseRangeS, streamM, withStreamSetup)
 import Janus.Data.HKD
@@ -119,7 +120,6 @@ import Janus.SPMD
     withSPMD,
     withSPMDMasked,
   )
-import Janus.Typed (JanusTyped)
 
 -- | C-ABI spine struct for 'DynVec'.
 data DynVecSpine a f = DynVecSpine
@@ -146,12 +146,7 @@ deriving stock instance Eq (DynVec Identity a)
 
 deriving stock instance Show (DynVec Identity a)
 
-type DynVecCtx m e a =
-  ( LayoutCtx m e a,
-    Typeable a,
-    ExpSized e (CStruct (DynVecSpine a)),
-    JanusTyped e (CStruct (DynVecSpine a))
-  )
+type DynVecCtx m e a = LayoutCtx m e a
 
 -- | Create an empty 'DynVec' (allocates the spine via @alloc@; buffer allocation is deferred until first push/reserve).
 new ::
@@ -296,7 +291,7 @@ push alloc v@(DynVec hdr) val = do
 -- | Pop the last scalar element, returning @(poppedOk, valueOrDefault)@.
 pop ::
   forall a s m e.
-  (DynVecCtx m e a, Elem e a ~ e s, JanusTyped e s) =>
+  (DynVecCtx m e a, Elem e a ~ e s, KnownJanusType e s) =>
   e s ->
   DynVec e a ->
   m (e Bool, e s)
@@ -338,7 +333,7 @@ withPop (DynVec hdr) onEmpty onElem = do
 
 peekBack ::
   forall a s m e.
-  (DynVecCtx m e a, Elem e a ~ e s, JanusTyped e s) =>
+  (DynVecCtx m e a, Elem e a ~ e s, KnownJanusType e s) =>
   e s ->
   DynVec e a ->
   m (e Bool, e s)

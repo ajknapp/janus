@@ -39,6 +39,7 @@ import Control.Applicative ((<|>))
 import Janus.Command.Memory (CmdMemCopy (..), CmdStorable (..), ExpPtr (..), janusSIMDAlignment)
 import Janus.Command.Cond (ifThenElseM_, whenM_)
 import Janus.Command.Ref (letM, newRef, readRef, writeRef)
+import Janus.Constraints (ExpJanus, withJanusType)
 import Janus.Control.Drain (drainAny, drainFind, drainForEach, runDrain)
 import Janus.Control.Stream (Stream, streamM, unfoldWhileM)
 import Janus.Data.HKD
@@ -49,7 +50,6 @@ import Janus.Expression.Cond (ExpCond (..))
 import Janus.Expression.Eq (ExpEq (..))
 import Janus.Expression.Integral (ExpIntegral (..))
 import Janus.Expression.Ord (ExpOrd (..))
-import Janus.Typed (JanusTyped)
 
 -- | 64-byte padded slab header so payload begins on a 64-byte boundary.
 data ArenaSlabHdr f = ArenaSlabHdr
@@ -130,16 +130,7 @@ deriving stock instance Eq (ArenaMark Identity)
 
 deriving stock instance Show (ArenaMark Identity)
 
-type ArenaCtx m e =
-  ( CmdAllocBase m e,
-    JanusTyped e (CStruct ArenaSpine),
-    JanusTyped e (CStruct ArenaSlabHdr),
-    ExpPtr e (CStruct ArenaSlabHdr),
-    CmdStorable m e (Ptr (CStruct ArenaSlabHdr)),
-    JanusTyped e (CStruct ArenaLargeHdr),
-    ExpPtr e (CStruct ArenaLargeHdr),
-    CmdStorable m e (Ptr (CStruct ArenaLargeHdr))
-  )
+type ArenaCtx m e = CmdAllocBase m e
 
 initArenaRaw ::
   (ArenaCtx m e) =>
@@ -160,28 +151,31 @@ initArenaRaw hdr slabCap minAl = do
 
 arenaSlabPayload ::
   forall e.
-  (ExpPtr e Word8, ExpPtrCast e, JanusTyped e Word8, JanusTyped e (CStruct ArenaSlabHdr), Num (e Int64)) =>
+  (ExpJanus e) =>
   e (Ptr (CStruct ArenaSlabHdr)) ->
   e (Ptr Word8)
 arenaSlabPayload slab =
-  ptrAdd (fromVoidPtr (toVoidPtr slab) :: e (Ptr Word8)) (fromIntegral arenaHdrBytes)
+  withJanusType @(CStruct ArenaSlabHdr) @e $
+    ptrAdd (fromVoidPtr (toVoidPtr slab) :: e (Ptr Word8)) (fromIntegral arenaHdrBytes)
 
-markArena :: (ArenaCtx m e) => Arena e -> m (ArenaMark e)
-markArena (Arena hdr) = do
-  let f = projectPtrs hdr
-  curSlab <- peek (getPtrOf (asCurSlab f))
-  largeHead <- peek (getPtrOf (asLargeHead f))
-  offRef <- newRef 0
-  whenM_ (ptrToWord64Expr curSlab `ne` 0) $ do
-    let sf = projectPtrs curSlab
-    peek (getPtrOf (ashOffset sf)) >>= writeRef offRef
-  off <- readRef offRef
-  pure
-    ArenaMark
-      { amCurSlab = fromVoidPtr (toVoidPtr curSlab),
-        amSlabOffset = off,
-        amLargeHead = fromVoidPtr (toVoidPtr largeHead)
-      }
+markArena :: forall m e. (ArenaCtx m e) => Arena e -> m (ArenaMark e)
+markArena (Arena hdr) =
+  withJanusType @(CStruct ArenaSlabHdr) @e $
+    withJanusType @(CStruct ArenaLargeHdr) @e $ do
+      let f = projectPtrs hdr
+      curSlab <- peek (getPtrOf (asCurSlab f))
+      largeHead <- peek (getPtrOf (asLargeHead f))
+      offRef <- newRef 0
+      whenM_ (ptrToWord64Expr curSlab `ne` 0) $ do
+        let sf = projectPtrs curSlab
+        peek (getPtrOf (ashOffset sf)) >>= writeRef offRef
+      off <- readRef offRef
+      pure
+        ArenaMark
+          { amCurSlab = fromVoidPtr (toVoidPtr curSlab),
+            amSlabOffset = off,
+            amLargeHead = fromVoidPtr (toVoidPtr largeHead)
+          }
 
 slabChainFrom ::
   forall m e.
@@ -189,10 +183,11 @@ slabChainFrom ::
   e (Ptr Word8) ->
   Stream m (e (Ptr (CStruct ArenaSlabHdr)))
 slabChainFrom startRaw =
-  unfoldWhileM startRaw (\p -> pure (ptrToWord64Expr p `ne` 0)) $ \p -> do
-    let s = fromVoidPtr (toVoidPtr p) :: e (Ptr (CStruct ArenaSlabHdr))
-    nxt <- peek (getPtrOf (ashNext (projectPtrs s)))
-    pure (nxt, s)
+  withJanusType @(CStruct ArenaSlabHdr) @e $
+    unfoldWhileM startRaw (\p -> pure (ptrToWord64Expr p `ne` 0)) $ \p -> do
+      let s = fromVoidPtr (toVoidPtr p) :: e (Ptr (CStruct ArenaSlabHdr))
+      nxt <- peek (getPtrOf (ashNext (projectPtrs s)))
+      pure (nxt, s)
 
 largeChainUntil ::
   forall m e.
@@ -201,13 +196,14 @@ largeChainUntil ::
   e Word64 ->
   Stream m (e (Ptr (CStruct ArenaLargeHdr)))
 largeChainUntil startRaw stopW =
-  unfoldWhileM
-    startRaw
-    (\p -> let w = ptrToWord64Expr p in pure ((w `ne` 0) `land` (w `ne` stopW)))
-    $ \p -> do
-      let lg = fromVoidPtr (toVoidPtr p) :: e (Ptr (CStruct ArenaLargeHdr))
-      nxt <- peek (getPtrOf (alhNext (projectPtrs lg)))
-      pure (nxt, lg)
+  withJanusType @(CStruct ArenaLargeHdr) @e $
+    unfoldWhileM
+      startRaw
+      (\p -> let w = ptrToWord64Expr p in pure ((w `ne` 0) `land` (w `ne` stopW)))
+      $ \p -> do
+        let lg = fromVoidPtr (toVoidPtr p) :: e (Ptr (CStruct ArenaLargeHdr))
+        nxt <- peek (getPtrOf (alhNext (projectPtrs lg)))
+        pure (nxt, lg)
 
 arenaOwnsPtr ::
   forall m e.
@@ -215,26 +211,28 @@ arenaOwnsPtr ::
   Arena e ->
   e (Ptr ()) ->
   m (e Bool)
-arenaOwnsPtr (Arena hdr) vp = do
-  let f = projectPtrs hdr
-      pW = ptrToWord64Expr (fromVoidPtr vp :: e (Ptr Word8))
-  firstSlab <- peek (getPtrOf (asFirstSlab f))
-  firstLg <- peek (getPtrOf (asLargeHead f))
-  let slabHits =
-        streamM (slabChainFrom (fromVoidPtr (toVoidPtr firstSlab))) $ \cur -> do
-          cap <- peek (getPtrOf (ashPayloadCap (projectPtrs cur)))
-          let baseW = ptrToWord64Expr (arenaSlabPayload cur)
-              endW = baseW + toIntegral cap
-          pure ((pW `ge` baseW) `land` (pW `lt` endW))
-      largeHits =
-        streamM (largeChainUntil (fromVoidPtr (toVoidPtr firstLg)) 0) $ \lg -> do
-          let lf = projectPtrs lg
-          payP <- peek (getPtrOf (alhPayloadPtr lf))
-          cap <- peek (getPtrOf (alhPayloadCap lf))
-          let baseW = ptrToWord64Expr payP
-              endW = baseW + toIntegral cap
-          pure ((pW `ge` baseW) `land` (pW `lt` endW))
-  runDrain (drainAny id) (slabHits <|> largeHits)
+arenaOwnsPtr (Arena hdr) vp =
+  withJanusType @(CStruct ArenaSlabHdr) @e $
+    withJanusType @(CStruct ArenaLargeHdr) @e $ do
+      let f = projectPtrs hdr
+          pW = ptrToWord64Expr (fromVoidPtr vp :: e (Ptr Word8))
+      firstSlab <- peek (getPtrOf (asFirstSlab f))
+      firstLg <- peek (getPtrOf (asLargeHead f))
+      let slabHits =
+            streamM (slabChainFrom (fromVoidPtr (toVoidPtr firstSlab))) $ \cur -> do
+              cap <- peek (getPtrOf (ashPayloadCap (projectPtrs cur)))
+              let baseW = ptrToWord64Expr (arenaSlabPayload cur)
+                  endW = baseW + toIntegral cap
+              pure ((pW `ge` baseW) `land` (pW `lt` endW))
+          largeHits =
+            streamM (largeChainUntil (fromVoidPtr (toVoidPtr firstLg)) 0) $ \lg -> do
+              let lf = projectPtrs lg
+              payP <- peek (getPtrOf (alhPayloadPtr lf))
+              cap <- peek (getPtrOf (alhPayloadCap lf))
+              let baseW = ptrToWord64Expr payP
+                  endW = baseW + toIntegral cap
+              pure ((pW `ge` baseW) `land` (pW `lt` endW))
+      runDrain (drainAny id) (slabHits <|> largeHits)
 
 tryBumpInSlab ::
   forall m e.
@@ -270,7 +268,9 @@ arenaAllocImpl ::
   e Int64 ->
   e Int64 ->
   m (e (Ptr ()))
-arenaAllocImpl parentAlloc (Arena hdr) reqSz reqAlign = do
+arenaAllocImpl parentAlloc (Arena hdr) reqSz reqAlign =
+  withJanusType @(CStruct ArenaSlabHdr) @e $
+    withJanusType @(CStruct ArenaLargeHdr) @e $ do
   let f = projectPtrs hdr
   minAl <- peek (getPtrOf (asMinAlign f))
   slabCap <- peek (getPtrOf (asSlabCap f))
@@ -413,7 +413,9 @@ arenaRewindImpl ::
   Arena e ->
   ArenaMark e ->
   m ()
-arenaRewindImpl parentFree (Arena hdr) mark = do
+arenaRewindImpl parentFree (Arena hdr) mark =
+  withJanusType @(CStruct ArenaSlabHdr) @e $
+    withJanusType @(CStruct ArenaLargeHdr) @e $ do
   let f = projectPtrs hdr
       targetLgW = ptrToWord64Expr (amLargeHead mark)
   -- 1. Pop & free dedicated large blocks newer than amLargeHead
@@ -464,7 +466,10 @@ arenaDestroyImpl ::
   e Int64 ->
   Arena e ->
   m ()
-arenaDestroyImpl parentFree spineSz (Arena hdr) = do
+arenaDestroyImpl parentFree spineSz (Arena hdr) =
+  withJanusType @(CStruct ArenaSpine) @e $
+    withJanusType @(CStruct ArenaSlabHdr) @e $
+      withJanusType @(CStruct ArenaLargeHdr) @e $ do
   let f = projectPtrs hdr
   lgHead0 <- peek (getPtrOf (asLargeHead f))
   runDrain

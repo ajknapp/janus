@@ -78,12 +78,13 @@ import Janus.Alloc.Policy
   )
 import Janus.Backend.C
 import Janus.Command.Cond (ifThenElseM_, whenM_)
-import Janus.Command.Memory (CmdStorable (..), ExpPtr (..), ExpSized (..))
+import Janus.Command.Memory (CmdStorable (..), ExpPtr (..))
 import Janus.Command.Ref (newRef, readRef, writeRef)
+import Janus.Constraints (KnownJanusType)
 import Janus.Control.Drain (Drain (..), drainFind, drainForEach, drain_, runDrain)
 import Janus.Control.Step (Step (..))
 import Janus.Control.Stream (Stream (..), iterateS, rangeS, streamM, unfoldWhileM, withStreamSetup)
-import Janus.Data.FlatMap (OrdKey (..))
+import Janus.Data.FlatMap (OrdKey (..), OrdLayoutCtx)
 import Janus.Data.HKD
 import Janus.Data.Layout
 import Janus.Expression.Bits (ExpBits (..))
@@ -92,7 +93,6 @@ import Janus.Expression.Cond (ExpCond (..))
 import Janus.Expression.Eq (ExpEq (..))
 import Janus.Expression.Ord (ExpOrd (..))
 import Janus.SPMD (SPMD, SPMDGang, SPMDM, SPMDTyped, liftSPMD, uniform, uniformAlignedPtr)
-import Janus.Typed (JanusTyped)
 import Prelude hiding (lookup)
 
 -- | Spine struct for 'IndexedPQ':
@@ -121,18 +121,7 @@ deriving stock instance Eq (IndexedPQ Identity p v)
 
 deriving stock instance Show (IndexedPQ Identity p v)
 
-type IndexedPQCtx m e p v =
-  ( LayoutCtx m e p,
-    LayoutCtx m e v,
-    OrdKey e p,
-    Typeable p,
-    Typeable v,
-    ExpPtr e Int64,
-    JanusTyped e (Ptr Int64),
-    CmdStorable m e (Ptr Int64),
-    ExpSized e (CStruct (IndexedPQSpine p v)),
-    JanusTyped e (CStruct (IndexedPQSpine p v))
-  )
+type IndexedPQCtx m e p v = (OrdLayoutCtx m e p, LayoutCtx m e v)
 
 new ::
   forall p v m e.
@@ -275,8 +264,8 @@ lookup ::
   ( IndexedPQCtx m e p v,
     Elem e p ~ e sp,
     Elem e v ~ e sv,
-    JanusTyped e sp,
-    JanusTyped e sv
+    KnownJanusType e sp,
+    KnownJanusType e sv
   ) =>
   e sp ->
   e sv ->
@@ -525,8 +514,8 @@ peekMin ::
   ( IndexedPQCtx m e p v,
     Elem e p ~ e sp,
     Elem e v ~ e sv,
-    JanusTyped e sp,
-    JanusTyped e sv
+    KnownJanusType e sp,
+    KnownJanusType e sv
   ) =>
   e sp ->
   e sv ->
@@ -577,8 +566,8 @@ popMin ::
   ( IndexedPQCtx m e p v,
     Elem e p ~ e sp,
     Elem e v ~ e sv,
-    JanusTyped e sp,
-    JanusTyped e sv
+    KnownJanusType e sp,
+    KnownJanusType e sv
   ) =>
   e sp ->
   e sv ->

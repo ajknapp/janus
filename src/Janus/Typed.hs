@@ -31,6 +31,15 @@ type instance JanusTyped Identity = IdConstraint
 
 type instance JanusTyped (JanusCT t) = JanusCTyped
 
+-- | Class wrapper carrying @'JanusTyped' e a@ as a superclass without a blanket
+-- instance, allowing @QuantifiedConstraints@ over @'KnownJanusType' e@ to compose
+-- across concrete backends and expression transformers without instance overlap.
+class (JanusTyped e a) => KnownJanusType (e :: K.Type -> K.Type) (a :: K.Type)
+
+instance KnownJanusType Identity a
+
+instance (JanusCTyped a) => KnownJanusType (JanusCT t) a
+
 janusBoolTypes :: Set.Set Name
 janusBoolTypes = Set.fromList [''CBool, ''Bool]
 
@@ -44,4 +53,4 @@ janusUnsignedIntTypes = Set.fromList
   [''CSize, ''CUChar, ''CUShort, ''CUInt, ''CULong, ''CULLong, ''Word8, ''Word16, ''Word32, ''Word64]
 
 janusFloatTypes :: Set.Set Name
-janusFloatTypes = Set.fromList [''Float, ''Double]
+janusFloatTypes = Set.fromList [''Float, ''Double, ''CFloat, ''CDouble]

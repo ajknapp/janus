@@ -78,8 +78,9 @@ import Janus.Alloc.Policy
   )
 import Janus.Backend.C
 import Janus.Command.Cond (ifThenElseM_, whenM_)
-import Janus.Command.Memory (CmdStorable (..), ExpPtr (..), ExpSized (..))
+import Janus.Command.Memory (CmdStorable (..), ExpPtr (..))
 import Janus.Command.Ref (letM, newRef, readRef, writeRef)
+import Janus.Constraints (KnownJanusType, withJanusType)
 import Janus.Control.Drain (Drain (..), drainFind, drainFoldM, drainForEach, runDrain)
 import Janus.Control.Stream (Stream, iterateS, rangeS, streamM, withStreamSetup)
 import Janus.Data.DynVec (DynVec)
@@ -107,7 +108,6 @@ import Janus.SPMD
     withSPMD,
     withSPMDMasked,
   )
-import Janus.Typed (JanusTyped)
 import Prelude hiding (lookup)
 
 freeListEnd :: Word32
@@ -185,20 +185,7 @@ deriving stock instance Eq (SlotMap Identity a)
 
 deriving stock instance Show (SlotMap Identity a)
 
-type SlotMapCtx m e a =
-  ( LayoutCtx m e a,
-    Typeable a,
-    ExpPtr e Word32,
-    JanusTyped e (Ptr Word32),
-    CmdStorable m e (Ptr Word32),
-    ExpPtr e (CStruct SlotEntry),
-    ExpSized e (CStruct SlotEntry),
-    JanusTyped e (CStruct SlotEntry),
-    JanusTyped e (Ptr (CStruct SlotEntry)),
-    CmdStorable m e (Ptr (CStruct SlotEntry)),
-    ExpSized e (CStruct (SlotMapSpine a)),
-    JanusTyped e (CStruct (SlotMapSpine a))
-  )
+type SlotMapCtx m e a = LayoutCtx m e a
 
 new ::
   forall a m e.
@@ -416,7 +403,7 @@ containsKey sm k = fst <$> resolveKey sm k
 
 lookup ::
   forall a s m e.
-  (SlotMapCtx m e a, Elem e a ~ e s, JanusTyped e s) =>
+  (SlotMapCtx m e a, Elem e a ~ e s, KnownJanusType e s) =>
   e s ->
   SlotMap e a ->
   SlotKey e ->
@@ -609,7 +596,8 @@ containsKeysSPMD ::
   SPMD w e Word32 ->
   SPMD w e Word32 ->
   SPMDM w m e (SPMD w e Bool)
-containsKeysSPMD (SlotMap hdr) sIdxW32 kGen = do
+containsKeysSPMD (SlotMap hdr) sIdxW32 kGen =
+  withJanusType @(CStruct SlotEntry) @e $ do
   let f = projectPtrs hdr
       sIdx64 = toIntegral sIdxW32 :: SPMD w e Int64
       genWordOff = fromIntegral (fieldByteOffset @SlotEntry seGen `div` 4) :: SPMD w e Int64

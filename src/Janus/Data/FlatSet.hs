@@ -72,8 +72,9 @@ import GHC.Generics (Generic)
 import Janus.Alloc.Policy (Alloc, allocStruct, freeStruct)
 import Janus.Backend.C
 import Janus.Command.Cond (ifThenElseM_, whenM_)
-import Janus.Command.Memory (CmdStorable (..), ExpSized (..))
+import Janus.Command.Memory (CmdStorable (..))
 import Janus.Command.Ref (RefCell, letM, newRef, readRef, writeRef)
+import Janus.Constraints (KnownJanusType)
 import Janus.Control.Drain (Drain (..), drainFind, drainFoldM, drainForEach, drain_, runDrain)
 import Janus.Control.Stream
   ( Stream,
@@ -87,7 +88,7 @@ import Janus.Control.Stream
     unionSortedByS,
     withStreamSetup,
   )
-import Janus.Data.FlatMap (OrdKey (..))
+import Janus.Data.FlatMap (OrdKey (..), OrdLayoutCtx)
 import Janus.Data.HKD
 import Janus.Data.Layout
 import Janus.Data.Sort (lowerBoundBuf, sortBufBy, upperBoundBuf)
@@ -104,7 +105,6 @@ import Janus.SPMD
     liftSPMD,
     uniform,
   )
-import Janus.Typed (JanusTyped)
 
 data FlatSetSpine k f = FlatSetSpine
   { fssKeys :: !(f (CStruct (Buf k))),
@@ -124,13 +124,7 @@ deriving stock instance Eq (FlatSet Identity k)
 
 deriving stock instance Show (FlatSet Identity k)
 
-type FlatSetCtx m e k =
-  ( LayoutCtx m e k,
-    OrdKey e k,
-    Typeable k,
-    ExpSized e (CStruct (FlatSetSpine k)),
-    JanusTyped e (CStruct (FlatSetSpine k))
-  )
+type FlatSetCtx m e k = OrdLayoutCtx m e k
 
 new ::
   forall k m e.
@@ -278,7 +272,7 @@ keyAt (FlatSet hdr) idx = do
 
 lookupGE ::
   forall k ks m e.
-  (FlatSetCtx m e k, Elem e k ~ e ks, JanusTyped e ks) =>
+  (FlatSetCtx m e k, Elem e k ~ e ks, KnownJanusType e ks) =>
   e ks ->
   FlatSet e k ->
   e ks ->
@@ -315,7 +309,7 @@ withLookupGE (FlatSet hdr) target onMiss onHit = do
 
 lookupLE ::
   forall k ks m e.
-  (FlatSetCtx m e k, Elem e k ~ e ks, JanusTyped e ks) =>
+  (FlatSetCtx m e k, Elem e k ~ e ks, KnownJanusType e ks) =>
   e ks ->
   FlatSet e k ->
   e ks ->

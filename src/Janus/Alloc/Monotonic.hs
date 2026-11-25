@@ -34,6 +34,7 @@ import Janus.Command.Cond (ifThenElseM_, whenM_)
 import Janus.Command.Ref (letM, newRef, readRef, writeRef)
 import Janus.Control.Drain (drainAny, drainForEach, runDrain)
 import Janus.Command.Memory (CmdMemCopy (..), CmdStorable (..), ExpPtr (..), janusSIMDAlignment)
+import Janus.Constraints (ExpJanus, withJanusType)
 import Janus.Control.Stream (Stream, streamM, unfoldWhileM)
 import Janus.Data.HKD
 import Janus.Expression.Bits (ExpBits (..))
@@ -42,7 +43,6 @@ import Janus.Expression.Cast (ExpIntegralCast (..), ExpPtrCast (..))
 import Janus.Expression.Cond (ExpCond (..))
 import Janus.Expression.Eq (ExpEq (..))
 import Janus.Expression.Ord (ExpOrd (..))
-import Janus.Typed (JanusTyped)
 
 -- | 64-byte padded slab header (4 * 8B = 32B + 4 * 8B padding = 64B so payload starts 64B aligned).
 data MonoSlabHdr f = MonoSlabHdr
@@ -91,7 +91,7 @@ deriving stock instance Show (Monotonic Identity)
 instance JanusHKD Monotonic
 
 initMonotonicRaw ::
-  (CmdAllocBase m e, JanusTyped e (CStruct MonoSlabHdr), ExpPtr e (CStruct MonoSlabHdr), CmdStorable m e (Ptr (CStruct MonoSlabHdr))) =>
+  (CmdAllocBase m e) =>
   e (Ptr (CStruct MonotonicSpine)) ->
   e Int64 ->
   e Int64 ->
@@ -107,121 +107,110 @@ initMonotonicRaw hdr initCap minAl = do
 
 slabPayloadBase ::
   forall e.
-  (ExpPtr e Word8, ExpPtrCast e, JanusTyped e Word8, JanusTyped e (CStruct MonoSlabHdr), Num (e Int64)) =>
+  (ExpJanus e) =>
   e (Ptr (CStruct MonoSlabHdr)) ->
   e (Ptr Word8)
 slabPayloadBase slab =
-  ptrAdd (fromVoidPtr (toVoidPtr slab) :: e (Ptr Word8)) (fromIntegral monoSlabHeaderBytes)
+  withJanusType @(CStruct MonoSlabHdr) @e $
+    ptrAdd (fromVoidPtr (toVoidPtr slab) :: e (Ptr Word8)) (fromIntegral monoSlabHeaderBytes)
 
 monoSlabChainFrom ::
   forall m e.
-  ( CmdAllocBase m e,
-    JanusTyped e (CStruct MonoSlabHdr),
-    ExpPtr e (CStruct MonoSlabHdr)
-  ) =>
+  (CmdAllocBase m e) =>
   e (Ptr Word8) ->
   Stream m (e (Ptr (CStruct MonoSlabHdr)))
 monoSlabChainFrom startRaw =
-  unfoldWhileM startRaw (\p -> pure (ptrToWord64Expr p `ne` 0)) $ \p -> do
-    let s = fromVoidPtr (toVoidPtr p) :: e (Ptr (CStruct MonoSlabHdr))
-    nxt <- peek (getPtrOf (mshNext (projectPtrs s)))
-    pure (nxt, s)
+  withJanusType @(CStruct MonoSlabHdr) @e $
+    unfoldWhileM startRaw (\p -> pure (ptrToWord64Expr p `ne` 0)) $ \p -> do
+      let s = fromVoidPtr (toVoidPtr p) :: e (Ptr (CStruct MonoSlabHdr))
+      nxt <- peek (getPtrOf (mshNext (projectPtrs s)))
+      pure (nxt, s)
 
 monotonicOwnsPtr ::
   forall m e.
-  ( CmdAllocBase m e,
-    JanusTyped e (CStruct MonoSlabHdr),
-    ExpPtr e (CStruct MonoSlabHdr),
-    CmdStorable m e (Ptr (CStruct MonoSlabHdr))
-  ) =>
+  (CmdAllocBase m e) =>
   Monotonic e ->
   e (Ptr ()) ->
   m (e Bool)
-monotonicOwnsPtr (Monotonic hdr) vp = do
-  let f = projectPtrs hdr
-      pW = ptrToWord64Expr (fromVoidPtr vp :: e (Ptr Word8))
-  headSlab <- peek (getPtrOf (msHeadSlab f))
-  runDrain (drainAny id) $
-    streamM (monoSlabChainFrom (fromVoidPtr (toVoidPtr headSlab))) $ \cur -> do
-      cap <- peek (getPtrOf (mshPayloadCap (projectPtrs cur)))
-      let baseW = ptrToWord64Expr (slabPayloadBase cur)
-          endW = baseW + toIntegral cap
-      pure ((pW `ge` baseW) `land` (pW `lt` endW))
+monotonicOwnsPtr (Monotonic hdr) vp =
+  withJanusType @(CStruct MonoSlabHdr) @e $ do
+    let f = projectPtrs hdr
+        pW = ptrToWord64Expr (fromVoidPtr vp :: e (Ptr Word8))
+    headSlab <- peek (getPtrOf (msHeadSlab f))
+    runDrain (drainAny id) $
+      streamM (monoSlabChainFrom (fromVoidPtr (toVoidPtr headSlab))) $ \cur -> do
+        cap <- peek (getPtrOf (mshPayloadCap (projectPtrs cur)))
+        let baseW = ptrToWord64Expr (slabPayloadBase cur)
+            endW = baseW + toIntegral cap
+        pure ((pW `ge` baseW) `land` (pW `lt` endW))
 
 monotonicAllocImpl ::
   forall m e.
-  ( CmdAllocBase m e,
-    JanusTyped e (CStruct MonoSlabHdr),
-    ExpPtr e (CStruct MonoSlabHdr),
-    CmdStorable m e (Ptr (CStruct MonoSlabHdr))
-  ) =>
+  (CmdAllocBase m e) =>
   (e Int64 -> e Int64 -> m (e (Ptr ()))) ->
   Monotonic e ->
   e Int64 ->
   e Int64 ->
   m (e (Ptr ()))
-monotonicAllocImpl parentAlloc (Monotonic hdr) reqSz reqAlign = do
-  let f = projectPtrs hdr
-  minAl <- peek (getPtrOf (msMinAlign f))
-  effAlI <- letM (ifThenElse (reqAlign `gt` minAl) reqAlign minAl)
-  let effAl = ifThenElse (effAlI `lt` 1) 1 effAlI
-      effAlW = toIntegral effAl :: e Word64
-      szPos = ifThenElse (reqSz `le` 0) effAl reqSz
-  headSlab <- peek (getPtrOf (msHeadSlab f))
-  outRef <- newRef (nullPtr @e @Word8)
-  placedRef <- newRef false
+monotonicAllocImpl parentAlloc (Monotonic hdr) reqSz reqAlign =
+  withJanusType @(CStruct MonoSlabHdr) @e $ do
+    let f = projectPtrs hdr
+    minAl <- peek (getPtrOf (msMinAlign f))
+    effAlI <- letM (ifThenElse (reqAlign `gt` minAl) reqAlign minAl)
+    let effAl = ifThenElse (effAlI `lt` 1) 1 effAlI
+        effAlW = toIntegral effAl :: e Word64
+        szPos = ifThenElse (reqSz `le` 0) effAl reqSz
+    headSlab <- peek (getPtrOf (msHeadSlab f))
+    outRef <- newRef (nullPtr @e @Word8)
+    placedRef <- newRef false
 
-  whenM_ (ptrToWord64Expr headSlab `ne` 0) $ do
-    let sf = projectPtrs headSlab
-    curOff <- peek (getPtrOf (mshOffset sf))
-    cap <- peek (getPtrOf (mshPayloadCap sf))
-    let base = slabPayloadBase headSlab
-        baseW = ptrToWord64Expr base
-        alignedW = alignUpWord64 (baseW + toIntegral curOff) effAlW
-        relStart = toIntegral (alignedW - baseW) :: e Int64
-    newOff <- letM (relStart + szPos)
-    whenM_ (newOff `le` cap) $ do
-      let outP = word64ToPtrExpr alignedW :: e (Ptr Word8)
-      poke (getPtrOf (mshOffset sf)) newOff
-      poke (getPtrOf (mshLastPtr sf)) outP
-      writeRef outRef outP
-      writeRef placedRef true
-
-  placed <- readRef placedRef
-  whenM_ (lnot placed) $ do
-    nxtCap <- peek (getPtrOf (msNextSlabCap f))
-    let neededPayload = szPos + effAl
-        chosenPayload = ifThenElse (neededPayload `gt` nxtCap) neededPayload nxtCap
-        slabAllocAl = ifThenElse (effAl `gt` fromIntegral janusSIMDAlignment) effAl (fromIntegral janusSIMDAlignment)
-        totalBytes = chosenPayload + fromIntegral monoSlabHeaderBytes
-    rawSlab <- parentAlloc totalBytes slabAllocAl
-    whenM_ (lnot (isNullVoidPtr rawSlab)) $ do
-      let newSlab = fromVoidPtr rawSlab :: e (Ptr (CStruct MonoSlabHdr))
-          sf = projectPtrs newSlab
-          base = slabPayloadBase newSlab
+    whenM_ (ptrToWord64Expr headSlab `ne` 0) $ do
+      let sf = projectPtrs headSlab
+      curOff <- peek (getPtrOf (mshOffset sf))
+      cap <- peek (getPtrOf (mshPayloadCap sf))
+      let base = slabPayloadBase headSlab
           baseW = ptrToWord64Expr base
-          alignedW = alignUpWord64 baseW effAlW
+          alignedW = alignUpWord64 (baseW + toIntegral curOff) effAlW
           relStart = toIntegral (alignedW - baseW) :: e Int64
-          newOff = relStart + szPos
-          outP = word64ToPtrExpr alignedW :: e (Ptr Word8)
-      poke (getPtrOf (mshNext sf)) (fromVoidPtr (toVoidPtr headSlab))
-      poke (getPtrOf (mshPayloadCap sf)) chosenPayload
-      poke (getPtrOf (mshOffset sf)) newOff
-      poke (getPtrOf (mshAllocBytes sf)) totalBytes
-      poke (getPtrOf (mshLastPtr sf)) outP
-      poke (getPtrOf (msHeadSlab f)) newSlab
-      poke (getPtrOf (msNextSlabCap f)) (chosenPayload * 2)
-      writeRef outRef outP
+      newOff <- letM (relStart + szPos)
+      whenM_ (newOff `le` cap) $ do
+        let outP = word64ToPtrExpr alignedW :: e (Ptr Word8)
+        poke (getPtrOf (mshOffset sf)) newOff
+        poke (getPtrOf (mshLastPtr sf)) outP
+        writeRef outRef outP
+        writeRef placedRef true
 
-  toVoidPtr <$> readRef outRef
+    placed <- readRef placedRef
+    whenM_ (lnot placed) $ do
+      nxtCap <- peek (getPtrOf (msNextSlabCap f))
+      let neededPayload = szPos + effAl
+          chosenPayload = ifThenElse (neededPayload `gt` nxtCap) neededPayload nxtCap
+          slabAllocAl = ifThenElse (effAl `gt` fromIntegral janusSIMDAlignment) effAl (fromIntegral janusSIMDAlignment)
+          totalBytes = chosenPayload + fromIntegral monoSlabHeaderBytes
+      rawSlab <- parentAlloc totalBytes slabAllocAl
+      whenM_ (lnot (isNullVoidPtr rawSlab)) $ do
+        let newSlab = fromVoidPtr rawSlab :: e (Ptr (CStruct MonoSlabHdr))
+            sf = projectPtrs newSlab
+            base = slabPayloadBase newSlab
+            baseW = ptrToWord64Expr base
+            alignedW = alignUpWord64 baseW effAlW
+            relStart = toIntegral (alignedW - baseW) :: e Int64
+            newOff = relStart + szPos
+            outP = word64ToPtrExpr alignedW :: e (Ptr Word8)
+        poke (getPtrOf (mshNext sf)) (fromVoidPtr (toVoidPtr headSlab))
+        poke (getPtrOf (mshPayloadCap sf)) chosenPayload
+        poke (getPtrOf (mshOffset sf)) newOff
+        poke (getPtrOf (mshAllocBytes sf)) totalBytes
+        poke (getPtrOf (mshLastPtr sf)) outP
+        poke (getPtrOf (msHeadSlab f)) newSlab
+        poke (getPtrOf (msNextSlabCap f)) (chosenPayload * 2)
+        writeRef outRef outP
+
+    toVoidPtr <$> readRef outRef
 
 monotonicReallocImpl ::
   forall m e.
-  ( CmdAllocBase m e,
-    JanusTyped e (CStruct MonoSlabHdr),
-    ExpPtr e (CStruct MonoSlabHdr),
-    CmdStorable m e (Ptr (CStruct MonoSlabHdr))
-  ) =>
+  (CmdAllocBase m e) =>
   (e Int64 -> e Int64 -> m (e (Ptr ()))) ->
   Monotonic e ->
   e (Ptr ()) ->
@@ -270,53 +259,47 @@ monotonicReallocImpl parentAlloc mono@(Monotonic hdr) oldPtr oldSz newSz reqAlig
 -- older slabs back to the parent allocator.
 monotonicResetImpl ::
   forall m e.
-  ( CmdAllocBase m e,
-    JanusTyped e (CStruct MonoSlabHdr),
-    ExpPtr e (CStruct MonoSlabHdr),
-    CmdStorable m e (Ptr (CStruct MonoSlabHdr))
-  ) =>
+  (CmdAllocBase m e) =>
   (e (Ptr ()) -> e Int64 -> m ()) ->
   Monotonic e ->
   m ()
-monotonicResetImpl parentFree (Monotonic hdr) = do
-  let f = projectPtrs hdr
-  headSlab <- peek (getPtrOf (msHeadSlab f))
-  whenM_ (ptrToWord64Expr headSlab `ne` 0) $ do
-    let hsf = projectPtrs headSlab
-    restRaw <- peek (getPtrOf (mshNext hsf))
-    poke (getPtrOf (mshNext hsf)) nullPtr
-    poke (getPtrOf (mshOffset hsf)) 0
-    poke (getPtrOf (mshLastPtr hsf)) nullPtr
-    runDrain
-      ( drainForEach $ \cur -> do
-          totSz <- peek (getPtrOf (mshAllocBytes (projectPtrs cur)))
-          parentFree (toVoidPtr cur) totSz
-      )
-      (monoSlabChainFrom restRaw)
+monotonicResetImpl parentFree (Monotonic hdr) =
+  withJanusType @(CStruct MonoSlabHdr) @e $ do
+    let f = projectPtrs hdr
+    headSlab <- peek (getPtrOf (msHeadSlab f))
+    whenM_ (ptrToWord64Expr headSlab `ne` 0) $ do
+      let hsf = projectPtrs headSlab
+      restRaw <- peek (getPtrOf (mshNext hsf))
+      poke (getPtrOf (mshNext hsf)) nullPtr
+      poke (getPtrOf (mshOffset hsf)) 0
+      poke (getPtrOf (mshLastPtr hsf)) nullPtr
+      runDrain
+        ( drainForEach $ \cur -> do
+            totSz <- peek (getPtrOf (mshAllocBytes (projectPtrs cur)))
+            parentFree (toVoidPtr cur) totSz
+        )
+        (monoSlabChainFrom restRaw)
 
 -- | Free all slabs and the spine struct back to the parent allocator.
 monotonicDestroyImpl ::
   forall m e.
-  ( CmdAllocBase m e,
-    JanusTyped e (CStruct MonotonicSpine),
-    JanusTyped e (CStruct MonoSlabHdr),
-    ExpPtr e (CStruct MonoSlabHdr),
-    CmdStorable m e (Ptr (CStruct MonoSlabHdr))
-  ) =>
+  (CmdAllocBase m e) =>
   (e (Ptr ()) -> e Int64 -> m ()) ->
   e Int64 ->
   Monotonic e ->
   m ()
-monotonicDestroyImpl parentFree spineSz (Monotonic hdr) = do
-  let f = projectPtrs hdr
-  headSlab <- peek (getPtrOf (msHeadSlab f))
-  runDrain
-    ( drainForEach $ \cur -> do
-        totSz <- peek (getPtrOf (mshAllocBytes (projectPtrs cur)))
-        parentFree (toVoidPtr cur) totSz
-    )
-    (monoSlabChainFrom (fromVoidPtr (toVoidPtr headSlab)))
-  parentFree (toVoidPtr hdr) spineSz
+monotonicDestroyImpl parentFree spineSz (Monotonic hdr) =
+  withJanusType @(CStruct MonoSlabHdr) @e $
+    withJanusType @(CStruct MonotonicSpine) @e $ do
+      let f = projectPtrs hdr
+      headSlab <- peek (getPtrOf (msHeadSlab f))
+      runDrain
+        ( drainForEach $ \cur -> do
+            totSz <- peek (getPtrOf (mshAllocBytes (projectPtrs cur)))
+            parentFree (toVoidPtr cur) totSz
+        )
+        (monoSlabChainFrom (fromVoidPtr (toVoidPtr headSlab)))
+      parentFree (toVoidPtr hdr) spineSz
 
 -- Host <-> C FFI Marshalling Instances
 

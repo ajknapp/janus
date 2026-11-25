@@ -67,6 +67,7 @@ import Janus.Command.Range (CmdRange (..))
 import Janus.Command.Ref (Cell (..), CmdRef (..), RefCell (..))
 import Janus.Command.TicToc (CmdTicToc (..), Tic (..), Toc (..))
 import Janus.Command.While (CmdWhile (..))
+import Janus.Constraints (CmdJanus, CmdJanusIO, ExpJanus)
 import Janus.Data.HKD (ExpPtrWord (..), ExpStructPtr (..))
 import Janus.Expression.Bits (ExpBits (..))
 import Janus.Expression.Bool (ExpBool (..))
@@ -88,7 +89,7 @@ import Janus.Expression.Ord (ExpOrd (..))
 import Janus.Expression.SIMD
 import Janus.Fix (ExpFix (..), JanusCFix (..), jfix)
 import Janus.SPMD.Types (ExpPair (..))
-import Janus.Typed (JanusTyped)
+import Janus.Typed (JanusTyped, KnownJanusType)
 
 --------------------------------------------------------------------------------
 -- Reader Expression, Reference, & Representational Coercion Wrappers
@@ -104,6 +105,14 @@ newtype ReaderExp (r :: K.Type) (e :: K.Type -> K.Type) a = ReaderExp
   deriving newtype (Applicative, Monad)
 
 type instance JanusTyped (ReaderExp r e) = JanusTyped e
+
+instance (KnownJanusType e a) => KnownJanusType (ReaderExp r e) a
+
+instance (ExpJanus e) => ExpJanus (ReaderExp r e)
+
+instance (CmdJanus m e) => CmdJanus (ReaderT r m) (ReaderExp r e)
+
+instance (CmdJanusIO m e) => CmdJanusIO (ReaderT r m) (ReaderExp r e)
 
 -- | Lift an underlying Janus expression @e a@ into @'ReaderExp' r e a@.
 liftReaderExp :: e a -> ReaderExp r e a
@@ -569,7 +578,7 @@ instance (CmdRef m e) => CmdRef (ReaderT r m) (ReaderExp r e) where
   readRef (ReaderRef ref) = lift (ReaderExp <$> readRef ref)
   writeRef (ReaderRef ref) (ReaderExp x) = lift (writeRef ref x)
 
-instance (CmdRef m e, JanusTyped e a) => RefCell (ReaderT r m) (ReaderExp r e) (ReaderExp r e a) where
+instance (CmdRef m e, KnownJanusType e a) => RefCell (ReaderT r m) (ReaderExp r e) (ReaderExp r e a) where
   newCell x = do
     ref <- newRef x
     pure (Cell (readRef ref) (writeRef ref))

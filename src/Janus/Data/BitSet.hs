@@ -97,7 +97,6 @@ import GHC.Generics (Generic)
 import GHC.TypeNats (natVal)
 import Janus.Alloc.Policy
   ( Alloc,
-    CmdAlloc,
     allocStruct,
     freeStruct,
     freeTypedArray,
@@ -105,8 +104,9 @@ import Janus.Alloc.Policy
   )
 import Janus.Backend.C
 import Janus.Command.Cond (ifThenElseM_, whenM_)
-import Janus.Command.Memory (CmdMemCopy (..), CmdStorable (..), ExpPtr (..), ExpSized (..))
+import Janus.Command.Memory (CmdMemCopy (..), CmdStorable (..), ExpPtr (..))
 import Janus.Command.Ref (letM, newRef, readRef, writeRef)
+import Janus.Constraints (CmdJanus)
 import Janus.Control.Drain (Drain (..), drainAll, drainFind, drainFirst, drainForEach, drainSum, runDrain)
 import Janus.Control.Step (Step (..))
 import Janus.Control.Stream (Stream, filterMapS, iterateS, rangeS, reverseRangeS, statefulS, streamM)
@@ -224,14 +224,7 @@ deriving stock instance Show (BitSet Identity)
 
 instance JanusHKD BitSet
 
-type BitSetCtx m e =
-  ( CmdAlloc m e,
-    ExpPtr e Word64,
-    JanusTyped e (Ptr Word64),
-    CmdStorable m e (Ptr Word64),
-    ExpSized e (CStruct BitSetSpine),
-    JanusTyped e (CStruct BitSetSpine)
-  )
+type BitSetCtx m e = CmdJanus m e
 
 --------------------------------------------------------------------------------
 -- Lifecycle & Capacity Management

@@ -21,7 +21,7 @@ import Data.Complex (Complex)
 import Data.Functor.Identity (Identity (..))
 import Data.Int (Int64)
 import Data.Proxy (Proxy)
-import Data.Word (Word64)
+import Data.Word (Word64, Word8)
 import Foreign.C (CChar, CFile, CInt, CString)
 import Foreign.Ptr (Ptr)
 import Foreign.Storable (Storable)
@@ -36,6 +36,8 @@ import Janus.Command.Range
 import Janus.Command.Ref
 import Janus.Command.TicToc
 import Janus.Command.While
+import Janus.Constraints (CmdJanus, CmdJanusIO, ExpJanus)
+import Janus.Data.HKD (ExpPtrWord (..), ExpStructPtr (..))
 import Janus.Expression.Bits
 import Janus.Expression.Cast
 import Janus.Expression.Cond
@@ -58,7 +60,19 @@ $( let mkCUDACPUBackend expTy monadTy refTy baseM =
 
            deriving via Identity instance ExpPtrCast $expTy
 
+           instance ExpPtrWord $expTy where
+             ptrToWord64Expr :: forall a. $expTy (Ptr a) -> $expTy Word64
+             ptrToWord64Expr = coerce (ptrToWord64Expr @Identity @a)
+             word64ToPtrExpr :: forall a. (JanusTyped $expTy a) => $expTy Word64 -> $expTy (Ptr a)
+             word64ToPtrExpr = coerce (word64ToPtrExpr @Identity @a)
+
+           instance ExpStructPtr $expTy where
+             structFieldPtr :: forall structTy field. (JanusTyped $expTy field) => $expTy (Ptr structTy) -> Int -> String -> $expTy (Ptr field)
+             structFieldPtr = coerce (structFieldPtr @Identity @structTy @field)
+
            deriving via Identity a instance (Num a) => Num ($expTy a)
+
+           deriving via Identity a instance (Bounded a) => Bounded ($expTy a)
 
            deriving via Identity a instance (Fractional a) => Fractional ($expTy a)
 
@@ -166,6 +180,18 @@ $( let mkCUDACPUBackend expTy monadTy refTy baseM =
              free :: $expTy (Ptr ()) -> $monadTy ()
              free = coerce (cudaFree @($baseM))
 
+           instance M.CmdDynamicAligned $monadTy $expTy where
+             alignedMalloc :: $expTy Int64 -> $expTy Int64 -> $monadTy ($expTy (Ptr ()))
+             alignedMalloc = coerce (cudaAlignedMalloc @($baseM))
+
+           instance M.CmdMemCopy $monadTy $expTy where
+             cmdMemcpy :: $expTy (Ptr ()) -> $expTy (Ptr ()) -> $expTy Int64 -> $monadTy ()
+             cmdMemcpy = coerce (cudaMemcpy @($baseM))
+             cmdMemmove :: $expTy (Ptr ()) -> $expTy (Ptr ()) -> $expTy Int64 -> $monadTy ()
+             cmdMemmove = coerce (cudaMemmove @($baseM))
+             cmdMemset :: $expTy (Ptr ()) -> $expTy Word8 -> $expTy Int64 -> $monadTy ()
+             cmdMemset = coerce (cudaMemset @($baseM))
+
            instance (Storable a) => M.CmdStorable $monadTy $expTy a where
              peek :: $expTy (Ptr a) -> $monadTy ($expTy a)
              peek = coerce (cudaPeek @($baseM) @a)
@@ -222,6 +248,14 @@ $( let mkCUDACPUBackend expTy monadTy refTy baseM =
              writeRef :: forall a. (JanusTyped $expTy a) => $refTy a -> $expTy a -> $monadTy ()
              writeRef = coerce (cudaWriteRef @($baseM) @a)
 
+           instance RefCell $monadTy $expTy ($expTy a) where
+             newCell x = do
+               r <- newRef x
+               pure (Cell (readRef r) (writeRef r))
+             newCell' = do
+               r <- newRef'
+               pure (Cell (readRef r) (writeRef r))
+
            instance CmdRange $monadTy $expTy
 
            instance CmdWhile $monadTy $expTy where
@@ -233,6 +267,12 @@ $( let mkCUDACPUBackend expTy monadTy refTy baseM =
              tic = coerce (cudaTic @($baseM))
              toc :: $monadTy (Toc $expTy)
              toc = coerce (cudaToc @($baseM))
+
+           instance ExpJanus $expTy
+
+           instance CmdJanus $monadTy $expTy
+
+           instance CmdJanusIO $monadTy $expTy
            |]
     in fmap concat $
          sequence

@@ -23,7 +23,7 @@ import Data.IORef (IORef, newIORef, readIORef, writeIORef)
 import Data.Int (Int32, Int64)
 import qualified Data.Kind as K
 import qualified Data.Vector as V
-import Data.Word (Word64)
+import Data.Word (Word64, Word8)
 import Foreign.C (CChar, CFile, CInt, CString, newCString)
 import qualified Foreign.Marshal.Alloc
 import Foreign.Marshal.Alloc (malloc)
@@ -192,6 +192,18 @@ cudaRealloc p n = liftIO $ M.realloc @IO @Identity p n
 
 cudaFree :: (MonadIO m) => Identity (Ptr ()) -> CUDAM m ()
 cudaFree = liftIO . M.free @IO @Identity
+
+cudaAlignedMalloc :: (MonadIO m) => Identity Int64 -> Identity Int64 -> CUDAM m (Identity (Ptr ()))
+cudaAlignedMalloc sz al = liftIO $ M.alignedMalloc @IO @Identity sz al
+
+cudaMemcpy :: (MonadIO m) => Identity (Ptr ()) -> Identity (Ptr ()) -> Identity Int64 -> CUDAM m ()
+cudaMemcpy dst src n = liftIO $ M.cmdMemcpy @IO @Identity dst src n
+
+cudaMemmove :: (MonadIO m) => Identity (Ptr ()) -> Identity (Ptr ()) -> Identity Int64 -> CUDAM m ()
+cudaMemmove dst src n = liftIO $ M.cmdMemmove @IO @Identity dst src n
+
+cudaMemset :: (MonadIO m) => Identity (Ptr ()) -> Identity Word8 -> Identity Int64 -> CUDAM m ()
+cudaMemset dst val n = liftIO $ M.cmdMemset @IO @Identity dst val n
 
 cudaPeek :: (MonadIO m, Storable a) => Identity (Ptr a) -> CUDAM m (Identity a)
 cudaPeek = liftIO . M.peek @IO @Identity

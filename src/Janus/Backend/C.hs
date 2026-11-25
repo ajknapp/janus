@@ -14,6 +14,7 @@
 {-# LANGUAGE MultiParamTypeClasses #-}
 {-# LANGUAGE PatternSynonyms #-}
 {-# LANGUAGE ScopedTypeVariables #-}
+{-# LANGUAGE StandaloneDeriving #-}
 {-# LANGUAGE TemplateHaskell #-}
 {-# LANGUAGE TypeApplications #-}
 {-# LANGUAGE TypeFamilies #-}
@@ -891,7 +892,9 @@ instance JanusCTyped CULLong where
   jctype _ = pure $ JCType (DeclSpec [] [] (Tlong_long (Just (Tunsigned noLoc)) noLoc) noLoc) (DeclRoot noLoc)
 
 instance JanusCTyped CSize where
-  jctype _ = pure $ JCType (DeclSpec [] [] (Tnamed (Id "size_t" noLoc) [] noLoc) noLoc) (DeclRoot noLoc)
+  jctype _ = do
+    addHeader "stddef.h"
+    pure $ JCType (DeclSpec [] [] (Tnamed (Id "size_t" noLoc) [] noLoc) noLoc) (DeclRoot noLoc)
 
 jcIntType :: String -> JanusCM JCType
 jcIntType name = do
@@ -943,7 +946,9 @@ voidPtrType :: JCType
 voidPtrType = JCType (DeclSpec [] [] (Tvoid noLoc) noLoc) (Ptr [] (DeclRoot noLoc) noLoc)
 
 instance JanusCTyped CFile where
-  jctype _ = pure $ JCType (DeclSpec [] [] (Tnamed (Id "FILE" noLoc) [] noLoc) noLoc) (DeclRoot noLoc)
+  jctype _ = do
+    addHeader "stdio.h"
+    pure $ JCType (DeclSpec [] [] (Tnamed (Id "FILE" noLoc) [] noLoc) noLoc) (DeclRoot noLoc)
 
 instance JanusCTyped (Complex Float) where
   jctype _ = pure $ JCType (DeclSpec [] [] (Tfloat_Complex noLoc) noLoc) (DeclRoot noLoc)
@@ -1249,6 +1254,10 @@ instance Floating (JanusCT t Double) where
   atanh = unMathFun "atanh"
   log1p = unMathFun "log1p"
   expm1 = unMathFun "expm1"
+
+deriving via (JanusCT t Float) instance Floating (JanusCT t CFloat)
+
+deriving via (JanusCT t Double) instance Floating (JanusCT t CDouble)
 
 instance Floating (JanusCT t (Complex Float)) where
   pi = JanusCT $ do

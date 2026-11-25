@@ -36,6 +36,7 @@ import Janus.Backend.C
 import Janus.Command.Memory (CmdMemCopy (..), CmdStorable (..), ExpPtr (..))
 import Janus.Command.Cond (ifThenElseM_, whenM_)
 import Janus.Command.Ref (letM, newRef, readRef, writeRef)
+import Janus.Constraints (withJanusType)
 import Janus.Control.Drain (drainFind, drainForEach, runDrain)
 import Janus.Control.Stream (indexedS, iterateS, rangeS, unfoldWhileM)
 import Janus.Data.HKD
@@ -45,7 +46,6 @@ import Janus.Expression.Cast (ExpIntegralCast (toIntegral), ExpPtrCast (..))
 import Janus.Expression.Cond (ExpCond (..))
 import Janus.Expression.Eq (ExpEq (..))
 import Janus.Expression.Ord (ExpOrd (..))
-import Janus.Typed (JanusTyped)
 
 -- | 22 power-of-2 buckets: @2^3 = 8B@ through @2^24 = 16MB@.
 type RecyclerBuckets = 22
@@ -81,12 +81,7 @@ deriving stock instance Show (Recycler Identity)
 
 instance JanusHKD Recycler
 
-type RecyclerCtx m e =
-  ( CmdAllocBase m e,
-    JanusTyped e (CStruct RecyclerSpine),
-    JanusTyped e (FixedArray RecyclerBuckets (Ptr Word8)),
-    JanusTyped e (FixedArray RecyclerBuckets Int64)
-  )
+type RecyclerCtx m e = CmdAllocBase m e
 
 initRecyclerRaw ::
   (RecyclerCtx m e) =>
@@ -288,14 +283,16 @@ recyclerFlushImpl parentFree (Recycler hdr) = do
     (rangeS 0 (fromIntegral numRecyclerBuckets))
 
 recyclerDestroyImpl ::
+  forall m e.
   (RecyclerCtx m e) =>
   (e (Ptr ()) -> e Int64 -> m ()) ->
   e Int64 ->
   Recycler e ->
   m ()
-recyclerDestroyImpl parentFree spineSz rec@(Recycler hdr) = do
-  recyclerFlushImpl parentFree rec
-  parentFree (toVoidPtr hdr) spineSz
+recyclerDestroyImpl parentFree spineSz rec@(Recycler hdr) =
+  withJanusType @(CStruct RecyclerSpine) @e $ do
+    recyclerFlushImpl parentFree rec
+    parentFree (toVoidPtr hdr) spineSz
 
 -- Host <-> C FFI Marshalling Instances
 

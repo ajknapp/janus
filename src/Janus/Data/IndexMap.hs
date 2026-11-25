@@ -97,10 +97,10 @@ import Janus.Command.Memory
   ( CmdMemCopy (..),
     CmdStorable (..),
     ExpPtr (..),
-    ExpSized (..),
     janusSIMDAlignment,
   )
 import Janus.Command.Ref (letM, newRef, readRef, writeRef)
+import Janus.Constraints (KnownJanusType)
 import Janus.Control.Drain (Drain (..), drainFind, drainFirst, drainForEach, drain_, runDrain)
 import Janus.Control.Stream
   ( Stream,
@@ -114,7 +114,7 @@ import Janus.Control.Stream
   )
 import Janus.Data.FlatMap (OrdKey (..))
 import Janus.Data.HKD
-import Janus.Data.HashMap (HashKey (..), probeGroupsS, swarBitsS, swarOccupiedSlotsS)
+import Janus.Data.HashMap (HashKey (..), HashLayoutCtx, probeGroupsS, swarBitsS, swarOccupiedSlotsS)
 import Janus.Data.Layout
 import Janus.Data.Sort (sortKeyValBufsBy)
 import Janus.Expression.Bits (ExpBits (..))
@@ -139,7 +139,6 @@ import Janus.SPMD
     withSPMD,
     withSPMDMasked,
   )
-import Janus.Typed (JanusTyped)
 import Prelude hiding (lookup)
 
 --------------------------------------------------------------------------------
@@ -259,17 +258,7 @@ deriving stock instance Eq (IndexMap Identity k v)
 
 deriving stock instance Show (IndexMap Identity k v)
 
-type IndexMapCtx m e k v =
-  ( LayoutCtx m e k,
-    LayoutCtx m e v,
-    HashKey e k,
-    Typeable k,
-    Typeable v,
-    JanusTyped e (Ptr Int64),
-    CmdStorable m e (Ptr Int64),
-    ExpSized e (CStruct (IndexMapSpine k v)),
-    JanusTyped e (CStruct (IndexMapSpine k v))
-  )
+type IndexMapCtx m e k v = (HashLayoutCtx m e k, LayoutCtx m e v)
 
 --------------------------------------------------------------------------------
 -- Lifecycle, Queries, & Capacity Management
@@ -563,7 +552,7 @@ lookupIndex im key = do
 
 lookup ::
   forall k v s m e.
-  (IndexMapCtx m e k v, Elem e v ~ e s, JanusTyped e s) =>
+  (IndexMapCtx m e k v, Elem e v ~ e s, KnownJanusType e s) =>
   e s ->
   IndexMap e k v ->
   Elem e k ->
@@ -716,7 +705,7 @@ insertWith alloc im@(IndexMap hdr) combine key val = do
 -- | Pop the most-recently inserted back entry in O(1), returning @(poppedOk, key, val)@.
 popBack ::
   forall k v ks vs m e.
-  (IndexMapCtx m e k v, Elem e k ~ e ks, Elem e v ~ e vs, JanusTyped e ks, JanusTyped e vs) =>
+  (IndexMapCtx m e k v, Elem e k ~ e ks, Elem e v ~ e vs, KnownJanusType e ks, KnownJanusType e vs) =>
   e ks ->
   e vs ->
   IndexMap e k v ->

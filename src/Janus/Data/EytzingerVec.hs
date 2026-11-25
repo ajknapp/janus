@@ -57,13 +57,14 @@ import GHC.Generics (Generic)
 import Janus.Alloc.Policy (Alloc, CmdAlloc, allocStruct, freeStruct)
 import Janus.Backend.C
 import Janus.Command.Cond (ifThenElseM_, whenM_)
-import Janus.Command.Memory (CmdStorable (..), ExpSized (..))
+import Janus.Command.Memory (CmdStorable (..))
 import Janus.Command.Ref (newRef, readRef, writeRef)
+import Janus.Constraints (KnownJanusType)
 import Janus.Control.Drain (Drain (..), drainIndexed, drainLast, drain_, runDrain)
 import Janus.Control.Step (Step (..))
 import Janus.Control.Stream (Stream, rangeS, statefulS, streamM, unfoldWhileM, withStreamSetup)
 import qualified Janus.Data.DynVec as DV
-import Janus.Data.FlatMap (OrdKey (..))
+import Janus.Data.FlatMap (OrdKey (..), OrdLayoutCtx)
 import Janus.Data.HKD
 import Janus.Data.Layout
 import Janus.Expression.Bits (ExpBits (..))
@@ -80,7 +81,6 @@ import Janus.SPMD
     liftSPMD,
     uniform,
   )
-import Janus.Typed (JanusTyped)
 
 -- | Spine struct for 1-indexed Eytzinger (BFS-layout) static search array.
 --
@@ -106,19 +106,12 @@ deriving stock instance Eq (EytzingerVec Identity k)
 
 deriving stock instance Show (EytzingerVec Identity k)
 
-type EytzingerVecCtx m e k =
-  ( LayoutCtx m e k,
-    OrdKey e k,
-    Typeable k,
-    ExpSized e (CStruct (EytzingerVecSpine k)),
-    JanusTyped e (CStruct (EytzingerVecSpine k)),
-    DV.DynVecCtx m e k
-  )
+type EytzingerVecCtx m e k = OrdLayoutCtx m e k
 
 -- | Branchless 6-step count-trailing-zeros over @Word64@ (returns @64@ when @m == 0@).
 ctzWord64 ::
   forall e.
-  (ExpBits e Word64, ExpCond e, JanusTyped e Int64, Num (e Word64), Num (e Int64)) =>
+  (ExpBits e Word64, ExpCond e, KnownJanusType e Int64, Num (e Word64), Num (e Int64)) =>
   e Word64 ->
   e Int64
 ctzWord64 m =
@@ -141,7 +134,7 @@ ascendRightSpines ::
     ExpCond e,
     ExpIntegralCast e Int64 Word64,
     ExpIntegralCast e Word64 Int64,
-    JanusTyped e Int64,
+    KnownJanusType e Int64,
     Num (e Word64),
     Num (e Int64)
   ) =>
@@ -281,7 +274,7 @@ findGEIdx b n target = do
 -- | O(log N) branchless Eytzinger lower-bound search returning @(found, firstValGEOrDefault)@.
 lookupGE ::
   forall k s m e.
-  (EytzingerVecCtx m e k, Elem e k ~ e s, JanusTyped e s) =>
+  (EytzingerVecCtx m e k, Elem e k ~ e s, KnownJanusType e s) =>
   e s ->
   EytzingerVec e k ->
   Elem e k ->

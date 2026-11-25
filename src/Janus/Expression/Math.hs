@@ -34,6 +34,7 @@ instance FMA a => FMA (Identity a) where
 
 instance FMA (JanusCT t Float) where
   fma (JanusC a) (JanusC b) (JanusC c) = JanusC $ do
+    addHeader "math.h"
     RVal a' <- a
     RVal b' <- b
     RVal c' <- c
@@ -41,6 +42,23 @@ instance FMA (JanusCT t Float) where
 
 instance FMA (JanusCT t Double) where
   fma (JanusC a) (JanusC b) (JanusC c) = JanusC $ do
+    addHeader "math.h"
+    RVal a' <- a
+    RVal b' <- b
+    RVal c' <- c
+    pure $ RVal $ FnCall (Var (Id "fma" noLoc) noLoc) [a', b', c'] noLoc
+
+instance FMA (JanusCT t CFloat) where
+  fma (JanusC a) (JanusC b) (JanusC c) = JanusC $ do
+    addHeader "math.h"
+    RVal a' <- a
+    RVal b' <- b
+    RVal c' <- c
+    pure $ RVal $ FnCall (Var (Id "fmaf" noLoc) noLoc) [a', b', c'] noLoc
+
+instance FMA (JanusCT t CDouble) where
+  fma (JanusC a) (JanusC b) (JanusC c) = JanusC $ do
+    addHeader "math.h"
     RVal a' <- a
     RVal b' <- b
     RVal c' <- c
@@ -56,12 +74,28 @@ class Floating a => Hypot a where
 
 instance Hypot (JanusCT t Float) where
   hypot (JanusC a) (JanusC b) = JanusC $ do
+    addHeader "math.h"
     RVal a' <- a
     RVal b' <- b
     pure $ RVal $ FnCall (Var (Id "hypotf" noLoc) noLoc) [a', b'] noLoc
 
 instance Hypot (JanusCT t Double) where
   hypot (JanusC a) (JanusC b) = JanusC $ do
+    addHeader "math.h"
+    RVal a' <- a
+    RVal b' <- b
+    pure $ RVal $ FnCall (Var (Id "hypot" noLoc) noLoc) [a', b'] noLoc
+
+instance Hypot (JanusCT t CFloat) where
+  hypot (JanusC a) (JanusC b) = JanusC $ do
+    addHeader "math.h"
+    RVal a' <- a
+    RVal b' <- b
+    pure $ RVal $ FnCall (Var (Id "hypotf" noLoc) noLoc) [a', b'] noLoc
+
+instance Hypot (JanusCT t CDouble) where
+  hypot (JanusC a) (JanusC b) = JanusC $ do
+    addHeader "math.h"
     RVal a' <- a
     RVal b' <- b
     pure $ RVal $ FnCall (Var (Id "hypot" noLoc) noLoc) [a', b'] noLoc
@@ -94,17 +128,21 @@ instance ExpComplex Identity a where
 
 instance ExpComplex (JanusCT t) Float where
   rePart (JanusC z) = JanusC $ do
+    addHeader "complex.h"
     RVal z' <- z
     pure $ RVal $ FnCall (Var (Id "crealf" noLoc) noLoc) [z'] noLoc
   imPart (JanusC z) = JanusC $ do
+    addHeader "complex.h"
     RVal z' <- z
     pure $ RVal $ FnCall (Var (Id "cimagf" noLoc) noLoc) [z'] noLoc
 
 instance ExpComplex (JanusCT t) Double where
   rePart (JanusC z) = JanusC $ do
+    addHeader "complex.h"
     RVal z' <- z
     pure $ RVal $ FnCall (Var (Id "creal" noLoc) noLoc) [z'] noLoc
   imPart (JanusC z) = JanusC $ do
+    addHeader "complex.h"
     RVal z' <- z
     pure $ RVal $ FnCall (Var (Id "cimag" noLoc) noLoc) [z'] noLoc
 

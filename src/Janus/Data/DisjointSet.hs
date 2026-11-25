@@ -56,7 +56,6 @@ import Foreign.Ptr (Ptr)
 import GHC.Generics (Generic)
 import Janus.Alloc.Policy
   ( Alloc,
-    CmdAlloc,
     allocStruct,
     allocTypedArray,
     freeStruct,
@@ -65,8 +64,9 @@ import Janus.Alloc.Policy
   )
 import Janus.Backend.C
 import Janus.Command.Cond (ifThenElseM_, whenM_)
-import Janus.Command.Memory (CmdStorable (..), ExpSized (..))
+import Janus.Command.Memory (CmdStorable (..))
 import Janus.Command.Ref (letM, newRef, readRef, writeRef)
+import Janus.Constraints (CmdJanus)
 import Janus.Control.Drain (Drain, drainFind, drainForEach, drainLast, drain_, runDrain)
 import Janus.Control.Stream (Stream, filterMapS, iterateS, rangeS, unfoldWhileM, withStreamSetup)
 import Janus.Data.HKD
@@ -84,7 +84,6 @@ import Janus.SPMD
     uniform,
     uniformAlignedPtr,
   )
-import Janus.Typed (JanusTyped)
 
 -- | Spine struct for flat signed-parent 'DisjointSet' (Union-Find):
 -- * @dssData[x] < 0@: @x@ is a canonical component root of size @-dssData[x]@.
@@ -114,13 +113,7 @@ deriving stock instance Show (DisjointSet Identity)
 
 instance JanusHKD DisjointSet
 
-type DisjointSetCtx m e =
-  ( CmdAlloc m e,
-    JanusTyped e (Ptr Int64),
-    CmdStorable m e (Ptr Int64),
-    ExpSized e (CStruct DisjointSetSpine),
-    JanusTyped e (CStruct DisjointSetSpine)
-  )
+type DisjointSetCtx m e = CmdJanus m e
 
 -- | Create a 'DisjointSet' over @n@ singleton elements @[0 .. n - 1]@ initialized to @-1@.
 new ::

@@ -26,7 +26,6 @@ import qualified Hedgehog.Gen as Gen
 import qualified Hedgehog.Range as Range
 import Janus.Alloc
   ( Alloc,
-    AllocTrackerSpine,
     CmdAlloc,
     destroyFixedBuf,
     destroyRecycler,
@@ -47,7 +46,7 @@ import Janus.Alloc
     withAllocTracker,
     withFixedBuf,
   )
-import Janus.Backend.C (JanusC, JanusCM, JanusCTyped, acquireJanusC, releaseJanusC, withJanusC)
+import Janus.Backend.C (JanusC, JanusCM, acquireJanusC, releaseJanusC, withJanusC)
 import Janus.Backend.C.Build (CBuildConfig, cBuildConfigCacheDir, defaultCBuildConfig)
 import Janus.Backend.C.LinuxX86_64 (LinuxX86_64, LinuxX86_64C, LinuxX86_64CM)
 import Janus.Command.Memory (ExpSized (..))
@@ -546,17 +545,7 @@ exerciseLayoutLifecycle composite tinyPolicy mkElem projElem = do
 
 lifecycleAllLayoutsKernel ::
   forall m e.
-  ( CmdAlloc m e,
-    LayoutElemCtx m e Int64,
-    LayoutElemCtx m e (AoS Particle),
-    LayoutElemCtx m e (SoA Particle),
-    LayoutElemCtx m e (AoSoA 8 Particle),
-    LayoutElemCtx m e (SOAOA 8 ParticleSys),
-    JanusTyped e Float,
-    ExpFloatingCast e Int64 Float,
-    Fractional (e Float),
-    JanusCTyped (CStruct AllocTrackerSpine)
-  ) =>
+  (CmdJanus m e) =>
   m (e Float)
 lifecycleAllLayoutsKernel = do
   tracker <- newAllocTracker

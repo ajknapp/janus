@@ -19,100 +19,31 @@ module Janus.Alloc.Dynamic
   )
 where
 
-import Data.Int (Int32, Int64)
-import Data.Word (Word32, Word64, Word8)
+import Data.Int (Int64)
+import Data.Word (Word64, Word8)
 import Foreign.Ptr (Ptr)
-import Janus.Command.Case (CmdCase)
 import Janus.Command.Cond (CmdCond (..), whenM_)
 import qualified Janus.Command.Memory as Mem
 import Janus.Command.Memory
   ( CmdDynamicAligned (..),
     CmdMem,
     CmdMemCopy (..),
-    CmdStorable (..),
     ExpPtr (..),
     janusSIMDAlignment,
   )
-import Janus.Command.Range (CmdRange)
-import Janus.Command.Ref (CmdRef (..), RefCell)
-import Janus.Command.While (CmdWhile)
+import Janus.Command.Ref (CmdRef (..))
+import Janus.Constraints (CmdJanus)
 import Janus.Data.HKD (ExpStructPtr, ptrToWord64Expr)
 import Janus.Expression.Bits (ExpBits (..))
 import Janus.Expression.Bool (ExpBool (..))
-import Janus.Expression.Cast (ExpIntegralCast, ExpPtrCast (..))
+import Janus.Expression.Cast (ExpPtrCast (..))
 import Janus.Expression.Cond (ExpCond (..))
 import Janus.Expression.Eq (ExpEq (..))
-import Janus.Expression.Integral (ExpIntegral)
-import Janus.Expression.Let (ExpLet)
 import Janus.Expression.Ord (ExpOrd (..))
 import Janus.Typed (JanusTyped)
 
--- | Core constraint bundle satisfied by all CPU Janus backends:
--- @(IO, Identity)@ and @(JanusCMT t, JanusCT t)@ across any target @t@.
-type CmdAllocBase m e =
-  ( Monad m,
-    CmdMem m e,
-    CmdMemCopy m e,
-    CmdDynamicAligned m e,
-    CmdRef m e,
-    CmdCond m e,
-    CmdWhile m e,
-    CmdRange m e,
-    CmdCase m e,
-    ExpStructPtr e,
-    ExpPtrCast e,
-    ExpBool e,
-    ExpCond e,
-    ExpLet e,
-    ExpPtr e Word8,
-    ExpPtr e Int64,
-    ExpPtr e Word64,
-    ExpPtr e (Ptr Word8),
-    CmdStorable m e Word8,
-    CmdStorable m e Int32,
-    CmdStorable m e Word32,
-    CmdStorable m e Int64,
-    CmdStorable m e Word64,
-    CmdStorable m e (Ptr Word8),
-    RefCell m e (e Bool),
-    RefCell m e (e Int32),
-    RefCell m e (e Word32),
-    RefCell m e (e Int64),
-    RefCell m e (e Word64),
-    RefCell m e (e (Ptr Word8)),
-    ExpBits e Int64,
-    ExpBits e Word64,
-    ExpBits e Word32,
-    ExpBits e Word8,
-    ExpIntegral e Int64,
-    ExpIntegral e Word64,
-    ExpOrd e Int64,
-    ExpOrd e Word64,
-    ExpOrd e Int32,
-    ExpOrd e Word32,
-    ExpOrd e Word8,
-    ExpEq e Bool,
-    ExpIntegralCast e Int64 Word64,
-    ExpIntegralCast e Word64 Int64,
-    ExpIntegralCast e Word64 Word8,
-    ExpIntegralCast e Word8 Word64,
-    ExpIntegralCast e Word32 Int64,
-    ExpIntegralCast e Int64 Word32,
-    ExpIntegralCast e Int32 Int64,
-    ExpIntegralCast e Int64 Int32,
-    Num (e Int64),
-    Num (e Word64),
-    Num (e Int32),
-    Num (e Word32),
-    Num (e Word8),
-    JanusTyped e Bool,
-    JanusTyped e Word8,
-    JanusTyped e Int32,
-    JanusTyped e Word32,
-    JanusTyped e Int64,
-    JanusTyped e Word64,
-    JanusTyped e (Ptr Word8)
-  )
+-- | Core constraint bundle satisfied by all Janus backends.
+type CmdAllocBase m e = CmdJanus m e
 
 nullVoidPtr :: forall e. (ExpPtr e Word8, ExpPtrCast e, JanusTyped e Word8) => e (Ptr ())
 nullVoidPtr = toVoidPtr (nullPtr @e @Word8)

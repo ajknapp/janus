@@ -5,7 +5,10 @@
 -- For per-container operations ('new', 'free', 'insert', 'lookup', 'stream', etc.),
 -- import the specific container modules qualified (e.g. @import qualified Janus.Data.DynVec as DV@).
 module Janus.Data
-  ( -- * HKD C-ABI & Storage Layouts (`Scalar`, `AoS`, `SoA`, `AoSoA w`, `SOAOA w`)
+  ( -- * Reusable Constraint Bundles (`ExpJanus`, `CmdJanus`, `CmdJanusIO`, ...)
+    module Janus.Constraints,
+
+    -- * HKD C-ABI & Storage Layouts (`Scalar`, `AoS`, `SoA`, `AoSoA w`, `SOAOA w`)
     module Janus.Data.HKD,
     module Janus.Data.Layout,
     module Janus.Data.Sort,
@@ -46,6 +49,8 @@ module Janus.Data
 
     -- * Associative, Insertion-Ordered, Eviction-Cache, & Ordered Data Structures
     HashKey (..),
+    HashFilterCtx,
+    HashLayoutCtx,
     HashMap (..),
     HashMapCtx,
     HashSet (..),
@@ -59,6 +64,8 @@ module Janus.Data
     LruCache (..),
     LruCacheCtx,
     OrdKey (..),
+    OrdLayoutCtx,
+    InlineOrdLayoutCtx,
     FlatMap (..),
     FlatMapCtx,
     FlatSet (..),
@@ -116,6 +123,7 @@ module Janus.Data
   )
 where
 
+import Janus.Constraints
 import Janus.Data.BTreeMap (BTreeMap (..), BTreeMapCtx)
 import Janus.Data.BTreeSet (BTreeSet (..), BTreeSetCtx)
 import Janus.Data.BitSet (BitSet (..), BitSetCtx)
@@ -128,10 +136,10 @@ import Janus.Data.DisjointSet (DisjointSet (..), DisjointSetCtx)
 import Janus.Data.DynVec (DynVec (..), DynVecCtx, drainToVect)
 import Janus.Data.EytzingerVec (EytzingerVec (..), EytzingerVecCtx)
 import Janus.Data.FlatIntervalMap (FlatIntervalMap (..), FlatIntervalMapCtx)
-import Janus.Data.FlatMap (FlatMap (..), FlatMapCtx, OrdKey (..))
+import Janus.Data.FlatMap (FlatMap (..), FlatMapCtx, InlineOrdLayoutCtx, OrdKey (..), OrdLayoutCtx)
 import Janus.Data.FlatSet (FlatSet (..), FlatSetCtx)
 import Janus.Data.HKD
-import Janus.Data.HashMap (HashKey (..), HashMap (..), HashMapCtx)
+import Janus.Data.HashMap (HashFilterCtx, HashKey (..), HashLayoutCtx, HashMap (..), HashMapCtx)
 import Janus.Data.HashSet (HashSet (..), HashSetCtx)
 import Janus.Data.IndexMap (IndexMap (..), IndexMapCtx)
 import Janus.Data.IndexSet (IndexSet (..), IndexSetCtx)

@@ -20,6 +20,8 @@ module Janus.Data.FlatMap
   ( -- * Ordered Key Class (Supporting Scalars & Lexicographic HKD Records)
     OrdKey (..),
     GOrdStruct (..),
+    OrdLayoutCtx,
+    InlineOrdLayoutCtx,
 
     -- * Contiguous SoA Sorted FlatMap Spine & Handle
     FlatMapSpine (..),
@@ -102,8 +104,9 @@ import GHC.Generics
 import Janus.Alloc.Policy (Alloc, allocStruct, freeStruct)
 import Janus.Backend.C
 import Janus.Command.Cond (ifThenElseM_, whenM_)
-import Janus.Command.Memory (CmdStorable (..), ExpSized (..))
+import Janus.Command.Memory (CmdStorable (..))
 import Janus.Command.Ref (RefCell, letM, newRef, readRef, writeRef)
+import Janus.Constraints (KnownJanusType)
 import Janus.Control.Drain (Drain (..), drainFind, drainFoldM, drainForEach, drain_, runDrain)
 import Janus.Control.Stream
   ( Stream,
@@ -133,7 +136,6 @@ import Janus.SPMD
     liftSPMD,
     uniform,
   )
-import Janus.Typed (JanusTyped)
 import Prelude hiding (lookup)
 
 --------------------------------------------------------------------------------
@@ -239,15 +241,11 @@ deriving stock instance Eq (FlatMap Identity k v)
 
 deriving stock instance Show (FlatMap Identity k v)
 
-type FlatMapCtx m e k v =
-  ( LayoutCtx m e k,
-    LayoutCtx m e v,
-    OrdKey e k,
-    Typeable k,
-    Typeable v,
-    ExpSized e (CStruct (FlatMapSpine k v)),
-    JanusTyped e (CStruct (FlatMapSpine k v))
-  )
+type OrdLayoutCtx m e k = (LayoutCtx m e k, OrdKey e k)
+
+type InlineOrdLayoutCtx n m e k = (InlineLayoutCtx n m e k, OrdKey e k)
+
+type FlatMapCtx m e k v = (OrdLayoutCtx m e k, LayoutCtx m e v)
 
 new ::
   forall k v m e.
@@ -397,7 +395,7 @@ member fm key = fst <$> findPos fm key
 
 lookup ::
   forall k v s m e.
-  (FlatMapCtx m e k v, Elem e v ~ e s, JanusTyped e s) =>
+  (FlatMapCtx m e k v, Elem e v ~ e s, KnownJanusType e s) =>
   e s ->
   FlatMap e k v ->
   Elem e k ->
@@ -430,7 +428,7 @@ withLookup fm@(FlatMap hdr) key onMiss onHit = do
 
 lookupGE ::
   forall k v ks vs m e.
-  (FlatMapCtx m e k v, Elem e k ~ e ks, Elem e v ~ e vs, JanusTyped e ks, JanusTyped e vs) =>
+  (FlatMapCtx m e k v, Elem e k ~ e ks, Elem e v ~ e vs, KnownJanusType e ks, KnownJanusType e vs) =>
   e ks ->
   e vs ->
   FlatMap e k v ->
@@ -476,7 +474,7 @@ withLookupGE (FlatMap hdr) target onMiss onHit = do
 
 lookupLE ::
   forall k v ks vs m e.
-  (FlatMapCtx m e k v, Elem e k ~ e ks, Elem e v ~ e vs, JanusTyped e ks, JanusTyped e vs) =>
+  (FlatMapCtx m e k v, Elem e k ~ e ks, Elem e v ~ e vs, KnownJanusType e ks, KnownJanusType e vs) =>
   e ks ->
   e vs ->
   FlatMap e k v ->

@@ -66,6 +66,7 @@ import Janus.Backend.C
 import Janus.Command.Cond (ifThenElseM_, whenM_)
 import Janus.Command.Memory (CmdMemCopy (..), CmdStorable (..), ExpSized (..))
 import Janus.Command.Ref (letM, newRef, readRef, writeRef)
+import Janus.Constraints (KnownJanusType)
 import Janus.Control.Drain (Drain (..), drainFoldM, drainForEach, drainSum, drain_, runDrain)
 import Janus.Control.Step (Step (..))
 import Janus.Control.Stream (Stream, rangeS, statefulS, streamM, unfoldWhileM, withStreamSetup)
@@ -89,7 +90,6 @@ import Janus.SPMD
     uniform,
     uniformAlignedPtr,
   )
-import Janus.Typed (JanusTyped)
 
 -- | Spine struct for pointer-free Compressed Sparse Row ('CsrGraph') directed weighted graph:
 -- * @cgsRowOffsets@: @cgsNumVerts + 1@ entries mapping vertex @u@ to edge slice @[ro[u], ro[u + 1])@.
@@ -115,16 +115,7 @@ deriving stock instance Eq (CsrGraph Identity w)
 
 deriving stock instance Show (CsrGraph Identity w)
 
-type CsrGraphCtx m e w =
-  ( LayoutCtx m e w,
-    Typeable w,
-    JanusTyped e (Ptr Int64),
-    CmdStorable m e (Ptr Int64),
-    ExpSized e (CStruct (CsrGraphSpine w)),
-    JanusTyped e (CStruct (CsrGraphSpine w)),
-    DV.DynVecCtx m e Int64,
-    DV.DynVecCtx m e w
-  )
+type CsrGraphCtx m e w = LayoutCtx m e w
 
 -- | Bulk-construct a 'CsrGraph' over @numVerts@ vertices from a 'Stream' of @(u, v, weight)@
 -- directed edges (ignoring out-of-range edges outside @[0, numVerts)@).
@@ -402,7 +393,7 @@ bfsDistances alloc g@(CsrGraph hdr) src = do
 -- | Sparse matrix-vector product @y[u] = sum_{(u, v, w)} w * x[v]@ over @[0, numVertices)@.
 csrSpMV ::
   forall w s m e.
-  (CsrGraphCtx m e w, Elem e w ~ e s, CmdStorable m e s, JanusTyped e s, Num (e s)) =>
+  (CsrGraphCtx m e w, Elem e w ~ e s, CmdStorable m e s, KnownJanusType e s, Num (e s)) =>
   CsrGraph e w ->
   e (Ptr s) ->
   e (Ptr s) ->
@@ -494,7 +485,7 @@ spmdCsrSpMV ::
     LayoutGatherSPMD w m e s,
     Elem e s ~ e s,
     Elem (SPMD w e) s ~ SPMD w e s,
-    JanusTyped e s,
+    KnownJanusType e s,
     SPMDTyped w e s,
     SPMDReduceByLayout (SPMDLayout w s) w e s,
     Num (e s),
@@ -546,7 +537,7 @@ spmdCsrSpMVVec ::
     LayoutGatherSPMD w m e s,
     Elem e s ~ e s,
     Elem (SPMD w e) s ~ SPMD w e s,
-    JanusTyped e s,
+    KnownJanusType e s,
     SPMDTyped w e s,
     SPMDReduceByLayout (SPMDLayout w s) w e s,
     Num (e s),

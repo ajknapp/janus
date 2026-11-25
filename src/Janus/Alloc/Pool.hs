@@ -36,6 +36,7 @@ import Janus.Backend.C
 import Janus.Command.Memory (CmdStorable (..), ExpPtr (..), janusSIMDAlignment)
 import Janus.Command.Cond (ifThenElseM_, whenM_)
 import Janus.Command.Ref (newRef, readRef, writeRef)
+import Janus.Constraints (withJanusType)
 import Janus.Control.Drain (drainAny, drainFind, drainForEach, runDrain)
 import Janus.Control.Stream (Stream, streamM, unfoldWhileM)
 import Janus.Data.HKD
@@ -44,7 +45,6 @@ import Janus.Expression.Cast (ExpIntegralCast (..), ExpPtrCast (..))
 import Janus.Expression.Cond (ExpCond (..))
 import Janus.Expression.Eq (ExpEq (..))
 import Janus.Expression.Ord (ExpOrd (..))
-import Janus.Typed (JanusTyped)
 
 data PoolSlabHdr f = PoolSlabHdr
   { pshNext :: !(f (Ptr Word8)),
@@ -94,13 +94,7 @@ deriving stock instance Show (MemPool Identity)
 
 instance JanusHKD MemPool
 
-type PoolCtx m e =
-  ( CmdAllocBase m e,
-    JanusTyped e (CStruct MemPoolSpine),
-    JanusTyped e (CStruct PoolSlabHdr),
-    ExpPtr e (CStruct PoolSlabHdr),
-    CmdStorable m e (Ptr (CStruct PoolSlabHdr))
-  )
+type PoolCtx m e = CmdAllocBase m e
 
 initMemPoolRaw ::
   (PoolCtx m e) =>
@@ -129,10 +123,11 @@ poolSlabChainFrom ::
   e (Ptr Word8) ->
   Stream m (e (Ptr (CStruct PoolSlabHdr)))
 poolSlabChainFrom startRaw =
-  unfoldWhileM startRaw (\p -> pure (ptrToWord64Expr p `ne` 0)) $ \p -> do
-    let s = fromVoidPtr (toVoidPtr p) :: e (Ptr (CStruct PoolSlabHdr))
-    nxt <- peek (getPtrOf (pshNext (projectPtrs s)))
-    pure (nxt, s)
+  withJanusType @(CStruct PoolSlabHdr) @e $
+    unfoldWhileM startRaw (\p -> pure (ptrToWord64Expr p `ne` 0)) $ \p -> do
+      let s = fromVoidPtr (toVoidPtr p) :: e (Ptr (CStruct PoolSlabHdr))
+      nxt <- peek (getPtrOf (pshNext (projectPtrs s)))
+      pure (nxt, s)
 
 poolOwnsPtr ::
   forall m e.
@@ -140,19 +135,20 @@ poolOwnsPtr ::
   MemPool e ->
   e (Ptr ()) ->
   m (e Bool)
-poolOwnsPtr (MemPool hdr) vp = do
-  let f = projectPtrs hdr
-      pW = ptrToWord64Expr (fromVoidPtr vp :: e (Ptr Word8))
-  slotSz <- peek (getPtrOf (mpsSlotSize f))
-  firstSlab <- peek (getPtrOf (mpsFirstSlab f))
-  runDrain (drainAny id) $
-    streamM (poolSlabChainFrom (fromVoidPtr (toVoidPtr firstSlab))) $ \s -> do
-      let sf = projectPtrs s
-      base <- peek (getPtrOf (pshPayloadBase sf))
-      cnt <- peek (getPtrOf (pshSlotsCap sf))
-      let baseW = ptrToWord64Expr base
-          endW = baseW + toIntegral (cnt * slotSz)
-      pure ((pW `ge` baseW) `land` (pW `lt` endW))
+poolOwnsPtr (MemPool hdr) vp =
+  withJanusType @(CStruct PoolSlabHdr) @e $ do
+    let f = projectPtrs hdr
+        pW = ptrToWord64Expr (fromVoidPtr vp :: e (Ptr Word8))
+    slotSz <- peek (getPtrOf (mpsSlotSize f))
+    firstSlab <- peek (getPtrOf (mpsFirstSlab f))
+    runDrain (drainAny id) $
+      streamM (poolSlabChainFrom (fromVoidPtr (toVoidPtr firstSlab))) $ \s -> do
+        let sf = projectPtrs s
+        base <- peek (getPtrOf (pshPayloadBase sf))
+        cnt <- peek (getPtrOf (pshSlotsCap sf))
+        let baseW = ptrToWord64Expr base
+            endW = baseW + toIntegral (cnt * slotSz)
+        pure ((pW `ge` baseW) `land` (pW `lt` endW))
 
 poolAllocImpl ::
   forall m e.
@@ -162,7 +158,8 @@ poolAllocImpl ::
   e Int64 ->
   e Int64 ->
   m (e (Ptr ()))
-poolAllocImpl parentAlloc (MemPool hdr) reqSz reqAlign = do
+poolAllocImpl parentAlloc (MemPool hdr) reqSz reqAlign =
+  withJanusType @(CStruct PoolSlabHdr) @e $ do
   let f = projectPtrs hdr
   slotSz <- peek (getPtrOf (mpsSlotSize f))
   slotAl <- peek (getPtrOf (mpsSlotAlign f))
@@ -292,14 +289,15 @@ poolResetImpl ::
   (PoolCtx m e) =>
   MemPool e ->
   m ()
-poolResetImpl (MemPool hdr) = do
-  let f = projectPtrs hdr
-  firstSlab <- peek (getPtrOf (mpsFirstSlab f))
-  poke (getPtrOf (mpsFreeHead f)) nullPtr
-  poke (getPtrOf (mpsCurSlab f)) firstSlab
-  runDrain
-    (drainForEach (\s -> poke (getPtrOf (pshBumped (projectPtrs s))) 0))
-    (poolSlabChainFrom (fromVoidPtr (toVoidPtr firstSlab)))
+poolResetImpl (MemPool hdr) =
+  withJanusType @(CStruct PoolSlabHdr) @e $ do
+    let f = projectPtrs hdr
+    firstSlab <- peek (getPtrOf (mpsFirstSlab f))
+    poke (getPtrOf (mpsFreeHead f)) nullPtr
+    poke (getPtrOf (mpsCurSlab f)) firstSlab
+    runDrain
+      (drainForEach (\s -> poke (getPtrOf (pshBumped (projectPtrs s))) 0))
+      (poolSlabChainFrom (fromVoidPtr (toVoidPtr firstSlab)))
 
 poolDestroyImpl ::
   forall m e.
@@ -308,7 +306,9 @@ poolDestroyImpl ::
   e Int64 ->
   MemPool e ->
   m ()
-poolDestroyImpl parentFree spineSz (MemPool hdr) = do
+poolDestroyImpl parentFree spineSz (MemPool hdr) =
+  withJanusType @(CStruct MemPoolSpine) @e $
+    withJanusType @(CStruct PoolSlabHdr) @e $ do
   let f = projectPtrs hdr
   firstSlab <- peek (getPtrOf (mpsFirstSlab f))
   runDrain

@@ -63,7 +63,6 @@ import Foreign.Ptr (Ptr)
 import GHC.Generics (Generic)
 import Janus.Alloc.Policy
   ( Alloc,
-    CmdAlloc,
     allocStruct,
     allocZeroedAligned,
     freeBytes,
@@ -71,8 +70,9 @@ import Janus.Alloc.Policy
   )
 import Janus.Backend.C
 import Janus.Command.Cond (ifThenElseM_, whenM_)
-import Janus.Command.Memory (CmdMemCopy (..), CmdStorable (..), ExpPtr (..), ExpSized (..), janusSIMDAlignment)
+import Janus.Command.Memory (CmdMemCopy (..), CmdStorable (..), janusSIMDAlignment)
 import Janus.Command.Ref (letM, newRef, readRef, writeRef)
+import Janus.Constraints (CmdJanus)
 import Janus.Control.Drain (Drain (..), drainForEach, runDrain)
 import Janus.Control.Step (Step (..))
 import Janus.Control.Stream (Stream, statefulS)
@@ -91,7 +91,6 @@ import Janus.SPMD
     uniform,
     uniformAlignedPtr,
   )
-import Janus.Typed (JanusTyped)
 
 -- | Maximum universe size @64^3 = 262,144@ covered by the 3-level 64-ary bitmask pyramid.
 maxBitTreeUniverse :: Int64
@@ -129,15 +128,7 @@ deriving stock instance Show (BitTree Identity)
 
 instance JanusHKD BitTree
 
-type BitTreeCtx m e =
-  ( CmdAlloc m e,
-    ExpPtr e Word64,
-    JanusTyped e (Ptr Word64),
-    CmdStorable m e (Ptr Word64),
-    JanusTyped e (FixedArray 64 Word64),
-    ExpSized e (CStruct BitTreeSpine),
-    JanusTyped e (CStruct BitTreeSpine)
-  )
+type BitTreeCtx m e = CmdJanus m e
 
 --------------------------------------------------------------------------------
 -- Lifecycle, Queries, & Clear

@@ -87,7 +87,7 @@ import Janus.Expression.Bits (ExpBits (..))
 import Janus.Expression.Cast (ExpPtrCast (..))
 import Janus.FFI.Arg (FFIArg (..), THParamMode (..), THParamSpec (..), typeRepToTHType)
 import Janus.FFI.Ret (THRetEffect (..), THRetMode (..), THRetSpec (..))
-import Janus.Typed (JanusTyped)
+import Janus.Typed (JanusTyped, KnownJanusType)
 import Language.C.Quote
   ( ArraySize (ArraySize),
     Decl (Array, DeclRoot),
@@ -177,7 +177,7 @@ instance (KnownNat w, Typeable w, JanusCTyped a) => JanusCTyped (FixedArray w a)
     let w = fromIntegral (natVal (Proxy @w)) :: Int
     pure $ JCType spec (Array [] (ArraySize False (signedIntConst w) noLoc) dec noLoc)
 
-fixedArrayElemPtr :: (ExpPtrCast e, JanusTyped e a, JanusTyped e (FixedArray w a)) => e (Ptr (FixedArray w a)) -> e (Ptr a)
+fixedArrayElemPtr :: (ExpPtrCast e, KnownJanusType e a, KnownJanusType e (FixedArray w a)) => e (Ptr (FixedArray w a)) -> e (Ptr a)
 fixedArrayElemPtr = fromVoidPtr . toVoidPtr
 
 --------------------------------------------------------------------------------
@@ -294,9 +294,9 @@ containerOfPtr ::
     GJanusStructProject Identity (Rep (s Identity)) (Rep (s (PtrOf Identity))),
     ExpPtr e Word8,
     ExpPtrCast e,
-    JanusTyped e a,
-    JanusTyped e Word8,
-    JanusTyped e (CStruct s),
+    KnownJanusType e a,
+    KnownJanusType e Word8,
+    KnownJanusType e (CStruct s),
     Num (e Int64)
   ) =>
   (s (PtrOf Identity) -> PtrOf Identity a) ->
@@ -599,7 +599,7 @@ instance
      in (fx :*: gx, off2)
 
 instance
-  (ExpStructPtr e, Storable.Storable a, JanusTyped e a) =>
+  (ExpStructPtr e, Storable.Storable a, KnownJanusType e a) =>
   GJanusStructProject e (K1 i (Identity a)) (K1 i (PtrOf e a))
   where
   gProjectPtrs p off0 fname =
@@ -611,7 +611,7 @@ instance
 instance
   ( ExpStructPtr e,
     Storable.Storable (Ptr a),
-    JanusTyped e (Ptr a)
+    KnownJanusType e (Ptr a)
   ) =>
   GJanusStructProject e (K1 i (PtrOf Identity a)) (K1 i (PtrOf e (Ptr a)))
   where
@@ -624,7 +624,7 @@ instance
 instance
   ( ExpStructPtr e,
     Storable.Storable (Ptr a),
-    JanusTyped e (Ptr a)
+    KnownJanusType e (Ptr a)
   ) =>
   GJanusStructProject e (K1 i (PtrOf Identity a)) (K1 i (PtrOf (PtrOf e) a))
   where
@@ -638,7 +638,7 @@ instance
   ( ExpStructPtr e,
     JanusStruct (PtrStruct sub),
     Generic (PtrStruct sub (PtrOf e)),
-    JanusTyped e (CStruct (PtrStruct sub)),
+    KnownJanusType e (CStruct (PtrStruct sub)),
     GJanusStructProject e (Rep (PtrStruct sub Identity)) (Rep (PtrStruct sub (PtrOf e)))
   ) =>
   GJanusStructProject e (K1 i (sub (PtrOf Identity))) (K1 i (sub (PtrOf (PtrOf e))))
@@ -655,7 +655,7 @@ instance
     KnownNat w,
     Typeable w,
     Storable.Storable a,
-    JanusTyped e (FixedArray w a)
+    KnownJanusType e (FixedArray w a)
   ) =>
   GJanusStructProject e (K1 i (TileField w Identity a)) (K1 i (TileField w (PtrOf e) a))
   where
@@ -670,7 +670,7 @@ instance
     JanusStruct (TileStruct w sub),
     Coercible (TileStruct w sub (PtrOf e)) (sub (TileField w (PtrOf e))),
     Generic (TileStruct w sub (PtrOf e)),
-    JanusTyped e (CStruct (TileStruct w sub)),
+    KnownJanusType e (CStruct (TileStruct w sub)),
     GJanusStructProject e (Rep (TileStruct w sub Identity)) (Rep (TileStruct w sub (PtrOf e)))
   ) =>
   GJanusStructProject e (K1 i (sub (TileField w Identity))) (K1 i (sub (TileField w (PtrOf e))))
@@ -686,7 +686,7 @@ instance
   ( ExpStructPtr e,
     JanusStruct sub,
     Generic (sub (PtrOf e)),
-    JanusTyped e (CStruct sub),
+    KnownJanusType e (CStruct sub),
     GJanusStructProject e (Rep (sub Identity)) (Rep (sub (PtrOf e)))
   ) =>
   GJanusStructProject e (K1 i (sub Identity)) (K1 i (sub (PtrOf e)))

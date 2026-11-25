@@ -81,8 +81,9 @@ import Janus.Alloc.Policy
   )
 import Janus.Backend.C
 import Janus.Command.Cond (ifThenElseM_, whenM_)
-import Janus.Command.Memory (CmdStorable (..), ExpPtr (..), ExpSized (..))
+import Janus.Command.Memory (CmdStorable (..), ExpPtr (..))
 import Janus.Command.Ref (newRef, readRef, writeRef)
+import Janus.Constraints (KnownJanusType)
 import Janus.Control.Drain (Drain (..), drainFirst, drainForEach, runDrain)
 import Janus.Control.Step (Step (..))
 import Janus.Control.Stream (Stream (..), filterMapS, rangeS)
@@ -103,7 +104,6 @@ import Janus.SPMD
     uniform,
     withSPMD,
   )
-import Janus.Typed (JanusTyped)
 
 type PoolSegSlots = 64
 
@@ -180,23 +180,12 @@ deriving stock instance Eq (Pool Identity a)
 
 deriving stock instance Show (Pool Identity a)
 
-type PoolCtx m e a =
-  ( LayoutCtx m e a,
-    Typeable a,
-    JanusTyped e (FixedArray PoolSegSlots Int64),
-    ExpPtr e (CStruct (PoolSeg a)),
-    ExpSized e (CStruct (PoolSeg a)),
-    JanusTyped e (CStruct (PoolSeg a)),
-    JanusTyped e (Ptr (CStruct (PoolSeg a))),
-    CmdStorable m e (Ptr (CStruct (PoolSeg a))),
-    ExpSized e (CStruct (PoolSpine a)),
-    JanusTyped e (CStruct (PoolSpine a))
-  )
+type PoolCtx m e a = LayoutCtx m e a
 
 -- | Branchless 6-step count-trailing-zeros for a non-zero @Word64@.
 ctzWord64 ::
   forall e.
-  (ExpBits e Word64, ExpCond e, JanusTyped e Int64, Num (e Word64), Num (e Int64)) =>
+  (ExpBits e Word64, ExpCond e, KnownJanusType e Int64, Num (e Word64), Num (e Int64)) =>
   e Word64 ->
   e Int64
 ctzWord64 m =

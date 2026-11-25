@@ -19,6 +19,7 @@ import Data.Loc (noLoc)
 import Data.Proxy (Proxy (..))
 import qualified Data.Set as Set
 import Data.Word
+import Foreign.C (CBool, CDouble (..), CFloat (..))
 import Foreign.Ptr (Ptr, ptrToWordPtr)
 import GHC.Float
 import GHC.Generics
@@ -75,6 +76,12 @@ instance ExpMurmurHash Identity (Identity Bool) where
 
 instance ExpMurmurHash (JanusCT t) (JanusCT t Bool) where
   murmurHashWithSalt seed b = hash64WithSalt seed (fromBool b)
+
+instance ExpMurmurHash Identity (Identity CBool) where
+  murmurHashWithSalt seed (Identity b) = hash64WithSalt seed (Identity (fromIntegral b))
+
+instance ExpMurmurHash (JanusCT t) (JanusCT t CBool) where
+  murmurHashWithSalt seed b = hash64WithSalt seed (janusCUnsafeCast b)
 
 instance ExpMurmurHash Identity (Identity (Ptr p)) where
   murmurHashWithSalt seed (Identity p) =
@@ -143,6 +150,22 @@ instance ExpMurmurHash (JanusCT t) (JanusCT t Float) where
 instance ExpMurmurHash (JanusCT t) (JanusCT t Double) where
   murmurHashWithSalt salt x =
     let w64 = jcBitcastToUInt @Double @Word64 8 x
+     in hash64WithSalt salt w64
+
+instance ExpMurmurHash Identity (Identity CFloat) where
+  murmurHashWithSalt salt (Identity (CFloat x)) = murmurHashWithSalt salt (Identity x)
+
+instance ExpMurmurHash Identity (Identity CDouble) where
+  murmurHashWithSalt salt (Identity (CDouble x)) = murmurHashWithSalt salt (Identity x)
+
+instance ExpMurmurHash (JanusCT t) (JanusCT t CFloat) where
+  murmurHashWithSalt salt x =
+    let w32 = jcBitcastToUInt @CFloat @Word32 4 x
+     in hash64WithSalt salt (toIntegral w32)
+
+instance ExpMurmurHash (JanusCT t) (JanusCT t CDouble) where
+  murmurHashWithSalt salt x =
+    let w64 = jcBitcastToUInt @CDouble @Word64 8 x
      in hash64WithSalt salt w64
 
 class GExpHash e f where

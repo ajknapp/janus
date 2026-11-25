@@ -77,16 +77,17 @@ import Janus.Alloc.Dynamic (CmdAllocBase)
 import Janus.Alloc.Policy (Alloc, CmdAlloc, allocStruct, freeStruct)
 import Janus.Backend.C
 import Janus.Command.Cond (ifThenElseM_, whenM_)
-import Janus.Command.Memory (CmdStorable (..), ExpPtr (..), ExpSized (..))
+import Janus.Command.Memory (CmdStorable (..), ExpPtr (..))
 import Janus.Command.Ref (newRef, readRef, writeRef)
+import Janus.Constraints (KnownJanusType)
 import Janus.Control.Drain (Drain (..), drainForEach, runDrain)
 import Janus.Control.Step (Step (..))
 import Janus.Control.Stream (Stream (..), streamM)
 import Janus.Data.HKD
+import Janus.Data.Layout (StructCtx)
 import Janus.Expression.Bool (ExpBool (..))
 import Janus.Expression.Cast (ExpPtrCast (..))
 import Janus.Expression.Eq (ExpEq (..))
-import Janus.Typed (JanusTyped)
 
 -- | 16-byte doubly-linked intrusive hook embedded directly inside user HKD node structs:
 -- @myHook :: !(f (CStruct RawListHook))@.
@@ -146,27 +147,16 @@ deriving stock instance Eq (IntrusiveList s Identity)
 
 deriving stock instance Show (IntrusiveList s Identity)
 
-type IntrusiveListCtx m e s =
-  ( CmdAllocBase m e,
-    Typeable s,
-    JanusStruct s,
-    ExpPtr e (CStruct s),
-    ExpSized e (CStruct s),
-    JanusTyped e (CStruct s),
-    JanusTyped e (Ptr (CStruct s)),
-    CmdStorable m e (Ptr (CStruct s)),
-    JanusTyped e (CStruct RawListHook),
-    JanusTyped e (CStruct IntrusiveListSpine)
-  )
+type IntrusiveListCtx m e s = StructCtx m e s
 
 asHookPtr ::
-  (ExpPtrCast e, JanusTyped e Word8, JanusTyped e (CStruct RawListHook)) =>
+  (ExpPtrCast e, KnownJanusType e Word8, KnownJanusType e (CStruct RawListHook)) =>
   e (Ptr Word8) ->
   e (Ptr (CStruct RawListHook))
 asHookPtr p = fromVoidPtr (toVoidPtr p)
 
 toRawHookPtr ::
-  (ExpPtrCast e, JanusTyped e (CStruct RawListHook), JanusTyped e Word8) =>
+  (ExpPtrCast e, KnownJanusType e (CStruct RawListHook), KnownJanusType e Word8) =>
   e (Ptr (CStruct RawListHook)) ->
   e (Ptr Word8)
 toRawHookPtr p = fromVoidPtr (toVoidPtr p)
@@ -203,7 +193,7 @@ hookRawToNode hookOff pHookRaw =
 -- | Allocate and initialize an empty circular sentinel 'IntrusiveList' for the given 'HookSpec'.
 new ::
   forall s m e.
-  (IntrusiveListCtx m e s, CmdAlloc m e, ExpSized e (CStruct IntrusiveListSpine)) =>
+  (IntrusiveListCtx m e s) =>
   Alloc e ->
   HookSpec s ->
   m (IntrusiveList s e)
@@ -221,7 +211,7 @@ new alloc (HookSpec off) = do
 
 -- | Free ONLY the list spine (leaving any nodes untouched).
 freeListSpine ::
-  (IntrusiveListCtx m e s, CmdAlloc m e, ExpSized e (CStruct IntrusiveListSpine)) =>
+  (IntrusiveListCtx m e s) =>
   Alloc e ->
   IntrusiveList s e ->
   m ()
@@ -229,7 +219,7 @@ freeListSpine alloc (IntrusiveList hdr) = freeStruct alloc hdr
 
 -- | Prefetch-safe walk freeing every currently linked node via @alloc@, then freeing the list spine.
 freeAllNodesAndSpine ::
-  (IntrusiveListCtx m e s, CmdAlloc m e, ExpSized e (CStruct IntrusiveListSpine)) =>
+  (IntrusiveListCtx m e s) =>
   Alloc e ->
   IntrusiveList s e ->
   m ()
@@ -337,7 +327,7 @@ isNodeLinked (IntrusiveList hdr) pNode = do
   pure (ptrToWord64Expr nxt `ne` 0)
 
 linkHookBetween ::
-  (CmdAllocBase m e, JanusTyped e (CStruct RawListHook)) =>
+  (CmdAllocBase m e) =>
   e (Ptr Word8) ->
   e (Ptr Word8) ->
   e (Ptr Word8) ->
@@ -644,7 +634,6 @@ drainToList ::
   forall s m e.
   ( IntrusiveListCtx m e s,
     CmdAlloc m e,
-    ExpSized e (CStruct IntrusiveListSpine),
     Generic (s (PtrOf e)),
     Generic (s e),
     GJanusStructProject e (Rep (s Identity)) (Rep (s (PtrOf e))),
@@ -661,7 +650,6 @@ drainToList alloc spec = Drain $ \st -> do
 fromStream ::
   ( IntrusiveListCtx m e s,
     CmdAlloc m e,
-    ExpSized e (CStruct IntrusiveListSpine),
     Generic (s (PtrOf e)),
     Generic (s e),
     GJanusStructProject e (Rep (s Identity)) (Rep (s (PtrOf e))),

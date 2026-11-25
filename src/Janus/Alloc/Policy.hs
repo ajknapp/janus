@@ -85,49 +85,17 @@ import Janus.Command.Memory
   )
 import Janus.Command.Cond (ifThenElseM_, whenM_)
 import Janus.Command.Ref (newRef, readRef, writeRef)
-import Janus.Data.HKD (CStruct, FixedArray, getPtrOf, projectPtrs)
+import Janus.Constraints (CmdJanus)
+import Janus.Data.HKD (CStruct, getPtrOf, projectPtrs)
 import Janus.Expression.Bool (ExpBool (..))
 import Janus.Expression.Cast (ExpPtrCast (..))
 import Janus.Expression.Cond (ExpCond (..))
 import Janus.Expression.Eq (ExpEq (..))
 import Janus.Expression.Ord (ExpOrd (..))
-import Janus.Typed (JanusTyped)
 
 -- | Unified constraint bundle supporting all composable 'Alloc' policies across
 -- @(IO, Identity)@ and @(JanusCMT t, JanusCT t)@ across any target @t@.
-type CmdAlloc m e =
-  ( CmdAllocBase m e,
-    ExpSized e (CStruct FixedBufSpine),
-    JanusTyped e (CStruct FixedBufSpine),
-    ExpSized e (CStruct MonoSlabHdr),
-    JanusTyped e (CStruct MonoSlabHdr),
-    ExpPtr e (CStruct MonoSlabHdr),
-    CmdStorable m e (Ptr (CStruct MonoSlabHdr)),
-    ExpSized e (CStruct MonotonicSpine),
-    JanusTyped e (CStruct MonotonicSpine),
-    ExpSized e (CStruct ArenaSlabHdr),
-    JanusTyped e (CStruct ArenaSlabHdr),
-    ExpPtr e (CStruct ArenaSlabHdr),
-    CmdStorable m e (Ptr (CStruct ArenaSlabHdr)),
-    ExpSized e (CStruct ArenaLargeHdr),
-    JanusTyped e (CStruct ArenaLargeHdr),
-    ExpPtr e (CStruct ArenaLargeHdr),
-    CmdStorable m e (Ptr (CStruct ArenaLargeHdr)),
-    ExpSized e (CStruct ArenaSpine),
-    JanusTyped e (CStruct ArenaSpine),
-    ExpSized e (CStruct PoolSlabHdr),
-    JanusTyped e (CStruct PoolSlabHdr),
-    ExpPtr e (CStruct PoolSlabHdr),
-    CmdStorable m e (Ptr (CStruct PoolSlabHdr)),
-    ExpSized e (CStruct MemPoolSpine),
-    JanusTyped e (CStruct MemPoolSpine),
-    ExpSized e (CStruct RecyclerSpine),
-    JanusTyped e (CStruct RecyclerSpine),
-    JanusTyped e (FixedArray RecyclerBuckets (Ptr Word8)),
-    JanusTyped e (FixedArray RecyclerBuckets Int64),
-    ExpSized e (CStruct AllocTrackerSpine),
-    JanusTyped e (CStruct AllocTrackerSpine)
-  )
+type CmdAlloc m e = CmdJanus m e
 
 -- | First-class composable memory allocation policy datatype.
 data Alloc (e :: K.Type -> K.Type)
@@ -443,7 +411,7 @@ resetAlloc policy = case policy of
 
 allocStruct ::
   forall a m e.
-  (CmdAlloc m e, ExpSized e a, JanusTyped e a) =>
+  (CmdAlloc m e, ExpSized e a) =>
   Alloc e ->
   m (e (Ptr a))
 allocStruct alloc =
@@ -451,7 +419,7 @@ allocStruct alloc =
 
 freeStruct ::
   forall a m e.
-  (CmdAlloc m e, ExpSized e a, JanusTyped e a) =>
+  (CmdAlloc m e, ExpSized e a) =>
   Alloc e ->
   e (Ptr a) ->
   m ()
@@ -462,7 +430,7 @@ freeStruct alloc p =
 -- (returns @NULL@ without invoking the allocator when @n <= 0@).
 allocTypedArray ::
   forall a m e.
-  (CmdAlloc m e, ExpSized e a, JanusTyped e a) =>
+  (CmdAlloc m e, ExpSized e a) =>
   Alloc e ->
   e Int64 ->
   m (e (Ptr a))
@@ -478,7 +446,7 @@ allocTypedArray alloc n = do
 
 reallocTypedArray ::
   forall a m e.
-  (CmdAlloc m e, ExpSized e a, JanusTyped e a) =>
+  (CmdAlloc m e, ExpSized e a) =>
   Alloc e ->
   e (Ptr a) ->
   e Int64 ->
@@ -509,7 +477,7 @@ reallocTypedArray alloc oldP oldN newN = do
 
 freeTypedArray ::
   forall a m e.
-  (CmdAlloc m e, ExpSized e a, JanusTyped e a) =>
+  (CmdAlloc m e, ExpSized e a) =>
   Alloc e ->
   e (Ptr a) ->
   e Int64 ->

@@ -70,8 +70,9 @@ import GHC.Generics (Generic)
 import Janus.Alloc.Policy (Alloc, allocStruct, freeStruct)
 import Janus.Backend.C
 import Janus.Command.Cond (ifThenElseM_, whenM_)
-import Janus.Command.Memory (CmdStorable (..), ExpSized (..))
+import Janus.Command.Memory (CmdStorable (..))
 import Janus.Command.Ref (letM, newRef, readRef, writeRef)
+import Janus.Constraints (KnownJanusType)
 import Janus.Control.Drain (Drain (..), drainFind, drainForEach, runDrain)
 import Janus.Control.Step (Step (..))
 import Janus.Control.Stream (Stream (..), iterateS, rangeS, reverseRangeS, streamM, withStreamSetup)
@@ -82,7 +83,6 @@ import Janus.Expression.Cond (ExpCond (..))
 import Janus.Expression.Eq (ExpEq (..))
 import Janus.Expression.Ord (ExpOrd (..))
 import Janus.SPMD (SPMD, SPMDM, SPMDTyped)
-import Janus.Typed (JanusTyped)
 
 -- | C-ABI control spine for a contiguous LIFO 'Stack'.
 data StackSpine a f = StackSpine
@@ -103,12 +103,7 @@ deriving stock instance Eq (Stack Identity a)
 
 deriving stock instance Show (Stack Identity a)
 
-type StackCtx m e a =
-  ( LayoutCtx m e a,
-    Typeable a,
-    ExpSized e (CStruct (StackSpine a)),
-    JanusTyped e (CStruct (StackSpine a))
-  )
+type StackCtx m e a = LayoutCtx m e a
 
 -- | Allocate an empty 'Stack' (zero element-buffer allocation until first 'push' or 'reserve').
 new ::
@@ -223,7 +218,7 @@ push alloc st@(Stack hdr) val = do
 -- | Pop the top element, returning @(found, valOrDefault)@.
 pop ::
   forall a s m e.
-  (StackCtx m e a, Elem e a ~ e s, JanusTyped e s) =>
+  (StackCtx m e a, Elem e a ~ e s, KnownJanusType e s) =>
   e s ->
   Stack e a ->
   m (e Bool, e s)
@@ -266,7 +261,7 @@ withPop (Stack hdr) onEmpty onElem = do
 -- | Inspect the top element without popping, returning @(found, valOrDefault)@.
 peekTop ::
   forall a s m e.
-  (StackCtx m e a, Elem e a ~ e s, JanusTyped e s) =>
+  (StackCtx m e a, Elem e a ~ e s, KnownJanusType e s) =>
   e s ->
   Stack e a ->
   m (e Bool, e s)

@@ -69,15 +69,15 @@ import Janus.Backend.C
 import Janus.Command.Cond (ifThenElseM_, whenM_)
 import Janus.Command.Memory (CmdStorable (..), ExpPtr (..), ExpSized (..))
 import Janus.Command.Ref (newRef, readRef, writeRef)
+import Janus.Constraints (CmdElem, KnownJanusType)
 import Janus.Control.Drain (Drain (..), drainFoldM, drainForEach, drain_, runDrain)
 import Janus.Control.Stream (Stream, unfoldWhileM)
-import Janus.Data.FlatMap (OrdKey (..))
+import Janus.Data.FlatMap (OrdKey (..), OrdLayoutCtx)
 import Janus.Data.HKD
-import Janus.Data.Layout (Elem, StorageLayout)
+import Janus.Data.Layout (Elem, StructCtx)
 import Janus.Expression.Bool (ExpBool (..))
 import Janus.Expression.Cast (ExpPtrCast (..))
 import Janus.Expression.Eq (ExpEq (..))
-import Janus.Typed (JanusTyped)
 
 -- | 24-byte 3-pointer intrusive pairing-heap hook embedded inside user HKD node structs:
 -- @myHeapHook :: !(f (CStruct RawHeapHook))@.
@@ -162,33 +162,20 @@ deriving stock instance Show (IntrusiveHeap s k Identity)
 instance JanusHKD (IntrusiveHeap s k)
 
 type IntrusiveHeapCtx m e s k =
-  ( CmdAllocBase m e,
-    Typeable s,
-    Typeable k,
-    JanusStruct s,
-    StorageLayout k,
+  ( StructCtx m e s,
+    OrdLayoutCtx m e k,
     Elem e k ~ e k,
-    OrdKey e k,
-    CmdStorable m e k,
-    ExpPtr e k,
-    JanusTyped e k,
-    ExpPtr e (CStruct s),
-    ExpSized e (CStruct s),
-    JanusTyped e (CStruct s),
-    JanusTyped e (Ptr (CStruct s)),
-    CmdStorable m e (Ptr (CStruct s)),
-    JanusTyped e (CStruct RawHeapHook),
-    JanusTyped e (CStruct IntrusiveHeapSpine)
+    CmdElem m e k
   )
 
 asHeapHookPtr ::
-  (ExpPtrCast e, JanusTyped e Word8, JanusTyped e (CStruct RawHeapHook)) =>
+  (ExpPtrCast e, KnownJanusType e Word8, KnownJanusType e (CStruct RawHeapHook)) =>
   e (Ptr Word8) ->
   e (Ptr (CStruct RawHeapHook))
 asHeapHookPtr p = fromVoidPtr (toVoidPtr p)
 
 spineMarkerRaw ::
-  (ExpPtrCast e, JanusTyped e (CStruct IntrusiveHeapSpine), JanusTyped e Word8) =>
+  (ExpPtrCast e, KnownJanusType e (CStruct IntrusiveHeapSpine), KnownJanusType e Word8) =>
   e (Ptr (CStruct IntrusiveHeapSpine)) ->
   e (Ptr Word8)
 spineMarkerRaw hdr = fromVoidPtr (toVoidPtr hdr)
@@ -267,7 +254,6 @@ allocNode ::
   ( CmdAlloc m e,
     JanusStruct s,
     ExpSized e (CStruct s),
-    JanusTyped e (CStruct s),
     Generic (s (PtrOf e)),
     Generic (s e),
     GJanusStructProject e (Rep (s Identity)) (Rep (s (PtrOf e))),
@@ -282,7 +268,7 @@ allocNode alloc val = do
   pure p
 
 freeNode ::
-  (CmdAlloc m e, ExpSized e (CStruct s), JanusTyped e (CStruct s)) =>
+  (CmdAlloc m e, ExpSized e (CStruct s)) =>
   Alloc e ->
   e (Ptr (CStruct s)) ->
   m ()
@@ -313,7 +299,7 @@ allocAndPush alloc hp val = do
 --------------------------------------------------------------------------------
 
 attachChild ::
-  (CmdAllocBase m e, JanusTyped e (CStruct RawHeapHook)) =>
+  (CmdAllocBase m e) =>
   e (Ptr Word8) ->
   e (Ptr Word8) ->
   m ()
@@ -361,7 +347,7 @@ meldHooks hookOff keyOff aRaw bRaw = do
 -- | O(1) detach of a non-root linked node from its parent or left sibling
 -- (preserving @nodeRaw.rhhChild@ intact).
 cutNode ::
-  (CmdAllocBase m e, JanusTyped e (CStruct RawHeapHook)) =>
+  (CmdAllocBase m e) =>
   e (Ptr Word8) ->
   m ()
 cutNode nodeRaw = do

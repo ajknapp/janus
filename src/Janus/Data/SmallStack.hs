@@ -72,8 +72,9 @@ import GHC.TypeNats (KnownNat, Nat, natVal)
 import Janus.Alloc.Policy (Alloc, allocStruct, freeStruct)
 import Janus.Backend.C
 import Janus.Command.Cond (ifThenElseM_, whenM_)
-import Janus.Command.Memory (CmdStorable (..), ExpSized (..), allocaAligned)
+import Janus.Command.Memory (CmdStorable (..), allocaAligned)
 import Janus.Command.Ref (letM, newRef, readRef, writeRef)
+import Janus.Constraints (KnownJanusType)
 import Janus.Control.Drain (Drain (..), drainFind, drainForEach, runDrain)
 import Janus.Control.Step (Step (..))
 import Janus.Control.Stream (Stream (..), iterateS, rangeS, reverseRangeS, streamM, withStreamSetup)
@@ -84,7 +85,6 @@ import Janus.Expression.Cond (ExpCond (..))
 import Janus.Expression.Eq (ExpEq (..))
 import Janus.Expression.Ord (ExpOrd (..))
 import Janus.SPMD (SPMD, SPMDM, SPMDTyped, withSPMD)
-import Janus.Typed (JanusTyped)
 
 -- | Spine struct embedding @n@ inline elements directly inside the struct.
 -- While @sstsLen <= n@ (and no larger 'reserve' has been requested), @sstsIsHeap == 0@
@@ -116,14 +116,7 @@ deriving stock instance Eq (SmallStack n Identity a)
 
 deriving stock instance Show (SmallStack n Identity a)
 
-type SmallStackCtx n m e a =
-  ( InlineLayoutCtx n m e a,
-    KnownNat n,
-    Typeable n,
-    Typeable a,
-    ExpSized e (CStruct (SmallStackSpine n a)),
-    JanusTyped e (CStruct (SmallStackSpine n a))
-  )
+type SmallStackCtx n m e a = InlineLayoutCtx n m e a
 
 initSmallStackSpine ::
   forall n a m e.
@@ -268,7 +261,7 @@ push alloc st@(SmallStack hdr) val = do
 
 pop ::
   forall n a s m e.
-  (SmallStackCtx n m e a, Elem e a ~ e s, JanusTyped e s) =>
+  (SmallStackCtx n m e a, Elem e a ~ e s, KnownJanusType e s) =>
   e s ->
   SmallStack n e a ->
   m (e Bool, e s)
@@ -309,7 +302,7 @@ withPop (SmallStack hdr) onEmpty onElem = do
 
 peekTop ::
   forall n a s m e.
-  (SmallStackCtx n m e a, Elem e a ~ e s, JanusTyped e s) =>
+  (SmallStackCtx n m e a, Elem e a ~ e s, KnownJanusType e s) =>
   e s ->
   SmallStack n e a ->
   m (e Bool, e s)
