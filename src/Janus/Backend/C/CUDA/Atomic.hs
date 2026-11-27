@@ -3,6 +3,7 @@
 {-# LANGUAGE FunctionalDependencies #-}
 {-# LANGUAGE KindSignatures #-}
 {-# LANGUAGE MultiParamTypeClasses #-}
+{-# LANGUAGE QuasiQuotes #-}
 {-# LANGUAGE ScopedTypeVariables #-}
 {-# LANGUAGE TypeApplications #-}
 
@@ -20,7 +21,6 @@ where
 
 import qualified Control.Concurrent.Classy as CC
 import Control.Concurrent.MVar (MVar, newMVar, withMVar)
-import Control.Lens ((%~), (&), (+~), (^.))
 import Control.Monad.IO.Class (MonadIO (..))
 import Control.Monad.Reader (ask, lift)
 import Data.Bits (Bits (..))
@@ -41,39 +41,28 @@ import Janus.Backend.C.CUDA.Types
     JanusCUDAM (..),
     askCUDAFeatures,
   )
+import Janus.Backend.C.Quote
+  ( freshCVar,
+    getCType,
+    jcStms,
+  )
 import Janus.Backend.C.Raw
-  ( JanusCM,
-    JanusCMT (..),
+  ( JanusCMT (..),
     JanusCT (..),
     JanusCTyped,
-    JCType (..),
+    MonadJanusC (..),
     RVal (..),
-    addHeader,
-    appendBlock,
-    emitLocalVal,
-    getFunction,
-    getJanusCType,
-    jcfBlock,
-    jcfVarCounter,
     liftJanusCM,
-    modifyFunction,
-    signedIntConst,
   )
 import Janus.Backend.C.Target (cudaSM)
 import Language.C.Quote
-  ( AssignOp (..),
-    BinOp (..),
-    BlockItem (..),
+  ( BinOp (..),
     Decl (..),
     DeclSpec (..),
     Exp (..),
     Id (..),
-    Init (..),
-    InitGroup (..),
-    Stm (..),
     Type (..),
     TypeSpec (..),
-    UnOp (..),
   )
 import System.IO.Unsafe (unsafePerformIO)
 import Test.DejaFu.Conc (ConcIO)
@@ -115,27 +104,6 @@ class (CmdAtomic m e) => CmdAtomicBits m e a where
 cNamedTy :: String -> Type
 cNamedTy s = Type (DeclSpec [] [] (Tnamed (Id s noLoc) [] noLoc) noLoc) (DeclRoot noLoc) noLoc
 
-cPtrTy :: String -> Type
-cPtrTy s = Type (DeclSpec [] [] (Tnamed (Id s noLoc) [] noLoc) noLoc) (Ptr [] (DeclRoot noLoc) noLoc) noLoc
-
-cCall :: String -> [Exp] -> Exp
-cCall f args = FnCall (Var (Id f noLoc) noLoc) args noLoc
-
-emitUninitLocal :: JCType -> JanusCM Exp
-emitUninitLocal (JCType spec dec) = do
-  fn <- getFunction
-  let c = fn ^. jcfVarCounter
-      vid = Id ("at_" <> show c) noLoc
-      decl = BlockDecl $ InitGroup spec [] [Init vid dec Nothing Nothing [] noLoc] noLoc
-  modifyFunction $ \f ->
-    f
-      & jcfBlock %~ flip appendBlock [decl]
-      & jcfVarCounter +~ 1
-  pure (Var vid noLoc)
-
-appendCStm :: Stm -> JanusCM ()
-appendCStm stm = modifyFunction $ \f -> f & jcfBlock %~ flip appendBlock [BlockStm stm]
-
 -- | Emit a GCC/Clang C11 @__atomic_compare_exchange_n@ returning the observed
 -- old value (matching CUDA @atomicCAS@ semantics!).
 emitHostCAS ::
@@ -149,19 +117,12 @@ emitHostCAS (JanusCT mp) (JanusCT mcmp) (JanusCT mval) = liftJanusCM $ do
   RVal ep <- mp
   RVal ecmp <- mcmp
   RVal eval <- mval
-  ty <- getJanusCType (Proxy @a)
-  oldVar <- emitLocalVal ty ecmp
-  let call =
-        cCall
-          "__atomic_compare_exchange_n"
-          [ ep,
-            UnOp AddrOf oldVar noLoc,
-            eval,
-            signedIntConst (0 :: Int),
-            Var (Id "__ATOMIC_ACQ_REL" noLoc) noLoc,
-            Var (Id "__ATOMIC_ACQUIRE" noLoc) noLoc
-          ]
-  appendCStm (Exp (Just call) noLoc)
+  ty <- getCType (Proxy @a)
+  (oldId, oldVar) <- freshCVar "x"
+  [jcStms|
+    $ty:ty $id:oldId = $exp:ecmp;
+    __atomic_compare_exchange_n($exp:ep, &$id:oldId, $exp:eval, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE);
+  |]
   pure (JanusCT (pure (RVal oldVar)))
 
 emitHostFetchOp ::
@@ -174,9 +135,10 @@ emitHostFetchOp ::
 emitHostFetchOp fnName (JanusCT mp) (JanusCT mv) = liftJanusCM $ do
   RVal ep <- mp
   RVal ev <- mv
-  ty <- getJanusCType (Proxy @a)
-  res <- emitLocalVal ty (cCall fnName [ep, ev, Var (Id "__ATOMIC_ACQ_REL" noLoc) noLoc])
-  pure (JanusCT (pure (RVal res)))
+  ty <- getCType (Proxy @a)
+  (resId, resVar) <- freshCVar "x"
+  [jcStms| $ty:ty $id:resId = $id:fnName($exp:ep, $exp:ev, __ATOMIC_ACQ_REL); |]
+  pure (JanusCT (pure (RVal resVar)))
 
 -- | Generic host CAS loop for floating-point add/min/max and integer min/max.
 emitHostCASLoop ::
@@ -189,39 +151,29 @@ emitHostCASLoop ::
   JanusCT t a ->
   JanusCMT t (JanusCT t a)
 emitHostCASLoop uName nbytes combine (JanusCT mp) (JanusCT mv) = liftJanusCM $ do
-  addHeader "stdint.h"
-  addHeader "string.h"
   RVal ep <- mp
   RVal ev <- mv
-  tyA <- getJanusCType (Proxy @a)
-  let tyU = JCType (DeclSpec [] [] (Tnamed (Id uName noLoc) [] noLoc) noLoc) (DeclRoot noLoc)
-  ptrU <- emitLocalVal (JCType (DeclSpec [] [] (Tnamed (Id uName noLoc) [] noLoc) noLoc) (Ptr [] (DeclRoot noLoc) noLoc)) (Cast (cPtrTy uName) ep noLoc)
-  valA <- emitLocalVal tyA ev
-  oldU <- emitLocalVal tyU (cCall "__atomic_load_n" [ptrU, Var (Id "__ATOMIC_RELAXED" noLoc) noLoc])
-  oldA <- emitUninitLocal tyA
-  newA <- emitUninitLocal tyA
-  newU <- emitUninitLocal tyU
-  let szE = signedIntConst nbytes
-      body =
-        [ BlockStm $ Exp (Just $ cCall "memcpy" [UnOp AddrOf oldA noLoc, UnOp AddrOf oldU noLoc, szE]) noLoc,
-          BlockStm $ Exp (Just $ Assign newA JustAssign (combine oldA valA) noLoc) noLoc,
-          BlockStm $ Exp (Just $ cCall "memcpy" [UnOp AddrOf newU noLoc, UnOp AddrOf newA noLoc, szE]) noLoc
-        ]
-      casCond =
-        UnOp
-          Lnot
-          ( cCall
-              "__atomic_compare_exchange_n"
-              [ ptrU,
-                UnOp AddrOf oldU noLoc,
-                newU,
-                signedIntConst (1 :: Int),
-                Var (Id "__ATOMIC_ACQ_REL" noLoc) noLoc,
-                Var (Id "__ATOMIC_RELAXED" noLoc) noLoc
-              ]
-          )
-          noLoc
-  appendCStm (DoWhile (Block body noLoc) casCond noLoc)
+  tyA <- getCType (Proxy @a)
+  let tyU = cNamedTy uName
+  (oldId, oldA) <- freshCVar "at"
+  let combinedExp = combine oldA (Var (Id "janus_val_a" noLoc) noLoc)
+  [jcStms|
+    #include <stdint.h>
+    #include <string.h>
+    $ty:tyA $id:oldId;
+    {
+      $ty:tyU *janus_ptr_u = ($ty:tyU *)$exp:ep;
+      $ty:tyA janus_val_a = $exp:ev;
+      $ty:tyU janus_old_u = __atomic_load_n(janus_ptr_u, __ATOMIC_RELAXED);
+      $ty:tyA janus_new_a;
+      $ty:tyU janus_new_u;
+      do {
+        memcpy(&$id:oldId, &janus_old_u, $int:nbytes);
+        janus_new_a = $exp:combinedExp;
+        memcpy(&janus_new_u, &janus_new_a, $int:nbytes);
+      } while (!__atomic_compare_exchange_n(janus_ptr_u, &janus_old_u, janus_new_u, 1, __ATOMIC_ACQ_REL, __ATOMIC_RELAXED));
+    }
+  |]
   pure (JanusCT (pure (RVal oldA)))
 
 --------------------------------------------------------------------------------
@@ -306,14 +258,14 @@ emitCUDAAtomic2 ::
   JanusCUDA (Ptr a) ->
   JanusCUDA a ->
   JanusCUDAM (JanusCUDA a)
-emitCUDAAtomic2 fnName cCastTy (JanusCUDA (JanusCT mp)) (JanusCUDA (JanusCT mv)) =
-  JanusCUDAM $ lift $ do
-    RVal ep <- mp
-    RVal ev <- mv
-    ty <- getJanusCType (Proxy @a)
-    let call = cCall fnName [Cast (cPtrTy cCastTy) ep noLoc, Cast (cNamedTy cCastTy) ev noLoc]
-    res <- emitLocalVal ty (Cast (let JCType s d = ty in Type s d noLoc) call noLoc)
-    pure (JanusCUDA (JanusCT (pure (RVal res))))
+emitCUDAAtomic2 fnName cCastTy (JanusCUDA (JanusCT mp)) (JanusCUDA (JanusCT mv)) = do
+  RVal ep <- liftJC mp
+  RVal ev <- liftJC mv
+  ty <- getCType (Proxy @a)
+  let castTy = cNamedTy cCastTy
+  (resId, resExp) <- freshCVar "x"
+  [jcStms| $ty:ty $id:resId = ($ty:ty)$id:fnName(($ty:castTy *)$exp:ep, ($ty:castTy)$exp:ev); |]
+  pure (JanusCUDA (JanusCT (pure (RVal resExp))))
 
 -- | Generic CUDA CAS loop using @atomicCAS@ on 32-bit @unsigned int@ or 64-bit
 -- @unsigned long long int@ (supports SM50 Double add, float/double min/max, etc.).
@@ -327,58 +279,51 @@ emitCUDACASLoop ::
   JanusCUDA (Ptr a) ->
   JanusCUDA a ->
   JanusCUDAM (JanusCUDA a)
-emitCUDACASLoop uTy toA toU combine (JanusCUDA (JanusCT mp)) (JanusCUDA (JanusCT mv)) =
-  JanusCUDAM $ lift $ do
-    RVal ep <- mp
-    RVal ev <- mv
-    tyA <- getJanusCType (Proxy @a)
-    let tyU = JCType (DeclSpec [] [] (Tnamed (Id uTy noLoc) [] noLoc) noLoc) (DeclRoot noLoc)
-        tyUPtr = JCType (DeclSpec [] [] (Tnamed (Id uTy noLoc) [] noLoc) noLoc) (Ptr [] (DeclRoot noLoc) noLoc)
-    addrU <- emitLocalVal tyUPtr (Cast (cPtrTy uTy) ep noLoc)
-    valA <- emitLocalVal tyA ev
-    oldU <- emitLocalVal tyU (UnOp Deref addrU noLoc)
-    assumedU <- emitUninitLocal tyU
-    let newExpr = combine (cCall toA [assumedU]) valA
-        newU = cCall toU [newExpr]
-        body =
-          [ BlockStm $ Exp (Just $ Assign assumedU JustAssign oldU noLoc) noLoc,
-            BlockStm $ Exp (Just $ Assign oldU JustAssign (cCall "atomicCAS" [addrU, assumedU, newU]) noLoc) noLoc
-          ]
-    appendCStm (DoWhile (Block body noLoc) (BinOp Ne assumedU oldU noLoc) noLoc)
-    res <- emitLocalVal tyA (cCall toA [oldU])
-    pure (JanusCUDA (JanusCT (pure (RVal res))))
+emitCUDACASLoop uTy toA toU combine (JanusCUDA (JanusCT mp)) (JanusCUDA (JanusCT mv)) = do
+  RVal ep <- liftJC mp
+  RVal ev <- liftJC mv
+  tyA <- getCType (Proxy @a)
+  let tyU = cNamedTy uTy
+  (resId, resExp) <- freshCVar "x"
+  let assumedA = FnCall (Var (Id toA noLoc) noLoc) [Var (Id "janus_assumed_u" noLoc) noLoc] noLoc
+      newExpr = combine assumedA (Var (Id "janus_val_a" noLoc) noLoc)
+  [jcStms|
+    $ty:tyA $id:resId;
+    {
+      $ty:tyU *janus_addr_u = ($ty:tyU *)$exp:ep;
+      $ty:tyA janus_val_a = $exp:ev;
+      $ty:tyU janus_old_u = *janus_addr_u;
+      $ty:tyU janus_assumed_u;
+      do {
+        janus_assumed_u = janus_old_u;
+        janus_old_u = atomicCAS(janus_addr_u, janus_assumed_u, $id:toU($exp:newExpr));
+      } while (janus_assumed_u != janus_old_u);
+      $id:resId = $id:toA(janus_old_u);
+    }
+  |]
+  pure (JanusCUDA (JanusCT (pure (RVal resExp))))
 
 instance CmdAtomic JanusCUDAM JanusCUDA where
-  atomicCAS32Ptr (JanusCUDA (JanusCT mp)) (JanusCUDA (JanusCT mcmp)) (JanusCUDA (JanusCT mval)) =
-    JanusCUDAM $ lift $ do
-      RVal ep <- mp
-      RVal ecmp <- mcmp
-      RVal eval <- mval
-      ty <- getJanusCType (Proxy @Word32)
-      let call =
-            cCall
-              "atomicCAS"
-              [ Cast (cPtrTy "unsigned int") ep noLoc,
-                Cast (cNamedTy "unsigned int") ecmp noLoc,
-                Cast (cNamedTy "unsigned int") eval noLoc
-              ]
-      res <- emitLocalVal ty (Cast (cNamedTy "uint32_t") call noLoc)
-      pure (JanusCUDA (JanusCT (pure (RVal res))))
-  atomicCAS64Ptr (JanusCUDA (JanusCT mp)) (JanusCUDA (JanusCT mcmp)) (JanusCUDA (JanusCT mval)) =
-    JanusCUDAM $ lift $ do
-      RVal ep <- mp
-      RVal ecmp <- mcmp
-      RVal eval <- mval
-      ty <- getJanusCType (Proxy @Word64)
-      let call =
-            cCall
-              "atomicCAS"
-              [ Cast (cPtrTy "unsigned long long int") ep noLoc,
-                Cast (cNamedTy "unsigned long long int") ecmp noLoc,
-                Cast (cNamedTy "unsigned long long int") eval noLoc
-              ]
-      res <- emitLocalVal ty (Cast (cNamedTy "uint64_t") call noLoc)
-      pure (JanusCUDA (JanusCT (pure (RVal res))))
+  atomicCAS32Ptr (JanusCUDA (JanusCT mp)) (JanusCUDA (JanusCT mcmp)) (JanusCUDA (JanusCT mval)) = do
+    RVal ep <- liftJC mp
+    RVal ecmp <- liftJC mcmp
+    RVal eval <- liftJC mval
+    ty <- getCType (Proxy @Word32)
+    (resId, resExp) <- freshCVar "x"
+    [jcStms|
+      $ty:ty $id:resId = (uint32_t)atomicCAS((unsigned int *)$exp:ep, (unsigned int)$exp:ecmp, (unsigned int)$exp:eval);
+    |]
+    pure (JanusCUDA (JanusCT (pure (RVal resExp))))
+  atomicCAS64Ptr (JanusCUDA (JanusCT mp)) (JanusCUDA (JanusCT mcmp)) (JanusCUDA (JanusCT mval)) = do
+    RVal ep <- liftJC mp
+    RVal ecmp <- liftJC mcmp
+    RVal eval <- liftJC mval
+    ty <- getCType (Proxy @Word64)
+    (resId, resExp) <- freshCVar "x"
+    [jcStms|
+      $ty:ty $id:resId = (uint64_t)atomicCAS((unsigned long long int *)$exp:ep, (unsigned long long int)$exp:ecmp, (unsigned long long int)$exp:eval);
+    |]
+    pure (JanusCUDA (JanusCT (pure (RVal resExp))))
 
 instance CmdAtomicAdd JanusCUDAM JanusCUDA Int32 where
   atomicAddPtr = emitCUDAAtomic2 "atomicAdd" "int"

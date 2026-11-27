@@ -78,12 +78,20 @@ data JanusCBackend = JC | JCUDA
 
 newtype LVal a = LVal {getLVal :: Exp}
 
+instance ToExp (LVal a) where
+  toExp (LVal e) _ = e
+
 newtype RVal a = RVal {getRVal :: Exp}
+
+instance ToExp (RVal a) where
+  toExp (RVal e) _ = e
 
 data JCType = JCType DeclSpec Decl
   deriving (Eq, Ord, Show)
 
-data JCTypedef = JCTypedef DeclSpec String
+data JCTypedef
+  = JCTypedef DeclSpec String
+  | JCTypedefFull DeclSpec Decl String
   deriving (Eq, Ord, Show)
 
 data JCFunc = JCFunc
@@ -163,6 +171,15 @@ getJanusC = getJanusCT
 
 type JanusC = JanusCT PortableC
 
+class (Monad m) => MonadJanusC (m :: K.Type -> K.Type) where
+  liftJC :: JanusCM a -> m a
+
+instance MonadJanusC (JanusCMT t) where
+  liftJC = liftJanusCM
+
+instance (MonadJanusC m) => MonadJanusC (ReaderT r m) where
+  liftJC = lift . liftJC
+
 askFuncName :: JanusCMT t String
 askFuncName = asks _jcfiName
 
@@ -203,13 +220,17 @@ addStaticStorage (DeclSpec sto tqs ts loc) =
    in DeclSpec sto' tqs ts loc
 addStaticStorage ds = ds
 
+jcTypedefName :: JCTypedef -> String
+jcTypedefName (JCTypedef _ nm) = nm
+jcTypedefName (JCTypedefFull _ _ nm) = nm
+
 dedupTypedefs :: [JCTypedef] -> [JCTypedef]
 dedupTypedefs = go Set.empty
   where
     go _ [] = []
-    go seen (td@(JCTypedef _ nm) : rest)
-      | Set.member nm seen = go seen rest
-      | otherwise = td : go (Set.insert nm seen) rest
+    go seen (td : rest)
+      | Set.member (jcTypedefName td) seen = go seen rest
+      | otherwise = td : go (Set.insert (jcTypedefName td) seen) rest
 
 renderJCFunc :: JCFunc -> String
 renderJCFunc (JCFunc fname headerSet typedefList _ funcSet (Just (JCType spec dec)) params block e _) =
@@ -223,9 +244,20 @@ renderJCFunc (JCFunc fname headerSet typedefList _ funcSet (Just (JCType spec de
               noLoc
           )
           noLoc
+      tdef (JCTypedefFull spec' dec' name) =
+        DecDef
+          ( TypedefGroup
+              spec'
+              []
+              [Typedef (Id name noLoc) dec' [] noLoc]
+              noLoc
+          )
+          noLoc
       protos = foldMap ((<> "\n") . pretty 120 . ppr . BlockDecl) funcSet
       typedefs = foldMap ((<> "\n") . pretty 120 . ppr . tdef) (dedupTypedefs typedefList)
-      block' = appendBlock block [BlockStm $ Return e noLoc]
+      block' = case e of
+        Just _ -> appendBlock block [BlockStm $ Return e noLoc]
+        Nothing -> block
       body = pretty 120 $ ppr $ Func spec (Id fname noLoc) dec params (appEndo block' []) noLoc
       externCBegin = "#ifdef __cplusplus\nextern \"C\" {\n#endif\n\n"
       externCEnd = "\n\n#ifdef __cplusplus\n}\n#endif\n"
@@ -249,6 +281,15 @@ renderJCProgram entryName funcs =
               noLoc
           )
           noLoc
+      tdef (JCTypedefFull spec' dec' name) =
+        DecDef
+          ( TypedefGroup
+              spec'
+              []
+              [Typedef (Id name noLoc) dec' [] noLoc]
+              noLoc
+          )
+          noLoc
       typedefList = dedupTypedefs (foldMap _jcfTypedefs orderedFuncs)
       typedefs = foldMap ((<> "\n") . pretty 120 . ppr . tdef) typedefList
       isExternalProto (InitGroup _ _ inits _) =
@@ -269,7 +310,9 @@ renderJCProgram entryName funcs =
       allProtos = extProtos <> localProtos
       renderBody (JCFunc fname _ _ _ _ (Just (JCType spec dec)) params block e _) =
         let spec' = if fname == entryName then spec else addStaticStorage spec
-            block' = appendBlock block [BlockStm $ Return e noLoc]
+            block' = case e of
+              Just _ -> appendBlock block [BlockStm $ Return e noLoc]
+              Nothing -> block
          in pretty 120 $ ppr $ Func spec' (Id fname noLoc) dec params (appEndo block' []) noLoc
       renderBody _ = error "renderJCProgram: function has no type specified!"
       bodies = intercalate "\n\n" (map renderBody orderedFuncs)

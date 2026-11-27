@@ -3,24 +3,22 @@
 {-# LANGUAGE FlexibleInstances #-}
 {-# LANGUAGE FunctionalDependencies #-}
 {-# LANGUAGE InstanceSigs #-}
+{-# LANGUAGE QuasiQuotes #-}
 {-# LANGUAGE ScopedTypeVariables #-}
 {-# LANGUAGE TypeApplications #-}
 {-# LANGUAGE UndecidableSuperClasses #-}
 
 module Janus.Command.Range where
 
-import Control.Lens
-import Control.Monad.State
+import Data.Functor.Identity (Identity (..))
 import Data.Int
-import Data.Loc
-import Data.Monoid
 import Data.Proxy
+import Janus.Backend.C.Quote (captureBlock_, freshCVar, getCType, jcStms)
 import Janus.Backend.C.Raw
 import Janus.Command.Ref
 import Janus.Command.While
 import Janus.Expression.Ord
 import Janus.Typed
-import Language.C.Quote
 
 class (JanusTyped e Int64, ExpOrd e Int64, Num (e Int64)) => CmdRange m e | m -> e, e -> m where
   rangeM :: e Int64 -> e Int64 -> (e Int64 -> m ()) -> m ()
@@ -42,7 +40,9 @@ class (JanusTyped e Int64, ExpOrd e Int64, Num (e Int64)) => CmdRange m e | m ->
 instance CmdRange IO Identity where
 
 instance CmdRange (JanusCMT t) (JanusCT t) where
-  rangeM :: forall a. JanusCTyped a =>
+  rangeM ::
+    forall a.
+    (JanusCTyped a) =>
     JanusCT t a ->
     JanusCT t a ->
     (JanusCT t a -> JanusCMT t ()) ->
@@ -50,26 +50,7 @@ instance CmdRange (JanusCMT t) (JanusCT t) where
   rangeM (JanusC l) (JanusC u) body = do
     RVal l' <- liftJanusCM l
     RVal u' <- liftJanusCM u
-    JCType spec dec <- getJanusCType (Proxy @a)
-    case spec of
-      DeclSpec _ _ tspec _ -> do
-        fn <- getFunction
-        let block = fn ^. jcfBlock
-            c = fn ^. jcfVarCounter
-            idxId = Id ("i_" <> show c) noLoc
-            idx = Var idxId noLoc
-            fn' = fn & jcfBlock .~ mempty
-                     & jcfVarCounter +~ 1
-        fname <- askFuncName
-        modify $ \s -> s & ix fname .~ fn'
-        body $ JanusC $ pure $ RVal idx
-        fn'' <- getFunction
-        let igroup = InitGroup (DeclSpec [] [] tspec noLoc) [] idxInit noLoc
-            idxInit = [Init idxId dec Nothing (Just $ ExpInitializer l' noLoc) [] noLoc]
-            idxCond = BinOp Lt idx u' noLoc
-            idxAdv = PostInc idx noLoc
-            forBlock = Block (appEndo (fn'' ^. jcfBlock) []) noLoc
-            forloop = [BlockStm $ For (Left igroup) (Just idxCond) (Just idxAdv) forBlock noLoc]
-            fn''' = fn'' & jcfBlock .~ appendBlock block forloop
-        modify $ \s -> s & ix fname .~ fn'''
-      _ -> error "JanusC.rangeM: the impossible happened"
+    idxTy <- getCType (Proxy @a)
+    (idxId, idxExp) <- freshCVar "i"
+    bodyItems <- captureBlock_ (body (JanusC (pure (RVal idxExp))))
+    [jcStms| for ($ty:idxTy $id:idxId = $exp:l'; $id:idxId < $exp:u'; $id:idxId++) { $items:bodyItems } |]

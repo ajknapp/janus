@@ -14,6 +14,7 @@
 {-# LANGUAGE InstanceSigs #-}
 {-# LANGUAGE KindSignatures #-}
 {-# LANGUAGE MultiParamTypeClasses #-}
+{-# LANGUAGE QuasiQuotes #-}
 {-# LANGUAGE RankNTypes #-}
 {-# LANGUAGE ScopedTypeVariables #-}
 {-# LANGUAGE StandaloneDeriving #-}
@@ -52,12 +53,12 @@ where
 import qualified Control.Concurrent.Async as Async
 import qualified Control.Concurrent.Classy as CC
 import qualified Control.Concurrent.Classy.Async as CCA
-import Control.Lens ((%~), (&), (+~), (.~), (^.))
+import Control.Lens ((&), (+~), (^.))
 import Control.Monad (when)
 import qualified Control.Monad.Catch as Catch
 import Control.Monad.IO.Class (MonadIO (..))
-import Control.Monad.Reader (MonadReader (..), ReaderT (..), ask, local)
-import Control.Monad.State (gets, modify)
+import Control.Monad.Reader (MonadReader (..), ReaderT (..), ask)
+import Control.Monad.State (gets)
 import Data.Bits (Bits (..))
 import Data.Coerce (coerce)
 import Data.Function (fix)
@@ -69,7 +70,6 @@ import Data.Loc (noLoc)
 import qualified Data.Map as Map
 import Data.Maybe (isJust)
 import Data.Proxy (Proxy (..))
-import qualified Data.Set as Set
 import Data.Word (Word32, Word64)
 import Foreign.C (newCString)
 import qualified Foreign.Marshal.Alloc as FMA
@@ -81,26 +81,23 @@ import Janus.Backend.C.CUDA.Atomic
     CmdAtomicBits (..),
     CmdAtomicMinMax (..),
   )
+import Janus.Backend.C.Quote
+  ( captureBlock_,
+    freshCVar,
+    jcFuncs,
+    jcStms,
+    jcType,
+  )
 import Janus.Backend.C.Raw
   ( JCFunc (..),
     JanusCM,
     JanusCMT (..),
     JanusCT (..),
     JCType (..),
-    JCTypedef (..),
     RVal (..),
-    addHeader,
-    appendBlock,
-    finishFunction_,
     getFunction,
     getJanusCType,
-    jcfBlock,
-    jcfParams,
-    jcfProtos,
-    jcfTypedefs,
     jcfVarCounter,
-    jcfiIsLocal,
-    jcfiName,
     liftJanusCM,
     mangleJanusLocalName,
     modifyFunction,
@@ -146,24 +143,17 @@ import Janus.Fix (ExpFix (..), LocalArgs (..), localArgsTypeReps)
 import Janus.SPMD.Types (ExpPair (..))
 import Janus.Typed (IdConstraint, JanusTyped, KnownJanusType)
 import Language.C.Quote
-  ( Attr (..),
-    BinOp (..),
-    BlockItem (..),
-    Decl (..),
+  ( Decl (..),
     DeclSpec (..),
+    Definition (..),
     Exp (..),
     Field (..),
     FieldGroup (..),
     Id (..),
-    Init (..),
     InitGroup (..),
     Initializer (..),
-    Param (..),
-    Params (..),
-    Stm (..),
-    Storage (..),
-    Type (..),
     TypeSpec (..),
+    Typedef (..),
     UnOp (..),
   )
 import Test.DejaFu.Conc (ConcIO, Condition, MemType, Trace, runConcurrent)
@@ -291,52 +281,8 @@ unpackCtxArgs pctxExp idx (LACons (_ :: JanusCT t a) rest) =
   let fld = PtrMember pctxExp (Id ("f_" <> show idx) noLoc) noLoc
    in LACons (JanusCT (pure (RVal fld))) (unpackCtxArgs pctxExp (idx + 1) rest)
 
-mkAbtParallelForProtos :: [InitGroup]
-mkAbtParallelForProtos =
-  let i32Ty = DeclSpec [] [] (Tnamed (Id "int32_t" noLoc) [] noLoc) noLoc
-      i64Ty = DeclSpec [] [] (Tnamed (Id "int64_t" noLoc) [] noLoc) noLoc
-      voidTy = DeclSpec [] [] (Tvoid noLoc) noLoc
-      voidPtrDec = Ptr [] (DeclRoot noLoc) noLoc
-      workerParams =
-        Params
-          [ Param Nothing i32Ty (DeclRoot noLoc) noLoc,
-            Param Nothing i64Ty (DeclRoot noLoc) noLoc,
-            Param Nothing i64Ty (DeclRoot noLoc) noLoc,
-            Param Nothing voidTy voidPtrDec noLoc
-          ]
-          False
-          noLoc
-      workerFnPtrDec = Ptr [] (Proto (DeclRoot noLoc) workerParams noLoc) noLoc
-      fnParams =
-        Params
-          [ Param Nothing i64Ty (DeclRoot noLoc) noLoc,
-            Param Nothing i64Ty (DeclRoot noLoc) noLoc,
-            Param Nothing i64Ty (DeclRoot noLoc) noLoc,
-            Param Nothing voidTy voidPtrDec noLoc,
-            Param Nothing voidTy workerFnPtrDec noLoc
-          ]
-          False
-          noLoc
-      weakAttr = [Attr (Id "weak" noLoc) [] noLoc]
-      extWeakProto =
-        InitGroup
-          (DeclSpec [Textern Nothing noLoc] [] (Tvoid noLoc) noLoc)
-          []
-          [Init (Id "janus_abt_parallel_for" noLoc) (Proto (DeclRoot noLoc) fnParams noLoc) Nothing Nothing weakAttr noLoc]
-          noLoc
-      hookDecl =
-        InitGroup
-          (DeclSpec [] [] (Tvoid noLoc) noLoc)
-          []
-          [Init (Id "janus_abt_pfor_hook" noLoc) (Ptr [] (Proto (DeclRoot noLoc) fnParams noLoc) noLoc) Nothing (Just (ExpInitializer (Var (Id "NULL" noLoc) noLoc) noLoc)) weakAttr noLoc]
-          noLoc
-   in [extWeakProto, hookDecl]
-
 instance CmdParallel (JanusCMT t) (JanusCT t) where
   parallelForRangeM label (JanusCT mlo) (JanusCT mhi) (JanusCT mgrain) actualArgs body = do
-    fi <- ask
-    addHeader "stdint.h"
-    addHeader "stddef.h"
     RVal loExp <- liftJanusCM mlo
     RVal hiExp <- liftJanusCM mhi
     RVal grainExp <- liftJanusCM mgrain
@@ -346,104 +292,61 @@ instance CmdParallel (JanusCMT t) (JanusCT t) where
     modifyFunction (\f -> f & jcfVarCounter +~ 1)
     let mangledWorker = mangleJanusLocalName ("par_" <> label <> "_" <> show callSiteId) inTys []
         ctxStructName = "janus_par_ctx_" <> mangledWorker
-        workerInfo = fi & jcfiName .~ mangledWorker & jcfiIsLocal .~ True
         isEmptyArgs = case actualArgs of
           LANil -> True
           LACons {} -> False
-    -- Build typedef if captured args are non-empty
-    mCtxTypedef <-
+    ctxTypedefDecls <-
       if isEmptyArgs
-        then pure Nothing
+        then pure []
         else do
           fields <- liftJanusCM (buildCtxStructFields 0 actualArgs)
           let structSpec = DeclSpec [] [] (Tstruct Nothing (Just fields) [] noLoc) noLoc
-          pure (Just (JCTypedef structSpec ctxStructName))
-    case mCtxTypedef of
-      Just td -> modifyFunction (\f -> f & jcfTypedefs %~ (<> [td]))
-      Nothing -> pure ()
-    -- Define the local worker function if not already emitted
+              td = TypedefGroup structSpec [] [Typedef (Id ctxStructName noLoc) (DeclRoot noLoc) [] noLoc] noLoc
+          pure [DecDef td noLoc]
     alreadyDefined <- gets (maybe False (isJust . _jcfType) . Map.lookup mangledWorker)
-    let workerParams =
-          Params
-            [ Param (Just (Id "wid" noLoc)) (DeclSpec [] [] (Tnamed (Id "int32_t" noLoc) [] noLoc) noLoc) (DeclRoot noLoc) noLoc,
-              Param (Just (Id "lo" noLoc)) (DeclSpec [] [] (Tnamed (Id "int64_t" noLoc) [] noLoc) noLoc) (DeclRoot noLoc) noLoc,
-              Param (Just (Id "hi" noLoc)) (DeclSpec [] [] (Tnamed (Id "int64_t" noLoc) [] noLoc) noLoc) (DeclRoot noLoc) noLoc,
-              Param (Just (Id "raw_ctx" noLoc)) (DeclSpec [] [] (Tvoid noLoc) noLoc) (Ptr [] (DeclRoot noLoc) noLoc) noLoc
-            ]
-            False
-            noLoc
-    when (not alreadyDefined) $
-      local (const workerInfo) $ do
-        _ <- getFunction
-        addHeader "stdint.h"
-        addHeader "stddef.h"
-        case mCtxTypedef of
-          Just td -> modifyFunction (\f -> f & jcfTypedefs %~ (<> [td]))
-          Nothing -> pure ()
-        modify $ \s -> s & Map.adjust (\f -> f & jcfParams .~ workerParams) mangledWorker
-        let widE = JanusCT (pure (RVal (Var (Id "wid" noLoc) noLoc)))
-            loE = JanusCT (pure (RVal (Var (Id "lo" noLoc) noLoc)))
-            hiE = JanusCT (pure (RVal (Var (Id "hi" noLoc) noLoc)))
-        formalArgs <-
-          if isEmptyArgs
-            then do
-              -- Suppress unused parameter warning for raw_ctx
-              let voidCast = BlockStm $ Exp (Just (Cast (Type (DeclSpec [] [] (Tvoid noLoc) noLoc) (DeclRoot noLoc) noLoc) (Var (Id "raw_ctx" noLoc) noLoc) noLoc)) noLoc
-              modifyFunction (\f -> f & jcfBlock %~ flip appendBlock [voidCast])
-              pure actualArgs
-            else do
-              let ctxSpec = DeclSpec [] [] (Tnamed (Id ctxStructName noLoc) [] noLoc) noLoc
-                  ctxPtrDec = Ptr [] (DeclRoot noLoc) noLoc
-                  ctxPtrTy = Type ctxSpec ctxPtrDec noLoc
-                  pctxId = Id "pctx" noLoc
-                  pctxDecl =
-                    BlockDecl $
-                      InitGroup
-                        ctxSpec
-                        []
-                        [Init pctxId ctxPtrDec Nothing (Just (ExpInitializer (Cast ctxPtrTy (Var (Id "raw_ctx" noLoc) noLoc) noLoc) noLoc)) [] noLoc]
-                        noLoc
-              modifyFunction (\f -> f & jcfBlock %~ flip appendBlock [pctxDecl])
-              pure (unpackCtxArgs (Var pctxId noLoc) 0 actualArgs)
-        body widE loE hiE formalArgs
-        finishFunction_
-    -- Emit call site in caller: worker proto + janus_abt_parallel_for proto + stack-allocated ctx struct
-    let workerProto =
-          InitGroup
-            (DeclSpec [] [] (Tvoid noLoc) noLoc)
-            []
-            [Init (Id mangledWorker noLoc) (Proto (DeclRoot noLoc) workerParams noLoc) Nothing Nothing [] noLoc]
-            noLoc
-    modifyFunction (\f -> f & jcfProtos %~ \ps -> foldr Set.insert ps (workerProto : mkAbtParallelForProtos))
+    workerItems <-
+      if alreadyDefined
+        then pure []
+        else captureBlock_ $ do
+          let widE = JanusCT (pure (RVal (Var (Id "wid" noLoc) noLoc)))
+              loE = JanusCT (pure (RVal (Var (Id "lo" noLoc) noLoc)))
+              hiE = JanusCT (pure (RVal (Var (Id "hi" noLoc) noLoc)))
+          formalArgs <-
+            if isEmptyArgs
+              then do
+                [jcStms| (void)raw_ctx; |]
+                pure actualArgs
+              else do
+                [jcStms| typename $id:ctxStructName *pctx = (typename $id:ctxStructName *)raw_ctx; |]
+                pure (unpackCtxArgs (Var (Id "pctx" noLoc) noLoc) 0 actualArgs)
+          body widE loE hiE formalArgs
+    [jcFuncs|
+      #include <stdint.h>
+      #include <stddef.h>
+      $edecls:ctxTypedefDecls
+      extern void janus_abt_parallel_for(int64_t, int64_t, int64_t, void *, void (*)(int32_t, int64_t, int64_t, void *)) __attribute__((weak));
+      void (*janus_abt_pfor_hook)(int64_t, int64_t, int64_t, void *, void (*)(int32_t, int64_t, int64_t, void *)) __attribute__((weak)) = NULL;
+
+      void $id:mangledWorker(int32_t wid, int64_t lo, int64_t hi, void *raw_ctx) {
+        $items:workerItems
+      }
+    |]
     ctxPtrExp <-
       if isEmptyArgs
         then pure (Var (Id "NULL" noLoc) noLoc)
         else do
           argExps <- liftJanusCM (extractLocalArgsExps actualArgs)
-          fn <- getFunction
-          let c = fn ^. jcfVarCounter
-              ctxId = Id ("par_ctx_" <> show c) noLoc
-              ctxSpec = DeclSpec [] [] (Tnamed (Id ctxStructName noLoc) [] noLoc) noLoc
-              initList = CompoundInitializer [(Nothing, ExpInitializer e noLoc) | e <- argExps] noLoc
-              ctxDecl = BlockDecl $ InitGroup ctxSpec [] [Init ctxId (DeclRoot noLoc) Nothing (Just initList) [] noLoc] noLoc
-          modifyFunction $ \f ->
-            f
-              & jcfBlock %~ flip appendBlock [ctxDecl]
-              & jcfVarCounter +~ 1
-          let JCType vSpec vDec = voidPtrType
-          pure (Cast (Type vSpec vDec noLoc) (UnOp AddrOf (Var ctxId noLoc) noLoc) noLoc)
-    let callArgs = [loExp, hiExp, grainExp, ctxPtrExp, Var (Id mangledWorker noLoc) noLoc]
-        hookVar = Var (Id "janus_abt_pfor_hook" noLoc) noLoc
-        callHook = BlockStm $ Exp (Just $ FnCall hookVar callArgs noLoc) noLoc
-        callDirect = BlockStm $ Exp (Just $ FnCall (Var (Id "janus_abt_parallel_for" noLoc) noLoc) callArgs noLoc) noLoc
-        callStm =
-          BlockStm $
-            If
-              (BinOp Ne hookVar (Var (Id "NULL" noLoc) noLoc) noLoc)
-              (Block [callHook] noLoc)
-              (Just (Block [callDirect] noLoc))
-              noLoc
-    modifyFunction (\f -> f & jcfBlock %~ flip appendBlock [callStm])
+          let argInits = [ExpInitializer e noLoc | e <- argExps]
+          (ctxId, ctxVar) <- freshCVar "par_ctx"
+          [jcStms| typename $id:ctxStructName $id:ctxId = { $inits:argInits }; |]
+          pure (Cast (jcType voidPtrType) (UnOp AddrOf ctxVar noLoc) noLoc)
+    [jcStms|
+      if (janus_abt_pfor_hook != NULL) {
+        janus_abt_pfor_hook($exp:loExp, $exp:hiExp, $exp:grainExp, $exp:ctxPtrExp, $id:mangledWorker);
+      } else {
+        janus_abt_parallel_for($exp:loExp, $exp:hiExp, $exp:grainExp, $exp:ctxPtrExp, $id:mangledWorker);
+      }
+    |]
 
 --------------------------------------------------------------------------------
 -- DejaFu-Verifiable Parallel CPU Emulator (`ParallelDejaFuM`)

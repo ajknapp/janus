@@ -1,22 +1,17 @@
 {-# LANGUAGE FlexibleInstances #-}
 {-# LANGUAGE MultiParamTypeClasses #-}
+{-# LANGUAGE QuasiQuotes #-}
 {-# LANGUAGE TypeApplications #-}
 {-# LANGUAGE TypeFamilies #-}
 
 module Janus.Backend.C.LinuxX86_64.Types where
 
-import Control.Lens
-import Control.Monad.State (get, put)
-import Data.Loc
-import qualified Data.Map as Map
-import Data.Proxy
 import qualified Data.Set as Set
-import Data.Word
+import Janus.Backend.C.Quote (freshCVar, jcStms)
 import Janus.Backend.C.Raw
 import Janus.Backend.C.Target
 import Janus.Command.Ref (JanusCRefT)
 import Janus.Command.TicToc
-import Language.C.Quote
 
 --------------------------------------------------------------------------------
 -- LinuxX86_64 Target Descriptor & Type Aliases
@@ -52,26 +47,20 @@ instance JanusCTarget LinuxX86_64 where
 -- Cycle-Counter Hardware Intrinsics (RDTSC / RDTSCP)
 --------------------------------------------------------------------------------
 
-ticTocAsmBlock ::
-  (LinuxX86_64C a -> b) -> String -> [String] -> LinuxX86_64CM b
-ticTocAsmBlock newty str clobbers = do
-  fname <- askFuncName
-  JCType spec dec <- getJanusCType (Proxy @Word64)
-  jcs <- get
-  case Map.lookup fname jcs of
-    Just f -> do
-      let c = f ^. jcfVarCounter
-          vid = Id ("x_" <> show c) noLoc
-          ini = Init vid dec Nothing Nothing [] noLoc
-          asm = Asm True [] (StringLit [show str] "" noLoc) [AsmOut Nothing "\"=a\"" vid] [] clobbers noLoc
-          block = appendBlock (f ^. jcfBlock) [BlockDecl (InitGroup spec [] [ini] noLoc), BlockStm asm]
-      put $
-        jcs
-          & at fname . _Just . jcfVarCounter +~ 1
-          & at fname . _Just . jcfBlock .~ block
-      pure $ newty $ JanusC $ pure $ RVal (Var vid noLoc)
-    Nothing -> error "tic: the impossible happened"
-
 instance CmdTicToc LinuxX86_64CM LinuxX86_64C where
-  tic = ticTocAsmBlock Tic "rdtsc\n\tlfence\n\tshl $32, %%rdx\n\tor %%rdx, %0" ["\"rdx\"", "\"cc\"", "\"memory\""]
-  toc = ticTocAsmBlock Toc "rdtscp\n\tshl $32, %%rdx\n\tor %%rdx, %0" ["\"rdx\"", "\"rcx\"", "\"cc\"", "\"memory\""]
+  tic = do
+    (vid, vexp) <- freshCVar "x"
+    [jcStms|
+      #include <stdint.h>
+      uint64_t $id:vid;
+      asm volatile ("rdtsc\n\tlfence\n\tshl $32, %%rdx\n\tor %%rdx, %0" : "=a" ($id:vid) : : "rdx", "cc", "memory");
+    |]
+    pure (Tic (JanusC (pure (RVal vexp))))
+  toc = do
+    (vid, vexp) <- freshCVar "x"
+    [jcStms|
+      #include <stdint.h>
+      uint64_t $id:vid;
+      asm volatile ("rdtscp\n\tshl $32, %%rdx\n\tor %%rdx, %0" : "=a" ($id:vid) : : "rdx", "rcx", "cc", "memory");
+    |]
+    pure (Toc (JanusC (pure (RVal vexp))))

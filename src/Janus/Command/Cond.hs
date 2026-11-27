@@ -1,17 +1,16 @@
 {-# LANGUAGE FlexibleContexts #-}
 {-# LANGUAGE FlexibleInstances #-}
 {-# LANGUAGE FunctionalDependencies #-}
+{-# LANGUAGE QuasiQuotes #-}
 
 module Janus.Command.Cond where
 
-import Control.Lens
-import Data.Loc
-import Data.Monoid
+import Data.Functor.Identity (Identity (..))
+import Janus.Backend.C.Quote (captureBlock_, jcStms)
 import Janus.Backend.C.Raw
 import Janus.Command.Ref
 import Janus.Expression.Bool
 import Janus.Typed
-import Language.C.Quote
 
 class (ExpBool e, Monad m) => CmdCond m e | e -> m, m -> e where
   ifThenElseM_ :: e Bool -> m () -> m () -> m ()
@@ -22,24 +21,11 @@ instance CmdCond IO Identity where
 instance CmdCond (JanusCMT t) (JanusCT t) where
   ifThenElseM_ (JanusC c) t f = do
     RVal c' <- liftJanusCM c
-    fn <- getFunction
-    modifyFunction $ \jfn -> jfn & jcfBlock .~ mempty
-    t
-    fn' <- getFunction
-    let tblock = fn' ^. jcfBlock
-    modifyFunction $ \jfn -> jfn & jcfBlock .~ mempty
-    f
-    fn'' <- getFunction
-    let fblock = fn'' ^. jcfBlock
-        fblock' = appEndo fblock []
-        ifteStm =
-          BlockStm $
-            If
-              c'
-              (Block (appEndo tblock []) noLoc)
-              (if null fblock' then Nothing else Just (Block fblock' noLoc))
-              noLoc
-    modifyFunction $ \jfn -> jfn & jcfBlock .~ appendBlock (fn ^. jcfBlock) [ifteStm]
+    tItems <- captureBlock_ t
+    fItems <- captureBlock_ f
+    if null fItems
+      then [jcStms| if ($exp:c') { $items:tItems } |]
+      else [jcStms| if ($exp:c') { $items:tItems } else { $items:fItems } |]
 
 ifThenElseM ::
   (CmdCond m e, CmdRef m e, JanusTyped e a) =>

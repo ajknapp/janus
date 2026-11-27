@@ -59,6 +59,7 @@ library
                       Janus.Backend.C.CUDA.SharedMem
                       Janus.Backend.C.CUDA.Warp
                       Janus.Backend.C.LinuxX86_64
+                      Janus.Backend.C.Quote
                       Janus.Backend.C.TH
                       Janus.Backend.C.Target
                       Janus.Bench
@@ -280,6 +281,8 @@ test-suite janus-test
                       Test.Janus.Bench
                       Test.Janus.BenchDefs
                       Test.Janus.Backend.C.CUDA
+                      Test.Janus.Backend.C.Quote
+                      Test.Janus.Backend.C.QuoteDefs
                       Test.Janus.Backend.C.TH
                       Test.Janus.Backend.C.THDefs
                       Test.Janus.Backend.C.THOther

@@ -5,6 +5,7 @@
 {-# LANGUAGE FunctionalDependencies #-}
 {-# LANGUAGE InstanceSigs #-}
 {-# LANGUAGE KindSignatures #-}
+{-# LANGUAGE QuasiQuotes #-}
 {-# LANGUAGE ScopedTypeVariables #-}
 {-# LANGUAGE TypeApplications #-}
 
@@ -17,7 +18,6 @@ module Janus.Backend.C.CUDA.SharedMem
 where
 
 import qualified Control.Concurrent.Classy as CC
-import Control.Lens ((%~), (&), (+~), (^.))
 import Control.Monad.IO.Class (MonadIO (..))
 import Control.Monad.Reader (ask, lift)
 import Data.Coerce (Coercible, coerce)
@@ -25,7 +25,6 @@ import Data.Functor.Identity (Identity (..))
 import Data.IORef (atomicModifyIORef')
 import qualified Data.Kind as K
 import qualified Data.Map.Strict as Map
-import Data.Loc (noLoc)
 import Data.Proxy (Proxy (..))
 import Data.Typeable (Typeable)
 import Foreign.Marshal.Alloc (callocBytes)
@@ -34,31 +33,13 @@ import Foreign.Storable (Storable (sizeOf))
 import GHC.TypeNats (KnownNat, Nat, natVal)
 import Janus.Backend.C.CUDA.Runtime (CUDAM (..), CUDADejaFuM (..), CUDAIOM (..), Thread (..))
 import Janus.Backend.C.CUDA.Types (CUDADejaFu (..), CUDAIO (..), JanusCUDA (..), JanusCUDAM (..))
+import Janus.Backend.C.Quote (freshCVar, getCType, jcStms)
 import Janus.Backend.C.Raw
   ( JanusCT (..),
     JanusCTyped,
-    JCType (..),
     RVal (..),
-    appendBlock,
-    getFunction,
-    getJanusCType,
-    jcfBlock,
-    jcfVarCounter,
-    modifyFunction,
-    signedIntConst,
   )
 import Janus.Command.Memory (allocaAligned)
-import Language.C.Quote
-  ( ArraySize (..),
-    BlockItem (..),
-    Decl (..),
-    DeclSpec (..),
-    Exp (..),
-    Id (..),
-    Init (..),
-    InitGroup (..),
-    TypeQual (..),
-  )
 import Test.DejaFu.Conc (ConcIO)
 
 class (Monad m) => CmdSharedMem (m :: K.Type -> K.Type) (e :: K.Type -> K.Type) | m -> e, e -> m where
@@ -80,22 +61,10 @@ instance CmdSharedMem JanusCUDAM JanusCUDA where
     JanusCUDAM r
   withSharedArray pn k = do
     let len = max 1 (fromIntegral (natVal pn) :: Int)
-    arrExp <- JanusCUDAM $ lift $ do
-      JCType spec dec <- getJanusCType (Proxy @a)
-      fn <- getFunction
-      let c = fn ^. jcfVarCounter
-          vid = Id ("smem_" <> show c) noLoc
-          sharedSpec = case spec of
-            DeclSpec sto tqs ts loc -> DeclSpec sto (TCUDAshared noLoc : tqs) ts loc
-            other -> other
-          arrDec = Array [] (ArraySize False (signedIntConst len) noLoc) dec noLoc
-          decl = BlockDecl $ InitGroup sharedSpec [] [Init vid arrDec Nothing Nothing [] noLoc] noLoc
-      modifyFunction $ \f ->
-        f
-          & jcfBlock %~ flip appendBlock [decl]
-          & jcfVarCounter +~ 1
-      pure (JanusCUDA (JanusCT (pure (RVal (Var vid noLoc)))))
-    k arrExp
+    elemTy <- getCType (Proxy @a)
+    (vid, vexp) <- freshCVar "smem"
+    [jcStms| __shared__ $ty:elemTy $id:vid[$int:len]; |]
+    k (JanusCUDA (JanusCT (pure (RVal vexp))))
 
 cudaWithSharedArray ::
   forall baseM e (n :: Nat) a r.

@@ -87,7 +87,7 @@ mapCUDAThreadInfo f CUDAThreadInfo {..} =
 newtype JanusCUDA a = JanusCUDA {getJanusCUDA :: JanusC a}
 
 newtype JanusCUDAM a = JanusCUDAM {getJanusCUDAM :: ReaderT (CUDAThreadInfo JanusCUDA) JanusCM a}
-  deriving newtype (Functor, Applicative, Monad, MonadFix, MonadReader (CUDAThreadInfo JanusCUDA), MonadTargetFeatures)
+  deriving newtype (Functor, Applicative, Monad, MonadFix, MonadReader (CUDAThreadInfo JanusCUDA), MonadTargetFeatures, MonadJanusC)
 
 runJanusCUDAM :: JanusCUDAM a -> JanusCM a
 runJanusCUDAM (JanusCUDAM m) = runReaderT m magicThreadInfo
@@ -110,6 +110,9 @@ runJanusCUDAM (JanusCUDAM m) = runReaderT m magicThreadInfo
         }
 
 newtype JanusCUDARef a = JanusCUDARef {getJanusCUDARef :: JanusCRef a}
+
+instance ToExp (JanusCUDARef a) where
+  toExp (JanusCUDARef r) loc = toExp r loc
 
 mkCUDAFuncInfo :: CUDAFeatures -> String -> JCFuncInfo
 mkCUDAFuncInfo fs name = setTargetFeature cudaFeatureKey fs (mkJCFuncInfo name JCUDA False)

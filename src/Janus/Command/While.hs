@@ -1,17 +1,15 @@
 {-# LANGUAGE FlexibleInstances #-}
 {-# LANGUAGE FunctionalDependencies #-}
+{-# LANGUAGE QuasiQuotes #-}
 
 module Janus.Command.While where
 
-import Control.Lens
 import Control.Monad
-import Control.Monad.State
-import Data.Loc
-import Data.Monoid
+import Data.Functor.Identity (Identity (..))
+import Janus.Backend.C.Quote (captureBlock_, jcStms)
 import Janus.Backend.C.Raw
 import Janus.Command.Ref
 import Janus.Expression.Bool
-import Language.C.Quote
 
 class (Monad m, ExpBool e, CmdRef m e) => CmdWhile m e | e -> m, m -> e where
   whileM :: e Bool -> (Ref m e Bool -> m ()) -> m ()
@@ -27,15 +25,5 @@ instance CmdWhile IO Identity where
 instance CmdWhile (JanusCMT t) (JanusCT t) where
   whileM c body = do
     ref <- newRef c
-    let LVal r = getJanusCRef ref
-    fn <- getFunction
-    fname <- askFuncName
-    let block = fn ^. jcfBlock
-        fn' = fn & jcfBlock .~ mempty
-    modify $ \s -> s & ix fname .~ fn'
-    body ref
-    fn'' <- getFunction
-    let block' = fn'' ^. jcfBlock
-        whileStm = BlockStm $ While r (Block (appEndo block' []) noLoc) noLoc
-        fn''' = fn'' & jcfBlock .~ appendBlock block [whileStm]
-    modify $ \s -> s & ix fname .~ fn'''
+    bodyItems <- captureBlock_ (body ref)
+    [jcStms| while ($exp:ref) { $items:bodyItems } |]

@@ -2,6 +2,7 @@
 {-# LANGUAGE FlexibleInstances #-}
 {-# LANGUAGE FunctionalDependencies #-}
 {-# LANGUAGE MultiParamTypeClasses #-}
+{-# LANGUAGE QuasiQuotes #-}
 {-# LANGUAGE RankNTypes #-}
 {-# LANGUAGE ScopedTypeVariables #-}
 {-# LANGUAGE TypeApplications #-}
@@ -25,14 +26,13 @@ module Janus.Command.Memory
 where
 
 import Control.Exception (bracket)
-import Control.Lens ((%~), (&), (+~), (^.))
 import Control.Monad (when)
 import Control.Monad.Reader (asks)
 import Data.Functor.Identity (Identity (..))
 import Data.Int (Int64)
 import Data.Loc (noLoc)
 import Data.Proxy (Proxy (..))
-import Data.Word (Word64, Word8)
+import Data.Word (Word8)
 import Foreign.C.Types (CSize (..))
 import qualified Foreign.Marshal.Alloc as Alloc
 import Foreign.Marshal.Array (pokeArray)
@@ -40,12 +40,12 @@ import qualified Foreign.Marshal.Utils as MarshalUtils
 import Foreign.Ptr (Ptr, castPtr, plusPtr)
 import qualified Foreign.Ptr as Ptr
 import qualified Foreign.Storable as Storable
+import Janus.Backend.C.Quote (freshCId, freshCVar, getCType, jcStms)
 import Janus.Backend.C.Raw
 import Janus.CBits ()
 import Janus.Command.Ref (CmdRef (..), JanusCRefT (..))
 import Janus.Typed (JanusTyped)
 import Language.C.Quote
-import qualified Language.C.Quote as C
 import Text.PrettyPrint.Mainland (pretty)
 import Text.PrettyPrint.Mainland.Class (ppr)
 
@@ -140,119 +140,100 @@ instance CmdMem IO Identity where
   realloc (Identity p) (Identity i) = Identity <$> c_janus_aligned_realloc p (fromIntegral (max 0 i))
   free (Identity p) = c_janus_aligned_free p
 
-cAlignedRoundUp :: Exp -> Exp
-cAlignedRoundUp szExp =
-  let alignE = unsignedIntConst (fromIntegral janusSIMDAlignment :: Word)
-      maskE = unsignedIntConst (fromIntegral (janusSIMDAlignment - 1) :: Word)
-      zeroE = unsignedIntConst (0 :: Word)
-      rounded = BinOp And (BinOp Add szExp maskE noLoc) (UnOp Not maskE noLoc) noLoc
-   in Cond (BinOp Eq szExp zeroE noLoc) alignE rounded noLoc
-
-cSizeCast :: Exp -> Exp
-cSizeCast e = Cast (Type (DeclSpec [] [] (Tnamed (Id "size_t" noLoc) [] noLoc) noLoc) (DeclRoot noLoc) noLoc) e noLoc
-
 instance CmdMem (JanusCMT t) (JanusCT t) where
   malloc (JanusC mi) = do
     backend <- asks _jcfiBackend
     case backend of
       JCUDA -> janusCFFICall Nothing "malloc" (JanusC mi)
       JC -> do
-        addHeader "stdlib.h"
-        addHeader "stddef.h"
         RVal i' <- liftJanusCM mi
-        sz <- emitLocalVal (JCType (DeclSpec [] [] (Tnamed (Id "size_t" noLoc) [] noLoc) noLoc) (DeclRoot noLoc)) (cSizeCast i')
-        let alignE = unsignedIntConst (fromIntegral janusSIMDAlignment :: Word)
-            callE = FnCall (Var (Id "aligned_alloc" noLoc) noLoc) [alignE, cAlignedRoundUp sz] noLoc
-        p <- emitLocalVal voidPtrType callE
-        pure (JanusC (pure (RVal p)))
+        (pId, pExp) <- freshCVar "x"
+        let align = fromIntegral janusSIMDAlignment :: Word
+            mask = fromIntegral (janusSIMDAlignment - 1) :: Word
+        [jcStms|
+          #include <stdlib.h>
+          #include <stddef.h>
+          void *$id:pId;
+          {
+            size_t janus_sz = (size_t)$exp:i';
+            size_t janus_alloc_sz = janus_sz == 0U ? $uint:align : ((janus_sz + $uint:mask) & ~$uint:mask);
+            $id:pId = aligned_alloc($uint:align, janus_alloc_sz);
+          }
+        |]
+        pure (JanusC (pure (RVal pExp)))
   calloc (JanusC mn) (JanusC ms) = do
     backend <- asks _jcfiBackend
-    addHeader "stdlib.h"
-    addHeader "stddef.h"
-    addHeader "string.h"
     RVal n' <- liftJanusCM mn
     RVal s' <- liftJanusCM ms
-    let sizeTy = JCType (DeclSpec [] [] (Tnamed (Id "size_t" noLoc) [] noLoc) noLoc) (DeclRoot noLoc)
-    total <- emitLocalVal sizeTy (BinOp Mul (cSizeCast n') (cSizeCast s') noLoc)
-    p <- case backend of
-      JCUDA -> emitLocalVal voidPtrType (FnCall (Var (Id "malloc" noLoc) noLoc) [total] noLoc)
-      JC -> do
-        let alignE = unsignedIntConst (fromIntegral janusSIMDAlignment :: Word)
-        emitLocalVal voidPtrType (FnCall (Var (Id "aligned_alloc" noLoc) noLoc) [alignE, cAlignedRoundUp total] noLoc)
-    let zeroStm =
-          BlockStm $
-            If
-              (BinOp Ne p (Var (Id "NULL" noLoc) noLoc) noLoc)
-              (Block [BlockStm $ Exp (Just $ FnCall (Var (Id "memset" noLoc) noLoc) [p, signedIntConst (0 :: Int), total] noLoc) noLoc] noLoc)
-              Nothing
-              noLoc
-    modifyFunction $ \fn -> fn & jcfBlock %~ flip appendBlock [zeroStm]
-    pure (JanusC (pure (RVal p)))
+    (pId, pExp) <- freshCVar "x"
+    let align = fromIntegral janusSIMDAlignment :: Word
+        mask = fromIntegral (janusSIMDAlignment - 1) :: Word
+    case backend of
+      JCUDA ->
+        [jcStms|
+          #include <stdlib.h>
+          #include <stddef.h>
+          #include <string.h>
+          void *$id:pId;
+          {
+            size_t janus_total = (size_t)$exp:n' * (size_t)$exp:s';
+            $id:pId = malloc(janus_total);
+            if ($id:pId != NULL) {
+              memset($id:pId, 0, janus_total);
+            }
+          }
+        |]
+      JC ->
+        [jcStms|
+          #include <stdlib.h>
+          #include <stddef.h>
+          #include <string.h>
+          void *$id:pId;
+          {
+            size_t janus_total = (size_t)$exp:n' * (size_t)$exp:s';
+            size_t janus_alloc_sz = janus_total == 0U ? $uint:align : ((janus_total + $uint:mask) & ~$uint:mask);
+            $id:pId = aligned_alloc($uint:align, janus_alloc_sz);
+            if ($id:pId != NULL) {
+              memset($id:pId, 0, janus_total);
+            }
+          }
+        |]
+    pure (JanusC (pure (RVal pExp)))
   realloc (JanusC mp) (JanusC mi) = do
     backend <- asks _jcfiBackend
     case backend of
       JCUDA -> janusCFFICall Nothing "realloc" (JanusC mp) (JanusC mi)
       JC -> do
-        addHeader "stdlib.h"
-        addHeader "stddef.h"
-        addHeader "string.h"
-        addHeader "malloc.h"
         RVal p' <- liftJanusCM mp
         RVal i' <- liftJanusCM mi
-        let sizeTy = JCType (DeclSpec [] [] (Tnamed (Id "size_t" noLoc) [] noLoc) noLoc) (DeclRoot noLoc)
-            alignE = unsignedIntConst (fromIntegral janusSIMDAlignment :: Word)
-            nullE = Var (Id "NULL" noLoc) noLoc
-        oldP <- emitLocalVal voidPtrType p'
-        newSz <- emitLocalVal sizeTy (cSizeCast i')
-        outP <- emitLocalVal voidPtrType nullE
-        let allocCall = FnCall (Var (Id "aligned_alloc" noLoc) noLoc) [alignE, cAlignedRoundUp newSz] noLoc
-            usableE = FnCall (Var (Id "malloc_usable_size" noLoc) noLoc) [oldP] noLoc
-            oldSzId = Id "janus_old_sz" noLoc
-            oldSzDecl =
-              BlockDecl $
-                InitGroup
-                  (DeclSpec [] [] (Tnamed (Id "size_t" noLoc) [] noLoc) noLoc)
-                  []
-                  [Init oldSzId (DeclRoot noLoc) Nothing (Just (ExpInitializer usableE noLoc)) [] noLoc]
-                  noLoc
-            oldSzVar = Var oldSzId noLoc
-            copyLen = Cond (BinOp Lt oldSzVar newSz noLoc) oldSzVar newSz noLoc
-            moveBlock =
-              Block
-                [ oldSzDecl,
-                  BlockStm $ Exp (Just $ Assign outP JustAssign allocCall noLoc) noLoc,
-                  BlockStm $
-                    If
-                      (BinOp Ne outP nullE noLoc)
-                      ( Block
-                          [ BlockStm $ Exp (Just $ FnCall (Var (Id "memcpy" noLoc) noLoc) [outP, oldP, copyLen] noLoc) noLoc,
-                            BlockStm $ Exp (Just $ FnCall (Var (Id "free" noLoc) noLoc) [oldP] noLoc) noLoc
-                          ]
-                          noLoc
-                      )
-                      Nothing
-                      noLoc
-                ]
-                noLoc
-            reallocStm =
-              BlockStm $
-                If
-                  (BinOp Eq oldP nullE noLoc)
-                  (Block [BlockStm $ Exp (Just $ Assign outP JustAssign allocCall noLoc) noLoc] noLoc)
-                  ( Just $
-                      Block
-                        [ BlockStm $
-                            If
-                              (BinOp Eq newSz (unsignedIntConst (0 :: Word)) noLoc)
-                              (Block [BlockStm $ Exp (Just $ FnCall (Var (Id "free" noLoc) noLoc) [oldP] noLoc) noLoc] noLoc)
-                              (Just moveBlock)
-                              noLoc
-                        ]
-                        noLoc
-                  )
-                  noLoc
-        modifyFunction $ \fn -> fn & jcfBlock %~ flip appendBlock [reallocStm]
-        pure (JanusC (pure (RVal outP)))
+        (outId, outExp) <- freshCVar "x"
+        let align = fromIntegral janusSIMDAlignment :: Word
+            mask = fromIntegral (janusSIMDAlignment - 1) :: Word
+        [jcStms|
+          #include <stdlib.h>
+          #include <stddef.h>
+          #include <string.h>
+          #include <malloc.h>
+          void *$id:outId = NULL;
+          {
+            void *janus_old_p = $exp:p';
+            size_t janus_new_sz = (size_t)$exp:i';
+            size_t janus_alloc_sz = janus_new_sz == 0U ? $uint:align : ((janus_new_sz + $uint:mask) & ~$uint:mask);
+            if (janus_old_p == NULL) {
+              $id:outId = aligned_alloc($uint:align, janus_alloc_sz);
+            } else if (janus_new_sz == 0U) {
+              free(janus_old_p);
+            } else {
+              size_t janus_old_sz = malloc_usable_size(janus_old_p);
+              $id:outId = aligned_alloc($uint:align, janus_alloc_sz);
+              if ($id:outId != NULL) {
+                memcpy($id:outId, janus_old_p, janus_old_sz < janus_new_sz ? janus_old_sz : janus_new_sz);
+                free(janus_old_p);
+              }
+            }
+          }
+        |]
+        pure (JanusC (pure (RVal outExp)))
   free p = do
     backend <- asks _jcfiBackend
     case backend of
@@ -276,21 +257,24 @@ instance CmdDynamicAligned (JanusCMT t) (JanusCT t) where
     case backend of
       JCUDA -> malloc (JanusC msz)
       JC -> do
-        addHeader "stdlib.h"
-        addHeader "stddef.h"
         RVal szE <- liftJanusCM msz
         RVal alE <- liftJanusCM mal
-        let sizeTy = JCType (DeclSpec [] [] (Tnamed (Id "size_t" noLoc) [] noLoc) noLoc) (DeclRoot noLoc)
-            minAl = unsignedIntConst (fromIntegral janusSIMDAlignment :: Word)
-        reqAl <- emitLocalVal sizeTy (cSizeCast alE)
-        effAl <- emitLocalVal sizeTy (Cond (BinOp C.Lt reqAl minAl noLoc) minAl reqAl noLoc)
-        rawSz <- emitLocalVal sizeTy (cSizeCast szE)
-        let mask = BinOp C.Sub effAl (unsignedIntConst (1 :: Word)) noLoc
-            roundedNonZero = BinOp C.And (BinOp C.Add rawSz mask noLoc) (UnOp C.Not mask noLoc) noLoc
-            rounded = Cond (BinOp C.Eq rawSz (unsignedIntConst (0 :: Word)) noLoc) effAl roundedNonZero noLoc
-            callE = FnCall (Var (Id "aligned_alloc" noLoc) noLoc) [effAl, rounded] noLoc
-        p <- emitLocalVal voidPtrType callE
-        pure (JanusC (pure (RVal p)))
+        (pId, pExp) <- freshCVar "x"
+        let minAl = fromIntegral janusSIMDAlignment :: Word
+        [jcStms|
+          #include <stdlib.h>
+          #include <stddef.h>
+          void *$id:pId;
+          {
+            size_t janus_req_al = (size_t)$exp:alE;
+            size_t janus_eff_al = janus_req_al < $uint:minAl ? $uint:minAl : janus_req_al;
+            size_t janus_raw_sz = (size_t)$exp:szE;
+            size_t janus_mask = janus_eff_al - 1U;
+            size_t janus_rounded = janus_raw_sz == 0U ? janus_eff_al : ((janus_raw_sz + janus_mask) & ~janus_mask);
+            $id:pId = aligned_alloc(janus_eff_al, janus_rounded);
+          }
+        |]
+        pure (JanusC (pure (RVal pExp)))
 
 class (CmdMem m e) => CmdMemCopy m e | m -> e, e -> m where
   cmdMemcpy :: e (Ptr ()) -> e (Ptr ()) -> e Int64 -> m ()
@@ -306,21 +290,19 @@ instance CmdMemCopy IO Identity where
     when (n > 0) $ MarshalUtils.fillBytes dst val (fromIntegral n)
 
 emitGuardedMemCall :: String -> [Exp] -> Exp -> JanusCMT t ()
-emitGuardedMemCall fnName callArgs nExp = do
-  addHeader "string.h"
-  addHeader "stddef.h"
-  addHeader "stdint.h"
-  let sizeTy = JCType (DeclSpec [] [] (Tnamed (Id "size_t" noLoc) [] noLoc) noLoc) (DeclRoot noLoc)
-  nVar <- emitLocalVal (JCType (DeclSpec [] [] (Tnamed (Id "int64_t" noLoc) [] noLoc) noLoc) (DeclRoot noLoc)) nExp
-  szVar <- emitLocalVal sizeTy (cSizeCast nVar)
-  let stm =
-        BlockStm $
-          If
-            (BinOp Gt nVar (signedIntConst (0 :: Int)) noLoc)
-            (Block [BlockStm $ Exp (Just $ FnCall (Var (Id fnName noLoc) noLoc) (callArgs <> [szVar]) noLoc) noLoc] noLoc)
-            Nothing
-            noLoc
-  modifyFunction $ \fn -> fn & jcfBlock %~ flip appendBlock [stm]
+emitGuardedMemCall fnName callArgs nExp =
+  [jcStms|
+    #include <string.h>
+    #include <stddef.h>
+    #include <stdint.h>
+    {
+      int64_t janus_n = $exp:nExp;
+      size_t janus_sz = (size_t)janus_n;
+      if (janus_n > 0) {
+        $id:fnName($args:callArgs, janus_sz);
+      }
+    }
+  |]
 
 instance CmdMemCopy (JanusCMT t) (JanusCT t) where
   cmdMemcpy (JanusC mdst) (JanusC msrc) (JanusC mn) = do
@@ -363,9 +345,8 @@ instance (JanusCTyped a) => CmdStorable (JanusCMT t) (JanusCT t) a where
   poke (JanusC p) (JanusC e) = do
     RVal p' <- liftJanusCM p
     RVal e' <- liftJanusCM e
-    modifyFunction $ \f ->
-      let pokestm = [BlockStm $ Exp (Just $ Assign (cDerefPtr p') JustAssign e' noLoc) noLoc]
-       in f & jcfBlock %~ flip appendBlock pokestm
+    let lhs = cDerefPtr p'
+    [jcStms| $exp:lhs = $exp:e'; |]
   peekElemOff (JanusC p) (JanusC i) = do
     RVal p' <- liftJanusCM p
     RVal i' <- liftJanusCM i
@@ -374,9 +355,7 @@ instance (JanusCTyped a) => CmdStorable (JanusCMT t) (JanusCT t) a where
     RVal p' <- liftJanusCM p
     RVal e' <- liftJanusCM e
     RVal i' <- liftJanusCM i
-    modifyFunction $ \f ->
-      let pokestm = [BlockStm $ Exp (Just $ Assign (Index p' i' noLoc) JustAssign e' noLoc) noLoc]
-       in f & jcfBlock %~ flip appendBlock pokestm
+    [jcStms| $exp:p'[$exp:i'] = $exp:e'; |]
 
 -- using the ref while the pointer in scope is undefined behavior
 class (CmdRef m e, CmdStorable m e a) => CmdRefPtr m e a | m -> e, e -> m where
@@ -407,18 +386,11 @@ instance CmdStackArray IO Identity where
 
 instance CmdStackArray (JanusCMT t) (JanusCT t) where
   withStackBytes nBytes k = do
-    addHeader "stdint.h"
     let nWords = max 1 ((max 8 nBytes + 7) `div` 8)
-    JCType spec dec <- getJanusCType (Proxy @Word64)
-    JCType w8PtrSpec w8PtrDec <- getJanusCType (Proxy @(Ptr Word8))
-    fn <- getFunction
-    let c = fn ^. jcfVarCounter
-        vid = Id ("stack_buf_" <> show c) noLoc
-        arrDec = Array [] (ArraySize False (signedIntConst nWords) noLoc) dec noLoc
-        decl = BlockDecl $ InitGroup spec [] [Init vid arrDec Nothing Nothing [] noLoc] noLoc
-        ptrExp = Cast (Type w8PtrSpec w8PtrDec noLoc) (Var vid noLoc) noLoc
-    modifyFunction $ \f ->
-      f
-        & jcfBlock %~ flip appendBlock [decl]
-        & jcfVarCounter +~ 1
-    k (JanusC (pure (RVal ptrExp)))
+    w8PtrTy <- getCType (Proxy @(Ptr Word8))
+    vid <- freshCId "stack_buf"
+    [jcStms|
+      #include <stdint.h>
+      uint64_t $id:vid[$int:nWords];
+    |]
+    k (JanusC (pure (RVal (Cast w8PtrTy (Var vid noLoc) noLoc))))

@@ -63,6 +63,9 @@ modifyRef r f = readRef r >>= writeRef r . f
 
 newtype JanusCRefT (t :: K.Type) a = JanusCRefT {getJanusCRefT :: LVal a}
 
+instance ToExp (JanusCRefT t a) where
+  toExp (JanusCRefT (LVal e)) _ = e
+
 pattern JanusCRef :: LVal a -> JanusCRefT t a
 pattern JanusCRef lv = JanusCRefT lv
 
