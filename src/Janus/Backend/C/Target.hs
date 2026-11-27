@@ -60,6 +60,7 @@ module Janus.Backend.C.Target
     getActiveHostX86Features,
     withHostX86Features,
     observeSleefFlags,
+    observeArgobotsFlags,
 
     -- * CUDA Target Feature Lattice
     CUDAFeatures (..),
@@ -116,6 +117,7 @@ import Foreign.Storable (peek)
 import GHC.Generics (Generic)
 import GHC.TypeLits (KnownSymbol, Symbol, cmpSymbol, sameSymbol, symbolVal)
 import Janus.CBits ()
+import Janus.CBits.Argobots (c_janus_abt_query_libdir)
 import System.Directory (doesDirectoryExist)
 import System.Environment (lookupEnv)
 import System.FilePath (takeDirectory, (</>))
@@ -371,6 +373,40 @@ observeSleefFlags = do
           ldflags =
             (if hasLib then ["-L" <> libDir, "-Wl,-rpath," <> libDir] else [])
               <> ["-lsleef"]
+      pure (cflags, ldflags)
+
+-- | Discover compiler (@-I...@) and linker (@-L...@, @-Wl,-rpath,...@, @-labt@)
+-- flags for linking Argobots into runtime-compiled shared objects.
+observeArgobotsFlags :: IO ([String], [String])
+observeArgobotsFlags = do
+  mEnv <- lookupEnv "ARGOBOTS_PATH"
+  case mEnv of
+    Just prefix | not (null prefix) -> flagsFromPrefix prefix
+    _ -> do
+      mLibDir <- allocaBytes 4096 $ \buf -> do
+        n <- c_janus_abt_query_libdir buf 4096
+        if n > 0
+          then Just <$> peekCString buf
+          else pure Nothing
+      case mLibDir of
+        Just libDir -> do
+          let prefix = takeDirectory libDir
+              incDir = prefix </> "include"
+          hasInc <- doesDirectoryExist incDir
+          let cflags = ["-I" <> incDir | hasInc]
+              ldflags = ["-L" <> libDir, "-Wl,-rpath," <> libDir, "-labt"]
+          pure (cflags, ldflags)
+        Nothing -> pure ([], ["-labt"])
+  where
+    flagsFromPrefix prefix = do
+      let incDir = prefix </> "include"
+          libDir = prefix </> "lib"
+      hasInc <- doesDirectoryExist incDir
+      hasLib <- doesDirectoryExist libDir
+      let cflags = ["-I" <> incDir | hasInc]
+          ldflags =
+            (if hasLib then ["-L" <> libDir, "-Wl,-rpath," <> libDir] else [])
+              <> ["-labt"]
       pure (cflags, ldflags)
 
 -- | Observe hardware & OS vector-save capabilities of the host x86-64 CPU.

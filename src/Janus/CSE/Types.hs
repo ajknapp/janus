@@ -134,11 +134,12 @@ import Foreign.C (CFile, CInt, CString)
 import Foreign.Ptr (Ptr)
 import Foreign.Storable (Storable)
 import GHC.Fingerprint (Fingerprint (..))
-import GHC.TypeNats (Nat)
+import GHC.TypeNats (KnownNat, Nat)
 import Janus.Backend.C.Raw (JanusCT (..), JanusCTyped (..), MonadTargetFeatures (..))
 import Janus.Backend.C.CUDA.CPU ()
 import Janus.Backend.C.CUDA.CPUSIMD ()
 import Janus.Backend.C.CUDA.Kernel ()
+import Janus.Backend.C.CUDA.SharedMem (CmdSharedMem)
 import Janus.Backend.C.CUDA.SIMD.Base ()
 import Janus.Backend.C.CUDA.Types (CUDADejaFu (..), CUDAIO (..), CUDAThreadInfo, JanusCUDA (..))
 import Janus.Backend.C.LinuxX86_64.SIMD.Base ()
@@ -147,7 +148,7 @@ import Janus.Backend.C.Target (TargetFeatureMap, cudaFeatureKey, x86FeatureKey)
 import Janus.Command.Case (CmdCase)
 import Janus.Command.Cond (CmdCond)
 import Janus.Command.Format (CmdString)
-import Janus.Command.Memory (CmdRefPtr)
+import Janus.Command.Memory (CmdRefPtr, CmdStackArray)
 import Janus.Command.Range (CmdRange)
 import Janus.Command.Ref (CmdRef (..))
 import Janus.Command.While (CmdWhile)
@@ -1150,6 +1151,20 @@ data ScopeItem (m :: K.Type -> K.Type) (e :: K.Type -> K.Type) where
     -- | Scoped 'CString' variable valid only within the inner block.
     !(VarId e CString) ->
     -- | Inner block executed unconditionally with the 'CString' variable in scope.
+    !(Block m e) ->
+    ScopeItem m e
+  -- | Scoped CUDA @__shared__@ array continuation ('Janus.Backend.C.CUDA.SharedMem.withSharedArray').
+  ItemWithSharedArray ::
+    (CmdSharedMem m e, KnownNat n, Typeable a, Storable a, JanusCTyped a) =>
+    !(Proxy n) ->
+    !(VarId e (Ptr a)) ->
+    !(Block m e) ->
+    ScopeItem m e
+  -- | Scoped stack byte-buffer continuation ('Janus.Command.Memory.withStackBytes').
+  ItemWithStackBytes ::
+    (CmdStackArray m e) =>
+    !Int ->
+    !(VarId e (Ptr Word8)) ->
     !(Block m e) ->
     ScopeItem m e
   -- | Scoped multi-versioned SIMD gang dispatch ('Janus.SPMD.Gang.withOptimalGang')

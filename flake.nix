@@ -8,13 +8,19 @@
       url = "git+https://github.com/shibatch/sleef?ref=refs/tags/3.9.0&submodules=1";
       flake = false;
     };
+    argobots-src = {
+      url = "github:pmodels/argobots/v1.2";
+      flake = false;
+    };
   };
 
-  outputs = { self, nixpkgs, flake-utils, sleef-src }:
+  outputs = { self, nixpkgs, flake-utils, sleef-src, argobots-src }:
     flake-utils.lib.eachDefaultSystem (system:
       let
         pkgs = import nixpkgs { system = system; config.allowUnfree = true; };
         haskellPackages = pkgs.haskellPackages;
+
+        argobots = pkgs.callPackage ./nix/argobots.nix { inherit argobots-src; };
 
         sleef = pkgs.stdenv.mkDerivation {
           pname = "sleef";
@@ -45,6 +51,8 @@
           , stdenv
           , lib
           , base
+          , adjunctions
+          , argobots
           , async
           , base16-bytestring
           , concurrency
@@ -57,6 +65,7 @@
           , dependent-hashmap
           , dependent-sum
           , dependent-sum-template
+          , distributive
           , exceptions
           , gcc
           , hashable
@@ -64,6 +73,7 @@
           , lens
           , language-c-quote
           , libffi
+          , linear
           , linuxPackages
           , profunctors
           , rock
@@ -85,6 +95,7 @@
             libraryHaskellDepends =
               [
                 base
+                adjunctions
                 async
                 base16-bytestring
                 concurrency
@@ -96,12 +107,14 @@
                 dependent-hashmap
                 dependent-sum
                 dependent-sum-template
+                distributive
                 exceptions
                 hashable
                 hkd
                 lens
                 language-c-quote
                 libffi
+                linear
                 profunctors
                 rock
                 semigroupoids
@@ -110,13 +123,13 @@
                 vector
                 zstd
               ];
-            libraryPkgconfigDepends = [ sleef (pkgs.cudaPackages.libnvjitlink.overrideAttrs (oldAttrs: {
+            libraryPkgconfigDepends = [ argobots sleef (pkgs.cudaPackages.libnvjitlink.overrideAttrs (oldAttrs: {
               postFixup = (oldAttrs.postFixup or "") + ''
 substituteInPlace $dev/share/pkgconfig/nvjitlink.pc --replace "-lnvjitlink" "-lnvJitLink"
 substituteInPlace $dev/share/pkgconfig/nvjitlink-12.9.pc --replace "-lnvjitlink" "-lnvJitLink"'';
             })) ];
-            librarySystemDepends = [ cudaPackages.cudatoolkit gcc linuxPackages.nvidia_x11 sleef ];
-            testHaskellDepends = [ concurrency dejafu hkd semilattices tasty-dejafu tasty-discover tasty-hedgehog tasty-hunit ];
+            librarySystemDepends = [ argobots cudaPackages.cudatoolkit gcc linuxPackages.nvidia_x11 sleef ];
+            testHaskellDepends = [ concurrency dejafu hkd linear semilattices tasty-dejafu tasty-discover tasty-hedgehog tasty-hunit ];
             description = "An extensible EDSL for high-performance computing.";
             license = "unknown";
             hydraPlatforms = lib.platforms.none;
@@ -129,10 +142,11 @@ substituteInPlace $dev/share/pkgconfig/nvjitlink-12.9.pc --replace "-lnvjitlink"
             rock = jailbreakUnbreak super.rock;
             semilattices = jailbreakUnbreak super.semilattices;
           };
-        }).callPackage derivation { inherit sleef; }) (old: {
+        }).callPackage derivation { inherit argobots sleef; }) (old: {
           preBuild = (old.preBuild or "") + ''
+            export ARGOBOTS_PATH=${argobots}
             export SLEEF_PATH=${sleef}
-            export LD_LIBRARY_PATH=${pkgs.lib.makeLibraryPath [ pkgs.linuxPackages.nvidia_x11 pkgs.cudaPackages.cudatoolkit pkgs.cudaPackages.libnvjitlink.lib sleef ]}''${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}
+            export LD_LIBRARY_PATH=${pkgs.lib.makeLibraryPath [ argobots pkgs.linuxPackages.nvidia_x11 pkgs.cudaPackages.cudatoolkit pkgs.cudaPackages.libnvjitlink.lib sleef ]}''${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}
           '';
           testToolDepends = (old.testToolDepends or []) ++ [ pkgs.gcc pkgs.cudaPackages.cudatoolkit ];
         });
@@ -140,6 +154,7 @@ substituteInPlace $dev/share/pkgconfig/nvjitlink-12.9.pc --replace "-lnvjitlink"
       in {
         packages = {
           ${packageName} = pkg;
+          argobots = argobots;
           sleef = sleef;
         };
 
@@ -148,6 +163,7 @@ substituteInPlace $dev/share/pkgconfig/nvjitlink-12.9.pc --replace "-lnvjitlink"
         devShell = haskellPackages.shellFor {
           packages = p: [ pkg ];
           buildInputs = with haskellPackages; pkg.env.buildInputs ++ [
+            argobots
             cabal-install
             haskell-language-server
             sleef
@@ -156,11 +172,12 @@ substituteInPlace $dev/share/pkgconfig/nvjitlink-12.9.pc --replace "-lnvjitlink"
           shellHook = ''
             export PATH=/run/current-system/sw/bin:${pkgs.gcc}/bin:$PATH
             export CUDA_PATH=${pkgs.cudaPackages.cudatoolkit}
+            export ARGOBOTS_PATH=${argobots}
             export SLEEF_PATH=${sleef}
-            export C_INCLUDE_PATH=${sleef}/include''${C_INCLUDE_PATH:+:$C_INCLUDE_PATH}
-            export LIBRARY_PATH=${sleef}/lib''${LIBRARY_PATH:+:$LIBRARY_PATH}
-            export PKG_CONFIG_PATH=${sleef}/lib/pkgconfig''${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}
-            export LD_LIBRARY_PATH=${sleef}/lib:${pkgs.cudaPackages.libnvjitlink.lib}/lib:${pkgs.lib.makeLibraryPath pkg.env.buildInputs}:$LD_LIBRARY_PATH
+            export C_INCLUDE_PATH=${argobots}/include:${sleef}/include''${C_INCLUDE_PATH:+:$C_INCLUDE_PATH}
+            export LIBRARY_PATH=${argobots}/lib:${sleef}/lib''${LIBRARY_PATH:+:$LIBRARY_PATH}
+            export PKG_CONFIG_PATH=${argobots}/lib/pkgconfig:${sleef}/lib/pkgconfig''${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}
+            export LD_LIBRARY_PATH=${argobots}/lib:${sleef}/lib:${pkgs.cudaPackages.libnvjitlink.lib}/lib:${pkgs.lib.makeLibraryPath pkg.env.buildInputs}:$LD_LIBRARY_PATH
             export EXTRA_LDFLAGS="-L${pkgs.linuxPackages.nvidia_x11}/lib"
          '';
         };

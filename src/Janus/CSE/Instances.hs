@@ -53,7 +53,15 @@ import Foreign.Storable (Storable)
 import GHC.Float (expm1, log1p)
 import GHC.Generics
 import GHC.TypeNats (KnownNat, natVal)
+import Janus.Backend.C.CUDA.Atomic
+  ( CmdAtomic (..),
+    CmdAtomicAdd (..),
+    CmdAtomicBits (..),
+    CmdAtomicMinMax (..),
+  )
+import Janus.Backend.C.CUDA.SharedMem (CmdSharedMem (..))
 import Janus.Backend.C.CUDA.Types (CUDAThreadInfo (..), CmdSync (..), mapCUDAThreadInfo)
+import Janus.Backend.C.CUDA.Warp (CmdWarpShuffle (..))
 import Janus.Backend.C.Raw (JanusCTyped)
 import Janus.CSE.Interpret (interpretCSEExp)
 import Janus.CSE.Optimize (CSEExpParamLeaf (..), SomeCSEExp (..), TargetExpElem, cseExp, cseM)
@@ -62,11 +70,13 @@ import Janus.Command.Case (CmdCase (..))
 import Janus.Command.Cond (CmdCond (..))
 import Janus.Command.Format (CmdFormat (..), CmdPutString (..), CmdString (..))
 import Janus.Command.IO (CmdIO (..))
+import Janus.Command.Parallel (CmdParallel (..))
 import Janus.Command.Memory
   ( CmdDynamicAligned (..),
     CmdMem (..),
     CmdMemCopy (..),
     CmdRefPtr (..),
+    CmdStackArray (..),
     CmdStorable (..),
     ExpPtr (..),
     ExpSized (..),
@@ -95,6 +105,7 @@ import Janus.Expression.Math (ExpComplex (..), FMA (..), Hypot (..))
 import Janus.Expression.MurmurHash (ExpMurmurHash (..))
 import Janus.Expression.Ord (ExpOrd (..))
 import Janus.Expression.SIMD
+import Janus.Expression.SpecialMath (ExpSpecialMath (..))
 import Janus.Fix (ExpFix (..))
 import Janus.SPMD.Typed (SPMDTyped (..))
 import Janus.SPMD.Types (ExpPair (..), SIMDPair, SPMD (..), SPMDM, SPMDRep, liftSPMD, runSPMD, runSPMDM)
@@ -2491,6 +2502,8 @@ instance
         ItemStm s -> ItemStm (substCUDAInStm sub s)
         ItemWithRefPtr ref vid b -> ItemWithRefPtr ref vid (substCUDAInBlk sub b)
         ItemWithString str vid b -> ItemWithString str vid (substCUDAInBlk sub b)
+        ItemWithSharedArray pn vid b -> ItemWithSharedArray pn vid (substCUDAInBlk sub b)
+        ItemWithStackBytes nb vid b -> ItemWithStackBytes nb vid (substCUDAInBlk sub b)
         ItemOptimalGang tr b2 b4 b8 b16 b32 ->
           ItemOptimalGang
             tr
@@ -2527,3 +2540,141 @@ instance
             (substCUDAInTree sub b8)
             (substCUDAInTree sub b16)
             (substCUDAInTree sub b32)
+
+--------------------------------------------------------------------------------
+-- Special Math, Shared Memory, Warp Shuffle, Atomics, & Parallel For Instances
+--------------------------------------------------------------------------------
+
+instance (ExpSpecialMath e a, Floating (CSEExp e a), CSETyped e a) => ExpSpecialMath (CSEExp e) a where
+  lgammaE = unOpTyped "lgamma" [] False lgammaE
+  digammaE = unOpTyped "digamma" [] False digammaE
+  trigammaE = unOpTyped "trigamma" [] False trigammaE
+  erfE = unOpTyped "erf" [] False erfE
+  erfcE = unOpTyped "erfc" [] False erfcE
+  erfinvE = unOpTyped "erfinv" [] False erfinvE
+  log1pE = unOpTyped "log1p" [] False log1pE
+  expm1E = unOpTyped "expm1" [] False expm1E
+  rsqrtE = unOpTyped "rsqrt" [] False rsqrtE
+
+instance (CmdSharedMem m e, ExpJanus e) => CmdSharedMem (CSEM m e) (CSEExp e) where
+  withSharedArray ::
+    forall n a r.
+    (KnownNat n, Typeable a, Storable a, JanusCTyped a) =>
+    Proxy n ->
+    (CSEExp e (Ptr a) -> CSEM m e r) ->
+    CSEM m e r
+  withSharedArray pn bodyFn =
+    withJanusType @(Ptr a) @e $
+      CSEM $ \tfm n0 ->
+        let vid = VarId (VarSSA n0) (TR.typeRep @(Ptr a)) (Just (BindDirect @e @(Ptr a)))
+            (n1, innerTree) = unCSEM (bodyFn (mkExpVar vid)) tfm (n0 + 1)
+         in (n1, wrapScopeWith (ItemWithSharedArray pn vid) innerTree)
+
+instance (CmdStackArray m e, ExpJanus e) => CmdStackArray (CSEM m e) (CSEExp e) where
+  withStackBytes nBytes bodyFn =
+    withJanusType @(Ptr Word8) @e $
+      CSEM $ \tfm n0 ->
+        let vid = VarId (VarSSA n0) (TR.typeRep @(Ptr Word8)) (Just (BindDirect @e @(Ptr Word8)))
+            (n1, innerTree) = unCSEM (bodyFn (mkExpVar vid)) tfm (n0 + 1)
+         in (n1, wrapScopeWith (ItemWithStackBytes nBytes vid) innerTree)
+
+instance (CmdWarpShuffle m e a, CSETyped e a) => CmdWarpShuffle (CSEM m e) (CSEExp e) a where
+  shflDownSync m v d =
+    emitEffectVal
+      (TR.typeRep @a)
+      (Just (BindDirect @e @a))
+      (HCons m (HCons v (HCons d HNil)))
+      (\(HCons m' (HCons v' (HCons d' HNil))) -> shflDownSync m' v' d')
+  shflUpSync m v d =
+    emitEffectVal
+      (TR.typeRep @a)
+      (Just (BindDirect @e @a))
+      (HCons m (HCons v (HCons d HNil)))
+      (\(HCons m' (HCons v' (HCons d' HNil))) -> shflUpSync m' v' d')
+  shflXorSync m v d =
+    emitEffectVal
+      (TR.typeRep @a)
+      (Just (BindDirect @e @a))
+      (HCons m (HCons v (HCons d HNil)))
+      (\(HCons m' (HCons v' (HCons d' HNil))) -> shflXorSync m' v' d')
+  shflSync m v d =
+    emitEffectVal
+      (TR.typeRep @a)
+      (Just (BindDirect @e @a))
+      (HCons m (HCons v (HCons d HNil)))
+      (\(HCons m' (HCons v' (HCons d' HNil))) -> shflSync m' v' d')
+
+instance (CmdAtomic m e) => CmdAtomic (CSEM m e) (CSEExp e) where
+  atomicCAS32Ptr p c v =
+    emitEffectVal
+      (TR.typeRep @Word32)
+      (Just BindWord32)
+      (HCons p (HCons c (HCons v HNil)))
+      (\(HCons p' (HCons c' (HCons v' HNil))) -> atomicCAS32Ptr p' c' v')
+  atomicCAS64Ptr p c v =
+    emitEffectVal
+      (TR.typeRep @Word64)
+      (Just BindWord64)
+      (HCons p (HCons c (HCons v HNil)))
+      (\(HCons p' (HCons c' (HCons v' HNil))) -> atomicCAS64Ptr p' c' v')
+
+instance (CmdAtomicAdd m e a, CSETyped e a) => CmdAtomicAdd (CSEM m e) (CSEExp e) a where
+  atomicAddPtr p v =
+    emitEffectVal
+      (TR.typeRep @a)
+      (Just (BindDirect @e @a))
+      (HCons p (HCons v HNil))
+      (\(HCons p' (HCons v' HNil)) -> atomicAddPtr p' v')
+
+instance (CmdAtomicMinMax m e a, CSETyped e a) => CmdAtomicMinMax (CSEM m e) (CSEExp e) a where
+  atomicMinPtr p v =
+    emitEffectVal
+      (TR.typeRep @a)
+      (Just (BindDirect @e @a))
+      (HCons p (HCons v HNil))
+      (\(HCons p' (HCons v' HNil)) -> atomicMinPtr p' v')
+  atomicMaxPtr p v =
+    emitEffectVal
+      (TR.typeRep @a)
+      (Just (BindDirect @e @a))
+      (HCons p (HCons v HNil))
+      (\(HCons p' (HCons v' HNil)) -> atomicMaxPtr p' v')
+
+instance (CmdAtomicBits m e a, CSETyped e a) => CmdAtomicBits (CSEM m e) (CSEExp e) a where
+  atomicAndPtr p v =
+    emitEffectVal
+      (TR.typeRep @a)
+      (Just (BindDirect @e @a))
+      (HCons p (HCons v HNil))
+      (\(HCons p' (HCons v' HNil)) -> atomicAndPtr p' v')
+  atomicOrPtr p v =
+    emitEffectVal
+      (TR.typeRep @a)
+      (Just (BindDirect @e @a))
+      (HCons p (HCons v HNil))
+      (\(HCons p' (HCons v' HNil)) -> atomicOrPtr p' v')
+  atomicXorPtr p v =
+    emitEffectVal
+      (TR.typeRep @a)
+      (Just (BindDirect @e @a))
+      (HCons p (HCons v HNil))
+      (\(HCons p' (HCons v' HNil)) -> atomicXorPtr p' v')
+
+parLocalArgsToHArgs :: LocalArgs f ts -> HArgs f ts
+parLocalArgsToHArgs LANil = HNil
+parLocalArgsToHArgs (LACons x rest) = HCons x (parLocalArgsToHArgs rest)
+
+parRebuildLocalArgs :: LocalArgs proxy ts -> HArgs f ts -> LocalArgs f ts
+parRebuildLocalArgs LANil HNil = LANil
+parRebuildLocalArgs (LACons _ pRest) (HCons x rest) = LACons x (parRebuildLocalArgs pRest rest)
+
+instance
+  ( CmdParallel m e,
+    CmdJanus (CSEM m e) (CSEExp e)
+  ) =>
+  CmdParallel (CSEM m e) (CSEExp e)
+  where
+  parallelForRangeM label lo hi minGrain args body =
+    emitEffectUnit
+      (HCons lo (HCons hi (HCons minGrain (parLocalArgsToHArgs args))))
+      (\(HCons lo' (HCons hi' (HCons grain' hArgs'))) -> parallelForRangeM label lo' hi' grain' (parRebuildLocalArgs args hArgs') body)

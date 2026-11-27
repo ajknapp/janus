@@ -22,11 +22,12 @@ import Data.Functor.Identity (Identity (..))
 import Data.IORef (IORef, newIORef, readIORef, writeIORef)
 import Data.Int (Int32, Int64)
 import qualified Data.Kind as K
+import qualified Data.Map.Strict as Map
 import qualified Data.Vector as V
 import Data.Word (Word64, Word8)
 import Foreign.C (CChar, CFile, CInt, CString, newCString)
 import qualified Foreign.Marshal.Alloc
-import Foreign.Marshal.Alloc (malloc)
+import Foreign.Marshal.Alloc (callocBytes, malloc)
 import Foreign.Ptr (Ptr)
 import Foreign.Storable (Storable (peek, poke))
 import Janus.Backend.C.CUDA.Foreign
@@ -66,7 +67,13 @@ data Thread m = Thread
     _threadBlockBarrier :: Barrier m,
     _threadActive :: Bool,
     _threadInfo :: CUDAThreadInfo Identity,
-    _threadFeatures :: CUDAFeatures
+    _threadFeatures :: CUDAFeatures,
+    _threadSharedMem :: CC.MVar m (Map.Map Int (Ptr ())),
+    _threadSharedCounter :: IORef Int,
+    _threadWarpBuf :: Ptr Word64,
+    _threadLaneId :: Int,
+    _threadWarpSize :: Int,
+    _threadAtomicLock :: CC.MVar m ()
   }
 
 newtype CUDAM (m :: K.Type -> K.Type) a = CUDAM {runCUDAM :: ReaderT (Thread m) m a}
@@ -113,7 +120,7 @@ foo = do
       )
   syncWarp
 
-launchCUDAMWithFeatures :: (CC.MonadConc m, MonadIO m) => CUDAFeatures -> CUlaunchConfig -> CUDAM m () -> m ()
+launchCUDAMWithFeatures :: (CC.MonadConc m, Catch.MonadMask m, MonadIO m) => CUDAFeatures -> CUlaunchConfig -> CUDAM m () -> m ()
 launchCUDAMWithFeatures fs conf (CUDAM m) = do
   liftIO $ SIO.hSetBuffering SIO.stdout SIO.LineBuffering
   let gridDimX = fromIntegral (conf ^. cuLaunchConfigGridDimX) :: Int
@@ -126,36 +133,60 @@ launchCUDAMWithFeatures fs conf (CUDAM m) = do
       blockSize = blockDimX * blockDimY * blockDimZ
       warpsPerBlock = (blockSize + cudaWarpSize - 1) `quot` cudaWarpSize
   blockBarriers <- V.generateM blockCount $ \_ -> newBarrier blockSize
+  blockSharedMems <- V.generateM blockCount $ \_ -> CC.newMVar Map.empty
   warpBarriers <- V.generateM blockCount $ \_ ->
     V.generateM warpsPerBlock $ \w ->
       newBarrier (min cudaWarpSize (blockSize - w * cudaWarpSize))
-  CCA.forConcurrently_ [(b, t) | b <- [0 .. blockCount - 1], t <- [0 .. blockSize - 1]] $ \(b, t) -> do
-    let info =
-          CUDAThreadInfo
-            { _cudaThreadInfoBlockIdxX = Identity $ fromIntegral (b `rem` gridDimX),
-              _cudaThreadInfoBlockIdxY = Identity $ fromIntegral ((b `quot` gridDimX) `rem` gridDimY),
-              _cudaThreadInfoBlockIdxZ = Identity $ fromIntegral ((b `quot` (gridDimX * gridDimY)) `rem` gridDimZ),
-              _cudaThreadInfoBlockDimX = Identity $ fromIntegral blockDimX,
-              _cudaThreadInfoBlockDimY = Identity $ fromIntegral blockDimY,
-              _cudaThreadInfoBlockDimZ = Identity $ fromIntegral blockDimZ,
-              _cudaThreadInfoThreadIdxX = Identity $ fromIntegral (t `rem` blockDimX),
-              _cudaThreadInfoThreadIdxY = Identity $ fromIntegral ((t `quot` blockDimX) `rem` blockDimY),
-              _cudaThreadInfoThreadIdxZ = Identity $ fromIntegral ((t `quot` (blockDimX * blockDimY)) `rem` blockDimZ),
-              _cudaThreadInfoGridDimX = Identity $ fromIntegral gridDimX,
-              _cudaThreadInfoGridDimY = Identity $ fromIntegral gridDimY,
-              _cudaThreadInfoGridDimZ = Identity $ fromIntegral gridDimZ
-            }
-        thread =
-          Thread
-            { _threadWarpBarrier = (warpBarriers V.! b) V.! (t `quot` cudaWarpSize),
-              _threadBlockBarrier = blockBarriers V.! b,
-              _threadActive = True,
-              _threadInfo = info,
-              _threadFeatures = fs
-            }
-    runReaderT m thread
+  warpBufs <- V.generateM blockCount $ \_ ->
+    V.generateM warpsPerBlock $ \_ ->
+      liftIO (callocBytes (cudaWarpSize * 8))
+  atomicLock <- CC.newMVar ()
+  let cleanup = do
+        V.forM_ blockSharedMems $ \mv -> do
+          mp <- CC.readMVar mv
+          liftIO $ mapM_ Foreign.Marshal.Alloc.free (Map.elems mp)
+        V.forM_ warpBufs $ \wb ->
+          V.forM_ wb (liftIO . Foreign.Marshal.Alloc.free)
+  Catch.finally
+    ( CCA.forConcurrently_ [(b, t) | b <- [0 .. blockCount - 1], t <- [0 .. blockSize - 1]] $ \(b, t) -> do
+        let w = t `quot` cudaWarpSize
+            lane = t `rem` cudaWarpSize
+            wSize = min cudaWarpSize (blockSize - w * cudaWarpSize)
+            info =
+              CUDAThreadInfo
+                { _cudaThreadInfoBlockIdxX = Identity $ fromIntegral (b `rem` gridDimX),
+                  _cudaThreadInfoBlockIdxY = Identity $ fromIntegral ((b `quot` gridDimX) `rem` gridDimY),
+                  _cudaThreadInfoBlockIdxZ = Identity $ fromIntegral ((b `quot` (gridDimX * gridDimY)) `rem` gridDimZ),
+                  _cudaThreadInfoBlockDimX = Identity $ fromIntegral blockDimX,
+                  _cudaThreadInfoBlockDimY = Identity $ fromIntegral blockDimY,
+                  _cudaThreadInfoBlockDimZ = Identity $ fromIntegral blockDimZ,
+                  _cudaThreadInfoThreadIdxX = Identity $ fromIntegral (t `rem` blockDimX),
+                  _cudaThreadInfoThreadIdxY = Identity $ fromIntegral ((t `quot` blockDimX) `rem` blockDimY),
+                  _cudaThreadInfoThreadIdxZ = Identity $ fromIntegral ((t `quot` (blockDimX * blockDimY)) `rem` blockDimZ),
+                  _cudaThreadInfoGridDimX = Identity $ fromIntegral gridDimX,
+                  _cudaThreadInfoGridDimY = Identity $ fromIntegral gridDimY,
+                  _cudaThreadInfoGridDimZ = Identity $ fromIntegral gridDimZ
+                }
+        sharedCtr <- liftIO (newIORef 0)
+        let thread =
+              Thread
+                { _threadWarpBarrier = (warpBarriers V.! b) V.! w,
+                  _threadBlockBarrier = blockBarriers V.! b,
+                  _threadActive = True,
+                  _threadInfo = info,
+                  _threadFeatures = fs,
+                  _threadSharedMem = blockSharedMems V.! b,
+                  _threadSharedCounter = sharedCtr,
+                  _threadWarpBuf = (warpBufs V.! b) V.! w,
+                  _threadLaneId = lane,
+                  _threadWarpSize = wSize,
+                  _threadAtomicLock = atomicLock
+                }
+        runReaderT m thread
+    )
+    cleanup
 
-launchCUDAM :: (CC.MonadConc m, MonadIO m) => CUlaunchConfig -> CUDAM m () -> m ()
+launchCUDAM :: (CC.MonadConc m, Catch.MonadMask m, MonadIO m) => CUlaunchConfig -> CUDAM m () -> m ()
 launchCUDAM = launchCUDAMWithFeatures cudaSM80
 
 --------------------------------------------------------------------------------

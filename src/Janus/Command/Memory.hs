@@ -20,18 +20,19 @@ module Janus.Command.Memory
     CmdMemCopy (..),
     CmdStorable (..),
     CmdRefPtr (..),
+    CmdStackArray (..),
   )
 where
 
 import Control.Exception (bracket)
-import Control.Lens ((%~), (&))
+import Control.Lens ((%~), (&), (+~), (^.))
 import Control.Monad (when)
 import Control.Monad.Reader (asks)
 import Data.Functor.Identity (Identity (..))
 import Data.Int (Int64)
 import Data.Loc (noLoc)
 import Data.Proxy (Proxy (..))
-import Data.Word (Word8)
+import Data.Word (Word64, Word8)
 import Foreign.C.Types (CSize (..))
 import qualified Foreign.Marshal.Alloc as Alloc
 import Foreign.Marshal.Array (pokeArray)
@@ -392,3 +393,32 @@ instance (Storable.Storable a) => CmdRefPtr IO Identity a where
 
 instance (JanusCTyped a) => CmdRefPtr (JanusCMT t) (JanusCT t) a where
   withRefPtr (JanusCRefT (LVal r)) f = f $ JanusC $ pure $ RVal $ UnOp AddrOf r noLoc
+
+-- | Zero-heap-allocation stack-scoped aligned byte buffer (C stack array
+-- @uint64_t stack_buf_k[nWords];@ in 'JanusCMT', pinned @allocaBytesAligned@
+-- in 'IO'). Enables statically-sized @Janus.Tensor@ programs to execute with
+-- zero @malloc@/@calloc@/@free@ calls when intermediates fit within budget.
+class (Monad m) => CmdStackArray m e | m -> e, e -> m where
+  withStackBytes :: Int -> (e (Ptr Word8) -> m r) -> m r
+
+instance CmdStackArray IO Identity where
+  withStackBytes nBytes k =
+    Alloc.allocaBytesAligned (max 8 nBytes) 64 (\p -> k (Identity (castPtr p)))
+
+instance CmdStackArray (JanusCMT t) (JanusCT t) where
+  withStackBytes nBytes k = do
+    addHeader "stdint.h"
+    let nWords = max 1 ((max 8 nBytes + 7) `div` 8)
+    JCType spec dec <- getJanusCType (Proxy @Word64)
+    JCType w8PtrSpec w8PtrDec <- getJanusCType (Proxy @(Ptr Word8))
+    fn <- getFunction
+    let c = fn ^. jcfVarCounter
+        vid = Id ("stack_buf_" <> show c) noLoc
+        arrDec = Array [] (ArraySize False (signedIntConst nWords) noLoc) dec noLoc
+        decl = BlockDecl $ InitGroup spec [] [Init vid arrDec Nothing Nothing [] noLoc] noLoc
+        ptrExp = Cast (Type w8PtrSpec w8PtrDec noLoc) (Var vid noLoc) noLoc
+    modifyFunction $ \f ->
+      f
+        & jcfBlock %~ flip appendBlock [decl]
+        & jcfVarCounter +~ 1
+    k (JanusC (pure (RVal ptrExp)))

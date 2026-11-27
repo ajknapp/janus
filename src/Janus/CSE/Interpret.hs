@@ -47,6 +47,7 @@ import qualified Data.Map.Strict as Map
 import Data.Proxy (Proxy (..))
 import Data.Type.Equality ((:~:) (Refl), testEquality)
 import GHC.TypeNats (natVal)
+import Janus.Backend.C.CUDA.SharedMem (CmdSharedMem (..))
 import Janus.Backend.C.CUDA.Types (CUDAThreadInfo (..))
 import Janus.Backend.C.Target (TargetFeatureMap)
 import Janus.CSE.Optimize
@@ -54,7 +55,7 @@ import Janus.CSE.Types
 import Janus.Command.Case (CmdCase (..))
 import Janus.Command.Cond (CmdCond (..))
 import Janus.Command.Format (CmdString (..))
-import Janus.Command.Memory (CmdRefPtr (..))
+import Janus.Command.Memory (CmdRefPtr (..), CmdStackArray (..))
 import Janus.Command.Range (CmdRange (..))
 import Janus.Command.Ref (CmdRef (..))
 import Janus.Command.While (CmdWhile (..))
@@ -306,6 +307,14 @@ interpItem tfm env = \case
   ItemWithString str vid innerBlk -> do
     envInner <- withString str $ \tgtCStr ->
       interpBlock tfm (insertEnvVar vid tgtCStr env) innerBlk
+    pure (deleteEnvVar vid envInner)
+  ItemWithSharedArray pn vid innerBlk -> do
+    envInner <- withSharedArray pn $ \tgtPtr ->
+      interpBlock tfm (insertEnvVar vid tgtPtr env) innerBlk
+    pure (deleteEnvVar vid envInner)
+  ItemWithStackBytes nBytes vid innerBlk -> do
+    envInner <- withStackBytes nBytes $ \tgtPtr ->
+      interpBlock tfm (insertEnvVar vid tgtPtr env) innerBlk
     pure (deleteEnvVar vid envInner)
   ItemOptimalGang (_ :: TR.TypeRep elemTy) b2 b4 b8 b16 b32 ->
     withOptimalGang @m @e (Proxy @elemTy) $ \pn ->

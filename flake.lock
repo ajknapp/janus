@@ -1,5 +1,22 @@
 {
   "nodes": {
+    "argobots-src": {
+      "flake": false,
+      "locked": {
+        "lastModified": 1691090806,
+        "narHash": "sha256-z2Ek4jqz8lhslxV1FsRlfhVwFR2DM8yQrl96evPZ8WU=",
+        "owner": "pmodels",
+        "repo": "argobots",
+        "rev": "6d216a9f546f0a0024a4fe0e8548aeaf51520d4a",
+        "type": "github"
+      },
+      "original": {
+        "owner": "pmodels",
+        "ref": "v1.2",
+        "repo": "argobots",
+        "type": "github"
+      }
+    },
     "flake-utils": {
       "inputs": {
         "systems": "systems"
@@ -36,6 +53,7 @@
     },
     "root": {
       "inputs": {
+        "argobots-src": "argobots-src",
         "flake-utils": "flake-utils",
         "nixpkgs": "nixpkgs",
         "sleef-src": "sleef-src"

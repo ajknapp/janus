@@ -26,14 +26,16 @@ common warnings
 
 library janus-cbits
     import:           warnings
-    extra-libraries:  cuda
-    pkgconfig-depends:   nvjitlink, sleef
+    extra-libraries:  cuda, pthread
+    pkgconfig-depends:   argobots, nvjitlink, sleef
     exposed-modules:  Janus.CBits
+                      Janus.CBits.Argobots
                       Janus.Backend.C.CUDA.Foreign
     build-depends:    base ^>=4.20
                     , lens
     hs-source-dirs:   cbits-hs
-    c-sources:        cbits/janus_simd.c
+    c-sources:        cbits/janus_abt.c
+                      cbits/janus_simd.c
                       cbits/janus.c
     include-dirs:     cbits/
     default-language: Haskell2010
@@ -53,6 +55,9 @@ library
                       Janus.Backend.C
                       Janus.Backend.C.Build
                       Janus.Backend.C.CUDA
+                      Janus.Backend.C.CUDA.Atomic
+                      Janus.Backend.C.CUDA.SharedMem
+                      Janus.Backend.C.CUDA.Warp
                       Janus.Backend.C.LinuxX86_64
                       Janus.Backend.C.TH
                       Janus.Backend.C.Target
@@ -63,6 +68,7 @@ library
                       Janus.Command.Format
                       Janus.Command.IO
                       Janus.Command.Memory
+                      Janus.Command.Parallel
                       Janus.Command.Range
                       Janus.Command.Ref
                       Janus.Command.TicToc
@@ -130,10 +136,29 @@ library
                       Janus.Expression.MurmurHash
                       Janus.Expression.Ord
                       Janus.Expression.SIMD
+                      Janus.Expression.SpecialMath
                       Janus.FFI.Arg
                       Janus.FFI.Ret
                       Janus.Fix
                       Janus.SPMD
+                      Janus.Tensor
+                      Janus.Tensor.Algebra
+                      Janus.Tensor.Bench
+                      Janus.Tensor.Compile
+                      Janus.Tensor.Compile.Fuse
+                      Janus.Tensor.Compile.Schedule
+                      Janus.Tensor.Contract.Hypergraph
+                      Janus.Tensor.Contract.Plan
+                      Janus.Tensor.Contract.Recognize
+                      Janus.Tensor.Custom
+                      Janus.Tensor.DSL
+                      Janus.Tensor.IR
+                      Janus.Tensor.Index
+                      Janus.Tensor.Linear
+                      Janus.Tensor.Lower.CPU
+                      Janus.Tensor.Lower.CUDA
+                      Janus.Tensor.ST
+                      Janus.Tensor.Types
                       Janus.Typed
     -- Modules included in this library but not exported.
     other-modules:    Janus.Backend.C.CUDA.CPU
@@ -195,6 +220,7 @@ library
     -- other-extensions:
     build-depends:    base ^>=4.20
                     , janus-cbits
+                    , adjunctions
                     , async
                     , base16-bytestring
                     , bytestring
@@ -208,6 +234,7 @@ library
                     , dependent-sum
                     , dependent-sum-template
                     , directory
+                    , distributive
                     , exceptions
                     , hashable
                     , hkd
@@ -216,6 +243,7 @@ library
                     , language-c-quote
                     , lens
                     , libffi
+                    , linear
                     , mtl
                     , mainland-pretty
                     , monad-control
@@ -255,9 +283,11 @@ test-suite janus-test
                       Test.Janus.Backend.C.TH
                       Test.Janus.Backend.C.THDefs
                       Test.Janus.Backend.C.THOther
+                      Test.Janus.Command.Parallel
                       Test.Janus.Control.StreamPipe
                       Test.Janus.Expression.Let
                       Test.Janus.Expression.SIMD
+                      Test.Janus.Expression.SpecialMath
                       Test.Janus.SPMD
                       Test.Janus.Alloc
                       Test.Janus.Data.HKDLayout
@@ -271,6 +301,10 @@ test-suite janus-test
                       Test.Janus.Data.IndexedAndIntrusive
                       Test.Janus.Data.IntrusiveSchedAndIntern
                       Test.Janus.Data.SPMD
+                      Test.Janus.Tensor.Core
+                      Test.Janus.Tensor.Contract
+                      Test.Janus.Tensor.Backends
+                      Test.Janus.Tensor.Validation
 
     -- LANGUAGE extensions used by modules in this package.
     -- other-extensions:
@@ -298,6 +332,7 @@ test-suite janus-test
                     , janus
                     , janus-cbits
                     , lens
+                    , linear
                     , mtl
                     , semilattices
                     , tasty

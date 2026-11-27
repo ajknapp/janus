@@ -9,6 +9,7 @@
 {-# LANGUAGE ScopedTypeVariables #-}
 {-# LANGUAGE StandaloneDeriving #-}
 {-# LANGUAGE TemplateHaskell #-}
+{-# LANGUAGE TypeApplications #-}
 {-# LANGUAGE TypeOperators #-}
 
 module Janus.Backend.C.Build where
@@ -47,6 +48,7 @@ import Foreign.Storable
 import GHC.Generics
 import Janus.Backend.C.CUDA.Foreign
 import Janus.Backend.C.Target
+import Janus.CBits.Argobots (c_janus_abt_parallel_for_addr)
 import qualified Rock
 import System.Directory
 import System.Exit
@@ -321,7 +323,17 @@ acquireJanusCDLWithConfig config extraCFlags extraLDFlags cfiles = do
       sofile_ = unpack filesHash <> ".so"
   result <- Rock.runTask (Rock.memoise memoVar janusRules) . Rock.fetch $ CSharedLibrary dir cc sofile_ cfiles cflags ldflags
   case result of
-    Just sofile -> dlopen sofile [RTLD_LAZY, RTLD_LOCAL]
+    Just sofile -> do
+      dl <- dlopen sofile [RTLD_LAZY, RTLD_LOCAL]
+      -- If the compiled shared object uses Argobots `CmdParallel`, bind its
+      -- weak `janus_abt_pfor_hook` slot to `janus-cbits`'s `janus_abt_parallel_for`
+      -- so runtime `dlopen` works even when the host executable lacks `-rdynamic`.
+      mHook <- try @SomeException (dlsym dl "janus_abt_pfor_hook")
+      case mHook of
+        Right fp | fp /= nullFunPtr ->
+          poke (castFunPtrToPtr fp :: Ptr (Ptr ())) (castFunPtrToPtr c_janus_abt_parallel_for_addr)
+        _ -> pure ()
+      pure dl
     Nothing -> error "withJanusDL: compilation failed!"
 
 acquireJanusCDLWithFlags :: FilePath -> [String] -> [String] -> [FilePath] -> IO DL

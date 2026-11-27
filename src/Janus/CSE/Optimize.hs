@@ -187,6 +187,8 @@ normalizeItem = \case
   ItemStm stm -> ItemStm (normalizeStm stm)
   ItemWithRefPtr ref vid blk -> ItemWithRefPtr ref vid (normalizeBlock blk)
   ItemWithString s vid blk -> ItemWithString s vid (normalizeBlock blk)
+  ItemWithSharedArray pn vid blk -> ItemWithSharedArray pn vid (normalizeBlock blk)
+  ItemWithStackBytes nb vid blk -> ItemWithStackBytes nb vid (normalizeBlock blk)
   ItemOptimalGang tr b2 b4 b8 b16 b32 ->
     ItemOptimalGang
       tr
@@ -614,6 +616,16 @@ registerItem sid idx item =
           addUncondChild sid sInner
           recordVarDef (vidKey vid) sInner 0
           registerBlock sInner innerBlk
+        ItemWithSharedArray _ vid innerBlk -> do
+          sInner <- allocScope sid idx SKBlock
+          addUncondChild sid sInner
+          recordVarDef (vidKey vid) sInner 0
+          registerBlock sInner innerBlk
+        ItemWithStackBytes _ vid innerBlk -> do
+          sInner <- allocScope sid idx SKBlock
+          addUncondChild sid sInner
+          recordVarDef (vidKey vid) sInner 0
+          registerBlock sInner innerBlk
         ItemOptimalGang _ b2 b4 b8 b16 b32 -> do
           s2 <- allocScope sid idx SKBlock
           s4 <- allocScope sid idx SKBlock
@@ -1021,6 +1033,18 @@ rewriteItem cs siteIdx act site@(UseSite sid idx) item =
                 _ -> error "Janus.CSE.Optimize: ItemWithString scope mismatch"
               (actAfter, innerBlk') = emitBlockCSE cs siteIdx act sInner innerBlk
            in (actAfter, ItemWithString s vid innerBlk')
+        ItemWithSharedArray pn vid innerBlk ->
+          let sInner = case blockChildren of
+                [a] -> a
+                _ -> error "Janus.CSE.Optimize: ItemWithSharedArray scope mismatch"
+              (actAfter, innerBlk') = emitBlockCSE cs siteIdx act sInner innerBlk
+           in (actAfter, ItemWithSharedArray pn vid innerBlk')
+        ItemWithStackBytes nb vid innerBlk ->
+          let sInner = case blockChildren of
+                [a] -> a
+                _ -> error "Janus.CSE.Optimize: ItemWithStackBytes scope mismatch"
+              (actAfter, innerBlk') = emitBlockCSE cs siteIdx act sInner innerBlk
+           in (actAfter, ItemWithStackBytes nb vid innerBlk')
         ItemOptimalGang tr b2 b4 b8 b16 b32 ->
           case blockChildren of
             [s2, s4, s8, s16, s32] ->
@@ -1276,6 +1300,12 @@ copyPropBlock sub0 cuda0 blk =
       ItemWithString s vid innerBlk ->
         let (subAfter, cudaAfter, innerBlk') = copyPropBlock sub cudaSeen innerBlk
          in (subAfter, cudaAfter, out Seq.|> ItemWithString s vid innerBlk')
+      ItemWithSharedArray pn vid innerBlk ->
+        let (subAfter, cudaAfter, innerBlk') = copyPropBlock sub cudaSeen innerBlk
+         in (subAfter, cudaAfter, out Seq.|> ItemWithSharedArray pn vid innerBlk')
+      ItemWithStackBytes nb vid innerBlk ->
+        let (subAfter, cudaAfter, innerBlk') = copyPropBlock sub cudaSeen innerBlk
+         in (subAfter, cudaAfter, out Seq.|> ItemWithStackBytes nb vid innerBlk')
       ItemOptimalGang tr b2 b4 b8 b16 b32 ->
         let b2' = thd3 (copyPropBlock sub cudaSeen b2)
             b4' = thd3 (copyPropBlock sub cudaSeen b4)
@@ -1423,6 +1453,8 @@ maxCSEVarInTree = \case
         StmFixCall _ _ args -> maxCSEHArgs args
       ItemWithRefPtr _ _ b -> maxCSEBlk b
       ItemWithString _ _ b -> maxCSEBlk b
+      ItemWithSharedArray _ _ b -> maxCSEBlk b
+      ItemWithStackBytes _ _ b -> maxCSEBlk b
       ItemOptimalGang _ b2 b4 b8 b16 b32 ->
         maximum [maxCSEBlk b2, maxCSEBlk b4, maxCSEBlk b8, maxCSEBlk b16, maxCSEBlk b32]
 
@@ -1492,6 +1524,8 @@ instantiateOptTree sub baseCounter countUsed tree
             ItemStm s -> ItemStm (remapStm s)
             ItemWithRefPtr ref vid b -> ItemWithRefPtr (remapRef ref) (remapVid vid) (remapBlk b)
             ItemWithString str vid b -> ItemWithString str (remapVid vid) (remapBlk b)
+            ItemWithSharedArray pn vid b -> ItemWithSharedArray pn (remapVid vid) (remapBlk b)
+            ItemWithStackBytes nb vid b -> ItemWithStackBytes nb (remapVid vid) (remapBlk b)
             ItemOptimalGang tr b2 b4 b8 b16 b32 ->
               ItemOptimalGang tr (remapBlk b2) (remapBlk b4) (remapBlk b8) (remapBlk b16) (remapBlk b32)
           remapStm = \case

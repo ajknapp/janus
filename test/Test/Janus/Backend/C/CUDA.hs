@@ -1,5 +1,7 @@
+{-# LANGUAGE DataKinds #-}
 {-# LANGUAGE FlexibleContexts #-}
 {-# LANGUAGE LambdaCase #-}
+{-# LANGUAGE ScopedTypeVariables #-}
 {-# LANGUAGE TypeApplications #-}
 module Test.Janus.Backend.C.CUDA where
 
@@ -8,9 +10,14 @@ import Control.Exception
 import Control.Monad
 import Control.Monad.Reader
 import Data.Int
+import Data.Proxy (Proxy (..))
+import Data.Word (Word32)
 import Foreign.Ptr
 import Foreign.Marshal.Alloc
 import Foreign.Storable
+import Hedgehog (evalIO, forAll, property, withTests, (===))
+import qualified Hedgehog.Gen as Gen
+import qualified Hedgehog.Range as Range
 import Janus.Backend.C.CUDA
 import Janus.Backend.C.CUDA.Foreign
 import Janus.Backend.C.Build
@@ -18,6 +25,7 @@ import qualified Janus.Command.Memory as M
 import Janus.Command.Cond
 import Janus.Command.Ref
 import Janus.Expression.Cast
+import Janus.Expression.Eq (ExpEq (..))
 import Janus.Expression.Inject
 import Janus.Expression.Integral
 import Janus.Expression.Ord
@@ -25,7 +33,9 @@ import Janus.Typed
 import System.Environment
 import Test.DejaFu.Schedule (roundRobinSchedNP)
 import Test.DejaFu.Settings (defaultMemType)
+import Test.Tasty (TestTree, testGroup)
 import Test.Tasty.HUnit
+import Test.Tasty.Hedgehog (testProperty)
 
 saxpy ::
   ( Monad m,
@@ -204,3 +214,72 @@ unit_sync_barriers_dejafu = do
     forM_ [0 .. gridX - 1] $ \b ->
       forM_ [0 .. blockX - 1] $ \t ->
         peekElemOff pbuf (b * blockX + t) >>= (@?= expectedNeighborSum blockX b t)
+
+-- | Block-shared reversal + warp-shuffle sum + global atomicAdd kernel testing
+-- CmdSharedMem, CmdWarpShuffle, and CmdAtomicAdd together under DejaFu & CUDA!
+sharedReverseAndAtomicSum ::
+  forall m e.
+  (CmdCUDA m e) =>
+  e (Ptr Int32) ->
+  e (Ptr Int32) ->
+  e (Ptr Int32) ->
+  m ()
+sharedReverseAndAtomicSum inBuf outBuf totalPtr = do
+  bdim <- asks _cudaThreadInfoBlockDimX
+  bidx <- asks _cudaThreadInfoBlockIdxX
+  tidx <- asks _cudaThreadInfoThreadIdxX
+  gid <- letM $ bdim * bidx + tidx
+  v <- M.peekElemOff inBuf (toIntegral gid)
+  withSharedArray (Proxy @64) $ \(smem :: e (Ptr Int32)) -> do
+    M.pokeElemOff smem v (toIntegral tidx)
+    syncBlock
+    revIdx <- letM $ bdim - 1 - tidx
+    revVal <- M.peekElemOff smem (toIntegral revIdx)
+    M.pokeElemOff outBuf revVal (toIntegral gid)
+    syncBlock
+  lane <- letM $ tidx `remainder` 32
+  rAcc <- newRef v
+  forM_ [16, 8, 4, 2, 1 :: Int32] $ \delta -> do
+    cur <- readRef rAcc
+    other <- shflDownSync (0xffffffff :: e Word32) cur (fromIntegral delta)
+    whenM_ ((lane + fromIntegral delta) `lt` 32) $
+      whenM_ ((tidx + fromIntegral delta) `lt` bdim) $
+        writeRef rAcc (cur + other)
+  whenM_ (lane `eq` 0) $ do
+    wsum <- readRef rAcc
+    _ <- atomicAddPtr totalPtr wsum
+    pure ()
+
+test_cuda_phase1_dejafu_properties :: TestTree
+test_cuda_phase1_dejafu_properties =
+  testGroup
+    "CUDA SharedMem / WarpShuffle / Atomic DejaFu Properties"
+    [ testProperty "shared memory reverse + warp shuffle sum + atomicAdd is race-free across arbitrary block sizes" $
+        withTests 15 $
+          property $ do
+            gridX <- forAll $ Gen.int (Range.linear 1 2)
+            blockX <- forAll $ Gen.int (Range.linear 1 40)
+            let total = gridX * blockX
+            xs <- forAll $ Gen.list (Range.singleton total) (Gen.int32 (Range.linear (-50) 50))
+            let conf = cpuLaunchConfig1D gridX blockX
+            (res, outs, tot) <- evalIO $
+              allocaBytes (total * sizeOf (undefined :: Int32)) $ \pIn ->
+                allocaBytes (total * sizeOf (undefined :: Int32)) $ \pOut ->
+                  allocaBytes (sizeOf (undefined :: Int32)) $ \pTot -> do
+                    forM_ (zip [0 ..] xs) $ \(i, x) -> pokeElemOff pIn i x
+                    poke pTot (0 :: Int32)
+                    (r, _tr) <-
+                      launchCUDADejaFuM conf $
+                        sharedReverseAndAtomicSum @CUDADejaFuM @CUDADejaFu
+                          (inject pIn)
+                          (inject pOut)
+                          (inject pTot)
+                    os <- mapM (peekElemOff pOut) [0 .. total - 1]
+                    t <- peek pTot
+                    pure (r, os, t)
+            res === Right ()
+            let expectedRev =
+                  concat [reverse (take blockX (drop (b * blockX) xs)) | b <- [0 .. gridX - 1]]
+            outs === expectedRev
+            tot === sum xs
+    ]

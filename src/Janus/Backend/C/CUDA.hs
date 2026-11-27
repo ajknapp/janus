@@ -1,5 +1,8 @@
+{-# LANGUAGE ConstraintKinds #-}
 {-# LANGUAGE FlexibleContexts #-}
 {-# LANGUAGE FlexibleInstances #-}
+{-# LANGUAGE KindSignatures #-}
+{-# LANGUAGE MultiParamTypeClasses #-}
 {-# LANGUAGE ScopedTypeVariables #-}
 {-# LANGUAGE TypeApplications #-}
 {-# LANGUAGE TypeFamilies #-}
@@ -10,12 +13,18 @@ module Janus.Backend.C.CUDA
   ( module Janus.Backend.C.CUDA.Types,
     module Janus.Backend.C.CUDA.Kernel,
     module Janus.Backend.C.CUDA.Runtime,
+    module Janus.Backend.C.CUDA.SharedMem,
+    module Janus.Backend.C.CUDA.Warp,
+    module Janus.Backend.C.CUDA.Atomic,
     module Janus.Backend.C.CUDA.CPUSIMD,
     module Janus.Backend.C.CUDA.SIMD.Base,
     module Janus.Backend.C.CUDA.SIMD.MaskCmp,
     module Janus.Backend.C.CUDA.SIMD.Float,
     module Janus.Backend.C.CUDA.SIMD.Bits,
     module Janus.Backend.C.CUDA.SIMD.ReduceDot,
+
+    -- * Unified CUDA Kernel Capability Bundle
+    CmdCUDA,
 
     -- * CSE-Backed CUDA Expression, Command, & Reference Type Aliases
     JanusCUDACSE,
@@ -40,15 +49,20 @@ module Janus.Backend.C.CUDA
   )
 where
 
+import Control.Monad.Reader (MonadReader)
 import qualified Data.Dependent.HashMap as DHM
 import Data.Functor.Identity (Identity (..))
+import Data.Int (Int32, Int64)
+import Data.Word (Word32, Word64)
 import Janus.Backend.C.Build (CBuildConfig)
+import Janus.Backend.C.CUDA.Atomic
 import Janus.Backend.C.CUDA.CPU ()
 import Janus.Backend.C.CUDA.CPUSIMD
 import Janus.Backend.C.CUDA.Foreign (CUctx, CUdevice, CUfunction, CUlaunchConfig)
 import Janus.Backend.C.CUDA.Gang ()
 import Janus.Backend.C.CUDA.Kernel
 import Janus.Backend.C.CUDA.Runtime
+import Janus.Backend.C.CUDA.SharedMem
 import Janus.Backend.C.CUDA.SIMD.Arith ()
 import Janus.Backend.C.CUDA.SIMD.Base
 import Janus.Backend.C.CUDA.SIMD.Bits
@@ -59,6 +73,10 @@ import Janus.Backend.C.CUDA.SIMD.Mem ()
 import Janus.Backend.C.CUDA.SIMD.ReduceDot
 import Janus.Backend.C.CUDA.SIMD.Shuffle ()
 import Janus.Backend.C.CUDA.Types
+import Janus.Backend.C.CUDA.Warp
+import Janus.Constraints (CmdJanus)
+import Janus.Expression.SpecialMath (ExpSpecialMath)
+import Janus.SPMD.Types (ExpPair)
 import Janus.Backend.C.Target (CUDAFeatures, TargetFeatureMap, cudaFeatureKey, cudaSM80, observeCUDAFeatures)
 import Janus.CSE
   ( CSEExp,
@@ -68,6 +86,41 @@ import Janus.CSE
     CSERef,
     CSETarget,
     withCSEWithFeatures,
+  )
+
+-- | Full CUDA kernel capability bundle (satisfied by 'JanusCUDAM'/'JanusCUDA',
+-- 'JanusCUDAMCSE'/'JanusCUDACSE', 'CUDAIOM'/'CUDAIO', and 'CUDADejaFuM'/'CUDADejaFu').
+type CmdCUDA m e =
+  ( CmdJanus m e,
+    ExpPair e,
+    ExpSpecialMath e Float,
+    ExpSpecialMath e Double,
+    MonadReader (CUDAThreadInfo e) m,
+    CmdSync m,
+    CmdSharedMem m e,
+    CmdWarpShuffle m e Int32,
+    CmdWarpShuffle m e Word32,
+    CmdWarpShuffle m e Int64,
+    CmdWarpShuffle m e Word64,
+    CmdWarpShuffle m e Float,
+    CmdWarpShuffle m e Double,
+    CmdAtomic m e,
+    CmdAtomicAdd m e Int32,
+    CmdAtomicAdd m e Word32,
+    CmdAtomicAdd m e Int64,
+    CmdAtomicAdd m e Word64,
+    CmdAtomicAdd m e Float,
+    CmdAtomicAdd m e Double,
+    CmdAtomicMinMax m e Int32,
+    CmdAtomicMinMax m e Word32,
+    CmdAtomicMinMax m e Int64,
+    CmdAtomicMinMax m e Word64,
+    CmdAtomicMinMax m e Float,
+    CmdAtomicMinMax m e Double,
+    CmdAtomicBits m e Int32,
+    CmdAtomicBits m e Word32,
+    CmdAtomicBits m e Int64,
+    CmdAtomicBits m e Word64
   )
 
 type JanusCUDACSE = CSEExp JanusCUDA
