@@ -65,6 +65,17 @@ module Janus.Tensor.IR
 
     -- * Representable Surface Table (`Tab i a`)
     Tab (..),
+    ScalarTab,
+    VectorTab,
+    MatrixTab,
+    Tensor3Tab,
+    Tensor4Tab,
+    Tensor5Tab,
+    Tensor6Tab,
+    Tensor7Tab,
+    Tensor8Tab,
+    Tensor9Tab,
+    TensorTab,
     fromNode,
     materialize,
 
@@ -112,6 +123,7 @@ import Data.Type.Equality ((:~:) (..))
 import qualified Data.Text as Text
 import qualified Data.Text.Encoding as Text
 import GHC.TypeLits (KnownSymbol, symbolVal)
+import GHC.TypeNats (Nat)
 import Janus.Tensor.Algebra
   ( SomeCommMonoid,
     SomeMonoid,
@@ -137,7 +149,7 @@ import Janus.Tensor.Index
     sixDigest,
     sixStaticSize,
   )
-import Janus.Tensor.Types (PrimAttrMap)
+import Janus.Tensor.Types (PrimAttrMap, ShapeToIx)
 import Linear.Conjugate (Conjugate (..))
 import Linear.Metric (Metric (..))
 import Linear.Trace (Trace (..))
@@ -572,6 +584,102 @@ data Tab (i :: IxKind) a = Tab
     tabIndex :: IxExpr i -> a
   }
   deriving stock (Functor)
+
+-- | Rank-0 (scalar) table synonym, matching @'ShapeToIx' '[]@.
+type ScalarTab a = Tab 'IxUnit a
+
+-- | Rank-1 (vector) static table synonym, matching @'ShapeToIx' '[n]@.
+type VectorTab (n :: Nat) a = Tab ('IxFin n) a
+
+-- | Rank-2 (matrix) static table synonym, matching @'ShapeToIx' '[n, m]@.
+type MatrixTab (n :: Nat) (m :: Nat) a = Tab ('IxProd ('IxFin n) ('IxFin m)) a
+
+-- | Rank-3 static tensor table synonym (right-nested to match 'ShapeToIx').
+type Tensor3Tab (d1 :: Nat) (d2 :: Nat) (d3 :: Nat) a =
+  Tab ('IxProd ('IxFin d1) ('IxProd ('IxFin d2) ('IxFin d3))) a
+
+-- | Rank-4 static tensor table synonym (right-nested to match 'ShapeToIx').
+type Tensor4Tab (d1 :: Nat) (d2 :: Nat) (d3 :: Nat) (d4 :: Nat) a =
+  Tab ('IxProd ('IxFin d1) ('IxProd ('IxFin d2) ('IxProd ('IxFin d3) ('IxFin d4)))) a
+
+-- | Rank-5 static tensor table synonym (right-nested to match 'ShapeToIx').
+type Tensor5Tab (d1 :: Nat) (d2 :: Nat) (d3 :: Nat) (d4 :: Nat) (d5 :: Nat) a =
+  Tab
+    ( 'IxProd
+        ('IxFin d1)
+        ('IxProd ('IxFin d2) ('IxProd ('IxFin d3) ('IxProd ('IxFin d4) ('IxFin d5))))
+    )
+    a
+
+-- | Rank-6 static tensor table synonym (right-nested to match 'ShapeToIx').
+type Tensor6Tab (d1 :: Nat) (d2 :: Nat) (d3 :: Nat) (d4 :: Nat) (d5 :: Nat) (d6 :: Nat) a =
+  Tab
+    ( 'IxProd
+        ('IxFin d1)
+        ( 'IxProd
+            ('IxFin d2)
+            ('IxProd ('IxFin d3) ('IxProd ('IxFin d4) ('IxProd ('IxFin d5) ('IxFin d6))))
+        )
+    )
+    a
+
+-- | Rank-7 static tensor table synonym (right-nested to match 'ShapeToIx').
+type Tensor7Tab (d1 :: Nat) (d2 :: Nat) (d3 :: Nat) (d4 :: Nat) (d5 :: Nat) (d6 :: Nat) (d7 :: Nat) a =
+  Tab
+    ( 'IxProd
+        ('IxFin d1)
+        ( 'IxProd
+            ('IxFin d2)
+            ( 'IxProd
+                ('IxFin d3)
+                ('IxProd ('IxFin d4) ('IxProd ('IxFin d5) ('IxProd ('IxFin d6) ('IxFin d7))))
+            )
+        )
+    )
+    a
+
+-- | Rank-8 static tensor table synonym (right-nested to match 'ShapeToIx').
+type Tensor8Tab (d1 :: Nat) (d2 :: Nat) (d3 :: Nat) (d4 :: Nat) (d5 :: Nat) (d6 :: Nat) (d7 :: Nat) (d8 :: Nat) a =
+  Tab
+    ( 'IxProd
+        ('IxFin d1)
+        ( 'IxProd
+            ('IxFin d2)
+            ( 'IxProd
+                ('IxFin d3)
+                ( 'IxProd
+                    ('IxFin d4)
+                    ('IxProd ('IxFin d5) ('IxProd ('IxFin d6) ('IxProd ('IxFin d7) ('IxFin d8))))
+                )
+            )
+        )
+    )
+    a
+
+-- | Rank-9 static tensor table synonym (right-nested to match 'ShapeToIx').
+type Tensor9Tab (d1 :: Nat) (d2 :: Nat) (d3 :: Nat) (d4 :: Nat) (d5 :: Nat) (d6 :: Nat) (d7 :: Nat) (d8 :: Nat) (d9 :: Nat) a =
+  Tab
+    ( 'IxProd
+        ('IxFin d1)
+        ( 'IxProd
+            ('IxFin d2)
+            ( 'IxProd
+                ('IxFin d3)
+                ( 'IxProd
+                    ('IxFin d4)
+                    ( 'IxProd
+                        ('IxFin d5)
+                        ('IxProd ('IxFin d6) ('IxProd ('IxFin d7) ('IxProd ('IxFin d8) ('IxFin d9))))
+                    )
+                )
+            )
+        )
+    )
+    a
+
+-- | Arbitrary-rank static tensor table synonym indexed by a type-level @[Nat]@
+-- shape list (matching 'Janus.Data.Tensor.Tensor').
+type TensorTab (ds :: [Nat]) a = Tab (ShapeToIx ds) a
 
 instance (IxSet i) => Applicative (Tab i) where
   pure x = Tab (six @i) (const x)

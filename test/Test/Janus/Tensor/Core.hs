@@ -3,6 +3,7 @@
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE ScopedTypeVariables #-}
 {-# LANGUAGE TypeApplications #-}
+{-# LANGUAGE TypeOperators #-}
 
 module Test.Janus.Tensor.Core
   ( test_tensor_core,
@@ -12,6 +13,7 @@ where
 import Data.Functor.Identity (Identity (..))
 import Data.Int (Int64)
 import Data.Proxy (Proxy (..))
+import Data.Type.Equality ((:~:) (..))
 import qualified Data.Vector as V
 import Hedgehog
 import qualified Hedgehog.Gen as Gen
@@ -36,6 +38,7 @@ test_tensor_core =
       testProperty "IxPrism partial-inverse & host/embedded parity laws" law_ixPrism,
       testProperty "IxAffine broadcast & window1D host/embedded parity" law_ixAffine,
       testCase "Merkle digest determinism, beta-reduction & eta-contraction" checkMerkleAndBetaEta,
+      testCase "Rank-indexed static table synonyms (ScalarTab..Tensor9Tab & TensorTab)" checkRankTabSynonyms,
       testCase "Kmett linear Representable/Additive/Metric/Trace & V2..V4/M33/V interop" checkLinearInterop,
       testCase "TensorST and AccumM construct well-typed Merkle-hashed IR nodes" checkStAndAccumIR
     ]
@@ -186,6 +189,36 @@ checkMerkleAndBetaEta = do
   case buildTensorFn fusedFn of
     NFor _ SIxUnit _ (EBinOp _ BAdd (EIndex _ (NInput _ _ _) (IxConst 3 _)) (ELit _ 5.0)) -> pure ()
     _ -> assertFailure "Expected beta-reduced EBinOp over NInput without intermediate NFor"
+
+checkRankTabSynonyms :: Assertion
+checkRankTabSynonyms = do
+  -- Verify every rank 0..9 synonym is definitionally identical to TensorTab / ShapeToIx
+  let _r0 :: ScalarTab Double :~: TensorTab '[] Double
+      _r0 = Refl
+      _r1 :: VectorTab 2 Double :~: TensorTab '[2] Double
+      _r1 = Refl
+      _r2 :: MatrixTab 2 3 Double :~: TensorTab '[2, 3] Double
+      _r2 = Refl
+      _r3 :: Tensor3Tab 2 3 4 Double :~: TensorTab '[2, 3, 4] Double
+      _r3 = Refl
+      _r4 :: Tensor4Tab 1 2 3 4 Double :~: TensorTab '[1, 2, 3, 4] Double
+      _r4 = Refl
+      _r5 :: Tensor5Tab 1 2 3 4 5 Double :~: TensorTab '[1, 2, 3, 4, 5] Double
+      _r5 = Refl
+      _r6 :: Tensor6Tab 1 2 3 4 5 6 Double :~: TensorTab '[1, 2, 3, 4, 5, 6] Double
+      _r6 = Refl
+      _r7 :: Tensor7Tab 1 2 3 4 5 6 7 Double :~: TensorTab '[1, 2, 3, 4, 5, 6, 7] Double
+      _r7 = Refl
+      _r8 :: Tensor8Tab 1 2 3 4 5 6 7 8 Double :~: TensorTab '[1, 2, 3, 4, 5, 6, 7, 8] Double
+      _r8 = Refl
+      _r9 :: Tensor9Tab 1 2 3 4 5 6 7 8 9 Double :~: TensorTab '[1, 2, 3, 4, 5, 6, 7, 8, 9] Double
+      _r9 = Refl
+      t9Fn ::
+        Tensor9Tab 1 2 1 2 1 2 1 2 3 (Expr Double) ->
+        Tensor9Tab 1 2 1 2 1 2 1 2 3 (Expr Double)
+      t9Fn t = forIx (\i -> (t ! i) + 1.0)
+      n9 = buildTensorFn t9Fn
+  assertEqual "Tensor9Tab static element count" (Just 48) (sixStaticSize (rawNodeShape n9))
 
 checkLinearInterop :: Assertion
 checkLinearInterop = do
